@@ -6,6 +6,13 @@ import test from "node:test";
 
 import { NativeRpcClient } from "../../src/native/rpc-client.js";
 
+// Source and patch assertions below match multi-line text. A Windows checkout
+// can materialize these files with CRLF, so normalize before comparing.
+async function readCheckedOutText(...segments: string[]): Promise<string> {
+  const contents = await readFile(join(process.cwd(), ...segments), "utf8");
+  return contents.replace(/\r\n/g, "\n");
+}
+
 test("native RPC client correlates responses and receives notifications", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-rpc-test-"));
   const executable = join(root, "mock-native.mjs");
@@ -66,10 +73,7 @@ lines.on("line", line => {
 });
 
 test("native login diagnostics do not print Apple identity material", async () => {
-  const source = await readFile(
-    join(process.cwd(), "pkg", "rustpushgo", "src", "lib.rs"),
-    "utf8",
-  );
+  const source = await readCheckedOutText("pkg", "rustpushgo", "src", "lib.rs");
   for (const unsafeLog of [
     "hardware_headers={:?}",
     "push_token={:?}",
@@ -80,19 +84,13 @@ test("native login diagnostics do not print Apple identity material", async () =
 });
 
 test("native IDS alias failures neither leak Apple payloads nor require a missing alias field", async () => {
-  const source = await readFile(
-    join(process.cwd(), "third_party", "rustpush-upstream", "src", "ids", "user.rs"),
-    "utf8",
-  );
+  const source = await readCheckedOutText("third_party", "rustpush-upstream", "src", "ids", "user.rs");
   assert.equal(source.includes("Got alias response"), false);
   assert.equal(source.includes("Just took action {operation} on alias"), false);
   assert.equal(source.includes("alias: Option<String>"), true);
   assert.equal(source.includes("parsed.alias.ok_or(PushError::BadMsg)?"), true);
 
-  const patch = await readFile(
-    join(process.cwd(), "rustpush", "upstream-iblue.patch"),
-    "utf8",
-  );
+  const patch = await readCheckedOutText("rustpush", "upstream-iblue.patch");
   const additions = patch
     .split("\n")
     .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
@@ -103,10 +101,7 @@ test("native IDS alias failures neither leak Apple payloads nor require a missin
 });
 
 test("native IDS key cache is explicitly anchored to the profile data directory", async () => {
-  const source = await readFile(
-    join(process.cwd(), "pkg", "rustpushgo", "src", "lib.rs"),
-    "utf8",
-  );
+  const source = await readCheckedOutText("pkg", "rustpushgo", "src", "lib.rs");
   assert.equal(source.includes('PathBuf::from("state/id_cache.plist")'), false);
   assert.equal(source.includes('std::fs::create_dir_all("state")'), false);
   assert.equal(
@@ -125,10 +120,7 @@ test("native IDS key cache is explicitly anchored to the profile data directory"
 });
 
 test("native APNs socket setup uses bounded asynchronous DNS and Apple's port fallback", async () => {
-  const patch = await readFile(
-    join(process.cwd(), "rustpush", "upstream-iblue.patch"),
-    "utf8",
-  );
+  const patch = await readCheckedOutText("rustpush", "upstream-iblue.patch");
   const additions = patch
     .split("\n")
     .filter((line) => line.startsWith("+") && !line.startsWith("+++"))

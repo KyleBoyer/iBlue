@@ -49,6 +49,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          # The action defaults to RUSTFLAGS=-D warnings, which fails the build
+          # on lints in the pinned upstream rustpush/apple-private-apis sources
+          # this workspace compiles but does not own.
+          rustflags: ""
 
       # unicorn-engine-sys uses CMake/Ninja for its bundled C library and
       # bindgen for the Rust API. This mirrors Unicorn's own Windows crate CI.

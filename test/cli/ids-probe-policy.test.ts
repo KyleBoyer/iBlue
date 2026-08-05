@@ -264,7 +264,6 @@ test("an active cooldown rejects a probe before launching the native process", a
 
 test("a held profile lease rejects the canary before creating one-shot evidence", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-ids-canary-lease-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
   const dataRoot = join(root, "data");
   const profileRoot = join(dataRoot, "profiles", "secondary");
   const nativeRoot = join(profileRoot, "native");
@@ -293,8 +292,12 @@ test("a held profile lease rejects the canary before creating one-shot evidence"
   const policyPath = join(profileRoot, "ids-policy.json");
   await writeFile(policyPath, `${JSON.stringify(expiredPolicy)}\n`, { mode: 0o600 });
 
+  // node:test runs `after` hooks in registration order, so the lease has to be
+  // registered before the tree removal: Windows refuses to unlink the lease
+  // database while it is still open, which POSIX allows.
   const lease = NativeProfileLease.acquire(nativeRoot);
   t.after(() => lease.release());
+  t.after(() => rm(root, { recursive: true, force: true }));
   const result = await runCli([
     "ids-canary",
     "--profile",
