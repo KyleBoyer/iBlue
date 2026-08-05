@@ -39,7 +39,12 @@ The exact REST implementations cover:
 - direct and group chat creation;
 - text, attachment, multipart, reaction, reply, edit, unsend, and Notify
   Anyway entry points, including subject/effect/audio flags used by the stock
-  client's private-API send mode;
+  client's private-API send mode. Edit and unsend are also reachable as
+  `POST /api/v1/message/edit` and `POST /api/v1/message/delete`, which take the
+  target as a `messageGuid` body field instead of a path parameter. Those two
+  paths are outside the pinned 1.9.9 route table above; they exist because
+  third-party BlueBubbles clients send that spelling, and they share the pinned
+  routes' handler;
 - typing, read, and unread controls;
 - inbound typing start/stop plus per-message delivered/read update events;
 - group name, participant, leave, and icon controls;

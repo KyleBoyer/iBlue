@@ -1354,6 +1354,29 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(editedBody.data.text, "hello, edited");
   assert.ok(editedBody.data.dateEdited > 0);
 
+  // BlueBubbles clients also send edit and unsend with the message GUID in the
+  // body instead of the path.
+  const editedByBody = await fetch(`${listening.address}/api/v1/message/edit?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      messageGuid: "sent-guid",
+      editedMessage: "hello, edited again",
+      backwardsCompatibilityMessage: "hello, edited again",
+      partIndex: 0,
+    }),
+  });
+  const editedByBodyPayload = await editedByBody.json() as { data: { text: string } };
+  assert.equal(editedByBodyPayload.data.text, "hello, edited again");
+
+  const editMissingGuid = await fetch(`${listening.address}/api/v1/message/edit?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ editedMessage: "no target" }),
+  });
+  assert.equal(editMissingGuid.status, 400);
+
   const typing = await fetch(
     `${listening.address}/api/v1/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/typing?password=secret`,
     { method: "POST" },
@@ -1367,6 +1390,19 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   });
   const unsentBody = await unsent.json() as { data: { dateRetracted: number } };
   assert.ok(unsentBody.data.dateRetracted > 0);
+
+  const deletedByBody = await fetch(`${listening.address}/api/v1/message/delete?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      messageGuid: "sent-guid",
+      partIndex: 0,
+    }),
+  });
+  const deletedByBodyPayload = await deletedByBody.json() as { data: { dateRetracted: number } };
+  assert.equal(deletedByBody.status, 200);
+  assert.ok(deletedByBodyPayload.data.dateRetracted > 0);
 
   socket = socketClient(listening.address, { query: { password: "secret" }, transports: ["websocket"] });
   await new Promise<void>((resolve, reject) => {
@@ -1501,7 +1537,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(reacted.status, 200);
   assert.equal(reacted.data.associatedMessageGuid, "sent-guid");
   assert.equal(engine.reactions.at(-1)?.reaction, "like");
-  assert.equal(engine.reactions.at(-1)?.targetText, "hello, edited");
+  assert.equal(engine.reactions.at(-1)?.targetText, "hello, edited again");
 
   await service.sendReaction({
     chatGuid: "iMessage;-;friend@example.com",

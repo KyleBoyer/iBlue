@@ -565,24 +565,40 @@ export class BlueBubblesServer {
       return success(message);
     });
 
-    this.app.post<{ Params: { guid: string } }>("/api/v1/message/:guid/edit", async (request) => {
-      const body = asRecord(request.body);
+    // BlueBubbles accepts both a path-parameter and a body-parameter spelling
+    // of edit and unsend, and clients pick either one. Both spellings share a
+    // handler here so the pair cannot drift apart.
+    const editMessage = async (messageGuid: string, body: Record<string, unknown>) => {
       const editedMessage = requiredString(body, "editedMessage");
       const message = await this.service.editMessage({
-        messageGuid: request.params.guid,
+        messageGuid,
         editedMessage,
         ...(body.partIndex === undefined ? {} : { partIndex: numberValue(body.partIndex, 0) }),
       });
       return success(message, "Message edited!");
-    });
-
-    this.app.post<{ Params: { guid: string } }>("/api/v1/message/:guid/unsend", async (request) => {
-      const body = asRecord(request.body);
+    };
+    const unsendMessage = async (messageGuid: string, body: Record<string, unknown>) => {
       const message = await this.service.unsendMessage({
-        messageGuid: request.params.guid,
+        messageGuid,
         ...(body.partIndex === undefined ? {} : { partIndex: numberValue(body.partIndex, 0) }),
       });
       return success(message, "Message unsent!");
+    };
+
+    this.app.post<{ Params: { guid: string } }>("/api/v1/message/:guid/edit", async (request) =>
+      editMessage(request.params.guid, asRecord(request.body)),
+    );
+    this.app.post("/api/v1/message/edit", async (request) => {
+      const body = asRecord(request.body);
+      return editMessage(requiredString(body, "messageGuid"), body);
+    });
+
+    this.app.post<{ Params: { guid: string } }>("/api/v1/message/:guid/unsend", async (request) =>
+      unsendMessage(request.params.guid, asRecord(request.body)),
+    );
+    this.app.post("/api/v1/message/delete", async (request) => {
+      const body = asRecord(request.body);
+      return unsendMessage(requiredString(body, "messageGuid"), body);
     });
     this.app.post<{ Params: { guid: string } }>("/api/v1/message/:guid/notify", async (request) => {
       return success(await this.service.notifyMessage(request.params.guid));
