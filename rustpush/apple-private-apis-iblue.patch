@@ -1,0 +1,41 @@
+diff --git a/icloud-auth/src/client.rs b/icloud-auth/src/client.rs
+index be878fe..7746de4 100644
+--- a/icloud-auth/src/client.rs
++++ b/icloud-auth/src/client.rs
+@@ -90,8 +90,8 @@ pub struct AuthTokenRequest {
+ }
+ 
+ pub struct FetchedToken {
+-    token: String,
+-    expiration: SystemTime,
++    pub token: String,
++    pub expiration: SystemTime,
+ }
+ 
+ pub struct AppleAccount<T: AnisetteProvider> {
+diff --git a/icloud-auth/src/lib.rs b/icloud-auth/src/lib.rs
+index ede480b..e8311a4 100644
+--- a/icloud-auth/src/lib.rs
++++ b/icloud-auth/src/lib.rs
+@@ -2,7 +2,7 @@ pub mod anisette;
+ mod client;
+ use std::fmt::Display;
+ 
+-pub use client::{AppleAccount, LoginState, TrustedPhoneNumber, AuthenticationExtras, VerifyBody, CircleSendMessage, GenerateVerificationTokenRequest};
++pub use client::{AppleAccount, FetchedToken, LoginState, TrustedPhoneNumber, AuthenticationExtras, VerifyBody, CircleSendMessage, GenerateVerificationTokenRequest};
+ pub use omnisette::{LoginClientInfo, default_provider, ArcAnisetteClient, DefaultAnisetteProvider};
+ 
+ 
+diff --git a/omnisette/Cargo.toml b/omnisette/Cargo.toml
+index f35a4ea..952fb71 100644
+--- a/omnisette/Cargo.toml
++++ b/omnisette/Cargo.toml
+@@ -8,6 +8,8 @@ async = ["dep:async-trait"]
+ default = ["dep:remove-async-await", "async"]
+ remote-anisette-v3 = ["async", "dep:tokio-tungstenite", "dep:futures-util"]
+ remote-clearadi = ["async", "dep:clearadi"]
++prefer-aoskit = []
++prefer-remote-anisette-v3 = []
+ 
+ [dependencies]
+ base64 = "0.21"

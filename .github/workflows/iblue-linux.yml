@@ -1,0 +1,140 @@
+name: iBlue Linux and container build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/iblue-linux.yml"
+      - "Dockerfile"
+      - "docker-compose.example.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "pkg/rustpushgo/**"
+      - "rustpush/**"
+      - "nac-validation/**"
+      - "third_party/rustpush-upstream.sha"
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/iblue-linux.yml"
+      - "Dockerfile"
+      - "docker-compose.example.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "pkg/rustpushgo/**"
+      - "rustpush/**"
+      - "nac-validation/**"
+      - "third_party/rustpush-upstream.sha"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake protobuf-compiler pkg-config libclang-dev
+
+      - name: Install TypeScript dependencies
+        run: npm ci
+
+      - name: Prepare pinned rustpush source
+        run: npm run prepare:native
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pkg/rustpushgo
+
+      - name: Check and test TypeScript
+        run: |
+          npm run check
+          npm test
+
+      - name: Build native engine
+        run: npm run build:native
+
+      - name: Test native encrypted credential backend offline
+        run: >-
+          cargo test --release --locked
+          --manifest-path pkg/rustpushgo/Cargo.toml
+          --bin iblue-native
+          --features hardware-key
+
+      - name: Smoke-test native JSON-RPC without Apple inputs
+        run: >-
+          node scripts/smoke-native.mjs
+          --binary pkg/rustpushgo/target/release/iblue-native
+          --platform linux
+          --architecture x86_64
+          --expect-registration-unavailable
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iblue-native-linux-x64
+          path: pkg/rustpushgo/target/release/iblue-native
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build production container
+        run: docker build --tag iblue:ci .
+
+      - name: Verify non-root runtime and writable profile volume
+        run: |
+          volume="iblue-ci-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker volume create "$volume"
+          trap 'docker volume rm "$volume"' EXIT
+          docker run --rm --network none \
+            --mount "type=volume,source=$volume,target=/data" \
+            --entrypoint sh iblue:ci -c \
+            'test "$(id -u)" = 10001 && test "$(id -g)" = 10001 && touch /data/.iblue-write-test'
+
+      - name: Smoke-test container CLI without networking
+        run: docker run --rm --network none iblue:ci help
+
+      - name: Smoke-test container native engine without Apple inputs
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"system.version","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"system.shutdown","params":{}}' |
+            docker run --rm --network none -i \
+              -e IBLUE_OFFLINE_ONLY=1 \
+              --entrypoint /app/iblue-native \
+              iblue:ci --state-dir /tmp/iblue-native-smoke > native-smoke.jsonl
+          grep -q '"platform":"linux"' native-smoke.jsonl
+          grep -q '"architecture":"x86_64"' native-smoke.jsonl
+          grep -q '"registrationBackend":"unicorn-imdappleservices-external"' native-smoke.jsonl
+          grep -q '"registrationAvailable":false' native-smoke.jsonl
+          grep -q '"hardwareKeyRequired":true' native-smoke.jsonl

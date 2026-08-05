@@ -1,0 +1,115 @@
+name: iBlue Windows native build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/iblue-windows.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "pkg/rustpushgo/**"
+      - "rustpush/**"
+      - "nac-validation/**"
+      - "third_party/rustpush-upstream.sha"
+  pull_request:
+    paths:
+      - ".github/workflows/iblue-windows.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "scripts/**"
+      - "src/**"
+      - "test/**"
+      - "pkg/rustpushgo/**"
+      - "rustpush/**"
+      - "nac-validation/**"
+      - "third_party/rustpush-upstream.sha"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      # unicorn-engine-sys uses CMake/Ninja for its bundled C library and
+      # bindgen for the Rust API. This mirrors Unicorn's own Windows crate CI.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install native build tools
+        shell: pwsh
+        run: |
+          choco install ninja protoc nasm strawberryperl --yes --no-progress
+          $perl = "C:\Strawberry\perl\bin\perl.exe"
+          if (-not (Test-Path $perl)) {
+            throw "Strawberry Perl was not installed at $perl"
+          }
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $clang = (Get-Command clang.exe).Source
+          $libclang = Split-Path $clang
+          if (-not (Test-Path (Join-Path $libclang "libclang.dll"))) {
+            throw "libclang.dll was not found beside $clang"
+          }
+          "LIBCLANG_PATH=$libclang" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          cmake --version
+          ninja --version
+          protoc --version
+          clang --version
+          & $perl -v
+          nmake /? | Select-Object -First 1
+
+      - name: Install TypeScript dependencies
+        run: npm ci
+
+      - name: Prepare pinned rustpush source
+        run: npm run prepare:native
+
+      - name: Check and test TypeScript
+        run: |
+          npm run check
+          npm test
+
+      - name: Build native engine with MSVC
+        run: npm run build:native
+
+      - name: Test native credential backends offline
+        run: >-
+          cargo test --release --locked
+          --manifest-path pkg/rustpushgo/Cargo.toml
+          --bin iblue-native
+          --features hardware-key
+
+      - name: Smoke-test native JSON-RPC
+        run: >-
+          node scripts/smoke-native.mjs
+          --binary pkg/rustpushgo/target/release/iblue-native.exe
+          --platform windows
+          --architecture x86_64
+          --expect-registration-unavailable
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iblue-native-windows-x64
+          path: pkg/rustpushgo/target/release/iblue-native.exe
+          if-no-files-found: error
+          retention-days: 7

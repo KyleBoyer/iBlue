@@ -1,0 +1,15 @@
+.git
+.gitignore
+.DS_Store
+node_modules
+dist-ts
+**/target
+third_party/rustpush-upstream
+data
+state
+secrets
+*.db*
+*.log
+.env
+docker-compose.yml
+docker-compose.override.yml

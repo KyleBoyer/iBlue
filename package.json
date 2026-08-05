@@ -1,0 +1,35 @@
+{
+  "name": "iblue",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A profile-isolated TypeScript iMessage service powered by rustpush",
+  "type": "module",
+  "bin": {
+    "iblue": "./dist-ts/src/cli.js"
+  },
+  "scripts": {
+    "build": "npm run build:typescript && npm run build:native",
+    "build:native": "node scripts/build-native.mjs",
+    "prepare:native": "node scripts/prepare-rustpush.mjs",
+    "build:typescript": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist-ts/src/cli.js",
+    "test": "node --import tsx --test test/**/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/multipart": "^10.1.0",
+    "fastify": "^5.11.2",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "socket.io-client": "^4.8.3",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

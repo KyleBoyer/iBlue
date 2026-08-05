@@ -1,0 +1,41 @@
+[package]
+name = "open-absinthe"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+log = "0.4"
+goblin = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+# The allowlisted NAC routine is x86_64. Unicorn defaults to `arch_all`, which
+# compiles ten unrelated CPU backends and substantially increases portable
+# Windows/Linux build time and failure surface.
+unicorn-engine = { version = "2.1.5", optional = true, default-features = false, features = ["arch_x86"] }
+
+# Optional: native NAC via AAAbsintheContext (macOS 13+).
+# When the `native-nac` feature is enabled AND the build target is macOS,
+# `ValidationCtx` delegates the NAC steps to Apple's AppleAccount.framework
+# (`AAAbsintheContext`) through the `nac-validation` crate.
+#
+# nac-validation is a standalone workspace member (libc + thiserror + cc only —
+# no rustpush, no open-absinthe), so this dep direction does NOT create a cycle.
+# The path reaches the repo-root `nac-validation/` from the built copy of this
+# crate at `third_party/rustpush-upstream/open-absinthe/`.
+[target.'cfg(target_os = "macos")'.dependencies]
+nac-validation = { path = "../../../nac-validation", optional = true }
+
+[features]
+serde = []
+# Native AAAbsintheContext NAC (real Mac). This is the FOSS macOS path.
+native-nac = ["dep:nac-validation"]
+# Portable x86_64 NAC emulation. This runs on non-macOS hosts through Unicorn,
+# but deliberately requires a user-supplied, SHA-256-allowlisted Apple binary
+# via IBLUE_NAC_BINARY_FILE. The binary is neither bundled nor downloaded.
+native-nac-rust = [
+    "dep:goblin",
+    "dep:rand",
+    "dep:sha2",
+    "dep:unicorn-engine",
+]

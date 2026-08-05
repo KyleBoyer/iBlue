@@ -1,0 +1,43 @@
+services:
+  iblue:
+    build: .
+    restart: unless-stopped
+    command:
+      - serve
+      - --profile
+      - secondary
+      - --data-root
+      - /data
+      - --host
+      - 0.0.0.0
+      - --port
+      - "1234"
+    environment:
+      IBLUE_HARDWARE_KEY_FILE: /run/secrets/iblue_hardware_key
+      IBLUE_NAC_BINARY_FILE: /run/secrets/iblue_nac_binary
+      IBLUE_CREDENTIAL_KEY_FILE: /run/secrets/iblue_credential_key
+      IBLUE_SERVER_PASSWORD_FILE: /run/secrets/iblue_server_password
+    ports:
+      - "1234:1234"
+    volumes:
+      - iblue-data:/data
+    secrets:
+      - iblue_hardware_key
+      - iblue_nac_binary
+      - iblue_credential_key
+      - iblue_server_password
+
+volumes:
+  iblue-data:
+
+secrets:
+  iblue_hardware_key:
+    file: ./secrets/hardware-key.txt
+  # A user-supplied Apple IMDAppleServices file with the exact SHA-256 listed
+  # in docs/platform-support.md. It is never copied into the image.
+  iblue_nac_binary:
+    file: ./secrets/IMDAppleServices
+  iblue_credential_key:
+    file: ./secrets/credential-key.bin
+  iblue_server_password:
+    file: ./secrets/server-password.txt

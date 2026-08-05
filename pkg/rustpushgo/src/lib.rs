@@ -1,0 +1,14752 @@
+pub mod util;
+#[cfg(target_os = "macos")]
+pub mod local_config;
+#[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
+pub mod anisette;
+mod ids_guard;
+mod statuskitgo;
+mod statuskit_cloudkit;
+#[cfg(test)]
+mod test_hwinfo;
+
+use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
+
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use icloud_auth::AppleAccount;
+use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
+use log::{debug, error, info, warn};
+use rustpush::{
+    authenticate_apple, deregister as deregister_ids, login_apple_delegates, register, APSConnectionResource,
+    APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
+    IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
+    MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
+    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+    ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
+    IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL,
+    TextFlags, TextFormat, TextEffect,
+    ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
+    UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
+    TokenProvider,
+    ScheduleMode,
+    cloudkit::{ZoneDeleteOperation, CloudKitSession},
+    ResourceState,
+};
+use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
+use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
+use rustpush::findmy::MULTIPLEX_SERVICE;
+
+use std::sync::RwLock;
+
+// ============================================================================
+// Anisette provider selection
+// ============================================================================
+//
+// `BridgeDefaultAnisetteProvider` is the concrete `AnisetteProvider` type used
+// by every rustpush client that's parameterized over one (AppleAccount,
+// KeychainClient, CloudKitClient, TokenProvider, etc.). With the default
+// `cleanroom-registration` feature this is omnisette's `ClearADIClient` on
+// Linux and macOS, backed by the portable clearadi ProvisioningSession. On
+// macOS, `anisette-aoskit` can explicitly re-select AOSKit. On Linux,
+// `anisette-remote-v3` can explicitly re-select the legacy remote service
+// wrapper for debugging.
+#[cfg(any(target_os = "macos", not(feature = "anisette-remote-v3")))]
+pub type BridgeDefaultAnisetteProvider = omnisette::DefaultAnisetteProvider;
+#[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
+pub type BridgeDefaultAnisetteProvider = anisette::BridgeAnisetteProvider;
+
+#[cfg(any(target_os = "macos", not(feature = "anisette-remote-v3")))]
+fn bridge_default_provider(
+    info: omnisette::LoginClientInfo,
+    path: PathBuf,
+    _device_id: String,
+) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+    // The current ClearADI, remote-anisette, and AOSKit providers all persist
+    // their device-specific state under `path`; the hardware-derived device ID
+    // is already carried by the OSConfig used by rustpush.
+    omnisette::default_provider(info, path)
+}
+#[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
+fn bridge_default_provider(
+    info: omnisette::LoginClientInfo,
+    path: PathBuf,
+    _device_id: String,
+) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(omnisette::AnisetteClient::new(
+        anisette::BridgeAnisetteProvider::new(info, path),
+    )))
+}
+use tokio::sync::broadcast;
+use util::{plist_from_string, plist_to_string};
+
+// Local helpers to replace rustpush's private `util::{base64_decode, encode_hex, ...}`.
+// Part of the zero-patch refactor: `rustpush::util` is private, so we
+// reimplement the same semantics (infallible on invalid base64/hex input) using the
+// `base64` and `hex` crates directly.
+#[inline]
+fn base64_decode(s: &str) -> Vec<u8> {
+    BASE64_STANDARD.decode(s).unwrap_or_default()
+}
+#[inline]
+fn base64_encode(data: &[u8]) -> String {
+    BASE64_STANDARD.encode(data)
+}
+#[inline]
+fn encode_hex(bytes: &[u8]) -> String {
+    hex::encode(bytes)
+}
+#[inline]
+fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
+    hex::decode(s)
+}
+
+// ============================================================================
+// Ford key cache (wrapper-level reimplementation of the 94f7b8e fix)
+// ============================================================================
+//
+// CloudKit videos are Ford-encrypted: each record carries a 32-byte Ford key
+// in `lqa.protection_info.protection_info`, and MMCS deduplicates identical
+// content at the storage layer. When the same video is uploaded twice, MMCS
+// returns ONE encrypted blob encrypted with the original uploader's key — so
+// the second record's own Ford key cannot SIV-decrypt it, and
+// rustpush's `get_mmcs` panics on the `.unwrap()` of the SIV result.
+//
+// This cache holds every Ford key the bridge has ever seen (populated during
+// CloudKit attachment sync). On a SIV panic during download, the wrapper
+// catches the panic and retries `container.get_assets(...)` with each cached
+// key in turn by mutating `Asset.protection_info.protection_info` before the
+// call. This matches the semantics of the original in-rustpush fix without
+// touching rustpush source.
+
+fn ford_key_cache() -> &'static std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Vec<u8>, Vec<u8>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Register a Ford key in the process-wide cache so that a later deduplicated
+/// download can recover from an SIV decrypt failure. Key is indexed by
+/// `fordChecksum = 0x01 || SHA1(key)`. Idempotent; no-op for empty input.
+#[uniffi::export]
+pub fn register_ford_key(key: Vec<u8>) {
+    if key.is_empty() {
+        return;
+    }
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(&key);
+    let sha = hasher.finalize();
+    let mut checksum = Vec::with_capacity(1 + sha.len());
+    checksum.push(0x01);
+    checksum.extend_from_slice(&sha);
+    let mut cache = match ford_key_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if cache.insert(checksum, key).is_some() {
+        return;
+    }
+    let size = cache.len();
+    drop(cache);
+    debug!("register_ford_key: cached Ford key for dedup fallback (size={})", size);
+}
+
+/// Number of Ford keys currently cached. Diagnostic only.
+#[uniffi::export]
+pub fn ford_key_cache_size() -> u64 {
+    let cache = match ford_key_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.len() as u64
+}
+
+/// Snapshot of all cached Ford keys, used by the download recovery path.
+fn ford_key_cache_values() -> Vec<Vec<u8>> {
+    let cache = match ford_key_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.values().cloned().collect()
+}
+
+/// Check whether a given asset is Ford-encrypted by parsing the CloudKit
+/// `AssetGetResponse` body (which is a `mmcsp::AuthorizeGetResponse` proto)
+/// and looking up the `wanted_chunks` entry for the asset's file_checksum.
+/// If that entry has a `ford_reference`, the asset uses Ford encryption
+/// (V2 / videos). If not, it's V1 per-chunk encryption (images, etc.) and
+/// the Ford dedup recovery path shouldn't run for it.
+///
+/// Returns `true` ONLY when we've proven the asset is Ford-encrypted.
+/// Returns `false` if the body can't be parsed, the checksum isn't found,
+/// or `ford_reference` is None — anything ambiguous is treated as non-Ford
+/// to avoid burning retries on records recovery can't help.
+fn is_ford_encrypted_asset(
+    asset_responses: &[rustpush::cloudkit_proto::AssetGetResponse],
+    asset: &rustpush::cloudkit_proto::Asset,
+) -> bool {
+    use prost::Message;
+
+    let Some(bundled_id) = asset.bundled_request_id.as_ref() else {
+        return false;
+    };
+    let Some(signature) = asset.signature.as_ref() else {
+        return false;
+    };
+    let Some(response) = asset_responses
+        .iter()
+        .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+    else {
+        return false;
+    };
+    let Some(body) = response.body.as_ref() else {
+        return false;
+    };
+
+    let auth_response = match rustpush::mmcsp::AuthorizeGetResponse::decode(&body[..]) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let Some(f1) = auth_response.f1.as_ref() else {
+        return false;
+    };
+    // Find our file's `wanted_chunks` entry by matching file_checksum
+    // (= the asset signature). If it has a ford_reference, the server is
+    // telling us this asset's chunks are Ford-wrapped and the Ford key
+    // lives in the asset's protection_info.
+    f1.references
+        .iter()
+        .find(|w| &w.file_checksum == signature)
+        .and_then(|w| w.ford_reference.as_ref())
+        .is_some()
+}
+
+// ============================================================================
+// Manual Ford download (V1 + V2 support — zero-patch workaround)
+// ============================================================================
+//
+// The rustpush crate's `get_mmcs` supports V1 Ford (`FordItem` with a flat
+// `chunks: Vec<FordChunkItem>`) only. When Apple's CloudKit serves a
+// V2 Ford blob (`FordItemV2` with grouped chunks) — which master's fork
+// supports via an extended proto — `get_mmcs` panics unconditionally at
+// `chunks.item.expect("Ford chunks missing?")` (mmcs.rs:1117). The panic
+// is post-SIV, so no amount of key brute-forcing in the wrapper can
+// recover: it crashes before it ever tries to extract per-chunk
+// keys.
+//
+// This module reimplements the Ford download path entirely at the
+// wrapper layer using rustpush's public primitives:
+//   - `rustpush::mmcsp::AuthorizeGetResponse` (the proto bytes we get
+//     back from the CloudKit AssetGetResponse body)
+//   - `rustpush::mmcs::transfer_mmcs_container` (the public HTTP fetch)
+//   - local prost types for `LocalFordChunk` that understand BOTH V1
+//     and V2 layouts (fields 1 and 2 of the wire format)
+//   - manual SIV decrypt loop (HKDF + CmacSiv) over every cached Ford
+//     key, because the dedup case means the record's OWN key isn't
+//     necessarily the right one
+//   - manual V2 chunk decrypt (AES-256-CTR + HKDF + HMAC verify)
+//   - manual V1 chunk decrypt (AES-128-CFB)
+//
+// The control flow is: rustpush's `container.get_assets` is still the
+// happy path (fast, no panic on V1 correct-key records). Only when that
+// panics or errors do we fall through to `manual_ford_download_asset`.
+// That function handles dedup, V2 Ford, V1 Ford, AND plain V1 chunks
+// all via the same code path, so recovery is a superset of rustpush's
+// capabilities.
+
+mod manual_ford {
+    use super::*;
+    use aes_siv::{siv::CmacSiv, KeyInit};
+    use aes::Aes256;
+    use hkdf::Hkdf;
+    use once_cell::sync::Lazy;
+    use openssl::{
+        hash::MessageDigest,
+        pkey::PKey,
+        sign::Signer,
+        symm::{decrypt as openssl_decrypt, Cipher},
+    };
+    use prost::Message;
+    use sha2::{Digest as Sha2Digest, Sha256};
+
+    /// Shared reqwest client for HTTP container fetches. We can't use
+    /// rustpush's private `REQWEST` static, so we maintain our own.
+    pub(super) static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+        reqwest::Client::builder()
+            .gzip(true)
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("reqwest client build")
+    });
+
+    /// Local FordChunk message. The `mmcsp::FordChunk` type only has
+    /// field 1 (`item: FordItem`) because its proto doesn't know
+    /// about V2. We decode the same bytes through this local type to get
+    /// access to the V2 `item_v2` field (tag 2), which carries chunks
+    /// grouped by size with multiple keys per group.
+    ///
+    /// Since prost decoders skip unknown fields by default, decoding the
+    /// same wire bytes through either type works regardless of which
+    /// version the server actually sent. Presence of `item`/`item_v2`
+    /// tells us which layout we got.
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordChunk {
+        #[prost(message, optional, tag = "1")]
+        pub item: Option<LocalFordItem>,
+        #[prost(message, optional, tag = "2")]
+        pub item_v2: Option<LocalFordItemV2>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordItem {
+        #[prost(message, repeated, tag = "1")]
+        pub chunks: Vec<LocalFordChunkItem>,
+        #[prost(bytes = "vec", tag = "2")]
+        pub checksum: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordChunkItem {
+        #[prost(bytes = "vec", tag = "1")]
+        pub key: Vec<u8>,
+        #[prost(bytes = "vec", tag = "2")]
+        pub chunk_len: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordItemV2 {
+        #[prost(bytes = "vec", tag = "1")]
+        pub checksum: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub chunks: Vec<LocalFordChunkGroup>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordChunkGroup {
+        #[prost(bytes = "vec", tag = "1")]
+        pub chunk_len: Vec<u8>,
+        #[prost(message, repeated, tag = "2")]
+        pub keys: Vec<LocalFordKeyWrapper>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(super) struct LocalFordKeyWrapper {
+        #[prost(bytes = "vec", tag = "1")]
+        pub key: Vec<u8>,
+    }
+
+    /// Flatten a LocalFordChunk (V1 or V2) into a sequence of
+    /// `(ford_key, chunk_len_bytes)` pairs, one per data chunk, in the
+    /// same order as the file's `wanted_chunks.chunk_references`.
+    pub(super) fn flatten_ford_entries(chunk: LocalFordChunk) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        if let Some(item) = chunk.item {
+            Some(item.chunks.into_iter().map(|c| (c.key, c.chunk_len)).collect())
+        } else if let Some(item_v2) = chunk.item_v2 {
+            let mut out = Vec::new();
+            for group in item_v2.chunks {
+                let chunk_len = group.chunk_len.clone();
+                for kw in group.keys {
+                    out.push((kw.key, chunk_len.clone()));
+                }
+            }
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Attempt a single SIV decrypt with the given key over the given
+    /// Ford blob. Returns None on failure (wrong key). Matches master's
+    /// `try_ford_siv` exactly: HKDF("PCSMMCS2", key) → expand 64 bytes →
+    /// CmacSiv::decrypt with headers [iv, version_byte].
+    pub(super) fn try_ford_siv(key: &[u8], ford_blob: &[u8]) -> Option<Vec<u8>> {
+        if ford_blob.len() < 17 {
+            return None;
+        }
+        let hk = Hkdf::<Sha256>::new(Some(b"PCSMMCS2"), key);
+        let mut result = [0u8; 64];
+        if hk.expand(&[], &mut result).is_err() {
+            return None;
+        }
+        let cipher = match CmacSiv::<Aes256>::new_from_slice(&result) {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+        // Wrap in catch_unwind — CmacSiv's decrypt has been observed to
+        // panic on malformed blobs in some aes-siv versions. Defensive.
+        let blob = ford_blob.to_vec();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut cipher = cipher;
+            cipher
+                .decrypt::<&[&[u8]], &&[u8]>(&[&blob[1..17], &blob[..1]], &blob[17..])
+                .ok()
+        }));
+        match res {
+            Ok(Some(plaintext)) => Some(plaintext),
+            _ => None,
+        }
+    }
+
+    /// Try every cached Ford key against the blob. The correct key for a
+    /// dedup'd upload is often from a DIFFERENT record than the one we're
+    /// currently downloading, so "trying the record's own key" is never
+    /// enough. Recency-first ordering makes the happy case (dedup with
+    /// recently-seen source) fast.
+    pub(super) fn ford_siv_retry(
+        record_own_key: &[u8],
+        ford_checksum: &[u8],
+        ford_blob: &[u8],
+        record_name: &str,
+    ) -> Option<Vec<u8>> {
+        // 1. The record's own declared key — usually the right one for
+        //    non-dedup'd uploads.
+        if let Some(d) = try_ford_siv(record_own_key, ford_blob) {
+            return Some(d);
+        }
+
+        // 2. fordChecksum direct lookup — the server gave us a chunk
+        //    reference checksum that identifies the original uploader's
+        //    key. If we've seen that key in a prior batch, we have an
+        //    exact-match hit.
+        if !ford_checksum.is_empty() {
+            let hit = {
+                let cache = ford_key_cache().lock().unwrap_or_else(|p| p.into_inner());
+                cache.get(ford_checksum).cloned()
+            };
+            if let Some(alt) = hit {
+                if let Some(d) = try_ford_siv(&alt, ford_blob) {
+                    info!(
+                        "manual_ford_download {}: SIV succeeded via fordChecksum cache hit",
+                        record_name
+                    );
+                    return Some(d);
+                }
+            }
+        }
+
+        // 3. Brute-force: try every cached key. The cross-batch dedup
+        //    case requires this — the right key can be from any record
+        //    the account has ever seen.
+        let all_keys = ford_key_cache_values();
+        let total = all_keys.len();
+        for (idx, alt) in all_keys.iter().enumerate() {
+            if let Some(d) = try_ford_siv(alt, ford_blob) {
+                info!(
+                    "manual_ford_download {}: SIV succeeded via brute-force (attempt {}/{})",
+                    record_name,
+                    idx + 1,
+                    total
+                );
+                return Some(d);
+            }
+        }
+
+        None
+    }
+
+    /// V2 chunk decrypt — ported from the private `ChunkDesc::decrypt`
+    /// at mmcs.rs:696. HKDF(key[1..]) → expand 0x60 bytes → split into
+    /// (sig_hmac [0..32], auth_hmac [32..64], aes_key [64..96]). IV is
+    /// HMAC(auth_hmac, chunk_id_padded_40)[..16]. Decrypts AES-256-CTR,
+    /// truncates to declared length, verifies sig HMAC.
+    ///
+    /// Returns `Err` on HMAC mismatch (wrong key or corrupt data) — the
+    /// rustpush version has `assert_eq!` there, which panics; we return
+    /// a typed error instead so the caller can fall through.
+    pub(super) fn decrypt_v2_chunk(
+        key33: &[u8],
+        chunk_len_bytes: &[u8],
+        chunk_id21: &[u8; 21],
+        data: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if key33.len() != 33 {
+            return Err(format!("V2 key wrong length: {}", key33.len()));
+        }
+        if chunk_len_bytes.len() != 4 {
+            return Err(format!("V2 chunk_len wrong length: {}", chunk_len_bytes.len()));
+        }
+
+        let hk = Hkdf::<Sha256>::new(None, &key33[1..]);
+        let mut expanded = [0u8; 0x60];
+        hk.expand(b"signature-key", &mut expanded)
+            .map_err(|e| format!("V2 HKDF expand: {e}"))?;
+
+        let auth_hmac_key = &expanded[0x20..0x40];
+        let aes_key = &expanded[0x40..0x60];
+        let sig_hmac_key = &expanded[0x00..0x20];
+
+        // IV construction: chunk_id[1..] (20 bytes) padded to 40 bytes,
+        // with data length (little-endian u32) at offset [32..36].
+        let mut id_padded = [0u8; 40];
+        id_padded[..20].copy_from_slice(&chunk_id21[1..]);
+        id_padded[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+        let auth_pkey = PKey::hmac(auth_hmac_key)
+            .map_err(|e| format!("V2 auth PKey: {e}"))?;
+        let mut signer = Signer::new(MessageDigest::sha256(), &auth_pkey)
+            .map_err(|e| format!("V2 auth Signer: {e}"))?;
+        let iv_material = signer
+            .sign_oneshot_to_vec(&id_padded)
+            .map_err(|e| format!("V2 IV sign: {e}"))?;
+        let iv = &iv_material[..16];
+
+        let mut result = openssl_decrypt(Cipher::aes_256_ctr(), aes_key, Some(iv), data)
+            .map_err(|e| format!("V2 AES-CTR decrypt: {e}"))?;
+
+        let length = u32::from_le_bytes(
+            chunk_len_bytes
+                .try_into()
+                .map_err(|_| "chunk_len bytes->[u8;4]")?,
+        ) as usize;
+        result.resize(length, 0);
+
+        // HMAC verify — if the decrypted chunk doesn't authenticate, the
+        // wrong key was used. This is the "is this chunk really mine"
+        // check that lets us fall through to try another key.
+        let plaintext_hash = {
+            let mut h = Sha256::new();
+            h.update(&result);
+            h.finalize()
+        };
+        let sig_pkey = PKey::hmac(sig_hmac_key)
+            .map_err(|e| format!("V2 sig PKey: {e}"))?;
+        let mut verifier = Signer::new(MessageDigest::sha256(), &sig_pkey)
+            .map_err(|e| format!("V2 sig Signer: {e}"))?;
+        let computed_id = verifier
+            .sign_oneshot_to_vec(&plaintext_hash)
+            .map_err(|e| format!("V2 sig sign: {e}"))?;
+
+        if &computed_id[..chunk_id21.len() - 1] != &chunk_id21[1..] {
+            return Err("V2 chunk HMAC mismatch".to_string());
+        }
+
+        Ok(result)
+    }
+
+    /// V1 chunk decrypt — AES-128-CFB with `key[1..]` as the 16-byte
+    /// key, no IV. Ported from mmcs.rs:695.
+    pub(super) fn decrypt_v1_chunk(key17: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+        if key17.len() != 17 {
+            return Err(format!("V1 key wrong length: {}", key17.len()));
+        }
+        openssl_decrypt(Cipher::aes_128_cfb128(), &key17[1..], None, data)
+            .map_err(|e| format!("V1 AES-CFB decrypt: {e}"))
+    }
+
+    /// Re-authorize a fresh AuthorizeGetResponse body directly from
+    /// MMCS. The cached body that came in the original AssetGetResponse
+    /// may be tied to a specific auth session that's since expired; on
+    /// the recovery path we want to re-issue the authorization to make
+    /// sure the container HTTP URLs are still valid.
+    ///
+    /// We don't currently re-authorize — the cached body from CloudKit
+    /// is usually still fresh (CloudKit authorization is bundled with
+    /// the AssetGetResponse). This helper is reserved for future use if
+    /// we start seeing auth expiry.
+    #[allow(dead_code)]
+    pub(super) fn noop_reauth() {}
+
+    /// Fetch the entire HTTP body of one container. Returns bytes ready
+    /// to slice by offset.
+    pub(super) async fn fetch_container_body(
+        container: &rustpush::mmcsp::Container,
+        user_agent: &str,
+    ) -> Result<Vec<u8>, String> {
+        let req = container
+            .request
+            .as_ref()
+            .ok_or_else(|| "container has no HttpRequest".to_string())?;
+        let url = format!("{}://{}:{}{}", req.scheme, req.domain, req.port, req.path);
+
+        let mut builder = match req.method.as_str() {
+            "GET" => HTTP_CLIENT.get(&url),
+            other => return Err(format!("unsupported MMCS method: {}", other)),
+        }
+        .header("x-apple-request-uuid", uuid::Uuid::new_v4().to_string().to_uppercase())
+        .header("user-agent", user_agent);
+
+        let complete_at_edge = req.headers.iter().any(|h| {
+            h.name == "x-apple-put-complete-at-edge-version" && h.value == "2"
+        });
+
+        for header in &req.headers {
+            if (header.name == "Content-Length" && complete_at_edge) || header.name == "Host" {
+                continue;
+            }
+            builder = builder.header(header.name.clone(), header.value.clone());
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| format!("MMCS fetch send: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("MMCS fetch HTTP {}", resp.status()));
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("MMCS fetch body: {e}"))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Manual Ford download of one asset. This is the V1+V2-capable
+    /// replacement for the `get_assets` → `get_mmcs` chain. It
+    /// bypasses all of rustpush's panicking code paths by reimplementing
+    /// the download primitives at this layer.
+    ///
+    /// Inputs:
+    /// - `asset_response`: the AuthorizeGetResponse body bytes from the
+    ///   original CloudKit AssetGetResponse for this bundled_request_id
+    /// - `asset_signature`: `record.lqa.signature` — identifies our file
+    ///   within the response's `references` list
+    /// - `asset_ford_key`: `record.lqa.protection_info.protection_info`
+    ///   — the record's own declared Ford key (usually right, but not
+    ///   always in the dedup case)
+    /// - `user_agent`: the CloudKit user agent string (for HTTP)
+    /// - `record_name`: diagnostic only
+    ///
+    /// Returns the decrypted file bytes.
+    pub(super) async fn manual_ford_download_asset(
+        asset_response_body: &[u8],
+        asset_signature: &[u8],
+        asset_ford_key: &[u8],
+        user_agent: &str,
+        record_name: &str,
+    ) -> Result<Vec<u8>, String> {
+        let response = rustpush::mmcsp::AuthorizeGetResponse::decode(asset_response_body)
+            .map_err(|e| format!("decode AuthorizeGetResponse: {e}"))?;
+
+        let f1 = response.f1.ok_or_else(|| {
+            let reason = response
+                .error
+                .and_then(|e| e.f2)
+                .map(|f2| f2.reason)
+                .unwrap_or_default();
+            format!("MMCS server returned error: {}", reason)
+        })?;
+
+        // Find OUR file's chunk references + ford_reference.
+        let wanted = f1
+            .references
+            .iter()
+            .find(|r| &r.file_checksum[..] == asset_signature)
+            .ok_or_else(|| {
+                format!(
+                    "no references entry matches signature {}",
+                    encode_hex(asset_signature)
+                )
+            })?;
+
+        // Fetch every container body once up front. Master's approach
+        // streams chunks through a matcher; we just pull each container
+        // in full (simpler, avoids needing the private MMCSMatcher).
+        // For typical attachments this is ONE container per file.
+        let mut container_bodies: Vec<Vec<u8>> = Vec::with_capacity(f1.containers.len());
+        for container in &f1.containers {
+            let body = fetch_container_body(container, user_agent).await?;
+            container_bodies.push(body);
+        }
+
+        // ---- Build ford_keymap: data_chunk_checksum -> (ford_key, chunk_len) ----
+        //
+        // If this file has a ford_reference, decrypt the Ford blob and
+        // flatten into per-chunk keys. Otherwise, we expect V1 per-chunk
+        // keys to come from `chunk.meta.encryption_key`.
+        let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+
+        if let Some(ford_ref) = &wanted.ford_reference {
+            let container_idx = ford_ref.container_index as usize;
+            let chunk_idx = ford_ref.chunk_index as usize;
+            let container = f1
+                .containers
+                .get(container_idx)
+                .ok_or_else(|| format!("ford_reference container_idx {} OOB", container_idx))?;
+            let body = container_bodies
+                .get(container_idx)
+                .ok_or_else(|| "ford container body missing".to_string())?;
+            let chunk = container
+                .chunks
+                .get(chunk_idx)
+                .ok_or_else(|| format!("ford_reference chunk_idx {} OOB", chunk_idx))?;
+            let enc_meta = chunk
+                .encryption
+                .as_ref()
+                .ok_or_else(|| "ford chunk has no encryption meta".to_string())?;
+
+            let blob_offset = enc_meta.offset as usize;
+            let blob_size = enc_meta.size as usize;
+            if blob_offset + blob_size > body.len() {
+                return Err(format!(
+                    "ford blob OOB: offset={} size={} body_len={}",
+                    blob_offset,
+                    blob_size,
+                    body.len()
+                ));
+            }
+            let ford_blob = &body[blob_offset..blob_offset + blob_size];
+
+            // SIV retry over record_own_key + cache.
+            let plaintext = ford_siv_retry(
+                asset_ford_key,
+                &wanted.ford_checksum,
+                ford_blob,
+                record_name,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "Ford SIV failed: tried record key + {} cached keys, no match",
+                    ford_key_cache_size()
+                )
+            })?;
+
+            // Decode plaintext as our local V1/V2-capable FordChunk.
+            let ford_chunk = LocalFordChunk::decode(&plaintext[..])
+                .map_err(|e| format!("decode FordChunk: {e}"))?;
+
+            let ford_entries = flatten_ford_entries(ford_chunk)
+                .ok_or_else(|| "FordChunk has neither item nor item_v2".to_string())?;
+
+            if ford_entries.len() != wanted.chunk_references.len() {
+                warn!(
+                    "manual_ford_download {}: ford_entries={} != chunk_references={} (will map what's present)",
+                    record_name,
+                    ford_entries.len(),
+                    wanted.chunk_references.len()
+                );
+            }
+
+            for (entry, chunk_ref) in ford_entries.iter().zip(wanted.chunk_references.iter()) {
+                let cidx = chunk_ref.container_index as usize;
+                let kidx = chunk_ref.chunk_index as usize;
+                let chunk = f1
+                    .containers
+                    .get(cidx)
+                    .and_then(|c| c.chunks.get(kidx))
+                    .ok_or_else(|| {
+                        format!("chunk_ref ({},{}) OOB", cidx, kidx)
+                    })?;
+                let meta = chunk
+                    .meta
+                    .as_ref()
+                    .ok_or_else(|| "data chunk has no meta".to_string())?;
+                ford_keymap.insert(meta.checksum.clone(), (entry.0.clone(), entry.1.clone()));
+            }
+        }
+
+        // ---- Assemble the file by iterating data chunk refs in order ----
+        let mut out = Vec::new();
+        for chunk_ref in &wanted.chunk_references {
+            let cidx = chunk_ref.container_index as usize;
+            let kidx = chunk_ref.chunk_index as usize;
+            let container = f1
+                .containers
+                .get(cidx)
+                .ok_or_else(|| format!("chunk_ref container OOB {}", cidx))?;
+            let body = container_bodies
+                .get(cidx)
+                .ok_or_else(|| "container body missing".to_string())?;
+            let chunk = container
+                .chunks
+                .get(kidx)
+                .ok_or_else(|| format!("chunk_ref chunk OOB {}", kidx))?;
+            let meta = chunk
+                .meta
+                .as_ref()
+                .ok_or_else(|| "chunk has no meta".to_string())?;
+
+            let offset = meta.offset as usize;
+            let size = meta.size as usize;
+            if offset + size > body.len() {
+                return Err(format!(
+                    "chunk OOB: offset={} size={} body_len={}",
+                    offset,
+                    size,
+                    body.len()
+                ));
+            }
+            let encrypted = &body[offset..offset + size];
+
+            let plaintext = if let Some((fkey, clen)) = ford_keymap.get(&meta.checksum) {
+                // V2: Ford-derived key + chunk_len
+                let chunk_id: [u8; 21] = meta
+                    .checksum
+                    .clone()
+                    .try_into()
+                    .map_err(|_| "chunk checksum not 21 bytes".to_string())?;
+                decrypt_v2_chunk(fkey, clen, &chunk_id, encrypted)?
+            } else if let Some(enc_key) = &meta.encryption_key {
+                // V1: per-chunk AES-128-CFB key from the authorize response
+                decrypt_v1_chunk(enc_key, encrypted)?
+            } else {
+                // Unencrypted chunk
+                encrypted.to_vec()
+            };
+
+            out.extend_from_slice(&plaintext);
+        }
+
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rustls 0.23 CryptoProvider initialization.
+//
+// The rustpush crate pulled in rustls 0.23 transitively. Unlike 0.21/0.22,
+// rustls 0.23 does not auto-install a process-wide CryptoProvider when
+// multiple provider crates are present in the dep graph; the first TLS
+// connection panics with "Could not automatically determine the
+// process-level CryptoProvider from Rustls crate features." We install
+// aws-lc-rs explicitly the first time any FFI entry point that may open
+// a TLS connection is called. install_default() returns Err if a provider
+// is already installed; that's fine — we ignore it.
+// ---------------------------------------------------------------------------
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+// ============================================================================
+// Local CloudKit record type that understands the `avid` field.
+// ============================================================================
+//
+// The `rustpush::cloud_messages::CloudAttachment` type only declares `cm` and
+// `lqa`, so parsed records drop the `avid` Asset (Live Photo MOV companion).
+// Our vendored fork added `pub avid: Asset` to support Live Photos.
+//
+// Instead of patching rustpush, we define our own CloudKit record type with
+// the same `attachment` record ID and the same field names — CloudKit's
+// on-the-wire record format is schema-driven by field name, so a local
+// struct that derives `CloudKitRecord` with an extra `avid: Asset` field
+// parses the exact same server-side records and populates all three fields.
+// The original `CloudAttachment` still works wherever we don't need
+// the avid — this type is used anywhere we DO need it (attachment sync for
+// `has_avid` detection, Live Photo MOV download).
+
+// Imports the derive macro sees at its expansion site. The `CloudKitRecord`
+// derive emits references to `CloudKitEncryptor` unqualified, and to
+// `cloudkit_proto::*` by crate name — both need to resolve in our scope.
+use rustpush::cloudkit_derive::CloudKitRecord;
+use cloudkit_proto::{Asset, CloudKitEncryptor};
+
+#[derive(CloudKitRecord, Debug, Default, Clone)]
+#[cloudkit_record(type = "attachment", encrypted)]
+pub struct CloudAttachmentWithAvid {
+    pub cm: rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>,
+    pub lqa: Asset,
+    pub avid: Asset,
+}
+
+// ============================================================================
+// Wrapper types
+// ============================================================================
+
+#[derive(uniffi::Object)]
+pub struct WrappedAPSState {
+    pub inner: Option<APSState>,
+}
+
+#[uniffi::export]
+impl WrappedAPSState {
+    #[uniffi::constructor]
+    pub fn new(string: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: string
+                .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                .and_then(|s| plist_from_string::<APSState>(&s).ok()),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        plist_to_string(&self.inner).unwrap_or_default()
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedAPSConnection {
+    pub inner: rustpush::APSConnection,
+    /// Epoch-ms of the last inbound APS frame — ANY frame, real message or the
+    /// ~60s keepalive Pong. The drain task stamps this on every frame; the Go
+    /// receive-watchdog reads `seconds_since_last_inbound()` to spot a wedged
+    /// receive path (a reconnect storm never delivers even a Pong) and trigger
+    /// a full client rebuild. It lives on the connection, NOT the Client,
+    /// because `Disconnect` only `close()`s the connection — it never destroys
+    /// this Go object — so the watchdog can poll it without any use-after-free.
+    pub last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedAPSConnection {
+    pub async fn state(&self) -> Arc<WrappedAPSState> {
+        Arc::new(WrappedAPSState {
+            inner: Some(self.inner.state.read().await.clone()),
+        })
+    }
+
+    /// Seconds since the last inbound APS frame. A healthy link refreshes this
+    /// every ~60s (the keepalive Pong) even when idle, so a value far past that
+    /// means the receive path is wedged — a reconnect storm or half-open socket
+    /// that never delivers a frame. The Go receive-watchdog polls this.
+    pub fn seconds_since_last_inbound(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self
+            .last_inbound_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_sub(last) / 1000
+    }
+
+    /// Tear down the APNs connection's ResourceManager — stops its reconnect
+    /// loop and frees the courier socket. Called on full client teardown so a
+    /// rebuild never leaves a SECOND live connection on the same device token:
+    /// Apple drops the duplicate ("Failed to read message from APS ... early
+    /// eof"), and rustpush's no-backoff reconnect loop turns that into a
+    /// self-sustaining ~9/sec storm that only a restart clears.
+    pub fn close(&self) {
+        self.inner.close();
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct IDSUsersWithIdentityRecord {
+    pub users: Arc<WrappedIDSUsers>,
+    pub identity: Arc<WrappedIDSNGMIdentity>,
+    /// TokenProvider for iCloud services (CardDAV, CloudKit, etc.)
+    pub token_provider: Option<Arc<WrappedTokenProvider>>,
+    /// Persist data for restoring the TokenProvider after restart.
+    pub account_persist: Option<AccountPersistData>,
+}
+
+/// Data needed to restore a TokenProvider from persisted state.
+/// Stored in session.json so it survives database resets.
+#[derive(uniffi::Record)]
+pub struct AccountPersistData {
+    pub username: String,
+    pub hashed_password_hex: String,
+    pub pet: String,
+    pub adsid: String,
+    pub dsid: String,
+    pub spd_base64: String,
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedIDSUsers {
+    pub inner: Vec<IDSUser>,
+}
+
+#[uniffi::export]
+impl WrappedIDSUsers {
+    #[uniffi::constructor]
+    pub fn new(string: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: string
+                .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                .and_then(|s| plist_from_string(&s).ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        plist_to_string(&self.inner).unwrap_or_default()
+    }
+
+    pub fn login_id(&self, i: u64) -> String {
+        self.inner[i as usize].user_id.clone()
+    }
+
+    pub fn get_handles(&self) -> Vec<String> {
+        self.inner.iter()
+            .flat_map(|user| {
+                user.registration.get("com.apple.madrid")
+                    .map(|reg| reg.handles.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Check that all keystore keys referenced by the user state actually exist.
+    /// Returns false if any auth/id keypair alias is missing from the keystore,
+    /// which means the keystore was wiped or never migrated and re-login is needed.
+    pub fn validate_keystore(&self) -> bool {
+        if self.inner.is_empty() {
+            return true;
+        }
+        for user in &self.inner {
+            let alias = &user.auth_keypair.private.0;
+            if keystore().get_key_type(alias).ok().flatten().is_none() {
+                warn!("Keystore key '{}' not found for user '{}' — keystore/state mismatch", alias, user.user_id);
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedIDSNGMIdentity {
+    pub inner: IDSNGMIdentity,
+}
+
+#[uniffi::export]
+impl WrappedIDSNGMIdentity {
+    #[uniffi::constructor]
+    pub fn new(string: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: string
+                .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                .and_then(|s| plist_from_string(&s).ok())
+                .unwrap_or_else(|| IDSNGMIdentity::new().expect("Failed to create new identity")),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        plist_to_string(&self.inner).unwrap_or_default()
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedOSConfig {
+    pub config: Arc<dyn OSConfig>,
+}
+
+#[uniffi::export]
+impl WrappedOSConfig {
+    /// Get the device UUID from the underlying OSConfig.
+    pub fn get_device_id(&self) -> String {
+        self.config.get_device_uuid()
+    }
+}
+
+#[derive(thiserror::Error, uniffi::Error, Debug)]
+pub enum WrappedError {
+    #[error("{msg}")]
+    GenericError { msg: String },
+    // Typed signal that a StatusKit invite found no valid keysharing targets
+    // (the peer isn't on the keysharing sub-service — Android / non-iPhone /
+    // StatusKit off). The Go no-keys cache keys on THIS variant via errors.Is
+    // rather than string-matching a Debug-formatted error, so neither a rustpush
+    // rename nor a wrapper refactor can silently break the anti-pound cache.
+    #[error("peer not registered for the StatusKit keysharing sub-service")]
+    NoStatusKitTargets,
+    // Typed signal that a send could only go over the text-message relay and no
+    // device on this account is registered to relay. Matched in Go by errors.Is
+    // on THIS variant rather than by string, so a rename cannot silently turn a
+    // visible failure back into a checkmark for a message nothing delivered.
+    #[error("no device on this account forwards text messages")]
+    NoSmsRelay,
+}
+
+impl From<rustpush::PushError> for WrappedError {
+    fn from(e: rustpush::PushError) -> Self {
+        WrappedError::GenericError { msg: format!("{}", e) }
+    }
+}
+
+fn is_pcs_recoverable_error(err: &rustpush::PushError) -> bool {
+    matches!(
+        err,
+        rustpush::PushError::ShareKeyNotFound(_)
+            | rustpush::PushError::DecryptionKeyNotFound(_)
+            | rustpush::PushError::PCSRecordKeyMissing
+            | rustpush::PushError::MasterKeyNotFound
+    )
+}
+
+/// True when the error is a missing-MME-token failure. The
+/// `get_mme_token(name)` call returns `TokenMissing` when the seeded delegate
+/// lacks the requested name (e.g. `cloudKitToken`), and it only
+/// auto-refreshes the delegate if it's older than one week. A partial or
+/// stale seeded delegate that's still within that week gets permanently
+/// stuck on this error until we force a refresh_mme() ourselves.
+fn is_token_missing_error(err: &rustpush::PushError) -> bool {
+    matches!(err, rustpush::PushError::TokenMissing)
+}
+
+fn keychain_retry_delay(attempt: usize) -> Duration {
+    match attempt {
+        0..=4 => Duration::from_secs(2),
+        5..=11 => Duration::from_secs(4),
+        _ => Duration::from_secs(6),
+    }
+}
+
+/// Try to recover usable CloudKit keys after a NotInClique failure.
+///
+/// The `sync_keychain` call gates everything behind `is_in_clique()`, which
+/// calls `sync_trust()` → Cuttlefish `fetchChanges`. If another device (e.g.
+/// an iPhone running Messages) posts a trust-update that excludes us, every
+/// `is_in_clique()` call returns false and `sync_keychain` is dead.
+///
+/// Recovery strategy — all public rustpush APIs, no internal field access:
+///   1. Try to refresh TLK shares via `fetch_shares_for` + `store_keys`.
+///      These hit a different Cuttlefish endpoint that doesn't check clique
+///      membership, so they work even when we appear excluded.
+///   2. Check `state.items` (public field): if the prior join/sync already
+///      populated the CloudKit key cache, those keys are sufficient for
+///      decryption. Return Ok — callers proceed with cached keys.
+///   3. If cache is empty (fresh install, no prior sync), return the real
+///      error so the caller knows it cannot proceed.
+///
+/// This mirrors what master's rustpush fork achieves by ignoring self-exclusion
+/// inside `fast_forward_trust`, but implemented entirely at the wrapper layer.
+async fn recover_keychain_after_exclusion(
+    keychain: &rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>,
+    context: &str,
+) -> Result<(), WrappedError> {
+    // Step 1: attempt TLK share refresh (best-effort; doesn't need clique membership).
+    let identity_opt = {
+        let state = keychain.state.read().await;
+        state.user_identity.clone()
+    };
+    if let Some(identity) = identity_opt {
+        match keychain.fetch_shares_for(&identity).await {
+            Ok(shares) if !shares.is_empty() => {
+                match keychain.store_keys(&shares).await {
+                    Ok(()) => info!("{}: refreshed {} TLK share(s) despite exclusion", context, shares.len()),
+                    Err(e) => warn!("{}: store_keys failed (non-fatal): {}", context, e),
+                }
+            }
+            Ok(_) => info!("{}: no TLK shares returned; using persisted keystore", context),
+            Err(e) => warn!("{}: fetch_shares_for failed (non-fatal): {}", context, e),
+        }
+    }
+
+    // Step 2: check whether the persisted CloudKit key cache is usable.
+    let has_cached_keys = {
+        let state = keychain.state.read().await;
+        state.items.values().any(|zone| !zone.keys.is_empty())
+    };
+
+    if has_cached_keys {
+        warn!(
+            "{}: excluded from Cuttlefish trust circle by another device, \
+             but CloudKit key cache is populated — using cached keys. \
+             Messages in iCloud sync will work; key rotation may require re-login.",
+            context
+        );
+        return Ok(());
+    }
+
+    // Step 3: nothing to fall back on — propagate the error.
+    Err(WrappedError::GenericError {
+        msg: format!("{} keychain sync failed: not in clique and no cached keys available", context),
+    })
+}
+
+async fn sync_keychain_with_retries(
+    keychain: &rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>,
+    max_attempts: usize,
+    context: &str,
+) -> Result<(), WrappedError> {
+    let attempts = max_attempts.max(1);
+    let mut last_err: Option<rustpush::PushError> = None;
+    for attempt in 0..attempts {
+        match keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!("{} keychain sync recovered after {} attempt(s)", context, attempt + 1);
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                if matches!(err, rustpush::PushError::NotInClique) {
+                    // Don't retry — NotInClique won't resolve with more attempts.
+                    // Fall back to cached CloudKit keys if available.
+                    return recover_keychain_after_exclusion(keychain, context).await;
+                }
+
+                let retrying = attempt + 1 < attempts;
+                warn!(
+                    "{} keychain sync attempt {}/{} failed: {}{}",
+                    context,
+                    attempt + 1,
+                    attempts,
+                    err,
+                    if retrying { " (retrying)" } else { "" }
+                );
+                last_err = Some(err);
+                if retrying {
+                    tokio::time::sleep(keychain_retry_delay(attempt)).await;
+                }
+            }
+        }
+    }
+
+    let msg = match last_err {
+        Some(err) => format!("{} keychain sync failed after retries: {}", context, err),
+        None => format!("{} keychain sync failed", context),
+    };
+    Err(WrappedError::GenericError { msg })
+}
+
+async fn refresh_recoverable_tlk_shares(
+    keychain: &Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    context: &str,
+) -> Result<(), WrappedError> {
+    let identity_opt = {
+        let state = keychain.state.read().await;
+        state.user_identity.clone()
+    };
+
+    let Some(identity) = identity_opt else {
+        warn!("{}: no keychain user identity available for TLK share refresh", context);
+        return Ok(());
+    };
+
+    match keychain.fetch_shares_for(&identity).await {
+        Ok(shares) => {
+            info!("{}: fetched {} recoverable TLK share(s)", context, shares.len());
+            if !shares.is_empty() {
+                keychain.store_keys(&shares).await?;
+            }
+        }
+        Err(err) => {
+            // Best-effort: we still attempt regular keychain sync / CloudKit probes.
+            warn!("{}: failed to fetch recoverable TLK shares: {}", context, err);
+        }
+    }
+
+    Ok(())
+}
+
+async fn finalize_keychain_setup_with_probe(
+    keychain: Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+    max_attempts: usize,
+) -> Result<(), WrappedError> {
+    let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit, keychain.clone());
+    let attempts = max_attempts.max(1);
+
+    for attempt in 0..attempts {
+        let attempt_no = attempt + 1;
+        if attempt == 0 {
+            // After join, explicitly refresh recoverable TLK shares for this new peer.
+            // Some accounts/devices need an extra fetch before all view keys materialize.
+            refresh_recoverable_tlk_shares(&keychain, "Login finalize").await?;
+        }
+        sync_keychain_with_retries(&keychain, 1, "Login finalize").await?;
+
+        match cloud_messages.sync_chats(None).await {
+            Ok((_token, chats, status)) => {
+                info!(
+                    "CloudKit decrypt probe (chats) succeeded on attempt {} (status={}, records={})",
+                    attempt_no,
+                    status,
+                    chats.len()
+                );
+            }
+            Err(err) => {
+                if matches!(err, rustpush::PushError::NotInClique) {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("CloudKit probe failed: {}", err),
+                    });
+                }
+
+                let retrying = attempt_no < attempts;
+                if is_pcs_recoverable_error(&err) {
+                    warn!(
+                        "CloudKit decrypt probe (chats) missing PCS keys on attempt {}/{}: {}{}",
+                        attempt_no,
+                        attempts,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                } else {
+                    warn!(
+                        "CloudKit decrypt probe (chats) failed on attempt {}/{}: {}{}",
+                        attempt_no,
+                        attempts,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                }
+                if retrying {
+                    if is_pcs_recoverable_error(&err) && attempt % 4 == 0 {
+                        refresh_recoverable_tlk_shares(&keychain, "Login finalize").await?;
+                    }
+                    tokio::time::sleep(keychain_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(WrappedError::GenericError {
+                    msg: format!("CloudKit decrypt probe failed after retries (chats): {}", err),
+                });
+            }
+        }
+
+        match cloud_messages.sync_messages(None).await {
+            Ok((_token, messages, status)) => {
+                info!(
+                    "CloudKit decrypt probe (messages) succeeded on attempt {} (status={}, records={})",
+                    attempt_no,
+                    status,
+                    messages.len()
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                if matches!(err, rustpush::PushError::NotInClique) {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("CloudKit probe failed: {}", err),
+                    });
+                }
+
+                let retrying = attempt_no < attempts;
+                if is_pcs_recoverable_error(&err) {
+                    warn!(
+                        "CloudKit decrypt probe (messages) missing PCS keys on attempt {}/{}: {}{}",
+                        attempt_no,
+                        attempts,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                } else {
+                    warn!(
+                        "CloudKit decrypt probe (messages) failed on attempt {}/{}: {}{}",
+                        attempt_no,
+                        attempts,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                }
+                if retrying {
+                    if is_pcs_recoverable_error(&err) && attempt % 4 == 0 {
+                        refresh_recoverable_tlk_shares(&keychain, "Login finalize").await?;
+                    }
+                    tokio::time::sleep(keychain_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(WrappedError::GenericError {
+                    msg: format!("CloudKit decrypt probe failed after retries (messages): {}", err),
+                });
+            }
+        }
+    }
+
+    Err(WrappedError::GenericError {
+        msg: "CloudKit decrypt probe failed after retries".into(),
+    })
+}
+
+// ============================================================================
+// Token Provider (iCloud auth for CardDAV, CloudKit, etc.)
+// ============================================================================
+
+/// Information about a device that has an escrow bottle in the iCloud Keychain
+/// trust circle. Used to let the user choose which device's passcode to enter.
+#[derive(uniffi::Record)]
+pub struct EscrowDeviceInfo {
+    /// Index into the bottles list (used when calling join_keychain_clique_for_device).
+    pub index: u32,
+    /// Human-readable device name (e.g. "Ludvig's iPhone").
+    pub device_name: String,
+    /// Device model identifier (e.g. "iPhone15,2").
+    pub device_model: String,
+    /// Device serial number.
+    pub serial: String,
+    /// When the escrow bottle was created.
+    pub timestamp: String,
+}
+
+/// Wraps a TokenProvider that manages MobileMe auth tokens with auto-refresh.
+/// Used for iCloud services like CardDAV contacts and CloudKit messages.
+///
+/// This wrapper stores `account`, `os_config`, and `mme_delegate` alongside the
+/// inner TokenProvider because the TokenProvider keeps these
+/// as private fields with no public getters. As part of the zero-patch refactor,
+/// we pass them in at construction time and read from our own state.
+#[derive(uniffi::Object)]
+pub struct WrappedTokenProvider {
+    inner: Arc<TokenProvider<BridgeDefaultAnisetteProvider>>,
+    account: Arc<rustpush::DebugMutex<AppleAccount<BridgeDefaultAnisetteProvider>>>,
+    os_config: Arc<dyn OSConfig>,
+    // MobileMe delegate stored as opaque plist XML bytes because
+    // `rustpush::auth::MobileMeDelegateResponse` is not nameable from outside the
+    // crate (`mod auth` is private). Call sites that
+    // need a typed `&MobileMeDelegateResponse` reconstruct it via
+    // `plist::from_bytes(&bytes)?` and let the compiler infer T from the
+    // receiving function's signature (e.g. `KeychainClientState::new(_, _, &T)`).
+    mme_delegate_bytes: tokio::sync::Mutex<Option<Vec<u8>>>,
+    // Cached (KeychainClient, CloudKitClient) pair. The keychain/cloudkit
+    // pair is built by `create_keychain_clients` and used by
+    // `get_escrow_devices` and `join_keychain_clique_for_device`.
+    //
+    // We cache it because each fresh pair forces a fresh CloudKit container
+    // init (`ckAppInit` POST to `gateway.icloud.com/setup/setup/ck/v1/ckAppInit`
+    // inside `CloudKitOpenContainer::init` at
+    // `third_party/rustpush/src/icloud/cloudkit.rs:1309-1340`).
+    // Apple has been observed returning empty bodies (401-with-no-body) for
+    // a *second* `ckAppInit` call from the same process minutes after the
+    // first one succeeded — typically the get_escrow_devices → user enters
+    // passcode → join_keychain_clique_for_device sequence in the install
+    // flow. The init handles 401 by calling `refresh_mme` but then
+    // still tries to JSON-decode the (empty) 401 response body
+    // (cloudkit.rs:1326-1330), surfacing as
+    // "HTTP error: error decoding response body: EOF while parsing a value
+    // at line 1 column 0".
+    //
+    // Caching the pair means the second call reuses the working container
+    // from the first call and skips the second ckAppInit entirely, which
+    // sidesteps the rustpush bug and any Apple-side rate limiting on
+    // ckAppInit for the same DSID.
+    keychain_clients_cache: tokio::sync::Mutex<Option<(
+        Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+        Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+    )>>,
+    // Serializes concurrent callers into `ensure_mme_delegate_bytes_seeded`
+    // so a cold start with empty `mme_delegate_bytes` produces ONE
+    // login_apple_delegates POST regardless of how many CloudKit/contacts
+    // call sites raced into self-heal at the same time. The actual storage
+    // is still `mme_delegate_bytes`; this lock just guards the populate
+    // path.
+    mme_self_heal_lock: tokio::sync::Mutex<()>,
+}
+
+/// Helper: create CloudKit + Keychain clients from a WrappedTokenProvider.
+/// Shared by get_escrow_devices, join_keychain_clique, and join_keychain_clique_for_device.
+///
+/// Reads dsid/adsid/anisette directly from the locally-stored AppleAccount and
+/// the cached MobileMe delegate, avoiding the need for getter methods on
+/// TokenProvider itself (which rustpush does not expose).
+async fn create_keychain_clients(
+    wp: &WrappedTokenProvider,
+) -> Result<(
+    Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+), WrappedError> {
+    // Fast path: return the cached pair if we've already built one in this
+    // process. See the keychain_clients_cache field docstring on
+    // WrappedTokenProvider for why caching is required (Apple returns empty
+    // body on a second ckAppInit, and the CloudKitOpenContainer::init
+    // can't recover from it). Holding the lock across the slow construction
+    // path below also serializes concurrent callers, so two parallel
+    // `get_escrow_devices` calls don't race into two separate ckAppInit POSTs.
+    let mut cache = wp.keychain_clients_cache.lock().await;
+    if let Some(pair) = &*cache {
+        debug!("create_keychain_clients: reusing cached keychain/cloudkit pair");
+        return Ok(pair.clone());
+    }
+
+    let (dsid, adsid, anisette) = {
+        let account = wp.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
+            msg: "AppleAccount has no SPD — not fully logged in".into(),
+        })?;
+        let dsid = spd.get("DsPrsId")
+            .and_then(|v| v.as_unsigned_integer())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
+            .to_string();
+        let adsid = spd.get("adsid")
+            .and_then(|v| v.as_string())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+            .to_string();
+        let anisette = account.anisette.clone();
+        (dsid, adsid, anisette)
+    };
+    // Load MobileMe delegate as typed `MobileMeDelegateResponse` via type
+    // inference from its downstream usage (the `&mme_delegate` reference passed
+    // to `KeychainClientState::new(..., &MobileMeDelegateResponse)` below — Rust
+    // propagates that constraint back to `parse_mme_delegate`'s `T`).
+    let mme_delegate = wp.parse_mme_delegate().await?;
+    let os_config = wp.os_config.clone();
+    let token_provider = wp.inner.clone();
+
+    let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
+        .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+    let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+            state: rustpush::DebugRwLock::new(cloudkit_state),
+        anisette: anisette.clone(),
+        config: os_config.clone(),
+        token_provider: token_provider.clone(),
+    });
+    let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+    let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+        Ok(data) => match plist::from_bytes(&data) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+            None
+        }
+    };
+    if keychain_state.is_none() {
+        keychain_state = Some(
+            rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+                .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?
+        );
+    }
+    let path_for_closure = keychain_state_path.clone();
+    let keychain = Arc::new(rustpush::keychain::KeychainClient {
+        anisette: anisette.clone(),
+        token_provider: token_provider.clone(),
+            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+        config: os_config.clone(),
+        update_state: Box::new(move |state| {
+            if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+                warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+            } else {
+                info!("Persisted keychain state to {}", path_for_closure);
+            }
+        }),
+        container: tokio::sync::Mutex::new(None),
+        security_container: tokio::sync::Mutex::new(None),
+        client: cloudkit.clone(),
+    });
+
+    let pair = (keychain, cloudkit);
+    *cache = Some(pair.clone());
+    Ok(pair)
+}
+
+/// Extract device name and model from an EscrowMetadata's client_metadata dictionary.
+fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, String) {
+    let dict = meta.client_metadata.as_dictionary();
+    let device_name = dict
+        .and_then(|d| d.get("device_name"))
+        .and_then(|v| v.as_string())
+        .unwrap_or("Unknown Device")
+        .to_string();
+    let device_model = dict
+        .and_then(|d| d.get("device_model"))
+        .and_then(|v| v.as_string())
+        .unwrap_or("Unknown")
+        .to_string();
+    (device_name, device_model)
+}
+
+/// Core keychain joining logic used by both join_keychain_clique and join_keychain_clique_for_device.
+/// If `preferred_index` is Some, the bottle at that index is tried first before falling back to others.
+async fn join_keychain_with_bottles(
+    keychain: Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+    bottles: &[(rustpush::cloudkit_proto::EscrowData, rustpush::keychain::EscrowMetadata)],
+    passcode: &str,
+    preferred_index: Option<u32>,
+) -> Result<String, WrappedError> {
+    let passcode_bytes = passcode.as_bytes();
+    let mut last_err = String::new();
+
+    // Build iteration order: preferred bottle first (if specified), then the rest.
+    let indices: Vec<usize> = if let Some(pref) = preferred_index {
+        let pref = pref as usize;
+        let mut order = vec![pref];
+        order.extend((0..bottles.len()).filter(|&i| i != pref));
+        order
+    } else {
+        (0..bottles.len()).collect()
+    };
+
+    // If there are many escrow bottles, do a quick probe per bottle first,
+    // then one extended probe at the end on the latest successful join.
+    let per_bottle_probe_attempts = if bottles.len() > 1 { 3 } else { 24 };
+
+    // Outer stability loop: after joining + probe, verify we stay in the clique.
+    // Other devices can exclude us within seconds of joining.
+    const MAX_REJOIN_ATTEMPTS: usize = 3;
+    let mut rejoin_attempt = 0;
+
+    'stability: loop {
+        let mut joined_any = false;
+        let mut probe_succeeded = false;
+        let mut last_joined_meta: Option<(String, String)> = None;
+
+        for &i in &indices {
+            let (data, meta) = &bottles[i];
+            info!("Trying bottle {} (serial={})...", i, meta.serial);
+            match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
+                Ok(()) => {
+                    joined_any = true;
+                    last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
+                    info!("Successfully joined keychain trust circle via bottle {}", i);
+                    info!(
+                        "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
+                        per_bottle_probe_attempts
+                    );
+                    match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
+                        Ok(()) => {
+                            probe_succeeded = true;
+                            break; // probe passed, go to stability check
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Bottle {} joined, but CloudKit decrypt probe failed: {}. Trying next bottle...",
+                                i,
+                                e
+                            );
+                            last_err = format!("{}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Bottle {} failed: {}", i, e);
+                    last_err = format!("{}", e);
+                }
+            }
+        }
+
+        if !joined_any {
+            return Err(WrappedError::GenericError {
+                msg: format!("All {} bottles failed. Last error: {}", bottles.len(), last_err)
+            });
+        }
+
+        // The CloudKit decrypt probe already verified clique membership
+        // (sync_keychain internally checks is_in_clique). Calling is_in_clique()
+        // again here triggers another sync_trust() → Cuttlefish fetchChanges,
+        // which can transiently fail to include us and reset our local state.
+        // Skip this check when the probe already confirmed membership; the
+        // stability loop below catches any subsequent exclusion.
+        if !probe_succeeded && !keychain.is_in_clique().await {
+            if rejoin_attempt >= MAX_REJOIN_ATTEMPTS {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Excluded from clique after {} rejoin attempts. Last error: {}", rejoin_attempt, last_err)
+                });
+            }
+            rejoin_attempt += 1;
+            warn!("Not in clique after bottle probes, rejoin attempt {}/{}", rejoin_attempt, MAX_REJOIN_ATTEMPTS);
+            continue 'stability;
+        }
+
+        // Stability check: wait, re-sync trust, verify we're still included.
+        // Other devices can exclude us within seconds of joining.
+        info!("Verifying clique membership stability...");
+        for check in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if !keychain.is_in_clique().await {
+                rejoin_attempt += 1;
+                warn!(
+                    "Excluded from clique during stability check {} — re-joining (attempt {}/{})",
+                    check + 1, rejoin_attempt, MAX_REJOIN_ATTEMPTS
+                );
+                if rejoin_attempt > MAX_REJOIN_ATTEMPTS {
+                    return Err(WrappedError::GenericError {
+                        msg: "Repeatedly excluded from iCloud Keychain trust circle by another device. \
+                              Try disabling and re-enabling 'Messages in iCloud' on your iPhone, then retry."
+                            .into()
+                    });
+                }
+                continue 'stability;
+            }
+        }
+
+        // Still in clique after stability checks
+        let (serial, build) = last_joined_meta.unwrap_or(("unknown".into(), "unknown".into()));
+        info!("Clique membership stable after {} stability checks", 3);
+        return Ok(format!(
+            "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
+            serial, build,
+        ));
+    }
+}
+
+/// Shared snapshot/merge body for proactive PET refresh. Used by both
+/// `restore_token_provider` (one-shot at startup) and
+/// `WrappedTokenProvider::refresh_pet_token` (periodic mid-run).
+///
+/// Snapshot `account.tokens` before the call, run `login_email_pass`, then
+/// merge the snapshot back so any token `login_email_pass` didn't (re)write is
+/// preserved. The `login_email_pass` call can unconditionally overwrite
+/// `self.tokens` when SPD contains a `t` dict (client.rs:776), which on a
+/// non-LoggedIn return path would partially wipe a good token map. The merge
+/// guarantees we never exit with fewer tokens than we entered.
+///
+/// NeedsExtraStep with a populated PET is treated as success (see
+/// LoginSession::finish / client.rs:1039).
+///
+/// Infallible — any auth/network error is logged and swallowed so callers
+/// (especially the periodic tick) can retry on the next cycle.
+async fn refresh_pet_with_snapshot(
+    account: &mut AppleAccount<BridgeDefaultAnisetteProvider>,
+    username: &str,
+    hashed_password: &[u8],
+    context: &str,
+) {
+    let snapshot = std::mem::take(&mut account.tokens);
+    match account.login_email_pass(username, hashed_password).await {
+        Ok(icloud_auth::LoginState::LoggedIn) => {
+            info!("{}: proactive PET refresh succeeded", context);
+        }
+        Ok(state) => {
+            if account.tokens.contains_key("com.apple.gs.idms.pet") {
+                info!(
+                    "{}: PET refresh returned {:?} but PET was populated — treating as success",
+                    context, state
+                );
+            } else {
+                warn!(
+                    "{}: proactive PET refresh returned non-logged-in state: {:?} — manual re-login may be required",
+                    context, state
+                );
+            }
+        }
+        Err(err) => {
+            warn!("{}: proactive PET refresh failed (non-fatal): {}", context, err);
+        }
+    }
+    for (k, v) in snapshot {
+        account.tokens.entry(k).or_insert(v);
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedTokenProvider {
+    /// Get HTTP headers needed for iCloud MobileMe API calls.
+    /// Includes Authorization (X-MobileMe-AuthToken) and anisette headers.
+    ///
+    /// rustpush exposes `TokenProvider::get_mme_token(&str)` which
+    /// returns the mmeAuthToken (and auto-refreshes internally). We build the
+    /// Apple-required HTTP headers (X-MobileMe-AuthToken, X-Client-UDID,
+    /// X-MMe-Client-Info, plus anisette) locally from our stored state.
+    pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, WrappedError> {
+        let token = self.inner.get_mme_token("mmeAuthToken").await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to fetch mmeAuthToken: {}", e),
+            })?;
+        let dsid = self.get_dsid().await?;
+
+        // Basic auth: "dsid:mmeAuthToken" base64-encoded in X-MMe-Client-Info? No.
+        // The header "Authorization: Basic base64(dsid:token)" is what Apple wants.
+        let auth_header_value = format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(format!("{}:{}", dsid, token)),
+        );
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("Authorization".to_string(), auth_header_value);
+        headers.insert("X-Client-UDID".to_string(), self.os_config.get_udid().to_lowercase());
+        headers.insert(
+            "X-MMe-Client-Info".to_string(),
+            self.os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"),
+        );
+        headers.insert("X-MMe-Country".to_string(), "US".to_string());
+        headers.insert("X-MMe-Language".to_string(), "en".to_string());
+
+        // Anisette headers from the AppleAccount. `get_headers()` returns a
+        // `&HashMap<String, String>` so we clone the entries we need.
+        let anisette = {
+            let account = self.account.lock().await;
+            account.anisette.clone()
+        };
+        let mut anisette_guard = anisette.lock().await;
+        let anisette_headers = anisette_guard.get_headers().await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to fetch anisette headers: {}", e),
+            })?;
+        for (k, v) in anisette_headers.iter() {
+            headers.insert(k.clone(), v.clone());
+        }
+        drop(anisette_guard);
+
+        Ok(headers)
+    }
+
+    /// Get the contacts CardDAV URL from the MobileMe delegate config.
+    /// Reads from our locally-cached MobileMe delegate plist bytes via generic
+    /// `plist::Value` traversal (we can't name `MobileMeDelegateResponse` from
+    /// outside the rustpush crate, so we use untyped plist parsing here).
+    /// Runs the bytes through `normalize_mme_delegate_dict` first so we look
+    /// up the URL on a single canonical shape regardless of which of the
+    /// three persisted shapes is on disk (see normalize comment for details).
+    pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
+        // Try self-heal first; if it fails (no PET / Apple omitted the
+        // delegate / network error), don't propagate — get_contacts_url's
+        // contract is "Ok(None) when we don't have a CardDAV URL", and a
+        // contacts lookup with no URL is recoverable. The self-heal logs
+        // the failure mode itself.
+        if let Err(e) = self.ensure_mme_delegate_bytes_seeded().await {
+            debug!("get_contacts_url: self-heal did not populate bytes: {:?}", e);
+        }
+        let bytes_guard = self.mme_delegate_bytes.lock().await;
+        let Some(bytes) = bytes_guard.as_ref() else {
+            return Ok(None);
+        };
+        let value: plist::Value = plist::from_bytes(bytes).map_err(|e| {
+            WrappedError::GenericError { msg: format!("Invalid MobileMe delegate plist: {}", e) }
+        })?;
+        let normalized = normalize_mme_delegate_dict(value);
+        // After normalize: `{tokens, config: {com.apple.Dataclass.Contacts: {url}, ...}}`.
+        let url = normalized
+            .as_dictionary()
+            .and_then(|d| d.get("config"))
+            .and_then(|v| v.as_dictionary())
+            .and_then(|d| d.get("com.apple.Dataclass.Contacts"))
+            .and_then(|v| v.as_dictionary())
+            .and_then(|d| d.get("url"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string());
+        Ok(url)
+    }
+
+    /// Get the DSID for this account (from AppleAccount's SPD dictionary).
+    pub async fn get_dsid(&self) -> Result<String, WrappedError> {
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
+            msg: "AppleAccount has no SPD — not fully logged in".into(),
+        })?;
+        let dsid = spd.get("DsPrsId")
+            .and_then(|v| v.as_unsigned_integer())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
+            .to_string();
+        Ok(dsid)
+    }
+
+    /// Get the serialized MobileMe delegate as a plist string (for persistence).
+    /// Returns None if no delegate is cached. The plist bytes are stored opaquely
+    /// and passed through as UTF-8 text.
+    pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
+        let bytes_guard = self.mme_delegate_bytes.lock().await;
+        Ok(bytes_guard.as_ref().map(|b| String::from_utf8_lossy(b).to_string()))
+    }
+
+    /// Seed the MobileMe delegate from persisted plist string. Validates as a
+    /// generic `plist::Value` first, then stores opaque bytes. Call sites that
+    /// need a typed `MobileMeDelegateResponse` reconstruct it via
+    /// `parse_mme_delegate()`.
+    pub async fn seed_mme_delegate_json(&self, json: String) -> Result<(), WrappedError> {
+        plist::from_bytes::<plist::Value>(json.as_bytes())
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to deserialize MobileMe delegate: {}", e),
+            })?;
+        *self.mme_delegate_bytes.lock().await = Some(json.into_bytes());
+        Ok(())
+    }
+
+    /// Proactively refresh the GSA/PET session by re-running login_email_pass
+    /// against the stored credentials. Apple's PET lifetime is ~24h; on a
+    /// long-running bridge without restarts, a mid-run refresh prevents the
+    /// session from aging out and forcing a manual 2FA.
+    ///
+    /// Lock scope: holds `self.account` across `login_email_pass` (network
+    /// I/O). This matches the `TokenProvider::get_token` pattern
+    /// at `icloud-auth/client.rs:338-360` which also holds this lock across
+    /// its auto-refresh `login_email_pass` call. Any concurrent `get_dsid` /
+    /// `get_adsid` / `get_gsa_token` caller briefly waits (typically 1-3s on
+    /// a warm session) once per 12h tick. Not a new contention pattern —
+    /// it's inherent to how rustpush serializes access to AppleAccount.
+    ///
+    /// Non-fatal: any failure is logged inside `refresh_pet_with_snapshot`
+    /// and swallowed so the Go-side caller treats an Err return as "try
+    /// again next tick" rather than a hard failure.
+    pub async fn refresh_pet_token(&self) -> Result<(), WrappedError> {
+        let mut account = self.account.lock().await;
+        let username = account.username.clone().ok_or(WrappedError::GenericError {
+            msg: "refresh_pet_token: account has no username".into(),
+        })?;
+        let hashed_password = account.hashed_password.clone().ok_or(WrappedError::GenericError {
+            msg: "refresh_pet_token: account has no hashed_password".into(),
+        })?;
+        refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "refresh_pet_token").await;
+        Ok(())
+    }
+
+    /// Announce this endpoint as a new "Apple Device" via GSA `/circle`, exactly
+    /// once per persisted login. Calls `restore_account` to
+    /// `update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"])`
+    /// guarded by `postdata_done` in `gsa.plist`.
+    ///
+    /// Why: at the IDS-register layer the bridge's requests are byte-identical to a
+    /// native Apple client's, yet peer iOS devices only reshape StatusKit keys to a
+    /// native Apple client automatically. The
+    /// difference is this GSA side-channel call, which declares a new
+    /// Apple-Device-class identity on the account with cdpStatus/circleStatus=true
+    /// across iCloud/iMessage/FaceTime. Apple propagates that device-enrollment
+    /// via iCloud account state, and peer iOS uses it to decide which endpoints
+    /// to proactively share Focus keys with.
+    ///
+    /// Idempotent on Apple's side: same device-name + same account dedupes
+    /// server-side. Non-fatal: a failure here does not break any other bridge
+    /// functionality. Previously guarded by a persisted `postdata-done.flag`;
+    /// that guard was removed because empirical evidence (zero
+    /// "GSA announce" log lines after a restart in which grep for them came
+    /// up empty, despite prior success on older code) suggests an earlier
+    /// announce can land on Apple without actually propagating the device
+    /// state that peer iOS needs for reshare eligibility. Forcing re-announce
+    /// every bridge start is the simplest way to guarantee eventual
+    /// propagation; the request itself is cheap and de-duped server-side.
+    pub async fn announce_apple_device_if_needed(&self) -> Result<(), WrappedError> {
+        // update_postdata needs the "com.apple.gs.idms.hb" (happy-birthday)
+        // GSA token. On fresh login that's populated as a side-effect of
+        // login_email_pass, but the warm-path restore_token_provider only
+        // injects the PET. Running a PET refresh first re-invokes
+        // login_email_pass internally, which repopulates the full GSA token
+        // set including HB — so update_postdata won't fail with
+        // HappyBirthdayError on first warm-path invocation.
+        {
+            let mut account = self.account.lock().await;
+            let username = account.username.clone();
+            let hashed_password = account.hashed_password.clone();
+            if let (Some(u), Some(h)) = (username, hashed_password) {
+                info!("GSA announce: priming GSA tokens via PET refresh");
+                refresh_pet_with_snapshot(&mut account, &u, &h, "announce_apple_device").await;
+            } else {
+                warn!("GSA announce: account has no username/password for prime — update_postdata may fail if HB token is missing");
+            }
+        }
+
+        info!("GSA announce: calling update_postdata(\"Apple Device\", None, [\"icloud\", \"imessage\", \"facetime\"])");
+        let mut account = self.account.lock().await;
+        match account
+            .update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"])
+            .await
+        {
+            Ok(state) => {
+                info!("GSA announce: update_postdata OK (login_state={:?})", state);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("GSA announce: update_postdata failed: {:?} — will retry on next restart", e);
+                Err(WrappedError::GenericError {
+                    msg: format!("update_postdata failed: {:?}", e),
+                })
+            }
+        }
+    }
+}
+
+/// Reshape a stored MobileMe delegate plist value so that deserializing it as
+/// the `MobileMeDelegateResponse` puts the *inner* iCloud service dict
+/// (the one keyed by `com.apple.Dataclass.KeychainSync`,
+/// `com.apple.Dataclass.Files`, etc.) into the `config` field.
+///
+/// We accept three stored shapes and normalize to a single output:
+///   1. **Current (post-a7fab47 double-wrapped)**:
+///      `{tokens, "com.apple.mobileme": {tokens, "com.apple.mobileme": {KeychainSync: ...}}}`
+///      — produced by our serialize path below after the "fix" made
+///      `mobileme.config` hold the entire delegate service_data.
+///   2. **Legacy (pre-a7fab47)**:
+///      `{tokens, "com.apple.mobileme": {KeychainSync: ...}}`
+///      — produced when `config` was deserialized via
+///      `#[serde(rename = "com.apple.mobileme")]` and held the inner dict directly.
+///   3. **Already-normalized**:
+///      `{tokens, config: {KeychainSync: ...}}` — ideal shape going forward.
+///
+/// Output: `{tokens, config: {KeychainSync: ...}}` every time, which matches
+/// the new `#[serde(default)] pub config: Dictionary` field on
+/// `MobileMeDelegateResponse` and keeps `KeychainClientState::new`
+/// (which does `delegate.config.get("com.apple.Dataclass.KeychainSync")`)
+/// working.
+fn normalize_mme_delegate_dict(value: plist::Value) -> plist::Value {
+    let Some(mut root) = value.into_dictionary() else {
+        return plist::Value::Dictionary(plist::Dictionary::new());
+    };
+    if root.contains_key("config") {
+        return plist::Value::Dictionary(root);
+    }
+    let Some(outer_mm) = root.remove("com.apple.mobileme") else {
+        return plist::Value::Dictionary(root);
+    };
+    let Some(outer_dict) = outer_mm.as_dictionary() else {
+        return plist::Value::Dictionary(root);
+    };
+    // If the outer has a nested `com.apple.mobileme`, that's shape 1 (double-wrap)
+    // and the nested dict is the real iCloud config. Otherwise it's shape 2 (legacy)
+    // and the outer IS the iCloud config.
+    let inner = outer_dict
+        .get("com.apple.mobileme")
+        .and_then(|v| v.as_dictionary())
+        .cloned()
+        .unwrap_or_else(|| outer_dict.clone());
+    root.insert("config".to_string(), plist::Value::Dictionary(inner));
+    plist::Value::Dictionary(root)
+}
+
+// Non-uniffi impl block: internal helpers used by other wrapper code that need
+// to read state previously available via `TokenProvider::get_xxx()` methods that
+// rustpush doesn't expose. These are not exported as FFI symbols.
+impl WrappedTokenProvider {
+    /// Get the ADSID from the AppleAccount's SPD dictionary.
+    pub(crate) async fn get_adsid(&self) -> Result<String, WrappedError> {
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
+            msg: "AppleAccount has no SPD — not fully logged in".into(),
+        })?;
+        let adsid = spd.get("adsid")
+            .and_then(|v| v.as_string())
+            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+            .to_string();
+        Ok(adsid)
+    }
+
+    /// Lazily fetch the MobileMe delegate from Apple if our wrapper's bytes
+    /// are not seeded yet. Recovers from the "switched from master to
+    /// refactor with persisted credentials but no persisted MmeDelegateJSON"
+    /// path — restore_token_provider stores `None`, and without this
+    /// self-heal the first CloudKit / contacts call errors out with
+    /// "MobileMe delegate not seeded" until the user manually re-logs in.
+    ///
+    /// Concurrency: serialized by `mme_self_heal_lock` with a check-lock-
+    /// recheck. First caller acquires the heal lock and does the network
+    /// round-trip; concurrent callers wait, then take the populated bytes
+    /// and short-circuit on the recheck.
+    ///
+    /// Diagnostic logging distinguishes `delegates.mobileme = None` (Apple
+    /// returned a response that omitted the com.apple.mobileme entry) from
+    /// `login_apple_delegates errored` so the bridge logs make it clear
+    /// which way the self-heal went sideways.
+    ///
+    /// Persistence: this method only populates the in-memory cache. The
+    /// existing `persistMmeDelegate` ticker in pkg/connector/client.go
+    /// picks up the new bytes on its next tick and writes them to
+    /// UserLoginMetadata, so subsequent restarts skip self-heal.
+    async fn ensure_mme_delegate_bytes_seeded(&self) -> Result<(), WrappedError> {
+        if self.mme_delegate_bytes.lock().await.is_some() {
+            return Ok(());
+        }
+
+        let _heal_guard = self.mme_self_heal_lock.lock().await;
+
+        if self.mme_delegate_bytes.lock().await.is_some() {
+            return Ok(());
+        }
+
+        info!("Self-healing MobileMe delegate: cached bytes empty, fetching fresh from Apple");
+
+        // login_apple_delegates panics on no-PET (auth.rs:361
+        // `panic!("No pet!")`), so guard against a cold/expired PET
+        // with get_gsa_token, which auto-refreshes via login_email_pass
+        // when the cached PET is stale.
+        if self.inner.get_gsa_token("com.apple.gs.idms.pet").await.is_none() {
+            return Err(WrappedError::GenericError {
+                msg: "MobileMe self-heal: no PET token available (Apple may require re-login)".into(),
+            });
+        }
+
+        let delegates = {
+            let account = self.account.lock().await;
+            login_apple_delegates(
+                &*account,
+                None,
+                &*self.os_config,
+                &[LoginDelegate::MobileMe],
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("MobileMe self-heal: login_apple_delegates errored: {}", e),
+            })?
+        };
+
+        let Some(mobileme) = delegates.mobileme else {
+            warn!(
+                "MobileMe self-heal: login_apple_delegates returned delegates.mobileme = None \
+                 (Apple did not include com.apple.mobileme in the response). CloudKit/contacts \
+                 services remain unavailable until re-login."
+            );
+            return Err(WrappedError::GenericError {
+                msg: "MobileMe self-heal: Apple omitted com.apple.mobileme delegate".into(),
+            });
+        };
+
+        // Match the serialization shape produced by the login path
+        // (lib.rs login.finish: `{"tokens": {...}, "com.apple.mobileme": {...}}`).
+        let mut tokens_dict = plist::Dictionary::new();
+        for (k, v) in &mobileme.tokens {
+            tokens_dict.insert(k.clone(), plist::Value::String(v.clone()));
+        }
+        let mut root = plist::Dictionary::new();
+        root.insert("tokens".to_string(), plist::Value::Dictionary(tokens_dict));
+        root.insert(
+            "com.apple.mobileme".to_string(),
+            plist::Value::Dictionary(mobileme.config.clone()),
+        );
+        let mut buf = Vec::new();
+        plist::Value::Dictionary(root).to_writer_xml(&mut buf)
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("MobileMe self-heal: serialize delegate to plist: {}", e),
+            })?;
+
+        *self.mme_delegate_bytes.lock().await = Some(buf);
+        info!("MobileMe self-heal: delegate fetched and cached in-memory; persistMmeDelegate ticker will save to disk");
+        Ok(())
+    }
+
+    /// Parse the stored MobileMe delegate plist bytes into whatever typed form
+    /// the caller context expects (usually `rustpush::auth::MobileMeDelegateResponse`).
+    /// `T` is inferred from the receiving function's signature at the call site —
+    /// we intentionally do NOT name the type here because it's not reachable from
+    /// outside the rustpush crate (`mod auth` is private).
+    ///
+    /// Normalizes the dict shape before deserialization so `config` ends up as
+    /// the inner iCloud service dict (the one holding `com.apple.Dataclass.KeychainSync`
+    /// etc.) regardless of which shape was stored. See `normalize_mme_delegate_dict`
+    /// below for the three shapes we accept.
+    pub(crate) async fn parse_mme_delegate<T: serde::de::DeserializeOwned>(&self) -> Result<T, WrappedError> {
+        self.ensure_mme_delegate_bytes_seeded().await?;
+        let bytes_guard = self.mme_delegate_bytes.lock().await;
+        let bytes = bytes_guard.as_ref().ok_or(WrappedError::GenericError {
+            msg: "MobileMe delegate not seeded — call seed_mme_delegate_json first".into(),
+        })?;
+        let value: plist::Value = plist::from_bytes(bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to parse MobileMe delegate bytes: {}", e),
+        })?;
+        let normalized = normalize_mme_delegate_dict(value);
+        plist::from_value::<T>(&normalized).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to deserialize MobileMe delegate: {}", e),
+        })
+    }
+
+    /// Clone the shared AppleAccount handle.
+    pub(crate) fn get_account(&self) -> Arc<rustpush::DebugMutex<AppleAccount<BridgeDefaultAnisetteProvider>>> {
+        self.account.clone()
+    }
+
+    /// Clone the shared OSConfig handle.
+    pub(crate) fn get_os_config(&self) -> Arc<dyn OSConfig> {
+        self.os_config.clone()
+    }
+
+    /// Read the logged-in user's full name ("First Last") from the SPD dict
+    /// ("fn" + "ln", populated during GSA login — the canonical "first last"
+    /// Apple stores for this Apple ID). Returns an empty string when the SPD
+    /// is missing (user not fully logged in) or when both fields are blank.
+    /// Used by the FaceTime link builder to pre-fill the web join page's
+    /// display-name field so peer sees a real name instead of a phone number.
+    pub(crate) async fn get_apple_account_full_name(&self) -> String {
+        let account = self.account.lock().await;
+        let Some(spd) = account.spd.as_ref() else { return String::new(); };
+        let first = spd
+            .get("fn")
+            .and_then(|v| v.as_string())
+            .unwrap_or("")
+            .trim();
+        let last = spd
+            .get("ln")
+            .and_then(|v| v.as_string())
+            .unwrap_or("")
+            .trim();
+        let combined = format!("{} {}", first, last);
+        combined.trim().to_string()
+    }
+}
+
+// Second uniffi-exported impl block: the iCloud Keychain clique methods that
+// were previously in the single uniffi block before I split out the internal
+// helpers above. These MUST be exported to Go so the bridge's login flow can
+// call them.
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedTokenProvider {
+    /// Read the logged-in user's full name ("First Last") from the cached
+    /// Apple Account SPD. Sourced from Apple's GSA login response (spd.fn /
+    /// spd.ln — what Apple has on file for this Apple ID), so it matches
+    /// what the user already sees on their iMessage account. Returns an
+    /// empty string if the account isn't fully logged in or the name
+    /// fields are blank (older accounts may lack them).
+    pub async fn apple_account_full_name(&self) -> String {
+        self.get_apple_account_full_name().await
+    }
+
+    /// List devices that have escrow bottles in the iCloud Keychain trust circle.
+    /// Returns device info (name, model, serial, timestamp) for each bottle.
+    /// Call this before join_keychain_clique_for_device to let the user choose.
+    pub async fn get_escrow_devices(&self) -> Result<Vec<EscrowDeviceInfo>, WrappedError> {
+        info!("Fetching escrow devices...");
+        let (keychain, _cloudkit) = create_keychain_clients(self).await?;
+
+        let bottles = keychain.get_viable_bottles().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+
+        if bottles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac.".into()
+            });
+        }
+
+        let devices: Vec<EscrowDeviceInfo> = bottles.iter().enumerate().map(|(i, (_data, meta))| {
+            let (device_name, device_model) = extract_device_info(meta);
+            info!("  [{}] name={:?} model={} serial={} timestamp={}", i, device_name, device_model, meta.serial, meta.timestamp);
+            EscrowDeviceInfo {
+                index: i as u32,
+                device_name,
+                device_model,
+                serial: meta.serial.clone(),
+                timestamp: meta.timestamp.clone(),
+            }
+        }).collect();
+
+        info!("Found {} escrow device(s)", devices.len());
+        Ok(devices)
+    }
+
+    /// Join the iCloud Keychain trust circle using a device passcode.
+    /// Tries all available escrow bottles in order.
+    /// Required before CloudKit Messages can decrypt PCS-encrypted records.
+    /// The passcode is the 6-digit PIN or password used to unlock an iPhone/Mac.
+    /// Returns a description of the escrow bottle used.
+    pub async fn join_keychain_clique(&self, passcode: String) -> Result<String, WrappedError> {
+        info!("=== Joining iCloud Keychain Trust Circle ===");
+        let (keychain, cloudkit) = create_keychain_clients(self).await?;
+
+        info!("Fetching escrow bottles...");
+        let bottles = keychain.get_viable_bottles().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+
+        if bottles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac.".into()
+            });
+        }
+
+        info!("Found {} escrow bottle(s)", bottles.len());
+        for (i, (_data, meta)) in bottles.iter().enumerate() {
+            info!("  [{}] serial={} build={} timestamp={}", i, meta.serial, meta.build, meta.timestamp);
+        }
+
+        join_keychain_with_bottles(keychain, cloudkit, &bottles, &passcode, None).await
+    }
+
+    /// Join the iCloud Keychain trust circle, trying the specified device first.
+    /// `device_index` is the index from get_escrow_devices(). If that bottle fails,
+    /// falls back to trying other bottles.
+    pub async fn join_keychain_clique_for_device(&self, passcode: String, device_index: u32) -> Result<String, WrappedError> {
+        info!("=== Joining iCloud Keychain Trust Circle (preferred device {}) ===", device_index);
+        let (keychain, cloudkit) = create_keychain_clients(self).await?;
+
+        info!("Fetching escrow bottles...");
+        let bottles = keychain.get_viable_bottles().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+
+        if bottles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac.".into()
+            });
+        }
+
+        info!("Found {} escrow bottle(s)", bottles.len());
+        for (i, (_data, meta)) in bottles.iter().enumerate() {
+            let (name, model) = extract_device_info(meta);
+            info!("  [{}] name={:?} model={} serial={} build={} timestamp={}", i, name, model, meta.serial, meta.build, meta.timestamp);
+        }
+
+        let preferred = if (device_index as usize) < bottles.len() {
+            Some(device_index)
+        } else {
+            warn!("Device index {} out of range (have {} bottles), trying all", device_index, bottles.len());
+            None
+        };
+
+        join_keychain_with_bottles(keychain, cloudkit, &bottles, &passcode, preferred).await
+    }
+}
+
+/// Restore a TokenProvider from persisted account credentials.
+/// Used on session restore (when we don't go through the login flow).
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn restore_token_provider(
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+    username: String,
+    hashed_password_hex: String,
+    pet: String,
+    spd_base64: String,
+) -> Result<Arc<WrappedTokenProvider>, WrappedError> {
+    let os_config = config.config.clone();
+    let conn = connection.inner.clone();
+
+    // Create a fresh anisette provider. On Linux the
+    // `BridgeAnisetteProvider` owns provisioning and bypasses rustpush's
+    // broken `ProvisionInput` enum entirely (see src/anisette.rs). On
+    // macOS this is the native AOSKit path, unchanged.
+    let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
+    // Persist the provisioned ADI machine in the absolute XDG data dir (same place
+    // every other subsystem uses), NOT a cwd-relative path. With the relative
+    // "state/anisette" the machine was re-provisioned on every login (state.plist
+    // never found → exists=false → fresh machine + new X-Mme-Device-Id each run),
+    // and Apple rejects the provision-then-complete churn at GSA `complete` (-22406).
+    // A real device provisions once and persists; this matches that.
+    let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
+
+    // Create a new AppleAccount and populate it with persisted state
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+
+    account.username = Some(username.clone());
+
+    // Restore hashed password
+    let hashed_password = decode_hex(&hashed_password_hex)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
+    account.hashed_password = Some(hashed_password.clone());
+
+    // Restore SPD from base64-encoded plist
+    let spd_bytes = base64_decode(&spd_base64);
+    let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
+
+    account.spd = Some(spd);
+
+    // Inject the persisted PET into account.tokens with an already-expired
+    // timestamp. Byte-for-byte port of the master-branch restore path
+    // (master's pkg/rustpushgo/src/lib.rs line 805).
+    //
+    // Why: the `get_token` call short-circuits and returns None when
+    // `tokens.is_empty() == false` AND the requested key is absent. So if
+    // we leave tokens empty OR populate it without the PET key, the first
+    // `get_gsa_token("com.apple.gs.idms.pet")` call either takes a
+    // corner-case path or returns None immediately. Neither gives `get_token`
+    // the opportunity to auto-refresh via `login_email_pass`.
+    //
+    // With an expired PET entry present, `get_token`'s expiration check
+    // fires (`data.expiration.elapsed().is_err()` → false → has_valid_token
+    // false), it enters the auto-refresh branch, calls `login_email_pass`
+    // with the persisted credentials, and — assuming Apple still trusts
+    // the device via consistent anisette state — returns LoggedIn with
+    // fresh GSA/HB/PET tokens populated from the SPD response. No 2FA.
+    //
+    // The 0bbb081 commit that removed this trick said "FetchedToken has
+    // private fields so we cannot reconstruct tokens from the persisted
+    // SPD" — that was accurate against raw rustpush but no
+    // longer applies, because the Makefile's `ensure-rustpush-source`
+    // target now sed-patches `pub token`/`pub expiration` onto
+    // `FetchedToken` alongside the existing `pub mod activation; pub mod
+    // ids;` visibility bumps. See Makefile:208-217.
+    //
+    // This is the PRIMARY fix for the daily-auth-breaks-at-24h regression
+    // that appeared after the refactor migration to raw rustpush and
+    // was never fully restored by the subsequent periodic-refresh commits
+    // (66d6402, bdd4ebe).
+    account.tokens.insert(
+        "com.apple.gs.idms.pet".to_string(),
+        icloud_auth::FetchedToken {
+            token: pet,
+            expiration: std::time::UNIX_EPOCH,
+        },
+    );
+
+    let account = Arc::new(rustpush::DebugMutex::new(account));
+    let token_provider = TokenProvider::new(account.clone(), os_config.clone());
+
+    info!("Restored TokenProvider from persisted credentials");
+
+    // Restore path does not have a MobileMe delegate — callers must
+    // seed_mme_delegate_json() from persisted state before using keychain/
+    // contacts features.
+    Ok(Arc::new(WrappedTokenProvider {
+        inner: token_provider,
+        account,
+        os_config,
+        mme_delegate_bytes: tokio::sync::Mutex::new(None),
+        keychain_clients_cache: tokio::sync::Mutex::new(None),
+        mme_self_heal_lock: tokio::sync::Mutex::new(()),
+    }))
+}
+
+// ============================================================================
+// Message wrapper types (flat structs for uniffi)
+// ============================================================================
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedMultipartPart {
+    pub part_index: u64,
+    pub text: Option<String>,
+    pub mention: Option<String>,
+    pub data: Option<Vec<u8>>,
+    pub mime_type: Option<String>,
+    pub uti_type: Option<String>,
+    pub filename: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone, Default)]
+pub struct WrappedMessage {
+    pub uuid: String,
+    pub sender: Option<String>,
+    pub text: Option<String>,
+    pub subject: Option<String>,
+    pub participants: Vec<String>,
+    pub group_name: Option<String>,
+    pub timestamp_ms: u64,
+    pub is_sms: bool,
+
+    // Tapback
+    pub is_tapback: bool,
+    pub tapback_type: Option<u32>,
+    pub tapback_target_uuid: Option<String>,
+    pub tapback_target_part: Option<u64>,
+    pub tapback_emoji: Option<String>,
+    pub tapback_remove: bool,
+
+    // Edit
+    pub is_edit: bool,
+    pub edit_target_uuid: Option<String>,
+    pub edit_part: Option<u64>,
+    pub edit_new_text: Option<String>,
+
+    // Unsend
+    pub is_unsend: bool,
+    pub unsend_target_uuid: Option<String>,
+    pub unsend_edit_part: Option<u64>,
+
+    // Rename
+    pub is_rename: bool,
+    pub new_chat_name: Option<String>,
+
+    // Participant change
+    pub is_participant_change: bool,
+    pub new_participants: Vec<String>,
+    pub participant_group_version: Option<u64>,
+
+    // Attachments
+    pub attachments: Vec<WrappedAttachment>,
+
+    // Reply
+    pub reply_guid: Option<String>,
+    pub reply_part: Option<String>,
+
+    // Typing
+    pub is_typing: bool,
+    pub typing_active: Option<bool>,
+    pub typing_app_bundle_id: Option<String>,
+    pub typing_app_icon: Option<Vec<u8>>,
+
+    // Read receipt
+    pub is_read_receipt: bool,
+
+    // Delivered
+    pub is_delivered: bool,
+
+    // Error
+    pub is_error: bool,
+    pub error_for_uuid: Option<String>,
+    pub error_status: Option<u64>,
+    pub error_status_str: Option<String>,
+
+    // Peer cache invalidate
+    pub is_peer_cache_invalidate: bool,
+
+    // Send delivered flag
+    pub send_delivered: bool,
+
+    // True when rustpush could decrypt an IDS payload but could not verify its
+    // sender signature because the peer identity was unavailable or invalid.
+    pub verification_failed: bool,
+
+    // Group chat UUID (persistent identifier for the group conversation)
+    pub sender_guid: Option<String>,
+
+    // Delete (MoveToRecycleBin / PermanentDelete) and Recover
+    pub is_move_to_recycle_bin: bool,
+    pub is_permanent_delete: bool,
+    pub is_recover_chat: bool,
+    pub delete_chat_participants: Vec<String>,
+    pub delete_chat_group_id: Option<String>,
+    pub delete_chat_guid: Option<String>,
+    pub delete_message_uuids: Vec<String>,
+
+    // Stored message detection: true if this message was queued by APNs
+    // while the client was offline and delivered on reconnect. Detected by
+    // checking if the message arrived (drain-time) within 10 seconds of an
+    // APNs reconnect (generated_signal). Drain-time is used instead of
+    // process-time so MMCS downloads and retries don't push messages past
+    // the window.
+    pub is_stored_message: bool,
+
+    // Group photo (icon) change. True when someone sets or clears the
+    // group chat photo from their iMessage client.
+    // group_photo_cleared: true = photo was removed ("ngp"), false = new photo set.
+    // When is_icon_change=true and group_photo_cleared=false, icon_change_photo_data
+    // contains the MMCS-downloaded photo bytes (None if download failed).
+    pub is_icon_change: bool,
+    pub group_photo_cleared: bool,
+    pub group_icon_version: Option<u64>,
+    // Pre-downloaded photo bytes for IconChange messages.
+    // Some(bytes) only when is_icon_change=true, group_photo_cleared=false, and download succeeded.
+    pub icon_change_photo_data: Option<Vec<u8>>,
+
+    // HTML-formatted text body. Some(...) when the message contains any non-plain
+    // formatting (bold, italic, underline, strikethrough, text effects, mentions).
+    pub html: Option<String>,
+
+    // Voice message flag. True for voice memo / audio message attachments.
+    pub is_voice: bool,
+
+    // Screen/bubble effect identifier (e.g., "com.apple.MobileSMS.expressivesend.impact").
+    pub effect: Option<String>,
+
+    // Scheduled send timestamp in milliseconds. Some(ms) when message is scheduled.
+    pub scheduled_ms: Option<u64>,
+
+    // SMS activation: true = activation request, false = deactivation.
+    pub is_sms_activation: Option<bool>,
+
+    // SMS confirmed sent status.
+    pub is_sms_confirm_sent: Option<bool>,
+
+    // Mark unread flag.
+    pub is_mark_unread: bool,
+
+    // Message-read-on-device acknowledgment.
+    pub is_message_read_on_device: bool,
+
+    // Unschedule marker for scheduled-message cancellation updates.
+    pub is_unschedule: bool,
+
+    // Update extension (sticker/balloon metadata update) targeting a message UUID.
+    pub is_update_extension: bool,
+    pub update_extension_for_uuid: Option<String>,
+
+    // Profile sharing state sync update.
+    pub is_update_profile_sharing: bool,
+    pub update_profile_sharing_dismissed: Vec<String>,
+    pub update_profile_sharing_all: Vec<String>,
+    pub update_profile_sharing_version: Option<u64>,
+
+    // Profile update (share profile card and/or sharing preference).
+    pub is_update_profile: bool,
+    pub update_profile_share_contacts: Option<bool>,
+
+    // "Notify anyway" control message.
+    pub is_notify_anyways: bool,
+
+    // Transcript background (conversation wallpaper) update.
+    pub is_set_transcript_background: bool,
+    pub transcript_background_remove: Option<bool>,
+    pub transcript_background_chat_id: Option<String>,
+    pub transcript_background_object_id: Option<String>,
+    pub transcript_background_url: Option<String>,
+    pub transcript_background_file_size: Option<u64>,
+
+    // Sticker data for sticker tapback reactions (tapback_type=7).
+    pub sticker_data: Option<Vec<u8>>,
+    pub sticker_mime: Option<String>,
+
+    // Profile sharing: set when a contact shares their name/photo with us.
+    // record_key + decryption_key + has_poster identify the CloudKit record;
+    // display_name/first_name/last_name/avatar are populated inline by the
+    // Rust receive loop via ProfilesClient::get_record so the Go side just
+    // reads bytes (mirrors the IconChange MMCS download pattern).
+    pub is_share_profile: bool,
+    pub share_profile_record_key: Option<String>,
+    pub share_profile_decryption_key: Option<Vec<u8>>,
+    pub share_profile_has_poster: bool,
+    pub share_profile_display_name: Option<String>,
+    pub share_profile_first_name: Option<String>,
+    pub share_profile_last_name: Option<String>,
+    pub share_profile_avatar: Option<Vec<u8>>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedAttachment {
+    pub mime_type: String,
+    pub filename: String,
+    pub uti_type: String,
+    pub size: u64,
+    pub is_inline: bool,
+    pub inline_data: Option<Vec<u8>>,
+    /// True for Live Photo attachments (Apple's "iris" flag).
+    pub iris: bool,
+    /// True when the attachment is the visual payload of an iMessage sticker.
+    pub is_sticker: bool,
+    /// Serialized MMCS descriptor JSON for non-inline attachments; None for
+    /// inline attachments and rich-link sidebands. The Go-side
+    /// AttachmentRetrier persists this alongside a pending row so it can
+    /// re-invoke the download later via retry_mmcs_from_descriptor without
+    /// needing the original MessageInst to still be in memory. See
+    /// MmcsDescriptor below.
+    pub mmcs_descriptor_json: Option<String>,
+}
+
+/// Serializable handle for a rustpush MMCSFile. Persisted by Go so the
+/// background AttachmentRetrier can reconstruct the handle and call
+/// download_one_mmcs_attachment against a freshly healthy APNs connection.
+/// Binary fields are base64-encoded so the JSON round-trips through SQLite
+/// without escaping headaches.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct MmcsDescriptor {
+    url: String,
+    object: String,
+    signature_b64: String,
+    key_b64: String,
+    size: usize,
+}
+
+impl MmcsDescriptor {
+    fn from_file(mmcs: &rustpush::MMCSFile) -> Self {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        Self {
+            url: mmcs.url.clone(),
+            object: mmcs.object.clone(),
+            signature_b64: STANDARD.encode(&mmcs.signature),
+            key_b64: STANDARD.encode(&mmcs.key),
+            size: mmcs.size,
+        }
+    }
+
+    fn to_file(&self) -> Result<rustpush::MMCSFile, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let signature = STANDARD
+            .decode(&self.signature_b64)
+            .map_err(|e| format!("decode signature_b64: {e}"))?;
+        let key = STANDARD
+            .decode(&self.key_b64)
+            .map_err(|e| format!("decode key_b64: {e}"))?;
+        Ok(rustpush::MMCSFile {
+            url: self.url.clone(),
+            object: self.object.clone(),
+            signature,
+            key,
+            size: self.size,
+        })
+    }
+}
+
+/// Result of fetching a shared iMessage profile (Name & Photo Sharing).
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedProfileRecord {
+    pub display_name: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub avatar: Option<Vec<u8>>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedStickerExtension {
+    pub msg_width: f64,
+    pub rotation: f64,
+    pub sai: u64,
+    pub scale: f64,
+    pub sli: u64,
+    pub normalized_x: f64,
+    pub normalized_y: f64,
+    pub version: u64,
+    pub hash: String,
+    pub safi: u64,
+    pub effect_type: i64,
+    pub sticker_id: String,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedShareProfileData {
+    pub cloud_kit_record_key: String,
+    pub cloud_kit_decryption_record_key: Vec<u8>,
+    pub low_res_wallpaper_tag: Option<Vec<u8>>,
+    pub wallpaper_tag: Option<Vec<u8>>,
+    pub message_tag: Option<Vec<u8>>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedStatusKitInviteHandle {
+    pub handle: String,
+    pub allowed_modes: Vec<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedPasswordEntryRef {
+    pub id: String,
+    pub group: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedPasswordSiteCounts {
+    pub website_meta_count: u64,
+    pub password_count: u64,
+    pub password_meta_count: u64,
+    pub passkey_count: u64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedLetMeInRequest {
+    pub delegation_uuid: String,
+    pub pseud: String,
+    pub requestor: String,
+    pub nickname: Option<String>,
+    pub usage: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedConversation {
+    pub participants: Vec<String>,
+    pub group_name: Option<String>,
+    pub sender_guid: Option<String>,
+    pub is_sms: bool,
+}
+
+impl From<&ConversationData> for WrappedConversation {
+    fn from(c: &ConversationData) -> Self {
+        Self {
+            participants: c.participants.clone(),
+            group_name: c.cv_name.clone(),
+            sender_guid: c.sender_guid.clone(),
+            is_sms: false,
+        }
+    }
+}
+
+impl From<&WrappedConversation> for ConversationData {
+    fn from(c: &WrappedConversation) -> Self {
+        ConversationData {
+            participants: c.participants.clone(),
+            cv_name: c.group_name.clone(),
+            sender_guid: c.sender_guid.clone(),
+            after_guid: None,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncChat {
+    pub record_name: String,
+    pub cloud_chat_id: String,
+    pub group_id: String,
+    /// CloudKit chat style: 43 = group, 45 = DM
+    pub style: i64,
+    pub service: String,
+    pub display_name: Option<String>,
+    pub participants: Vec<String>,
+    pub deleted: bool,
+    pub updated_timestamp_ms: u64,
+    /// CloudKit group photo GUID ("gpid" field). Non-null means a custom photo is set.
+    pub group_photo_guid: Option<String>,
+    /// CloudKit `filt` field: 0 = normal, 1 = filtered (spam/junk/unknown sender)
+    pub is_filtered: i64,
+}
+
+fn recoverable_record_field_names(fields: &[rustpush::cloudkit_proto::record::Field]) -> Vec<String> {
+    fields
+        .iter()
+        .filter_map(|field| field.identifier.as_ref()?.name.clone())
+        .collect()
+}
+
+fn record_looks_chat_like(fields: &[rustpush::cloudkit_proto::record::Field]) -> bool {
+    let names = recoverable_record_field_names(fields);
+    names.iter().any(|name| matches!(name.as_str(), "stl" | "cid" | "gid" | "ptcpts" | "name" | "lah"))
+}
+
+fn wrap_recoverable_chat(record_name: String, mut chat: rustpush::cloud_messages::CloudChat) -> Option<WrappedCloudSyncChat> {
+    if chat.participants.is_empty() && chat.style == 45 && !chat.last_addressed_handle.is_empty() {
+        chat.participants.push(rustpush::cloud_messages::CloudParticipant {
+            uri: chat.last_addressed_handle.clone(),
+        });
+    }
+
+    let has_identity = !chat.chat_identifier.is_empty()
+        || !chat.group_id.is_empty()
+        || !chat.participants.is_empty()
+        || chat.display_name.as_ref().is_some_and(|name| !name.is_empty());
+    if !has_identity || !matches!(chat.style, 43 | 45) {
+        return None;
+    }
+
+    let cloud_chat_id = if chat.chat_identifier.is_empty() {
+        record_name.clone()
+    } else {
+        chat.chat_identifier.clone()
+    };
+    Some(WrappedCloudSyncChat {
+        record_name,
+        cloud_chat_id,
+        group_id: chat.group_id,
+        style: chat.style,
+        service: chat.service_name,
+        display_name: chat.display_name,
+        participants: chat.participants.into_iter().map(|p| p.uri).collect(),
+        deleted: false,
+        updated_timestamp_ms: 0,
+        group_photo_guid: chat.group_photo_guid,
+        is_filtered: chat.is_filtered,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct RecoverableMessageMetadata {
+    v: u8,
+    record_name: String,
+    cloud_chat_id: String,
+    sender: String,
+    is_from_me: bool,
+    service: String,
+    timestamp_ms: i64,
+}
+
+fn encode_recoverable_message_entry(
+    guid: &str,
+    record_name: &str,
+    msg: &rustpush::cloud_messages::CloudMessage,
+) -> String {
+    if guid.is_empty() {
+        return String::new();
+    }
+
+    let metadata = RecoverableMessageMetadata {
+        v: 1,
+        record_name: record_name.to_string(),
+        cloud_chat_id: msg.chat_id.clone(),
+        sender: msg.sender.clone(),
+        is_from_me: msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+        service: msg.service.clone(),
+        timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
+    };
+    match serde_json::to_vec(&metadata) {
+        Ok(payload) => format!("{}|{}", guid, BASE64_STANDARD.encode(payload)),
+        Err(err) => {
+            debug!("list_recoverable_message_guids: failed to encode metadata for {}: {}", guid, err);
+            guid.to_string()
+        }
+    }
+}
+
+/// Parse a CloudKit `msgProto2.reply` value (format `r:<part>:<guid>`) into
+/// (reply_guid, reply_part), mirroring the live-receive parse in upstream
+/// rustpush (imessage/messages.rs) so the Go backfill path can reuse the same
+/// chatDBReplyTarget/parseBalloonPart logic as the live path. The GUID is the
+/// `:`-segment containing a `-` (a UUID); the remaining segments are the part.
+/// Returns (None, None) for an absent, empty, or malformed value. Panic-free:
+/// the recoverable-backfill normalizer is not wrapped in catch_unwind.
+fn parse_cloud_reply(reply: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(to) = reply.filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let mut parts: Vec<&str> = to.split(':').collect();
+    if parts.is_empty() {
+        return (None, None);
+    }
+    parts.remove(0); // drop the leading "r"
+    let Some(guididx) = parts.iter().position(|p| p.contains('-')) else {
+        return (None, None);
+    };
+    let guid = parts[guididx].to_string();
+    parts.remove(guididx);
+    (Some(guid), Some(parts.join(":")))
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncMessage {
+    pub record_name: String,
+    pub guid: String,
+    pub cloud_chat_id: String,
+    pub sender: String,
+    pub is_from_me: bool,
+    pub text: Option<String>,
+    pub subject: Option<String>,
+    pub service: String,
+    pub timestamp_ms: i64,
+    pub deleted: bool,
+
+    // Tapback/reaction fields (from msg_proto.associatedMessageType/Guid)
+    pub tapback_type: Option<u32>,
+    pub tapback_target_guid: Option<String>,
+    pub tapback_emoji: Option<String>,
+
+    // Attachment GUIDs extracted from messageSummaryInfo / attributedBody.
+    // These are matched against the attachment zone to download files.
+    pub attachment_guids: Vec<String>,
+
+    // When the recipient read this message (Apple epoch ns → Unix ms).
+    // Only meaningful for is_from_me messages. 0 means unread.
+    pub date_read_ms: i64,
+
+    // CloudKit msgType field. 0 = regular user message, non-zero = system/service
+    // record (group naming, participant changes, etc.). Used by Go to filter
+    // non-user-content that slips past IS_SYSTEM/IS_SERVICE_MESSAGE flags.
+    pub msg_type: i64,
+
+    // Whether the CloudKit record has an attributedBody (rich text payload).
+    // Regular user messages always have attributedBody; system/service messages
+    // (group renames, participant changes) never do. Used by Go to filter
+    // system messages that slip past flag-based filters.
+    pub has_body: bool,
+
+    // Reply target, parsed from msgProto2.reply (format `r:<part>:<guid>`).
+    // Mirrors the live-receive WrappedMessage.reply_guid/reply_part so the Go
+    // backfill conversion reuses chatDBReplyTarget identically. None when the
+    // message is not a reply (the common case — msgProto2 is empty for most).
+    pub reply_guid: Option<String>,
+    pub reply_part: Option<String>,
+}
+
+/// Metadata for an attachment referenced by a CloudKit message.
+/// The actual file data must be downloaded separately via cloud_download_attachment.
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudAttachmentInfo {
+    /// Attachment GUID (from AttachmentMeta.guid / attributedBody __kIMFileTransferGUID)
+    pub guid: String,
+    /// MIME type (from AttachmentMeta.mime_type)
+    pub mime_type: Option<String>,
+    /// UTI type (from AttachmentMeta.uti)
+    pub uti_type: Option<String>,
+    /// Filename (from AttachmentMeta.transfer_name)
+    pub filename: Option<String>,
+    /// File size in bytes (from AttachmentMeta.total_bytes)
+    pub file_size: i64,
+    /// CloudKit record name in attachmentManateeZone (needed for download)
+    pub record_name: String,
+    /// Whether this attachment is hidden (companion transfer, e.g. Live Photo MOV).
+    /// When true, this is the video component of a Live Photo — not shown standalone.
+    pub hide_attachment: bool,
+    /// Whether this attachment record has a Live Photo video in its `avid` asset field.
+    /// When true, use cloud_download_attachment_avid to get the MOV instead of the HEIC.
+    pub has_avid: bool,
+    /// PCS-decrypted `lqa.protection_info` bytes — for Ford-encrypted videos,
+    /// this is the raw 32-byte Ford key used to decrypt per-chunk keys from
+    /// the MMCS Ford metadata blob. None for attachments without Ford
+    /// encryption (images use V1 per-chunk keys in the MMCS chunk metadata).
+    ///
+    /// Exposed so the Go-side Ford key cache can pre-populate during sync
+    /// and fall back to cached keys on MMCS cross-batch dedup. See
+    /// `pkg/connector/ford_cache.go`.
+    pub ford_key: Option<Vec<u8>>,
+    /// PCS-decrypted `avid.protection_info` bytes — the Live Photo MOV
+    /// companion's Ford key. Same semantics as `ford_key`.
+    pub avid_ford_key: Option<Vec<u8>>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncChatsPage {
+    pub continuation_token: Option<String>,
+    pub status: i32,
+    pub done: bool,
+    pub chats: Vec<WrappedCloudSyncChat>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncMessagesPage {
+    pub continuation_token: Option<String>,
+    pub status: i32,
+    pub done: bool,
+    pub messages: Vec<WrappedCloudSyncMessage>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncAttachmentsPage {
+    pub continuation_token: Option<String>,
+    pub status: i32,
+    pub done: bool,
+    pub attachments: Vec<WrappedCloudAttachmentInfo>,
+}
+
+/// A clonable writer backed by a shared Vec<u8>.
+/// Used to recover written bytes after passing ownership to a consuming API.
+#[derive(Clone)]
+struct SharedWriter {
+    inner: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn new() -> Self {
+        Self { inner: Arc::new(std::sync::Mutex::new(Vec::new())) }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        }
+    }
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Extract attachment GUIDs from a CloudKit message's attributedBody.
+/// The attributedBody is an NSAttributedString containing ranges with
+/// __kIMFileTransferGUIDAttributeName → attachment GUID.
+fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
+    use rustpush::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
+
+    let decoded = match std::panic::catch_unwind(|| {
+        let flat = coder_decode_flattened(data);
+        if flat.is_empty() {
+            return None;
+        }
+        Some(NSAttributedString::decode(&flat[0]))
+    }) {
+        Ok(Some(attr_str)) => attr_str,
+        _ => return vec![],
+    };
+
+    let mut guids = Vec::new();
+    for (_len, dict) in &decoded.ranges {
+        if let Some(StCollapsedValue::Object { fields, .. }) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
+            if let Some(first) = fields.first().and_then(|f| f.first()) {
+                if let StCollapsedValue::String(s) = first {
+                    guids.push(s.clone());
+                }
+            }
+        } else if let Some(StCollapsedValue::String(s)) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
+            guids.push(s.clone());
+        }
+    }
+    guids
+}
+
+/// Extract attachment GUIDs from a CloudKit message's messageSummaryInfo.
+/// messageSummaryInfo is a binary plist containing an "ams" (attachment metadata
+/// summary) array. Each entry is a dict with "g" = GUID. This captures GUIDs
+/// for companion transfers (e.g. Live Photo MOV components) that are NOT
+/// referenced in attributedBody's __kIMFileTransferGUIDAttributeName.
+fn extract_attachment_guids_from_summary_info(data: &[u8]) -> Vec<String> {
+    let value: plist::Value = match plist::from_bytes(data) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("messageSummaryInfo: plist parse failed ({} bytes): {}", data.len(), e);
+            return vec![];
+        }
+    };
+    let dict = match value.as_dictionary() {
+        Some(d) => d,
+        None => return vec![],
+    };
+    let mut guids = Vec::new();
+    // "ams" = attachment metadata summary — array of per-attachment dicts
+    if let Some(plist::Value::Array(ams)) = dict.get("ams") {
+        for entry in ams {
+            if let Some(entry_dict) = entry.as_dictionary() {
+                // "g" = attachment GUID (file transfer GUID)
+                if let Some(plist::Value::String(guid)) = entry_dict.get("g") {
+                    if !guid.is_empty() {
+                        guids.push(guid.clone());
+                    }
+                }
+            }
+        }
+    }
+    guids
+}
+
+fn apple_timestamp_ns_to_unix_ms(timestamp_ns: i64) -> i64 {
+    const APPLE_EPOCH_UNIX_MS: i64 = 978_307_200_000;
+    APPLE_EPOCH_UNIX_MS.saturating_add(timestamp_ns / 1_000_000)
+}
+
+fn decode_continuation_token(token_b64: Option<String>) -> Result<Option<Vec<u8>>, WrappedError> {
+    match token_b64 {
+        Some(token) if !token.is_empty() => BASE64_STANDARD
+            .decode(token)
+            .map(Some)
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Invalid continuation token: {}", e),
+            }),
+        _ => Ok(None),
+    }
+}
+
+fn encode_continuation_token(token: Vec<u8>) -> Option<String> {
+    if token.is_empty() {
+        None
+    } else {
+        Some(BASE64_STANDARD.encode(token))
+    }
+}
+
+fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<String>, bool) {
+    let tapback_type = match reaction {
+        Reaction::Heart => Some(0),
+        Reaction::Like => Some(1),
+        Reaction::Dislike => Some(2),
+        Reaction::Laugh => Some(3),
+        Reaction::Emphasize => Some(4),
+        Reaction::Question => Some(5),
+        Reaction::Emoji(_) => Some(6),
+        Reaction::Sticker { .. } => Some(7),
+    };
+    let emoji = match reaction {
+        Reaction::Emoji(e) => Some(e.clone()),
+        _ => None,
+    };
+    (tapback_type, emoji, !enable)
+}
+
+fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
+    match target {
+        DeleteTarget::Chat(chat) => {
+            w.delete_chat_participants = chat.participants.clone();
+            w.delete_chat_group_id = if chat.group_id.is_empty() {
+                None
+            } else {
+                Some(chat.group_id.clone())
+            };
+            w.delete_chat_guid = if chat.guid.is_empty() {
+                None
+            } else {
+                Some(chat.guid.clone())
+            };
+        }
+        DeleteTarget::Messages(uuids) => {
+            w.delete_message_uuids = uuids.clone();
+        }
+    }
+}
+
+/// Convert message parts into HTML. Returns Some(html) only if there is any
+/// non-plain formatting (bold/italic/underline/strikethrough, text effects,
+/// or mentions). Returns None for plain-text-only messages so the Go side can
+/// skip HTML encoding.
+fn parts_to_html(parts: &MessageParts) -> Option<String> {
+    let has_formatting = parts.0.iter().any(|p| match &p.part {
+        MessagePart::Text(_, fmt) => !matches!(fmt, TextFormat::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false })),
+        MessagePart::Mention(_, _) => true,
+        _ => false,
+    });
+    if !has_formatting {
+        return None;
+    }
+
+    let mut html = String::new();
+    for indexed_part in &parts.0 {
+        match &indexed_part.part {
+            MessagePart::Text(text, format) => {
+                let escaped = html_escape(text);
+                match format {
+                    TextFormat::Flags(flags) => {
+                        let mut open = String::new();
+                        let mut close = String::new();
+                        if flags.bold { open.push_str("<strong>"); close.insert_str(0, "</strong>"); }
+                        if flags.italic { open.push_str("<em>"); close.insert_str(0, "</em>"); }
+                        if flags.underline { open.push_str("<u>"); close.insert_str(0, "</u>"); }
+                        if flags.strikethrough { open.push_str("<del>"); close.insert_str(0, "</del>"); }
+                        html.push_str(&open);
+                        html.push_str(&escaped);
+                        html.push_str(&close);
+                    }
+                    TextFormat::Effect(effect) => {
+                        let effect_name = match effect {
+                            TextEffect::Big => "big",
+                            TextEffect::Small => "small",
+                            TextEffect::Shake => "shake",
+                            TextEffect::Nod => "nod",
+                            TextEffect::Explode => "explode",
+                            TextEffect::Ripple => "ripple",
+                            TextEffect::Bloom => "bloom",
+                            TextEffect::Jitter => "jitter",
+                        };
+                        html.push_str(&format!(
+                            "<span data-mx-imessage-effect=\"{}\">",
+                            effect_name
+                        ));
+                        html.push_str(&escaped);
+                        html.push_str("</span>");
+                    }
+                }
+            }
+            MessagePart::Mention(uri, display) => {
+                let escaped_display = html_escape(display);
+                let escaped_uri = html_escape(uri);
+                html.push_str(&format!(
+                    "<a href=\"{}\">@{}</a>",
+                    escaped_uri, escaped_display
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if html.is_empty() {
+        None
+    } else {
+        Some(html)
+    }
+}
+
+/// Minimal HTML escaping for user-provided text.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+/// Parse Matrix HTML into iMessage MessageParts with formatting.
+/// Returns None if no formatting tags are found (plain text fallback).
+fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+    if !html.contains('<') {
+        return None;
+    }
+
+    let mut parts: Vec<IndexedMessagePart> = Vec::new();
+    let mut pos = 0;
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut bold = false;
+    let mut italic = false;
+    let mut underline = false;
+    let mut strikethrough = false;
+
+    while pos < len {
+        if bytes[pos] == b'<' {
+            let tag_end = match html[pos..].find('>') {
+                Some(e) => pos + e + 1,
+                None => break,
+            };
+            let tag_content = &html[pos + 1..tag_end - 1].trim().to_lowercase();
+            match tag_content.as_str() {
+                "strong" | "b" => bold = true,
+                "/strong" | "/b" => bold = false,
+                "em" | "i" => italic = true,
+                "/em" | "/i" => italic = false,
+                "u" => underline = true,
+                "/u" => underline = false,
+                "del" | "s" | "strike" => strikethrough = true,
+                "/del" | "/s" | "/strike" => strikethrough = false,
+                "br" | "br/" | "br /" => {
+                    let flags = TextFlags { bold, italic, underline, strikethrough };
+                    parts.push(IndexedMessagePart {
+                        part: MessagePart::Text("\n".to_string(), TextFormat::Flags(flags)),
+                        idx: None,
+                        ext: None,
+                    });
+                }
+                _ => {
+                    // Skip unknown tags (p, div, span without effect, etc.)
+                }
+            }
+            pos = tag_end;
+        } else {
+            let next_tag = html[pos..].find('<').map(|i| pos + i).unwrap_or(len);
+            let chunk = &html[pos..next_tag];
+            let decoded = chunk
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"");
+            if !decoded.is_empty() {
+                let flags = TextFlags { bold, italic, underline, strikethrough };
+                parts.push(IndexedMessagePart {
+                    part: MessagePart::Text(decoded, TextFormat::Flags(flags)),
+                    idx: None,
+                    ext: None,
+                });
+            }
+            pos = next_tag;
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let reconstructed: String = parts.iter().map(|p| match &p.part {
+        MessagePart::Text(t, _) => t.as_str(),
+        _ => "",
+    }).collect();
+    if reconstructed == plain_text && !parts.iter().any(|p| matches!(&p.part, MessagePart::Text(_, TextFormat::Flags(f)) if f.bold || f.italic || f.underline || f.strikethrough)) {
+        return None;
+    }
+
+    Some(MessageParts(parts))
+}
+
+/// Lift a ShareProfileMessage onto a WrappedMessage's share-profile keys.
+/// Used by both the standalone Message::ShareProfile / UpdateProfile arms
+/// and the embedded_profile field on NormalMessage / ReactMessage —
+/// iOS partners send profile keys piggybacked on regular text messages
+/// when Name & Photo Sharing is enabled, so the standalone control message
+/// alone is not sufficient to discover all shared profiles.
+///
+/// `kind` describes which message variant produced the profile, and is
+/// logged so the embedded path is observable. The standalone-variant
+/// "received Message::ShareProfile" log already covers those cases; this
+/// log catches NormalMessage/ReactMessage embedded arrivals which would
+/// otherwise be silent in the receive-loop log stream.
+fn populate_share_profile_keys(
+    w: &mut WrappedMessage,
+    profile: &rustpush::ShareProfileMessage,
+    kind: &'static str,
+) {
+    w.is_share_profile = true;
+    w.share_profile_record_key = Some(profile.cloud_kit_record_key.clone());
+    w.share_profile_decryption_key = Some(profile.cloud_kit_decryption_record_key.clone());
+    w.share_profile_has_poster = profile.poster.is_some();
+    info!(
+        "populated share_profile_keys from {} (record_key_len={}, has_poster={})",
+        kind,
+        profile.cloud_kit_record_key.len(),
+        profile.poster.is_some()
+    );
+}
+
+const FACETIME_RING_MARKER: &str = "[[FACETIME_RING]]";
+const FACETIME_MISSED_MARKER: &str = "[[FACETIME_MISSED]]";
+const FACETIME_ANSWERED_ELSEWHERE_MARKER: &str = "[[FACETIME_ANSWERED_ELSEWHERE]]";
+
+// Tracks FaceTime sessions that should ring a set of targets as soon as
+// somebody *other than the caller* joins. Populated by `!im facetime` in a
+// portal room: the command creates a session for the user + contact, returns
+// a join link, and queues a pending ring here. When the caller later taps
+// the link and a JoinEvent arrives on the APNs stream, the receive loop
+// fires ft.ring() against the queued targets. We filter out the caller's
+// own handle so the implicit self-join emitted during create_session does
+// NOT trigger the ring prematurely — the contact's phone must only ring
+// after the caller has actually joined.
+struct PendingFTRing {
+    caller_handle: String,
+    targets: Vec<String>,
+    expires_at: std::time::Instant,
+}
+
+static PENDING_FT_RINGS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, PendingFTRing>>> =
+    std::sync::OnceLock::new();
+
+fn pending_ft_rings() -> &'static tokio::sync::Mutex<HashMap<String, PendingFTRing>> {
+    PENDING_FT_RINGS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, joiner_handle: &str) {
+    let targets = {
+        let mut map = pending_ft_rings().lock().await;
+        let Some(entry) = map.get(guid) else {
+            return;
+        };
+        if entry.expires_at <= std::time::Instant::now() {
+            map.remove(guid);
+            return;
+        }
+        if joiner_handle == entry.caller_handle {
+            // Creator's own implicit join from create_session — keep the
+            // entry pending and wait for a real remote/web joiner.
+            return;
+        }
+        let targets = entry.targets.clone();
+        map.remove(guid);
+        targets
+    };
+    let session = {
+        let state = ft.state.read().await;
+        match state.sessions.get(guid).cloned() {
+            Some(s) => s,
+            None => {
+                warn!("pending ring: session {} not found", guid);
+                return;
+            }
+        }
+    };
+    let rang = match ft.ring(&session, &targets, false).await {
+        Ok(_) => {
+            info!(
+                "pending ring: rang {} target(s) in session {} (triggered by join from {})",
+                targets.len(),
+                guid,
+                joiner_handle
+            );
+            // Flip is_ringing_inaccurate=true now that the Invitation is on
+            // the wire. create_session_no_ring starts it false to suppress
+            // prop_up_conv's RespondedElsewhere diversion; we need it true
+            // here so the missed-call detection (facetime.rs:1411)
+            // trips if the callee declines / times out — otherwise a
+            // no-answer call silently drops instead of surfacing as Missed.
+            let mut state = ft.state.write().await;
+            if let Some(session) = state.sessions.get_mut(guid) {
+                session.is_ringing_inaccurate = true;
+            }
+            true
+        }
+        Err(e) => {
+            warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e);
+            false
+        }
+    };
+    if rang {
+        suppress_own_device_ring(ft, guid).await;
+
+        // Leave the session now that the user's device has joined AND the
+        // ring is on the wire. The bridge was only propped in the session
+        // to satisfy the OneOnOne-mode exit requirement (see
+        // facetime.rs:1071-1077 comment: "we solve this by
+        // 'joining' the call until the web client has an opportunity to
+        // join, and then leaving ASAP"). Staying propped makes peer's
+        // client and the user's Mac Continuity UI render the call as
+        // "{callee} and one other person" — that "other person" being
+        // the bridge's participant with video_enabled=Some(false). The
+        // user's device handles audio + video end-to-end; the bridge is
+        // only needed through session creation and ring dispatch.
+        //
+        // Safe to unprop here because the joiner that triggered
+        // maybe_fire_pending_ring is guaranteed to be a non-caller (filtered
+        // at line 3153), so at least one user-side participant is active
+        // before the bridge leaves. Callee's own join arrives over the
+        // wire when they answer and is processed by rustpush's handle()
+        // independently.
+        let mut state = ft.state.write().await;
+        if let Some(session) = state.sessions.get_mut(guid) {
+            if session.is_propped {
+                if let Err(e) = ft.unprop_conv(session).await {
+                    warn!("pending ring: unprop_conv failed for session {}: {:?}", guid, e);
+                } else {
+                    info!(
+                        "pending ring: unpropped bridge from session {} — web client carries the call from here",
+                        guid
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Send a RespondedElsewhere FaceTime message scoped to the caller's own
+// handle, to silence Apple's server-side Continuity fanout on outgoing calls.
+//
+// Problem: when the bridge initiates an outgoing FT call (via
+// create_session_no_ring + pending-ring fire-on-join, or via respond_letmein
+// for web-link taps), Apple's Continuity layer sees "handle X initiated a
+// call via web/bridge" and rings handle X's OTHER registered devices (Mac,
+// iPad) to offer "join this call on your native device." Native iPhone FT
+// doesn't trip this because local CallKit registers the initiating device
+// as an active-call device; the bridge can't do that.
+//
+// Fix: mirror the pattern at facetime.rs:708-725, where
+// `prop_up_conv(ring=false)` sends RespondedElsewhere to own-devices when
+// the user picks up an incoming call. We emit the same wire after our
+// outgoing ring fires so the caller's MacBook/iPad stop ringing. The push
+// is scoped to the caller's own handle only — the target (callee) receives
+// no RespondedElsewhere, so their ring is unaffected.
+//
+// Reuses only public rustpush APIs (IdentityManager::cache_keys /
+// send_message, KeyCache::get_participants_targets, ConversationMessage
+// proto). No rustpush patching.
+async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str) {
+    use prost::Message as _;
+    use rustpush::facetime::facetimep::{ConversationMessage, ConversationMessageType};
+    use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
+    use rustpush::ids::user::QueryOptions;
+
+    let handle = {
+        let state = ft.state.read().await;
+        let Some(session) = state.sessions.get(guid) else {
+            warn!("suppress_own_device_ring: session {} not found", guid);
+            return;
+        };
+        match session.my_handles.first().cloned() {
+            Some(h) => h,
+            None => {
+                warn!("suppress_own_device_ring: session {} has no my_handles", guid);
+                return;
+            }
+        }
+    };
+
+    let mut message = ConversationMessage::default();
+    message.set_type(ConversationMessageType::RespondedElsewhere);
+    message.conversation_group_uuid_string = guid.to_string();
+    message.disconnected_reason = 4;
+
+    let relevant_people = vec![handle.clone()];
+    let topic = "com.apple.private.alloy.facetime.multi";
+
+    if let Err(e) = ft
+        .identity
+        .cache_keys(
+            topic,
+            &relevant_people,
+            &handle,
+            false,
+            &QueryOptions { required_for_message: true, result_expected: true },
+        )
+        .await
+    {
+        warn!(
+            "suppress_own_device_ring: cache_keys failed for session {}: {:?}",
+            guid, e
+        );
+        return;
+    }
+
+    // Suppress the user's OTHER Apple devices (e.g. a MacBook in the same
+    // Apple ID) from ringing when the bridge places/answers a call — but never
+    // the bridge's OWN call-carrying leg. rustpush identifies the bridge's own
+    // participant by base64(conn.get_token()) (facetime.rs:730-748); excluding
+    // that token here keeps the RespondedElsewhere off the live leg (which
+    // would tear the call down) while still reaching genuine sibling devices.
+    let my_token = ft.conn.get_token().await;
+    let targets: Vec<_> = ft
+        .identity
+        .cache
+        .lock()
+        .await
+        .get_participants_targets(topic, &handle, &relevant_people)
+        .into_iter()
+        .filter(|t| t.delivery_data.push_token != my_token)
+        .collect();
+    if targets.is_empty() {
+        // Only the bridge's own leg was registered — nothing to suppress.
+        return;
+    }
+
+    let ids_send = IDSSendMessage {
+        sender: handle.clone(),
+        raw: Raw::Body(message.encode_to_vec()),
+        send_delivered: false,
+        command: 242,
+        no_response: false,
+        id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+        scheduled_ms: None,
+        queue_id: None,
+        relay: None,
+        extras: Default::default(),
+    };
+
+    if let Err(e) = ft.identity.send_message(topic, ids_send, targets).await {
+        warn!(
+            "suppress_own_device_ring: send_message failed for session {}: {:?}",
+            guid, e
+        );
+    }
+}
+
+// Wrapper-side replacement for the prop_up_conv on the inbound
+// letmein path, with `video_enabled = Some(true)` instead of the
+// hardcoded `Some(false)` (facetime.rs:775).
+//
+// The bug: when the bridge approves an inbound LetMeIn, the
+// respond_letmein detects the OneOnOne-mode condition and calls
+// prop_up_conv(session, false). That sends a cmd 207 announcing the
+// bridge participant with video=Some(true), video_enabled=Some(false).
+// Wife's iPhone has no other IDS-visible participant for this call (the
+// webview joins through Apple's HTTPS relay, invisible at IDS), so it
+// reads the bridge ghost's video_enabled=false as the call's authoritative
+// video state and renders the call as "FaceTime Audio" — even though
+// she dialed FaceTime Video. The call connects, audio flows both ways,
+// but the webview's video stream never gets classified.
+//
+// Why post-letmein RequestVideoUpgrade didn't work: peer iOS caches the
+// first prop's classification on first-sighting (see memory:
+// project_relog_required_after_identity_changes); after-the-fact
+// upgrades are fragile against that cache. The fix has to land in the
+// first prop peer sees.
+//
+// We can't change line 775 without modifying rustpush source
+// (which the project's no-patch rule forbids). Instead: emit the same
+// cmd 207 ourselves with the corrected flag, then mark
+// `session.is_ringing_inaccurate = false` so the respond_letmein
+// skips its own auto-prop.
+//
+// Implementation notes:
+//  - Builds the wire payload as a raw plist::Dictionary instead of going
+//    through the `FTWireMessage` struct, because two of FTWireMessage's
+//    fields are typed Option<ParticipantID> and the ParticipantID enum is
+//    private to the facetime module. The kebab-case keys here mirror
+//    FTWireMessage's `#[serde(rename_all = "kebab-case")]` plus its explicit
+//    `#[serde(rename = ...)]` overrides for s / fanout-groupID-key /
+//    fanout-groupMembers-key. ParticipantID itself is `#[serde(untagged)]`
+//    so its wire form is just the integer — Value::Integer((u64).into()) is
+//    the same bytes the typed path produces.
+//  - sampleavcdata.bplist (participant-data-key) is included from
+//    third_party/ at compile time; rustpush uses include_bytes! against the
+//    same file from inside its own module. CARGO_MANIFEST_DIR is stable
+//    (relative to pkg/rustpushgo/Cargo.toml).
+//  - On success: sets is_propped=true and is_ringing_inaccurate=false on the
+//    session, so the respond_letmein needs_prop check fails and it
+//    skips. On failure: leaves session state untouched so the
+//    auto-prop runs as a fallback (audio-only call > broken call).
+// Hand-rolled cmd 207 prop with video_enabled=Some(true) instead of the
+// hardcoded Some(false) (facetime.rs:775). Mirrors prop_up_conv's
+// ring=false branch byte-for-byte except for the video_enabled flag and the
+// fact that we operate on &mut FTSession (caller's lock) so we can compose
+// with auto_approve_bridge_letmein's bridge+webview pre-stamp logic without
+// fighting locks.
+//
+// Originally added in 0f0cd0f3 (then encoded XML by mistake; the XML-vs-binary
+// fix landed in 7c41baf2; both were reverted in df77da71 after a falsified
+// theory). User's empirical recall: this manual construction was what made
+// inbound classify as Video on peer's end. Restored here on top of the
+// active-stamping work in 3842e830 / 8818ecdc.
+async fn prop_up_conv_inbound_video_on(
+    facetime: &rustpush::facetime::FTClient,
+    session: &mut rustpush::facetime::FTSession,
+) -> Result<(), rustpush::PushError> {
+    use prost::Message as _;
+    use rustpush::facetime::facetimep::{
+        ConversationInvitationPreference, ConversationMember, ConversationMessage,
+        ConversationParticipantDidJoinContext, ConversationReport, Handle, HandleType,
+    };
+    use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
+    use rustpush::ids::user::QueryOptions;
+    use plist::{Dictionary, Value};
+
+    const UNIX_TO_2001_MS: u64 = 978_307_200_000;
+
+    // handle_from_ids reimplemented from facetime.rs:55-70 (private fn).
+    fn handle_from_ids(ids: &str) -> Handle {
+        let mut handle = Handle::default();
+        if let Some(rest) = ids.strip_prefix("mailto:") {
+            handle.set_type(HandleType::EmailAddress);
+            handle.value = rest.to_string();
+        } else if let Some(rest) = ids.strip_prefix("tel:") {
+            handle.set_type(HandleType::PhoneNumber);
+            handle.value = rest.to_string();
+            handle.iso_country_code = "us".to_string();
+        } else if ids.starts_with("temp:") {
+            handle.set_type(HandleType::Generic);
+            handle.value = ids.to_string();
+        }
+        handle
+    }
+
+    let group_id = session.group_id.clone();
+    let handle = session
+        .my_handles
+        .first()
+        .ok_or(rustpush::PushError::NoHandle)?
+        .clone();
+    let self_token = facetime.conn.get_token().await;
+    let base64_self_token = Some(base64_encode(&self_token));
+    let my_participant = session
+        .participants
+        .values()
+        .find(|p| &p.token == &base64_self_token)
+        .ok_or(rustpush::PushError::NoParticipantTokenIndex)?;
+    let my_participant_id = my_participant.participant_id;
+
+    let members: Vec<rustpush::facetime::FTMember> =
+        session.members.iter().cloned().collect();
+    let link = session.link.clone();
+    let start_time_ms = session
+        .start_time
+        .ok_or(rustpush::PushError::NoParticipantTokenIndex)?;
+    let timebase_secs =
+        (start_time_ms as f64 - UNIX_TO_2001_MS as f64) / 1000.0;
+    let report_data = ConversationReport {
+        conversation_id: session.report_id.clone(),
+        timebase: timebase_secs,
+    };
+
+    let mut participants_map: HashMap<String, Vec<u64>> = HashMap::new();
+    for p in session.participants.values() {
+        participants_map
+            .entry(p.handle.clone())
+            .or_default()
+            .push(p.participant_id);
+    }
+
+    let is_ringing_inaccurate = session.is_ringing_inaccurate;
+
+    let topic = "com.apple.private.alloy.facetime.multi";
+
+    // Mirrors prop_up_conv lines 707-726: when picking up an
+    // incoming call, fan a RespondedElsewhere out to our own handle so any
+    // other devices registered to it stop ringing.
+    if is_ringing_inaccurate {
+        let mut message = ConversationMessage::default();
+        message.set_type(rustpush::facetime::facetimep::ConversationMessageType::RespondedElsewhere);
+        message.conversation_group_uuid_string = group_id.clone();
+        message.disconnected_reason = 4;
+
+        let relevant_people = vec![handle.clone()];
+        facetime
+            .identity
+            .cache_keys(
+                topic,
+                &relevant_people,
+                &handle,
+                false,
+                &QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await?;
+
+        let targets = facetime
+            .identity
+            .cache
+            .lock()
+            .await
+            .get_participants_targets(topic, &handle, &relevant_people);
+
+        let _ = facetime
+            .identity
+            .send_message(
+                topic,
+                IDSSendMessage {
+                    sender: handle.clone(),
+                    raw: Raw::Body(message.encode_to_vec()),
+                    send_delivered: false,
+                    command: 242,
+                    no_response: false,
+                    id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+                    scheduled_ms: None,
+                    queue_id: None,
+                    relay: None,
+                    extras: Default::default(),
+                },
+                targets,
+            )
+            .await;
+    }
+
+    // Cache keys for the prop fan-out (the actual peers).
+    let member_handles: Vec<String> =
+        members.iter().map(|m| m.handle.clone()).collect();
+    facetime
+        .identity
+        .cache_keys(
+            topic,
+            &member_handles,
+            &handle,
+            false,
+            &QueryOptions {
+                required_for_message: true,
+                result_expected: true,
+            },
+        )
+        .await?;
+
+    let prop_targets = facetime
+        .identity
+        .cache
+        .lock()
+        .await
+        .get_participants_targets(topic, &handle, &member_handles);
+
+    // Inner ConversationMessage: no Invitation here (the `ring=false`
+    // branch also skips Invitation; this is the post-letmein prop).
+    let mut inner_message = ConversationMessage::default();
+    inner_message.link = link;
+    inner_message.report_data = Some(report_data);
+    inner_message.invitation_preferences = vec![
+        ConversationInvitationPreference {
+            version: 0,
+            handle_type: HandleType::PhoneNumber as i32,
+            notification_styles: 1,
+        },
+        ConversationInvitationPreference {
+            version: 0,
+            handle_type: HandleType::Generic as i32,
+            notification_styles: 1,
+        },
+        ConversationInvitationPreference {
+            version: 0,
+            handle_type: HandleType::EmailAddress as i32,
+            notification_styles: 1,
+        },
+    ];
+
+    // The whole point of this function: video_enabled = Some(true).
+    let mut update_context = ConversationParticipantDidJoinContext::default();
+    update_context.members = members
+        .iter()
+        .map(|m| ConversationMember {
+            version: 0,
+            handle: Some(handle_from_ids(&m.handle)),
+            nickname: m.nickname.clone(),
+            lightweight_primary: None,
+            lightweight_primary_participant_id: 0,
+            validation_source: 0,
+        })
+        .collect();
+    update_context.message = Some(inner_message);
+    update_context.is_moments_available = true;
+    update_context.provider_identifier =
+        "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
+    update_context.video = Some(true);
+    update_context.video_enabled = Some(true);
+    update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
+    update_context.is_u_plus_n_downgrade_available = Some(false);
+    update_context.is_u_plus_one_av_less_available = Some(false);
+    update_context.is_screen_sharing_available = true;
+    update_context.is_gondola_calling_available = true;
+    update_context.share_play_protocol_version = 4;
+
+    // Build the cmd 207 wire payload as a raw plist Dictionary. Field names
+    // match FTWireMessage: kebab-case for everything except the
+    // explicit serde renames.
+    let is_initiator = true;
+    let is_u_plus_one = false;
+
+    let mut wire_dict = Dictionary::new();
+    wire_dict.insert("s".to_string(), Value::String(group_id.clone()));
+    wire_dict.insert(
+        "fanout-groupID-key".to_string(),
+        Value::String(group_id.clone()),
+    );
+    wire_dict.insert(
+        "client-context-data-key".to_string(),
+        Value::Data(update_context.encode_to_vec()),
+    );
+    wire_dict.insert(
+        "participant-data-key".to_string(),
+        Value::Data(
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
+            ))
+            .to_vec(),
+        ),
+    );
+    wire_dict.insert(
+        "is-initiator-key".to_string(),
+        Value::Boolean(is_initiator),
+    );
+    wire_dict.insert(
+        "fanout-groupMembers-key".to_string(),
+        Value::Array(
+            members
+                .iter()
+                .map(|m| Value::String(m.handle.clone()))
+                .collect(),
+        ),
+    );
+    wire_dict.insert(
+        "is-u-plus-one-key".to_string(),
+        Value::Boolean(is_u_plus_one),
+    );
+    wire_dict.insert(
+        "join-notification-key".to_string(),
+        Value::Integer(1u32.into()),
+    );
+    wire_dict.insert(
+        "participant-id-key".to_string(),
+        Value::Integer(my_participant_id.into()),
+    );
+
+    let mut uri_to_pid_dict = Dictionary::new();
+    for (h, ids) in participants_map.iter() {
+        let arr: Vec<Value> = ids
+            .iter()
+            .map(|id| Value::Integer((*id).into()))
+            .collect();
+        uri_to_pid_dict.insert(h.clone(), Value::Array(arr));
+    }
+    wire_dict.insert(
+        "uri-to-participant-id-key".to_string(),
+        Value::Dictionary(uri_to_pid_dict),
+    );
+
+    // Apple's FT cmd 207 wire is a binary plist (matches the
+    // plist_to_bin at facetime.rs:805). util::plist_to_buf writes XML —
+    // peer iOS silently drops it, classification falls back to audio.
+    let mut wire_payload: Vec<u8> = Vec::new();
+    plist::to_writer_binary(&mut wire_payload, &Value::Dictionary(wire_dict))
+        .map_err(|_| rustpush::PushError::BadMsg)?;
+
+    let mut extras = Dictionary::new();
+    extras.insert("is-initiator-key".to_string(), Value::Boolean(is_initiator));
+    extras.insert("up1".to_string(), Value::Boolean(is_u_plus_one));
+
+    facetime
+        .identity
+        .send_message(
+            topic,
+            IDSSendMessage {
+                sender: handle.clone(),
+                raw: Raw::Body(wire_payload),
+                send_delivered: false,
+                command: 207,
+                no_response: false,
+                id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+                scheduled_ms: None,
+                queue_id: None,
+                relay: None,
+                extras,
+            },
+            prop_targets,
+        )
+        .await?;
+
+    // Send succeeded — mark session as propped and clear
+    // is_ringing_inaccurate so the respond_letmein needs_prop check
+    // fails and it skips its own video_enabled=false prop. Caller already
+    // holds a write lock on facetime.state; just mutate session in place.
+    session.is_propped = true;
+    session.is_ringing_inaccurate = false;
+
+    info!(
+        "prop_up_conv_inbound_video_on: cmd 207 sent for session {} with video_enabled=true",
+        group_id
+    );
+    Ok(())
+}
+
+// Overlay around FTClient::handle that tolerates Apple sending cmd 207/209
+// wire messages with `ConversationParticipantDidJoinContext.message = None`.
+// The handler at facetime.rs:1272/1344 hard-requires that field and
+// returns PushError::BadMsg when it's missing, which means the bridge never
+// records the joiner in session.participants. When wife answers an
+// outbound call (or when a link-tap joiner completes), her device's
+// server-originated 207 trips this path and the session state diverges
+// from Apple's — symptom is "this call is not available" on the callee.
+//
+// Strategy: always try rustpush's handler first so successful paths stay on the
+// standard path. Only on BadMsg do we re-decode the wire
+// message locally (using rustpush's pub types: FTWireMessage +
+// facetimep::ConversationParticipantDidJoinContext) and register the
+// joiner ourselves. No rustpush source changes — see feedback_no_patch_rustpush.
+async fn ft_handle_with_join_recovery(
+    ft: &rustpush::facetime::FTClient,
+    msg: rustpush::APSMessage,
+) -> Result<Option<rustpush::facetime::FTMessage>, rustpush::PushError> {
+    // Locally-mirrored wire-message shape. FTWireMessage's fields are
+    // private to rustpush, so we can't deserialize into it directly — but the
+    // plist schema is stable (same serde rename attrs as rustpush), so a
+    // parallel struct here gives us the fields we need without touching
+    // rustpush source.
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(crate = "serde", rename_all = "kebab-case")]
+    struct LocalFTWire {
+        #[serde(rename = "s")]
+        session: String,
+        #[serde(default)]
+        client_context_data_key: Option<plist::Value>,
+        #[serde(default)]
+        participant_id_key: Option<LocalParticipantId>,
+    }
+
+    #[derive(serde::Deserialize, Debug, Clone, Copy)]
+    #[serde(crate = "serde", untagged)]
+    enum LocalParticipantId {
+        Signed(i64),
+        Unsigned(u64),
+    }
+    impl LocalParticipantId {
+        fn as_u64(self) -> u64 {
+            match self {
+                Self::Signed(i) => i as u64,
+                Self::Unsigned(i) => i,
+            }
+        }
+    }
+
+    // Try rustpush's handler first.
+    let upstream_result = ft.handle(msg.clone()).await;
+    if !matches!(&upstream_result, Err(rustpush::PushError::BadMsg)) {
+        return upstream_result;
+    }
+
+    // Re-decrypt to inspect cmd and payload. identity.receive_message has
+    // no side effects beyond decryption, so a second call is safe.
+    let recv = match ft
+        .identity
+        .receive_message(
+            msg,
+            &[
+                "com.apple.private.alloy.facetime.multi",
+                "com.apple.private.alloy.facetime.video",
+            ],
+        )
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return upstream_result,
+    };
+
+    // Only recover 207 (JoinEvent) and 209 (GroupUpdate).
+    if recv.command != 207 && recv.command != 209 {
+        return upstream_result;
+    }
+
+    let Some(message_unenc) = recv.message_unenc else { return upstream_result };
+    let Some(sender) = recv.sender.clone() else { return upstream_result };
+    let Some(target) = recv.target.clone() else { return upstream_result };
+    let Some(token_bytes) = recv.token.clone() else { return upstream_result };
+    let Some(ns_since_epoch) = recv.ns_since_epoch else { return upstream_result };
+
+    let payload_value: plist::Value = match message_unenc.plist() {
+        Ok(v) => v,
+        Err(_) => return upstream_result,
+    };
+    let wire: LocalFTWire = match plist::from_value(&payload_value) {
+        Ok(w) => w,
+        Err(_) => return upstream_result,
+    };
+
+    // Apply minimal state mutation: session lookup/creation + joiner
+    // registration. We intentionally skip session.unpack_members (that
+    // helper is private) — member-list drift is cosmetic; the
+    // load-bearing piece is session.participants so Apple-side state
+    // lines up when Apple retries delivery or the callee's device
+    // queries participant tokens.
+    let mut state = ft.state.write().await;
+    let session = state.sessions.entry(wire.session.clone()).or_default();
+    session.group_id = wire.session.clone();
+    if !session.my_handles.contains(&target) {
+        session.my_handles.push(target.clone());
+    }
+    let guid = session.group_id.clone();
+
+    let emitted = if recv.command == 207 {
+        let participant_id = match wire.participant_id_key {
+            Some(id) => id.as_u64(),
+            None => return upstream_result,
+        };
+        session.participants.insert(
+            participant_id.to_string(),
+            rustpush::facetime::FTParticipant {
+                token: Some(base64_encode(&token_bytes)),
+                participant_id,
+                last_join_date: Some(ns_since_epoch / 1_000_000),
+                handle: sender.clone(),
+                active: None,
+            },
+        );
+
+        if session.is_propped && sender.starts_with("temp:") {
+            // Matches the behavior at facetime.rs:1315 — once someone
+            // has joined via link tap, the call is live and the propped-up
+            // invitation can retire.
+            let _ = ft.unprop_conv(session).await;
+        }
+
+        Some(rustpush::facetime::FTMessage::JoinEvent {
+            guid: guid.clone(),
+            participant: participant_id,
+            handle: sender.clone(),
+            // ring=false: without the message field we can't tell whether
+            // Apple's carrying an Invitation type. Missing the ring flag
+            // is strictly better than failing the handshake entirely.
+            ring: false,
+        })
+    } else {
+        // 209 (GroupUpdate) — nothing to emit; local state is best-effort.
+        None
+    };
+
+    info!(
+        "FaceTime cmd={} BadMsg recovery: session={} sender={} target={} participant={:?}",
+        recv.command, guid, sender, target, wire.participant_id_key,
+    );
+
+    Ok(emitted)
+}
+
+// Bridge user's FaceTime display name (resolved Go-side: facetime_display_name
+// config override → Apple SPD name → handle), set via set_self_display_name.
+// Stamped onto the bridge webview's LetMeIn nickname so the peer sees the
+// user's name instead of the raw temp:<uuid> pseud — the URL &n= pre-fill only
+// fills Apple's join-page name box client-side and never reaches the wire.
+static FACETIME_SELF_DISPLAY_NAME: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+fn facetime_self_display_name() -> Option<String> {
+    FACETIME_SELF_DISPLAY_NAME
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
+async fn auto_approve_bridge_letmein(
+    facetime: &rustpush::facetime::FTClient,
+    request: &rustpush::facetime::LetMeInRequest,
+) -> Result<(), rustpush::PushError> {
+    // Only auto-approve for links owned by this bridge. We now use the
+    // rustpush-style rotating usage slots ("next" / "current" /
+    // "current-old" for outbound; "nextincomingcall" / "incomingcall" /
+    // "incomingcall-old" for inbound). Session-specific links (from
+    // get_session_link) have usage=None but session_link=Some. All are
+    // bridge-created and safe to auto-approve.
+    let (link_handle, linked_group, member_group, ringing_group, inbound_session) = {
+        let state = facetime.state.read().await;
+        let Some(link) = state.links.get(&request.pseud) else {
+            return Ok(());
+        };
+        let is_bridge_usage = matches!(
+            link.usage.as_deref(),
+            Some("next")
+                | Some("current")
+                | Some("current-old")
+                | Some("nextincomingcall")
+                | Some("incomingcall")
+                | Some("incomingcall-old")
+        );
+        let is_session_link = link.session_link.is_some();
+        if !is_bridge_usage && !is_session_link {
+            return Ok(());
+        }
+
+        let linked_group = link
+            .session_link
+            .clone()
+            .filter(|group| state.sessions.contains_key(group));
+
+        let member_group = state.sessions.iter().find_map(|(group, session)| {
+            if !session.my_handles.iter().any(|h| h == &link.handle) {
+                return None;
+            }
+            if session.members.iter().any(|member| member.handle == request.requestor) {
+                Some(group.clone())
+            } else {
+                None
+            }
+        });
+
+        let ringing_group = state.sessions.iter().find_map(|(group, session)| {
+            if !session.my_handles.iter().any(|h| h == &link.handle) {
+                return None;
+            }
+            if session.is_ringing_inaccurate {
+                Some(group.clone())
+            } else {
+                None
+            }
+        });
+
+        // Check the candidate session's mode. Peer-initiated (Incoming)
+        // sessions must not be joined by the bridge — even if `linked`
+        // matches, because get_session_link auto-creates a bridge-owned
+        // link pinned to the inbound session when Go's handleFaceTimeRingNotice
+        // builds the Matrix-side "Answer" link. That pins session_link →
+        // inbound session, which makes `linked_group` match on pure
+        // inbound calls. `session.mode` is the authoritative discriminator:
+        // rustpush sets mode=Incoming on inbound Invitation wire handling
+        // (facetime.rs:1236) and mode=Outgoing when the bridge creates
+        // the session (facetime.rs:607).
+        let candidate_group = linked_group
+            .as_ref()
+            .or(member_group.as_ref())
+            .or(ringing_group.as_ref());
+        let inbound_session = candidate_group
+            .and_then(|g| state.sessions.get(g))
+            .map(|s| matches!(s.mode, Some(rustpush::facetime::FTMode::Incoming)))
+            .unwrap_or(false);
+
+        (link.handle.clone(), linked_group, member_group, ringing_group, inbound_session)
+    };
+
+    // Priority: linked > member > ringing.
+    let match_kind = if inbound_session {
+        "inbound-peer-initiated"
+    } else if linked_group.is_some() {
+        "linked"
+    } else if member_group.is_some() {
+        "member"
+    } else if ringing_group.is_some() {
+        "ringing-inbound-only"
+    } else {
+        "cold-start"
+    };
+    info!(
+        "FaceTime letmein approve: match_kind={} pseud={} requestor={} link_handle={}",
+        match_kind, request.pseud, request.requestor, link_handle,
+    );
+
+    let approved_group = if let Some(group) = linked_group.or(member_group).or(ringing_group) {
+        group
+    } else {
+        let group = uuid::Uuid::new_v4().to_string().to_uppercase();
+        // Cold-start fallback: the tap request doesn't map to any known
+        // session via linked/member/ringing. Call rustpush's handler directly — the
+        // strip-own-devices wrapper caused the callee not to ring (see
+        // WrappedFaceTimeClient::create_session for the full writeup).
+        facetime
+            .create_session(group.clone(), link_handle.clone(), &[request.requestor.clone()])
+            .await?;
+        group
+    };
+
+    {
+        let mut state = facetime.state.write().await;
+        if let Some(link) = state.links.get_mut(&request.pseud) {
+            if link.session_link.as_deref() != Some(approved_group.as_str()) {
+                link.session_link = Some(approved_group.clone());
+            }
+        }
+    }
+
+    // Inbound parity with outbound: pre-prop + pre-stamp bridge.active=Some
+    // BEFORE respond_letmein runs. Without this, respond_letmein's needs_prop
+    // branch (facetime.rs:1078) gates on `is_ringing_inaccurate && active_count==1`
+    // — true on inbound when only the peer is active — so it runs its own
+    // prop_up_conv. The prop_up_conv leaves our own .active=None
+    // locally (facetime.rs:820), then the immediate add_members(webview)
+    // fans cmd 209 with active_participants=[peer.active] only. By
+    // pre-ensuring bridge is propped + stamped active here, needs_prop flips
+    // to false → respond_letmein skips its internal prop → add_members fans
+    // with [bridge.active, peer.active]. Mirrors outbound's create_session_no_ring
+    // bridge stamp (9b9c5784).
+    //
+    // We deliberately do NOT pre-stamp webview.active here. The synthetic
+    // avc_data (sampleavcdata.bplist = iMac19,2 hardware H.264 codec
+    // descriptors) declares Mac-style media capabilities. Bridge's own
+    // pseud is registered for the full FT topic bundle including
+    // `facetime.video`, so peer's CallKit can negotiate media against it;
+    // the webview's `temp:UUID` pseud is registered ONLY for `facetime.multi`.
+    // Stamping webview.active with synthetic Mac avc_data on inbound caused
+    // peer's unpack_participants (facetime.rs:245) to write that synthetic
+    // blob into peer's `participants[webview_pid].active`. Peer's CallKit
+    // then attempted Mac-style negotiation on the webview pseud, failed
+    // (temp:UUID not on .video topic), and downgraded the call display
+    // to "FaceTime Audio." Letting webview's own subsequent cmd 207
+    // populate peer's webview entry — with real WebRTC-shaped avc_data —
+    // is what keeps peer's classification on Video. (Outbound has never
+    // pre-stamped webview for the same reason; that path works.)
+    if inbound_session {
+        use rustpush::facetime::facetimep::{ConversationParticipant, Handle, HandleType};
+        fn handle_from_ids(ids: &str) -> Handle {
+            let mut h = Handle::default();
+            if let Some(addr) = ids.strip_prefix("mailto:") {
+                h.set_type(HandleType::EmailAddress);
+                h.value = addr.to_string();
+            } else if let Some(phone) = ids.strip_prefix("tel:") {
+                h.set_type(HandleType::PhoneNumber);
+                h.value = phone.to_string();
+                h.iso_country_code = "us".to_string();
+            } else {
+                h.set_type(HandleType::Generic);
+                h.value = ids.to_string();
+            }
+            h
+        }
+        fn synthesize_active(handle: &str, participant_id: u64) -> ConversationParticipant {
+            ConversationParticipant {
+                version: 0,
+                identifier: participant_id,
+                handle: Some(handle_from_ids(handle)),
+                avc_data: include_bytes!(
+                    "../../../third_party/rustpush-upstream/src/sampleavcdata.bplist"
+                )
+                .to_vec(),
+                is_moments_available: Some(true),
+                is_screen_sharing_available: Some(true),
+                is_gondola_calling_available: Some(true),
+                is_mirage_available: None,
+                is_lightweight: None,
+                share_play_protocol_version: 4,
+                options: 0,
+                is_gft_downgrade_to_one_to_one_available: Some(false),
+                guest_mode_enabled: None,
+                association: None,
+                is_u_plus_n_downgrade_available: Some(false),
+            }
+        }
+
+        let my_token_b64 = base64_encode(&facetime.conn.get_token().await);
+        let mut state = facetime.state.write().await;
+        if let Some(session) = state.sessions.get_mut(&approved_group) {
+            if !session.is_propped {
+                let prop_outcome = async {
+                    facetime.ensure_allocations(session, &[]).await?;
+                    // Hand-rolled prop with video_enabled=Some(true) instead of
+                    // the hardcoded Some(false). User's empirical recall:
+                    // this manual construction was what made inbound classify
+                    // as Video on peer's end. Restored from 0f0cd0f3 + 7c41baf2
+                    // (XML→binary plist fix), this time with the active-stamping
+                    // from 3842e830 / 8818ecdc layered on top.
+                    prop_up_conv_inbound_video_on(facetime, session).await?;
+                    Ok::<(), rustpush::PushError>(())
+                }
+                .await;
+                match prop_outcome {
+                    Ok(()) => {
+                        if let Some(my_participant) = session
+                            .participants
+                            .values_mut()
+                            .find(|p| p.token.as_deref() == Some(my_token_b64.as_str()))
+                        {
+                            let pid = my_participant.participant_id;
+                            let h = my_participant.handle.clone();
+                            my_participant.active = Some(synthesize_active(&h, pid));
+                        }
+                        info!(
+                            "FaceTime inbound letmein: pre-propped + stamped bridge active locally for session {} so respond_letmein's add_members fans active_participants including bridge",
+                            approved_group,
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "FaceTime inbound letmein: pre-prop failed for session {} ({:?}) — falling through to respond_letmein's internal prop",
+                            approved_group, e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // respond_letmein: sends LetMeInResponse then add_members/ring over APNs.
+    // APNs can flap (early eof → SendTimedOut) especially right after boot.
+    //
+    // Subtlety: respond_letmein's first action for delegated requests is
+    // removing the delegation_uuid from delegated_requests. If the later
+    // send fails and we retry with the same request, it hits "Already
+    // responded" and no-ops silently — member never added. Strip
+    // delegation_uuid on retries so the check is skipped; duplicate
+    // LetMeInResponse sends are harmless (web client decrypts the first),
+    // and add_members is idempotent (already-present member triggers ring
+    // instead of re-add).
+    let mut last_err: Option<rustpush::PushError> = None;
+    for attempt in 0..3u32 {
+        let mut retry_request = request.clone();
+        if attempt > 0 {
+            retry_request.delegation_uuid = None;
+        }
+        // Stamp the bridge user's display name onto the webview's nickname so
+        // the peer sees a name (FTMember.nickname → ConversationMember on the
+        // wire, facetime.rs:127-131) instead of the raw temp:<uuid> pseud. The
+        // webview's own LetMeIn carries no usable nickname (Apple's &n= join-
+        // page pre-fill stays client-side), so we set it bridge-side.
+        if retry_request.nickname.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(name) = facetime_self_display_name() {
+                retry_request.nickname = Some(name);
+            }
+        }
+        match facetime.respond_letmein(retry_request, Some(&approved_group)).await {
+            Ok(()) => {
+                info!(
+                    "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} inbound={}",
+                    request.requestor,
+                    approved_group,
+                    inbound_session,
+                );
+                suppress_own_device_ring(facetime, &approved_group).await;
+                // Match the answerFtRequest
+                // (rustpush_service.dart:3347): approve the letmein and
+                // return. No unprop_conv, no RemoveMember. Previous
+                // attempts to strip the bridge post-letmein all regressed
+                // the call (see TPP _todo/TPP-facetime-bridge-participant.md
+                // failed approaches 1-5).
+                return Ok(());
+            }
+            Err(e) => {
+                let is_timeout = matches!(&e, rustpush::PushError::SendTimedOut);
+                last_err = Some(e);
+                if !is_timeout || attempt >= 2 {
+                    break;
+                }
+                warn!(
+                    "FaceTime letmein respond_letmein timed out (attempt {}), retrying in {}s",
+                    attempt + 1,
+                    attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_secs((attempt + 1) as u64)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or(rustpush::PushError::SendTimedOut))
+}
+
+async fn facetime_event_to_wrapped(
+    facetime: &rustpush::facetime::FTClient,
+    event: &rustpush::facetime::FTMessage,
+) -> Option<WrappedMessage> {
+    let (guid, mut sender, marker) = match event {
+        rustpush::facetime::FTMessage::Ring { guid } => {
+            (guid.clone(), None, FACETIME_RING_MARKER)
+        }
+        rustpush::facetime::FTMessage::JoinEvent { guid, handle, ring, .. } if *ring => {
+            (guid.clone(), Some(handle.clone()), FACETIME_RING_MARKER)
+        }
+        rustpush::facetime::FTMessage::AddMembers { guid, members, ring } if *ring => {
+            let fallback = members.iter().next().map(|member| member.handle.clone());
+            (guid.clone(), fallback, FACETIME_RING_MARKER)
+        }
+        rustpush::facetime::FTMessage::Decline { guid } => {
+            (guid.clone(), None, FACETIME_MISSED_MARKER)
+        }
+        rustpush::facetime::FTMessage::RespondedElsewhere { guid } => {
+            (guid.clone(), None, FACETIME_ANSWERED_ELSEWHERE_MARKER)
+        }
+        _ => return None,
+    };
+
+    let state = facetime.state.read().await;
+    let (participants, my_handles, link) = state
+        .sessions
+        .get(&guid)
+        .map(|session| {
+            // Mirror the temp-pseud filter
+            // (intents_service.dart:68): the webview joins under a fresh
+            // temp:UUID generated client-side by Apple's main.js. Surfacing
+            // those to Matrix creates a ghost-per-call in the user's room.
+            // Drop them before they reach bridgev2's portal-membership
+            // pipeline; peer-side state is unaffected (this is purely a
+            // local rendering filter).
+            let participants = session
+                .members
+                .iter()
+                .map(|member| member.handle.clone())
+                .filter(|handle| !handle.starts_with("temp:"))
+                .collect::<Vec<_>>();
+            let my_handles: std::collections::HashSet<String> =
+                session.my_handles.iter().cloned().collect();
+            let link = session.link.as_ref().map(|link| {
+                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
+                let pseud = link
+                    .pseudonym
+                    .strip_prefix("temp:")
+                    .unwrap_or(&link.pseudonym);
+                format!("https://facetime.apple.com/join#v=1&p={pseud}&k={encoded}")
+            });
+            (participants, my_handles, link)
+        })
+        .unwrap_or_else(|| (Vec::new(), std::collections::HashSet::new(), None));
+    drop(state);
+
+    if sender.is_none() {
+        sender = participants
+            .iter()
+            .find(|participant| {
+                !participant.starts_with("temp:") && !my_handles.contains(*participant)
+            })
+            .cloned();
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let event_kind = marker.trim_matches('[').trim_matches(']').to_lowercase();
+    let mut wrapped = WrappedMessage::default();
+    wrapped.uuid = format!("FACETIME_{}_{}_{}", event_kind.to_uppercase(), guid, now_ms);
+    wrapped.sender = sender;
+    wrapped.text = Some(match link {
+        Some(link) if marker == FACETIME_RING_MARKER => format!("{marker} guid={guid} {link}"),
+        _ => format!("{marker} guid={guid}"),
+    });
+    wrapped.participants = participants;
+    wrapped.timestamp_ms = now_ms;
+    wrapped.is_notify_anyways = true;
+    Some(wrapped)
+}
+
+fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
+    let conv = msg.conversation.as_ref();
+
+    let mut w = WrappedMessage {
+        uuid: msg.id.clone(),
+        sender: msg.sender.clone(),
+        text: None,
+        subject: None,
+        participants: conv.map(|c| c.participants.clone()).unwrap_or_default(),
+        group_name: conv.and_then(|c| c.cv_name.clone()),
+        timestamp_ms: msg.sent_timestamp,
+        is_sms: false,
+        is_tapback: false,
+        tapback_type: None,
+        tapback_target_uuid: None,
+        tapback_target_part: None,
+        tapback_emoji: None,
+        tapback_remove: false,
+        is_edit: false,
+        edit_target_uuid: None,
+        edit_part: None,
+        edit_new_text: None,
+        is_unsend: false,
+        unsend_target_uuid: None,
+        unsend_edit_part: None,
+        is_rename: false,
+        new_chat_name: None,
+        is_participant_change: false,
+        new_participants: vec![],
+        participant_group_version: None,
+        attachments: vec![],
+        reply_guid: None,
+        reply_part: None,
+        is_typing: false,
+        typing_active: None,
+        typing_app_bundle_id: None,
+        typing_app_icon: None,
+        is_read_receipt: false,
+        is_delivered: false,
+        is_error: false,
+        error_for_uuid: None,
+        error_status: None,
+        error_status_str: None,
+        is_peer_cache_invalidate: false,
+        send_delivered: msg.send_delivered,
+        verification_failed: msg.verification_failed,
+        sender_guid: conv.and_then(|c| c.sender_guid.clone()),
+        is_move_to_recycle_bin: false,
+        is_permanent_delete: false,
+        is_recover_chat: false,
+        delete_chat_participants: vec![],
+        delete_chat_group_id: None,
+        delete_chat_guid: None,
+        delete_message_uuids: vec![],
+        is_stored_message: false, // set by caller based on connection state
+        is_icon_change: false,
+        group_photo_cleared: false,
+        group_icon_version: None,
+        icon_change_photo_data: None,
+        html: None,
+        is_voice: false,
+        effect: None,
+        scheduled_ms: None,
+        is_sms_activation: None,
+        is_sms_confirm_sent: None,
+        is_mark_unread: false,
+        is_message_read_on_device: false,
+        is_unschedule: false,
+        is_update_extension: false,
+        update_extension_for_uuid: None,
+        is_update_profile_sharing: false,
+        update_profile_sharing_dismissed: vec![],
+        update_profile_sharing_all: vec![],
+        update_profile_sharing_version: None,
+        is_update_profile: false,
+        update_profile_share_contacts: None,
+        is_notify_anyways: false,
+        is_set_transcript_background: false,
+        transcript_background_remove: None,
+        transcript_background_chat_id: None,
+        transcript_background_object_id: None,
+        transcript_background_url: None,
+        transcript_background_file_size: None,
+        sticker_data: None,
+        sticker_mime: None,
+        is_share_profile: false,
+        share_profile_record_key: None,
+        share_profile_decryption_key: None,
+        share_profile_has_poster: false,
+        share_profile_display_name: None,
+        share_profile_first_name: None,
+        share_profile_last_name: None,
+        share_profile_avatar: None,
+    };
+
+    match &msg.message {
+        Message::Message(normal) => {
+            w.text = Some(normal.parts.raw_text());
+            w.subject = normal.subject.clone();
+            w.reply_guid = normal.reply_guid.clone();
+            w.reply_part = normal.reply_part.clone();
+            w.is_sms = matches!(normal.service, MessageType::SMS { .. });
+            if let MessageType::SMS { from_handle: Some(ref fh), .. } = normal.service {
+                // Apple's SMS relay puts the forwarding iPhone's handle in the APNs
+                // envelope sender, causing the bridge to misidentify it as IsFromMe.
+                // The true sender of an inbound SMS is stored in from_handle.
+                w.sender = Some(fh.clone());
+            }
+            // iOS piggybacks Name & Photo Sharing keys on regular text
+            // messages from contacts who have sharing enabled; lift them so
+            // the receive loop's inline download still fires.
+            if let Some(profile) = &normal.embedded_profile {
+                populate_share_profile_keys(&mut w, profile, "NormalMessage.embedded_profile");
+            }
+
+            append_wrapped_attachments(&mut w, &normal.parts, false);
+
+            // Encode rich link as special attachments for the Go side
+            if let Some(ref lm) = normal.link_meta {
+                let original_url: String = lm
+                    .data
+                    .original_url
+                    .clone()
+                    .map(|u| -> String { u.into() })
+                    .unwrap_or_default();
+                let url: String = lm.data.url.clone().map(|u| u.into()).unwrap_or_default();
+                let title = lm.data.title.clone().unwrap_or_default();
+                let summary = lm.data.summary.clone().unwrap_or_default();
+
+                info!("Inbound rich link: original_url={}, url={}, title={:?}, summary={:?}, has_image={}, has_icon={}",
+                    original_url, url, title, summary,
+                    lm.data.image.is_some(), lm.data.icon.is_some());
+
+                let image_mime = if let Some(ref img) = lm.data.image {
+                    img.mime_type.clone()
+                } else if let Some(ref icon) = lm.data.icon {
+                    icon.mime_type.clone()
+                } else {
+                    String::new()
+                };
+
+                // Metadata: original_url\x01url\x01title\x01summary\x01image_mime
+                let meta = format!("{}\x01{}\x01{}\x01{}\x01{}",
+                    original_url, url, title, summary, image_mime);
+                w.attachments.push(WrappedAttachment {
+                    mime_type: "x-richlink/meta".to_string(),
+                    filename: String::new(),
+                    uti_type: String::new(),
+                    size: 0,
+                    is_inline: true,
+                    inline_data: Some(meta.into_bytes()),
+                    iris: false,
+                    is_sticker: false,
+                    mmcs_descriptor_json: None,
+                });
+
+                // Image data (from image or icon)
+                let image_data = if let Some(ref img) = lm.data.image {
+                    let idx = img.rich_link_image_attachment_substitute_index as usize;
+                    lm.attachments.get(idx).cloned()
+                } else if let Some(ref icon) = lm.data.icon {
+                    let idx = icon.rich_link_image_attachment_substitute_index as usize;
+                    lm.attachments.get(idx).cloned()
+                } else {
+                    None
+                };
+
+                if let Some(img_data) = image_data {
+                    w.attachments.push(WrappedAttachment {
+                        mime_type: "x-richlink/image".to_string(),
+                        filename: String::new(),
+                        uti_type: String::new(),
+                        size: img_data.len() as u64,
+                        is_inline: true,
+                        inline_data: Some(img_data),
+                        iris: false,
+                        is_sticker: false,
+                        mmcs_descriptor_json: None,
+                    });
+                }
+            }
+
+            // HTML formatting
+            w.html = parts_to_html(&normal.parts);
+
+            // Voice message flag
+            w.is_voice = normal.voice;
+
+            // Screen/bubble effects
+            w.effect = normal.effect.as_ref().map(|e| e.to_string());
+
+            // Scheduled send
+            if let Some(ref sched) = normal.scheduled {
+                w.scheduled_ms = Some(sched.ms);
+            }
+
+            // Sticker data from extension balloons (icon field)
+            if let Some(ref app) = normal.app {
+                if let Some(ref balloon) = app.balloon {
+                    if let Some(ref icon_data) = balloon.icon {
+                        if !icon_data.is_empty() {
+                            w.sticker_data = Some(icon_data.clone());
+                            w.sticker_mime = Some("image/png".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Message::React(react) => {
+            w.is_tapback = true;
+            w.tapback_target_uuid = Some(react.to_uuid.clone());
+            w.tapback_target_part = react.to_part;
+            match &react.reaction {
+                ReactMessageType::React { reaction, enable } => {
+                    let (tt, emoji, remove) = convert_reaction(reaction, *enable);
+                    w.tapback_type = tt;
+                    w.tapback_emoji = emoji;
+                    w.tapback_remove = remove;
+                    if let Reaction::Sticker { body, .. } = reaction {
+                        append_wrapped_attachments(&mut w, body, true);
+                    }
+                }
+                ReactMessageType::Extension { spec, body, .. } => {
+                    // Extension reactions (stickers etc.) — mark as tapback
+                    w.tapback_type = Some(7);
+                    let sticker = spec.bundle_id.to_ascii_lowercase().contains("sticker");
+                    append_wrapped_attachments(&mut w, body, sticker);
+                }
+            }
+            // Reactions can also carry a piggybacked profile (same pattern
+            // as text messages). Surface it for inline download.
+            if let Some(profile) = &react.embedded_profile {
+                populate_share_profile_keys(&mut w, profile, "ReactMessage.embedded_profile");
+            }
+        }
+        Message::Edit(edit) => {
+            w.is_edit = true;
+            w.edit_target_uuid = Some(edit.tuuid.clone());
+            w.edit_part = Some(edit.edit_part);
+            w.edit_new_text = Some(edit.new_parts.raw_text());
+        }
+        Message::Unsend(unsend) => {
+            w.is_unsend = true;
+            w.unsend_target_uuid = Some(unsend.tuuid.clone());
+            w.unsend_edit_part = Some(unsend.edit_part);
+        }
+        Message::RenameMessage(rename) => {
+            w.is_rename = true;
+            w.new_chat_name = Some(rename.new_name.clone());
+        }
+        Message::ChangeParticipants(change) => {
+            w.is_participant_change = true;
+            w.new_participants = change.new_participants.clone();
+            w.participant_group_version = Some(change.group_version);
+        }
+        Message::Typing(typing, app) => {
+            // `false` is a stop-typing control, not the absence of a typing
+            // event. Preserve event presence separately from its active state.
+            w.is_typing = true;
+            w.typing_active = Some(*typing);
+            if let Some(app) = app {
+                w.typing_app_bundle_id = Some(app.bundle_id.clone());
+                w.typing_app_icon = Some(app.icon.clone());
+            }
+        }
+        Message::Read => {
+            w.is_read_receipt = true;
+        }
+        Message::Delivered => {
+            w.is_delivered = true;
+        }
+        Message::Error(err) => {
+            w.is_error = true;
+            w.error_for_uuid = Some(err.for_uuid.clone());
+            w.error_status = Some(err.status);
+            w.error_status_str = Some(err.status_str.clone());
+        }
+        Message::PeerCacheInvalidate => {
+            w.is_peer_cache_invalidate = true;
+        }
+        Message::MoveToRecycleBin(del) => {
+            w.is_move_to_recycle_bin = true;
+            populate_delete_target(&mut w, &del.target);
+        }
+        Message::PermanentDelete(del) => {
+            w.is_permanent_delete = true;
+            populate_delete_target(&mut w, &del.target);
+        }
+        Message::RecoverChat(chat) => {
+            w.is_recover_chat = true;
+            w.delete_chat_participants = chat.participants.clone();
+            w.delete_chat_group_id = Some(chat.group_id.clone()).filter(|s| !s.is_empty());
+            w.delete_chat_guid = Some(chat.guid.clone()).filter(|s| !s.is_empty());
+        }
+        Message::IconChange(change) => {
+            w.is_icon_change = true;
+            w.group_photo_cleared = change.file.is_none();
+            w.group_icon_version = Some(change.group_version);
+        }
+        Message::EnableSmsActivation(enable) => {
+            w.is_sms_activation = Some(*enable);
+        }
+        Message::SmsConfirmSent(status) => {
+            w.is_sms_confirm_sent = Some(*status);
+        }
+        Message::MarkUnread => {
+            w.is_mark_unread = true;
+        }
+        Message::MessageReadOnDevice => {
+            w.is_message_read_on_device = true;
+        }
+        Message::Unschedule => {
+            w.is_unschedule = true;
+        }
+        Message::UpdateExtension(update) => {
+            w.is_update_extension = true;
+            w.update_extension_for_uuid = Some(update.for_uuid.clone());
+        }
+        Message::NotifyAnyways => {
+            w.is_notify_anyways = true;
+        }
+        Message::ShareProfile(profile) => {
+            populate_share_profile_keys(&mut w, profile, "Message::ShareProfile");
+        }
+        Message::UpdateProfile(update) => {
+            w.is_update_profile = true;
+            w.update_profile_share_contacts = Some(update.share_contacts);
+            if let Some(profile) = &update.profile {
+                populate_share_profile_keys(&mut w, profile, "Message::UpdateProfile.profile");
+            }
+        }
+        Message::UpdateProfileSharing(update) => {
+            w.is_update_profile_sharing = true;
+            w.update_profile_sharing_dismissed = update.shared_dismissed.clone();
+            w.update_profile_sharing_all = update.shared_all.clone();
+            w.update_profile_sharing_version = Some(update.version);
+        }
+        Message::SetTranscriptBackground(update) => {
+            w.is_set_transcript_background = true;
+            match update {
+                SetTranscriptBackgroundMessage::Remove { chat_id, remove, .. } => {
+                    w.transcript_background_remove = Some(*remove);
+                    w.transcript_background_chat_id = chat_id.clone();
+                }
+                SetTranscriptBackgroundMessage::Set { chat_id, object_id, url, file_size, .. } => {
+                    w.transcript_background_remove = Some(false);
+                    w.transcript_background_chat_id = chat_id.clone();
+                    w.transcript_background_object_id = Some(object_id.clone());
+                    w.transcript_background_url = Some(url.clone());
+                    w.transcript_background_file_size = Some(*file_size as u64);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    w
+}
+
+fn append_wrapped_attachments(
+    wrapped: &mut WrappedMessage,
+    parts: &MessageParts,
+    force_sticker: bool,
+) {
+    for indexed_part in &parts.0 {
+        let MessagePart::Attachment(att) = &indexed_part.part else {
+            continue;
+        };
+        let (is_inline, inline_data, size, mmcs_descriptor_json) = match &att.a_type {
+            AttachmentType::Inline(data) => (true, Some(data.clone()), data.len() as u64, None),
+            AttachmentType::MMCS(mmcs) => {
+                let descriptor = MmcsDescriptor::from_file(mmcs);
+                let json = serde_json::to_string(&descriptor).ok();
+                (false, None, mmcs.size as u64, json)
+            }
+        };
+        wrapped.attachments.push(WrappedAttachment {
+            mime_type: att.mime.clone(),
+            filename: att.name.clone(),
+            uti_type: att.uti_type.clone(),
+            size,
+            is_inline,
+            inline_data,
+            iris: att.iris,
+            is_sticker: force_sticker || indexed_part.ext.is_some(),
+            mmcs_descriptor_json,
+        });
+    }
+}
+
+// ============================================================================
+// Callback interfaces
+// ============================================================================
+
+#[uniffi::export(callback_interface)]
+pub trait MessageCallback: Send + Sync {
+    fn on_message(&self, msg: WrappedMessage);
+}
+
+#[uniffi::export(callback_interface)]
+pub trait UpdateUsersCallback: Send + Sync {
+    fn update_users(&self, users: Arc<WrappedIDSUsers>);
+}
+
+/// Callback invoked when an iMessage contact's presence state changes.
+/// `user` is an iMessage handle (e.g. "tel:+1..." or "mailto:..."). When
+/// `available` is false, `mode` may carry a Focus/DND mode identifier such
+/// as "com.apple.donotdisturb.mode.default".
+#[uniffi::export(callback_interface)]
+pub trait StatusCallback: Send + Sync {
+    fn on_status_update(&self, user: String, mode: Option<String>, available: bool);
+    /// Called when StatusKit receives a key-sharing message, which adds new
+    /// encryption keys to the internal state. The Go side should re-subscribe
+    /// to presence so that APNs channels are created for the newly-available keys.
+    fn on_keys_received(&self);
+    /// Called once per reshare with the `from` handle of the peer device that
+    /// sent it. Peer iOS fans reshares to every alias of our account (tel: plus
+    /// each mailto:) with the SAME channel id but a DIFFERENT sender handle.
+    /// The state keys by channel, so every reshare overwrites the previous
+    /// sender — only the last one survives in `state.keys`. Without this hook
+    /// the Go side only learns ONE alias per peer and cannot resolve presence
+    /// updates that arrive on any of the others. Stamping each sender into the
+    /// learned-sender cache preserves all aliases across overwrites.
+    ///
+    /// `channel_id` is the StatusKit channel the reshare carried. Pairing it
+    /// with the sender handle lets the Go side build a (channel_id ↔ aliases)
+    /// cluster across all reshare events: two senders observed on the same
+    /// channel id are aliases of the same peer. The cluster powers a
+    /// transitive resolver that maps presence updates from a previously-
+    /// unknown alias to the DM portal of any sibling alias that does
+    /// resolve via the standard chain.
+    fn on_reshare_sender(&self, sender: String, channel_id: String);
+    /// Called when a presence update arrives on the StatusKit presence topic but
+    /// we could NOT turn it into a status — almost always because the sending peer
+    /// rotated their StatusKit key (re-registration / fresh reshare) and our stored
+    /// copy is now stale, so the encrypted payload won't open. The Go side should
+    /// force a rate-limited CloudKit peer-key re-pull to fetch the fresh key right
+    /// away instead of waiting for the steady-state pull floor, then re-subscribe.
+    /// `sender` is the peer handle when the envelope exposes it (best-effort).
+    fn on_status_decrypt_failed(&self, sender: Option<String>);
+}
+
+// ============================================================================
+// Top-level functions
+// ============================================================================
+
+fn protect_private_state_file(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to protect private state file {}: {}", path, error);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[uniffi::export]
+pub fn init_logger() {
+    if std::env::var("RUST_LOG").is_err() {
+        // Default log filter: silence the entire `rustpush` crate at WARN
+        // (rustpush has ~80+ info! sites across mmcs, cloudkit,
+        // keychain, cloud_messages, pcs, aps, util, statuskit, findmy, and
+        // more — vastly more chatty than master's vendored tree). Keep our
+        // own `rustpushgo` wrapper at INFO so Ford recovery messages,
+        // relay wiring, and other wrapper-level diagnostics surface.
+        //
+        // The Go-side bridge (`component=imessage`, `component=cloud_sync`,
+        // etc.) writes through zerolog and is unaffected — those logs come
+        // through at whatever level the Go bridge is configured for.
+        //
+        // If you need to debug rustpush internals, override at invocation
+        // time with e.g.:
+        //   RUST_LOG=info,rustpush=info          # all rustpush info logs
+        //   RUST_LOG=info,rustpush::icloud=debug # deep cloudkit/mmcs/pcs
+        //   RUST_LOG=debug                       # everything
+        std::env::set_var(
+            "RUST_LOG",
+            "warn,rustpush=warn,rustpushgo=info",
+        );
+    }
+    let _ = pretty_env_logger::try_init();
+
+    // Install a panic hook that silences rustpush's `.unwrap()` /
+    // `.expect()` panics inside the CloudKit download path. These panics
+    // are intentional — the wrapper's Ford dedup recovery loops wrap
+    // each get_assets / download_attachment call in catch_unwind and
+    // brute-force cached Ford keys until one decrypts successfully. The
+    // default Rust panic hook runs BEFORE catch_unwind catches, so each
+    // wrong-key attempt floods stderr with lines like
+    //   thread '<unnamed>' panicked at mmcs.rs:1113:101
+    //   called `Result::unwrap()` on an `Err` value
+    //   thread '<unnamed>' panicked at cloudkit.rs:2075
+    //   No bundled asset!
+    // This hook silently drops panics from rustpush's MMCS + CloudKit
+    // download code paths (all caught by the wrapper) and falls through
+    // to the default hook for everything else — real panics from other
+    // modules still surface normally.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(loc) = info.location() {
+            let file = loc.file();
+            // Match both Unix and Windows path separators. Files listed
+            // here are ones whose panics are intercepted by
+            // catch_unwind in pkg/rustpushgo/src/lib.rs download recovery.
+            let noisy = [
+                "icloud/mmcs.rs",
+                "icloud\\mmcs.rs",
+                "icloud/cloudkit.rs",
+                "icloud\\cloudkit.rs",
+            ];
+            if noisy.iter().any(|p| file.ends_with(p)) {
+                // Suppress the flood, but never go completely silent. This
+                // filter matches by FILE, not by "is anyone actually catching
+                // this" — so it erased UNCAUGHT panics from these files just
+                // as thoroughly. That is exactly how an unguarded
+                // `expect("No record found?")` reached from the inline
+                // ShareProfile fetch was able to unwind the APNs process task
+                // and stall all message receiving with zero trace in the logs.
+                //
+                // Keep the flood protection (the Ford-key brute force panics
+                // once per wrong key) but always leave a breadcrumb naming the
+                // most recent file:line and how many panics were swallowed
+                // since the last one. Two relaxed atomics only: a lock here
+                // could be held by the panicking thread, and a panic inside a
+                // panic hook aborts the process.
+                // A pure time gate is not enough on its own. The Ford-key loops
+                // panic repeatedly at a stable line, so a window opened by that
+                // flood would swallow the FIRST sighting of a genuinely new
+                // panic site — the one case this whole breadcrumb exists to
+                // surface. So gate on the site as well: a location that differs
+                // from the last one reported prints immediately, bounded to a
+                // few per window so an alternating flood can't reopen the noise
+                // problem the suppression is here to solve.
+                //
+                // The memory has to be a SET of sites already reported this
+                // window, not just the last one seen. With a single slot, a
+                // novel site interleaved with the flood makes the flood's very
+                // next panic compare "different" too — so the flood burns the
+                // budget and prints a misleading "check this call site" line
+                // about a site that is known-guarded. A small fixed table of
+                // reported sites fixes that: a site prints once per window, and
+                // the budget is spent only on sites that are genuinely new.
+                //
+                // Deliberately not fully atomic. The scan/claim below is
+                // scan-then-store, so two threads panicking at the same NEW
+                // site can both miss the scan and both print. Measured at
+                // roughly one duplicate per thousand first-sightings under
+                // realistic concurrency (the reachable case is the 4 parallel
+                // CloudKit downloads), worst case two lines for one site, and
+                // it can never exhaust the table. Tightening it means more
+                // lock-free machinery inside a panic hook — where a panic of
+                // our own aborts the process — to save an occasional duplicate
+                // log line. Not a trade worth making.
+                const BREADCRUMB_INTERVAL_SECS: u64 = 60;
+                const REPORTED_SLOTS: usize = 8;
+                static LAST_BREADCRUMB_SECS: AtomicU64 = AtomicU64::new(0);
+                static SUPPRESSED_COUNT: AtomicU64 = AtomicU64::new(0);
+                static REPORTED_SITES: [AtomicU64; REPORTED_SLOTS] = [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ];
+                static REPORTED_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+                SUPPRESSED_COUNT.fetch_add(1, Ordering::Relaxed);
+                // FNV-1a over file+line. Inline and allocation-free: this runs
+                // inside a panic hook, where a panic of our own would abort.
+                let site = {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in file.as_bytes() {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    h ^= loc.line() as u64;
+                    h.wrapping_mul(0x0000_0100_0000_01b3)
+                };
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let last = LAST_BREADCRUMB_SECS.load(Ordering::Relaxed);
+                if now_secs.saturating_sub(last) >= BREADCRUMB_INTERVAL_SECS
+                    && LAST_BREADCRUMB_SECS
+                        .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    // New window: forget which sites have been reported, and
+                    // seed the table with this one so the summary below does
+                    // not immediately get echoed by a novel-site line.
+                    for slot in REPORTED_SITES.iter() {
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                    REPORTED_SITES[0].store(site, Ordering::Relaxed);
+                    REPORTED_CURSOR.store(1, Ordering::Relaxed);
+                    // This panic is itself counted and is the latest of them,
+                    // so the location below really is the most recent one.
+                    let swallowed = SUPPRESSED_COUNT.swap(0, Ordering::Relaxed);
+                    warn!(
+                        "suppressed {} rustpush MMCS/CloudKit panic(s) since the last breadcrumb; \
+                         most recent at {}:{} (this summary is rate-limited to one line per {}s). \
+                         These are EXPECTED for the catch_unwind-guarded recovery paths. If one \
+                         shows up next to a receive stall or a 'process task' line, an UNGUARDED \
+                         call site is unwinding its task.",
+                        swallowed,
+                        file,
+                        loc.line(),
+                        BREADCRUMB_INTERVAL_SECS
+                    );
+                } else if !REPORTED_SITES
+                    .iter()
+                    .any(|slot| slot.load(Ordering::Relaxed) == site)
+                {
+                    let cursor = REPORTED_CURSOR.fetch_add(1, Ordering::Relaxed);
+                    if (cursor as usize) < REPORTED_SLOTS {
+                        REPORTED_SITES[cursor as usize].store(site, Ordering::Relaxed);
+                        // Printed on its own rather than folded into the count,
+                        // so subtract it back out — otherwise the next summary
+                        // counts a panic it already showed.
+                        let _ = SUPPRESSED_COUNT.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |n| Some(n.saturating_sub(1)),
+                        );
+                        warn!(
+                            "suppressed rustpush panic at a site not yet reported this window: \
+                             {}:{}. Printed immediately rather than waiting for the {}s summary, \
+                             because a new site is the interesting case — check whether this call \
+                             site is actually inside a catch_unwind. At most {} distinct sites are \
+                             reported per window.",
+                            file,
+                            loc.line(),
+                            BREADCRUMB_INTERVAL_SECS,
+                            REPORTED_SLOTS
+                        );
+                    }
+                }
+                return;
+            }
+        }
+        default_hook(info);
+    }));
+
+    // Initialize the keystore with a file-backed software keystore.
+    // This must be called before any rustpush operations (APNs connect, login, etc.).
+    //
+    // The keystore lives alongside session.json in the XDG data directory
+    // (~/.local/share/corten-matrix/) so that all session state is in one
+    // place and easy to migrate between machines.
+    let xdg_dir = resolve_xdg_data_dir();
+    let state_path = format!("{}/keystore.plist", xdg_dir);
+    let _ = std::fs::create_dir_all(&xdg_dir);
+
+    // Migrate the old `<data-dir>/state/keystore.plist` layout if the new file
+    // does not exist yet. Anchor even the legacy read beneath the selected
+    // profile: an embedder's process cwd must never become credential input.
+    let legacy_path = format!("{}/state/keystore.plist", xdg_dir);
+    if !std::path::Path::new(&state_path).exists() {
+        if std::path::Path::new(&legacy_path).exists() {
+            match std::fs::copy(&legacy_path, &state_path) {
+                Ok(_) => {
+                    protect_private_state_file(&state_path);
+                    info!("Migrated keystore from {} to {}", legacy_path, state_path);
+                }
+                Err(e) => warn!(
+                    "Failed to migrate keystore from {} to {}: {}",
+                    legacy_path, state_path, e
+                ),
+            }
+        }
+    }
+
+    let state: SoftwareKeystoreState = match std::fs::read(&state_path) {
+        Ok(data) => plist::from_bytes(&data).unwrap_or_else(|e| {
+            warn!("Failed to parse keystore at {}: {} — starting with empty keystore", state_path, e);
+            SoftwareKeystoreState::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("No keystore file at {} — starting fresh", state_path);
+            SoftwareKeystoreState::default()
+        }
+        Err(e) => {
+            warn!("Failed to read keystore at {}: {} — starting with empty keystore", state_path, e);
+            SoftwareKeystoreState::default()
+        }
+    };
+    // SoftwareKeystoreState contains APNs/IDS private keys. The profile parent
+    // is already 0700, but enforce file-level least privilege as well and fix
+    // files created by earlier iBlue builds.
+    protect_private_state_file(&state_path);
+    let path_for_closure = state_path.clone();
+    init_keystore(SoftwareKeystore {
+        state: RwLock::new(state),
+        update_state: Box::new(move |s| {
+            if plist::to_file_xml(&path_for_closure, s).is_ok() {
+                protect_private_state_file(&path_for_closure);
+            }
+        }),
+        encryptor: NoEncryptor,
+    });
+}
+
+/// Resolve the data directory for process-local session state.
+///
+/// iBlue runs one process per Apple account. `IBLUE_DATA_DIR` lets each
+/// process isolate its keystore, anisette data, and subsystem state from both
+/// Corten and every other iBlue account. Corten's existing XDG behavior stays
+/// as the fallback so this wrapper remains usable by the upstream bridge.
+fn resolve_xdg_data_dir() -> String {
+    if let Ok(data_dir) = std::env::var("IBLUE_DATA_DIR") {
+        if !data_dir.is_empty() {
+            return data_dir;
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return format!("{}/corten-matrix", xdg);
+        }
+    }
+    if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+        return format!("{}/.local/share/corten-matrix", home);
+    }
+    // Last resort — fall back to old relative path
+    warn!("Could not determine HOME or XDG_DATA_HOME, using local state directory");
+    "state".to_string()
+}
+
+pub(crate) fn subsystem_state_path(file_name: &str) -> String {
+    let xdg_dir = resolve_xdg_data_dir();
+    let _ = std::fs::create_dir_all(&xdg_dir);
+    format!("{}/{}", xdg_dir, file_name)
+}
+
+pub(crate) fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+    match std::fs::read(path) {
+        Ok(data) => match plist::from_bytes(&data) {
+            Ok(state) => Some(state),
+            Err(err) => {
+                warn!("Failed to parse state at {}: {}", path, err);
+                None
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            warn!("Failed to read state at {}: {}", path, err);
+            None
+        }
+    }
+}
+
+pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
+    // Write to a sibling tmp file, then atomic-rename. Sidesteps EACCES
+    // when the existing file at `path` is owned by a UID different from
+    // the current bridge process (stranded from a prior deploy under a
+    // different uid/gid — seen on Beeper-hosted infra where plist files
+    // landed as 0644 owned by a previous deploy's user, leaving the
+    // current bridge with read-but-not-write access). The tmp file
+    // inherits our uid; rename(2) replaces the old inode regardless of
+    // its ownership, since we own the parent directory.
+    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        plist::to_writer_xml(&mut file, state)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        warn!("Failed to persist state to {}: {}", path, err);
+    }
+}
+
+fn serialize_state_json<T: serde::Serialize>(state: &T) -> Result<String, WrappedError> {
+    serde_json::to_string(state).map_err(|err| WrappedError::GenericError {
+        msg: format!("Failed to serialize state: {}", err),
+    })
+}
+
+/// Create a local macOS config that reads hardware info from IOKit
+/// and uses AAAbsintheContext for NAC validation (no SIP disable, no relay needed).
+/// Only works on macOS — returns an error on other platforms.
+#[uniffi::export]
+pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    #[cfg(target_os = "macos")]
+    {
+        let config = local_config::LocalMacOSConfig::new()
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .into_macos_config();
+        Ok(Arc::new(WrappedOSConfig {
+            config: Arc::new(config),
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(WrappedError::GenericError {
+            msg: "Local macOS config is only available on macOS. Use create_config_from_hardware_key instead.".into(),
+        })
+    }
+}
+
+/// Create a local macOS config with a persisted device ID.
+/// Only works on macOS — returns an error on other platforms.
+#[uniffi::export]
+pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    #[cfg(target_os = "macos")]
+    {
+        let config = local_config::LocalMacOSConfig::new()
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .with_device_id(device_id)
+            .into_macos_config();
+        Ok(Arc::new(WrappedOSConfig {
+            config: Arc::new(config),
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(WrappedError::GenericError {
+            msg: "Local macOS config is only available on macOS. Use create_config_from_hardware_key_with_device_id instead.".into(),
+        })
+    }
+}
+
+/// Create a cross-platform config from a base64-encoded JSON hardware key.
+///
+/// The hardware key is a JSON-serialized `HardwareConfig` extracted once from
+/// a real Mac (e.g., via copper's QR code tool). Portable builds combine it
+/// with open-absinthe's Unicorn NAC backend and a separately supplied,
+/// allowlisted Apple IMDAppleServices binary.
+///
+/// On macOS this is not needed (use `create_local_macos_config` instead).
+/// Building Linux through the Makefile enables this `hardware-key` API while
+/// keeping the clean-room NAC default active.
+#[uniffi::export]
+pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    _create_config_from_hardware_key_inner(base64_key, None)
+}
+
+/// Create a cross-platform config from a base64-encoded JSON hardware key
+/// with a persisted device ID.
+#[uniffi::export]
+pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    _create_config_from_hardware_key_inner(base64_key, Some(device_id))
+}
+
+#[cfg(feature = "hardware-key")]
+fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use rustpush::macos::{MacOSConfig, HardwareConfig};
+    use serde::Deserialize;
+
+    // Local wire-compatible struct: MacOSConfig only has
+    // inner/version/protocol_version/device_id/icloud_ua/aoskit_version/udid.
+    // We parse the hardware-key JSON into a local struct that holds everything
+    // and then split. The portable NAC backend consumes the retained hardware
+    // fields during validation.
+    #[derive(Deserialize)]
+    struct FullHardwareKey {
+        #[serde(default)]
+        inner: Option<HardwareConfig>,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        protocol_version: Option<u32>,
+        #[serde(default)]
+        device_id: Option<String>,
+        #[serde(default)]
+        icloud_ua: Option<String>,
+        #[serde(default)]
+        aoskit_version: Option<String>,
+        #[serde(default)]
+        udid: Option<String>,
+    }
+
+    // Strip whitespace/newlines AND base64 padding that chat clients and copy-paste
+    // routinely insert or drop, then re-pad to a multiple of 4. A pasted key that
+    // lost its trailing '=' now decodes instead of failing with "Invalid padding".
+    let mut clean_key: String = base64_key
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '=')
+        .collect();
+    while clean_key.len() % 4 != 0 {
+        clean_key.push('=');
+    }
+    let json_bytes = STANDARD.decode(&clean_key)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
+
+    // Try parsing as FullHardwareKey first (extract-key tool output). Fall
+    // back to bare HardwareConfig for legacy keys that are just the hw blob.
+    let (hw, version, protocol_version, icloud_ua, aoskit_version) =
+        if let Ok(full) = serde_json::from_slice::<FullHardwareKey>(&json_bytes) {
+            if let Some(hw) = full.inner {
+                let version = full.version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "13.6.4".to_string());
+                let protocol_version = full.protocol_version
+                    .filter(|v| *v != 0)
+                    .unwrap_or(1660);
+                // get_normal_ua() expects icloud_ua to contain whitespace so
+                // it can split out the "com.apple.iCloudHelper/..." prefix.
+                let icloud_ua = full.icloud_ua
+                    .filter(|v| v.split_once(char::is_whitespace).is_some())
+                    .unwrap_or_else(|| "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string());
+                let aoskit_version = full.aoskit_version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
+                (
+                    hw,
+                    version,
+                    protocol_version,
+                    icloud_ua,
+                    aoskit_version,
+                )
+            } else {
+                // JSON parsed as FullHardwareKey but has no `inner` field —
+                // retry as bare HardwareConfig.
+                let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+                let version = full.version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "13.6.4".to_string());
+                let protocol_version = full.protocol_version
+                    .filter(|v| *v != 0)
+                    .unwrap_or(1660);
+                let icloud_ua = full.icloud_ua
+                    .filter(|v| v.split_once(char::is_whitespace).is_some())
+                    .unwrap_or_else(|| "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string());
+                let aoskit_version = full.aoskit_version
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
+                (
+                    hw,
+                    version,
+                    protocol_version,
+                    icloud_ua,
+                    aoskit_version,
+                )
+            }
+        } else {
+            let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+                .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+            (
+                hw,
+                "13.6.4".to_string(),
+                1660,
+                "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
+                "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+            )
+        };
+
+    // Use the extracted key's REAL hardware identity verbatim — exactly like
+    // a native Mac. Apple's GSA validates the device identity at login `init`; a
+    // randomized/synthetic serial is NOT a recognized, activated device, so GSA
+    // rejects it with the generic -22421 ("native" / "Try again"). The phantom was
+    // ALWAYS wrong — a fabricated serial cannot pass GrandSlam. The extracted key is
+    // a real, already-activated Mac, so GSA accepts it (this is exactly why the same
+    // account logs in fine on a native Mac, which sends the real extracted identity).
+    // Multi-tenant per-user identity is a SEPARATE problem: it needs real per-user
+    // extracted keys, never randomization (Apple rejects synthetic devices outright).
+    let mut hw = hw;
+
+    // Some keys ship with empty `_enc` fields. The portable overlay leaves them
+    // unchanged and supplies every field present in the extracted format to the
+    // emulated Apple routine.
+    if let Err(e) = open_absinthe::nac::enrich_missing_enc_fields(&mut hw) {
+        log::warn!("Could not enrich missing _enc fields: {}", e);
+    }
+
+    // device_id / udid announced at GSA login == the extracted key's real device
+    // UUID (stable across restarts — it's the key's own UUID, just like a native Mac).
+    let _ = &device_id;
+    let device_id = hw.platform_uuid.to_uppercase();
+
+    // Build the MacOSConfig consumed by rustpush. Portable validation remains
+    // fail-closed unless IBLUE_NAC_BINARY_FILE identifies the exact supported
+    // external Apple binary.
+    let config = Arc::new(MacOSConfig {
+        inner: hw,
+        version,
+        protocol_version,
+        device_id: device_id.clone(),
+        icloud_ua,
+        aoskit_version,
+        // Avoid panics in codepaths that expect a UDID (Find My, CloudKit, etc).
+        // Using the device UUID is sufficient.
+        udid: Some(device_id),
+    });
+
+    // Coerce the concrete MacOSConfig into the trait object the wrapper holds.
+    let config: Arc<dyn OSConfig> = config;
+    Ok(Arc::new(WrappedOSConfig {
+        config,
+    }))
+}
+
+#[cfg(not(feature = "hardware-key"))]
+fn _create_config_from_hardware_key_inner(base64_key: String, _device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    let _ = base64_key;
+    Err(WrappedError::GenericError {
+        msg: "Hardware key support not available in this build. \
+              On macOS, use the Apple ID login flow instead (which uses native validation). \
+              To enable hardware key support, rebuild with: cargo build --features hardware-key".into(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// APNs courier socket hardening (entirely in-crate — does NOT touch rustpush).
+//
+// rustpush's open_socket() (aps.rs) opens the long-lived TLS/TCP connection to
+// the APNs courier (push.apple.com:5223) with ZERO socket options: no TCP
+// keep-alive, no write/user timeout. On a home network (consumer NAT, Wi-Fi
+// power-save on a Pi/Mac), that idle long-lived connection can be silently
+// dropped: the read half goes dead (read_exact blocks forever) and/or a wedged
+// write_all() holds the connection's socket lock. With no kernel timeout the
+// socket can stay wedged for the default TCP retransmission ceiling (~15 min) or
+// effectively forever — the "silent death": inbound iMessages stop while the
+// process stays alive, only a restart recovers.
+//
+// We cannot reach rustpush's internally-created socket through any API, and we
+// neither vendor nor patch rustpush. So we discover the courier socket(s) by
+// scanning our OWN open fds for a TCP peer on port 5223 and set, in place:
+//   - SO_KEEPALIVE + keep-idle/intvl/cnt  -> the kernel probes an idle-but-dead
+//     peer and errors the read within ~2 min (frees the blocked read_exact).
+//   - a write/user timeout (Linux TCP_USER_TIMEOUT / macOS TCP_RXT_CONNDROPTIME)
+//     -> a wedged write_all() errors within ~90s (frees self.socket.lock()).
+// Either path makes rustpush's existing ResourceManager regenerate the socket;
+// the in-crate inbound-liveness watchdog (new_client drain task) is the backstop.
+// Idempotent and best-effort, re-applied on a timer so it covers the initial
+// connect AND every reconnect; failures are logged-and-ignored. Port 5223 is
+// APNs-courier-specific, so we never touch the homeserver/CardDAV/IDS sockets
+// (all :443).
+// ---------------------------------------------------------------------------
+const APNS_COURIER_PORT: u16 = 5223;
+
+static APNS_KEEPALIVE_TASK_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn aps_list_open_fds() -> Vec<i32> {
+    // Linux: exact open-fd set via /proc/self/fd. macOS (no procfs): bounded scan
+    // up to the soft NOFILE limit — getpeername on a closed fd returns EBADF
+    // immediately, so this is just fast syscalls.
+    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+        let mut v = Vec::new();
+        for e in rd.flatten() {
+            if let Ok(n) = e.file_name().to_string_lossy().parse::<i32>() {
+                v.push(n);
+            }
+        }
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let mut cap: i64 = 4096;
+    unsafe {
+        let mut lim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            // Cover the bridge's RAISED NOFILE (65536) — macOS has no /proc to enumerate
+            // exactly, and the very fd-spike conditions this patch targets can allocate the
+            // courier fd high. A getpeername on a closed fd is an immediate EBADF, so even a
+            // full 65536-fd sweep every 45s is cheap; do not clamp below NOFILE or the
+            // courier socket can be silently missed.
+            cap = (lim.rlim_cur as i64).clamp(1024, 65536);
+        }
+    }
+    (0..cap as i32).collect()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn aps_socket_peer_port(fd: i32) -> Option<u16> {
+    unsafe {
+        let mut sotype: libc::c_int = 0;
+        let mut tlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut sotype as *mut _ as *mut libc::c_void,
+            &mut tlen,
+        ) != 0
+        {
+            return None;
+        }
+        if sotype != libc::SOCK_STREAM {
+            return None;
+        }
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        if libc::getpeername(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+            return None;
+        }
+        match addr.ss_family as libc::c_int {
+            libc::AF_INET => {
+                let a = &*(&addr as *const _ as *const libc::sockaddr_in);
+                Some(u16::from_be(a.sin_port))
+            }
+            libc::AF_INET6 => {
+                let a = &*(&addr as *const _ as *const libc::sockaddr_in6);
+                Some(u16::from_be(a.sin6_port))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn aps_apply_keepalive(fd: i32) -> bool {
+    unsafe fn setopt(fd: i32, level: libc::c_int, opt: libc::c_int, val: libc::c_int) {
+        let _ = libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    unsafe {
+        // One-shot per socket epoch: a fresh rustpush courier socket has SO_KEEPALIVE
+        // OFF; once we turn it on we skip the socket on later sweeps. This avoids
+        // re-arming the idle timer every 45s (XNU may reset the countdown on a repeat
+        // set, which could keep keepalive probes from ever firing) and keeps the sweep
+        // cheap, while still hardening the NEW socket created after each reconnect.
+        let mut already: libc::c_int = 0;
+        let mut alen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &mut already as *mut _ as *mut libc::c_void,
+            &mut alen,
+        ) == 0
+            && already != 0
+        {
+            return false;
+        }
+        let on: libc::c_int = 1;
+        let ok = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) == 0;
+        let tcp = libc::IPPROTO_TCP;
+        #[cfg(target_os = "linux")]
+        {
+            // stable kernel ABI values (netinet/tcp.h)
+            const TCP_KEEPIDLE: libc::c_int = 4;
+            const TCP_KEEPINTVL: libc::c_int = 5;
+            const TCP_KEEPCNT: libc::c_int = 6;
+            const TCP_USER_TIMEOUT: libc::c_int = 18;
+            // 90s idle is ABOVE rustpush's existing 60s app-level Ping cadence, so on a
+            // HEALTHY link the app traffic always resets the timer first and the kernel
+            // never emits a probe — we add no traffic to Apple. Probes only fire once the
+            // link is actually dead (which is exactly when we want detection).
+            setopt(fd, tcp, TCP_KEEPIDLE, 90);
+            setopt(fd, tcp, TCP_KEEPINTVL, 15);
+            setopt(fd, tcp, TCP_KEEPCNT, 4);
+            // bound unacked (wedged) writes -> write_all() errors in ~90s, freeing the socket lock
+            setopt(fd, tcp, TCP_USER_TIMEOUT, 90_000);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // stable values from <netinet/tcp.h>
+            const TCP_KEEPALIVE: libc::c_int = 0x10; // idle seconds before first probe
+            const TCP_KEEPINTVL: libc::c_int = 0x101;
+            const TCP_KEEPCNT: libc::c_int = 0x102;
+            const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80; // seconds to drop after retransmit failures
+            // 90s idle is ABOVE rustpush's existing 60s app-level Ping cadence (see Linux
+            // note above): healthy links never emit an extra probe.
+            setopt(fd, tcp, TCP_KEEPALIVE, 90);
+            setopt(fd, tcp, TCP_KEEPINTVL, 15);
+            setopt(fd, tcp, TCP_KEEPCNT, 4);
+            setopt(fd, tcp, TCP_RXT_CONNDROPTIME, 90);
+        }
+        ok
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_apns_socket_keepalive() {
+    let mut hardened = 0usize;
+    for fd in aps_list_open_fds() {
+        if aps_socket_peer_port(fd) == Some(APNS_COURIER_PORT) && aps_apply_keepalive(fd) {
+            hardened += 1;
+        }
+    }
+    if hardened > 0 {
+        // Fires only when we NEWLY harden a socket (per connect/reconnect) — already
+        // hardened sockets are skipped above — so this is a per-epoch confirmation line,
+        // not 45s log spam.
+        info!(
+            "APNs keepalive: applied TCP keep-alive + write timeout to {} courier socket(s) (:{}); a half-open courier socket now self-recovers in ~90-150s instead of stalling indefinitely",
+            hardened, APNS_COURIER_PORT
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn set_apns_socket_keepalive() {}
+
+/// Spawn (once per process) a background sweep that keeps TCP keep-alive + a
+/// write/user timeout applied to the APNs courier socket(s). Idempotent; covers
+/// the initial connect and every reconnect. No-op if already started.
+fn ensure_apns_keepalive_task() {
+    use std::sync::atomic::Ordering;
+    if APNS_KEEPALIVE_TASK_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            set_apns_socket_keepalive();
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        }
+    });
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn connect(
+    config: &WrappedOSConfig,
+    state: &WrappedAPSState,
+) -> Arc<WrappedAPSConnection> {
+    ensure_crypto_provider();
+    // Keep TCP keep-alive + a write timeout applied to the APNs courier socket so
+    // a half-open/wedged connection errors out (~90-120s) and rustpush's
+    // ResourceManager (and our inbound-liveness watchdog) can recover — instead
+    // of the read/write blocking for the kernel default (~15 min) or forever.
+    ensure_apns_keepalive_task();
+    let config = config.config.clone();
+    let state = state.inner.clone();
+    let (connection, error) = APSConnectionResource::new(config, state).await;
+    if let Some(error) = error {
+        error!("APS connection error (non-fatal, will retry): {}", error);
+    }
+    Arc::new(WrappedAPSConnection {
+        inner: connection,
+        // Seed "now" so a freshly-built connection isn't instantly seen as
+        // wedged; the drain task re-stamps it on the first inbound frame.
+        last_inbound_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        )),
+    })
+}
+
+/// Login session object that holds state between login steps.
+#[derive(uniffi::Object)]
+pub struct LoginSession {
+    account: tokio::sync::Mutex<Option<AppleAccount<BridgeDefaultAnisetteProvider>>>,
+    username: String,
+    password_hash: Vec<u8>,
+    needs_2fa: bool,
+    // SMS (secondaryAuth) 2FA: the verify body returned by send_sms_2fa_to_devices,
+    // consumed by submit_2fa via verify_sms_2fa. None for trusted-device 2FA.
+    sms_verify_body: std::sync::Mutex<Option<icloud_auth::VerifyBody>>,
+}
+
+/// A privacy-preserving trusted-phone choice for the interactive 2FA flow.
+/// Apple exposes more phone metadata, but iBlue only needs the opaque ID for
+/// the follow-up request and the final two digits so the user can choose.
+#[derive(uniffi::Record, Clone)]
+pub struct TwoFactorPhoneOption {
+    pub id: u32,
+    pub last_two_digits: String,
+}
+
+/// Run a throwaway GSA `init` purely to capture the native-sync SIM
+/// (`X-Apple-I-MD-DATA`) that the `login_email_pass` call swallows into a bare
+/// `-22421` error. The machine-sync rejection precedes SRP validation, so a random
+/// `A2k` suffices. Returns the base64 SIM string on success.
+#[allow(dead_code)] // retained for diagnostics; phantom-Mac fix removed the -22421 retry that called it
+async fn gsa_init_capture_sim(
+    account: &AppleAccount<BridgeDefaultAnisetteProvider>,
+    username: &str,
+) -> Option<String> {
+    use plist::Value;
+    let anisette = account.get_anisette().await.ok()?;
+    let request_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let cpd = anisette.get_cpd_data(&request_id);
+    let a2k: Vec<u8> = (0..256).map(|_| rand::random::<u8>()).collect();
+
+    let mut request = plist::Dictionary::new();
+    request.insert("A2k".into(), Value::Data(a2k));
+    request.insert("cpd".into(), Value::Dictionary(cpd));
+    request.insert("o".into(), Value::String("init".into()));
+    request.insert("ps".into(), Value::Array(vec![
+        Value::String("s2k".into()),
+        Value::String("s2k_fo".into()),
+    ]));
+    request.insert("u".into(), Value::String(username.to_string()));
+    let mut header = plist::Dictionary::new();
+    header.insert("Version".into(), Value::String("1.0.1".into()));
+    let mut top = plist::Dictionary::new();
+    top.insert("Header".into(), Value::Dictionary(header));
+    top.insert("Request".into(), Value::Dictionary(request));
+
+    let mut buf: Vec<u8> = Vec::new();
+    plist::to_writer_xml(&mut buf, &Value::Dictionary(top)).ok()?;
+
+    let mut hmap = reqwest::header::HeaderMap::new();
+    hmap.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("text/x-xml-plist"),
+    );
+    hmap.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("*/*"),
+    );
+    for (k, v) in anisette.get_gsservice_headers() {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&v),
+        ) {
+            hmap.insert(name, val);
+        }
+    }
+
+    let text = reqwest::Client::new()
+        .post("https://gsa.apple.com/grandslam/GsService2")
+        .headers(hmap)
+        .body(buf)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    let parsed = plist::Value::from_reader(std::io::Cursor::new(text.into_bytes())).ok()?;
+    let status = parsed.as_dictionary()?.get("Status")?.as_dictionary()?;
+    let sim = status.get("X-Apple-I-MD-DATA")?.as_string()?.to_string();
+    info!("login_start: captured native-sync SIM via self-init (len={})", sim.len());
+    Some(sim)
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn login_start(
+    apple_id: String,
+    password: String,
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+) -> Result<Arc<LoginSession>, WrappedError> {
+    ensure_crypto_provider();
+    let os_config = config.config.clone();
+    let conn = connection.inner.clone();
+
+    let user_trimmed = apple_id.trim().to_string();
+    // Apple's GSA SRP expects the password to be pre-hashed with SHA-256.
+    // See test.rs: sha256(password.as_bytes())
+    let pw_bytes = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(password.trim().as_bytes());
+        hasher.finalize().to_vec()
+    };
+    // Never log password-derived material. The old Matrix-oriented diagnostic
+    // emitted a reusable SHA-256 password fingerprint; iBlue accepts credentials
+    // over its private stdin RPC channel and keeps logs safe to forward.
+    debug!("login_start: received credential input for account (identifier length={})", user_trimmed.len());
+
+    let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
+    // LoginClientInfo contains stable hardware headers and the APNs token. Do
+    // not print the struct or its fields: native stderr is forwarded to the
+    // TypeScript service log, which operators reasonably share for debugging.
+    debug!("login_start: GSA client metadata prepared");
+    // Persist the provisioned ADI machine in the absolute XDG data dir (same place
+    // every other subsystem uses), NOT a cwd-relative path. With the relative
+    // "state/anisette" the machine was re-provisioned on every login (state.plist
+    // never found → exists=false → fresh machine + new X-Mme-Device-Id each run),
+    // and Apple rejects the provision-then-complete churn at GSA `complete` (-22406).
+    // A real device provisions once and persists; this matches that.
+    let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
+    let state_plist = anisette_state_path.join("state.plist");
+    info!("login_start: persisted anisette state exists={}", state_plist.exists());
+
+    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
+
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+
+    info!("login_start: calling login_email_pass");
+    // The clean-room now registers as a phantom Mac (synthetic identity), so the
+    // GSA init no longer presents a clone of a live Mac and the -22421 native-sync
+    // challenge should not fire. The old capture-SIM + anisette-sync + retry dance
+    // (which only ever produced -29003 and extra GSA requests that fed Apple's
+    // rate-limiter) is removed — a single login attempt.
+    let result = account.login_email_pass(&user_trimmed, &pw_bytes).await
+        .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
+    info!("login_start: login_email_pass returned ok");
+
+    info!("login_email_pass returned: {:?}", result);
+    let mut sms_verify_body: Option<icloud_auth::VerifyBody> = None;
+    let needs_2fa = match result {
+        icloud_auth::LoginState::LoggedIn => {
+            info!("Login completed without 2FA");
+            false
+        }
+        icloud_auth::LoginState::Needs2FAVerification => {
+            info!("2FA required (Needs2FAVerification — push already sent by Apple)");
+            true
+        }
+        icloud_auth::LoginState::NeedsDevice2FA => {
+            info!("Trusted-device 2FA — sending device push (verified via verify_2fa)");
+            match account.send_2fa_to_devices().await {
+                Ok(_) => info!("send_2fa_to_devices succeeded"),
+                Err(e) => error!("send_2fa_to_devices failed: {}", e),
+            }
+            true
+        }
+        icloud_auth::LoginState::NeedsSMS2FA => {
+            // secondaryAuth account: the trusted-device verify (verify_2fa) accepts the
+            // code but does NOT satisfy secondaryAuth (re-login loops). We must request an
+            // SMS and verify via verify_sms_2fa with the returned body.
+            info!("SMS (secondaryAuth) 2FA — requesting code to trusted phone 1");
+            match account.send_sms_2fa_to_devices(1).await {
+                Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
+                    info!("SMS 2FA code sent; awaiting code");
+                    sms_verify_body = Some(body);
+                }
+                Ok(other) => error!("send_sms_2fa_to_devices: unexpected state {:?}", other),
+                Err(e) => error!("send_sms_2fa_to_devices failed: {}", e),
+            }
+            true
+        }
+        icloud_auth::LoginState::NeedsSMS2FAVerification(body) => {
+            info!("2FA required (NeedsSMS2FAVerification — SMS already sent)");
+            sms_verify_body = Some(body);
+            true
+        }
+        icloud_auth::LoginState::NeedsExtraStep(ref step) => {
+            if account.get_pet().is_some() {
+                info!("Login completed (extra step ignored, PET available)");
+                false
+            } else {
+                return Err(WrappedError::GenericError { msg: format!("Login requires extra step: {}", step) });
+            }
+        }
+        icloud_auth::LoginState::NeedsLogin => {
+            return Err(WrappedError::GenericError { msg: "Login failed - bad credentials".to_string() });
+        }
+    };
+
+    Ok(Arc::new(LoginSession {
+        account: tokio::sync::Mutex::new(Some(account)),
+        username: user_trimmed,
+        password_hash: pw_bytes,
+        needs_2fa,
+        sms_verify_body: std::sync::Mutex::new(sms_verify_body),
+    }))
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl LoginSession {
+    pub fn needs_2fa(&self) -> bool {
+        self.needs_2fa
+    }
+
+    /// Identify how login_start expects the next code to arrive. A trusted-
+    /// device challenge may still be switched to SMS with request_sms_2fa.
+    pub fn two_factor_kind(&self) -> String {
+        if self.sms_verify_body.lock().unwrap().is_some() {
+            "sms".to_string()
+        } else {
+            "trusted-device".to_string()
+        }
+    }
+
+    /// Fetch the phone choices Apple permits for an SMS fallback. Do not
+    /// expose full phone numbers across the native RPC boundary.
+    pub async fn two_factor_phone_options(&self) -> Result<Vec<TwoFactorPhoneOption>, WrappedError> {
+        let guard = self.account.lock().await;
+        let account = guard.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No active session".to_string(),
+        })?;
+        let extras = account.get_auth_extras().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to fetch trusted phone numbers: {}", e),
+        })?;
+        Ok(extras
+            .trusted_phone_numbers
+            .into_iter()
+            .map(|phone| TwoFactorPhoneOption {
+                id: phone.id,
+                last_two_digits: phone.last_two_digits,
+            })
+            .collect())
+    }
+
+    /// Switch an active trusted-device challenge to Apple's SMS flow. The
+    /// returned VerifyBody is retained for submit_2fa, whose verification
+    /// endpoint differs from the trusted-device endpoint.
+    pub async fn request_sms_2fa(&self, phone_id: u32) -> Result<bool, WrappedError> {
+        let mut guard = self.account.lock().await;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError {
+            msg: "No active session".to_string(),
+        })?;
+        let result = account
+            .send_sms_2fa_to_devices(phone_id)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send an SMS verification code: {}", e),
+            })?;
+        match result {
+            icloud_auth::LoginState::NeedsSMS2FAVerification(body) => {
+                *self.sms_verify_body.lock().unwrap() = Some(body);
+                Ok(true)
+            }
+            other => Err(WrappedError::GenericError {
+                msg: format!("Apple returned an unexpected SMS challenge state: {:?}", other),
+            }),
+        }
+    }
+
+    pub async fn submit_2fa(&self, code: String) -> Result<bool, WrappedError> {
+        let mut guard = self.account.lock().await;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+
+        // SMS (secondaryAuth) accounts must verify via verify_sms_2fa with the body
+        // captured at login_start; trusted-device accounts use verify_2fa.
+        // Keep the body until verification succeeds. Consuming it before the
+        // request made a mistyped SMS code silently fall back to the wrong
+        // trusted-device endpoint on the next attempt.
+        let sms_body = self.sms_verify_body.lock().unwrap().clone();
+        let result = if let Some(body) = sms_body {
+            info!("Verifying 2FA code via SMS securitycode endpoint (verify_sms_2fa)");
+            account.verify_sms_2fa(code, body).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?
+        } else {
+            info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
+            account.verify_2fa(code).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?
+        };
+
+        info!("2FA verification returned: {:?}", result);
+        info!("PET token available: {}", account.get_pet().is_some());
+
+        // verify_2fa returns NeedsLogin when Apple accepted the code (ec=0) but the
+        // /validate response carried no X-Apple-PE-Token header — the normal
+        // trusted-device flow. The PET is issued by RE-RUNNING the SRP login now that
+        // the device is 2FA-verified (icloud-auth's own login_with_anisette does this
+        // on NeedsLogin). The hand-rolled flow was mapping NeedsLogin -> Ok(false),
+        // surfacing as "2FA verification failed — invalid code" on a perfectly valid code.
+        let accepted = match result {
+            icloud_auth::LoginState::LoggedIn => true,
+            icloud_auth::LoginState::NeedsExtraStep(_) => {
+                account.get_pet().is_some()
+            }
+            icloud_auth::LoginState::NeedsLogin => {
+                info!("2FA code accepted; re-running login_email_pass to collect the PET");
+                let hashed = account.hashed_password.clone().ok_or(WrappedError::GenericError {
+                    msg: "No hashed password available for post-2FA re-login".to_string(),
+                })?;
+                let relogin = account.login_email_pass(&self.username, &hashed).await
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Post-2FA re-login failed: {}", e) })?;
+                info!("Post-2FA re-login returned: {:?}; PET available: {}", relogin, account.get_pet().is_some());
+                matches!(relogin, icloud_auth::LoginState::LoggedIn) || account.get_pet().is_some()
+            }
+            _ => false,
+        };
+        if accepted {
+            *self.sms_verify_body.lock().unwrap() = None;
+        }
+        Ok(accepted)
+    }
+
+    pub async fn finish(
+        &self,
+        config: &WrappedOSConfig,
+        connection: &WrappedAPSConnection,
+        existing_identity: Option<Arc<WrappedIDSNGMIdentity>>,
+        existing_users: Option<Arc<WrappedIDSUsers>>,
+    ) -> Result<IDSUsersWithIdentityRecord, WrappedError> {
+        let os_config = config.config.clone();
+        let conn = connection.inner.clone();
+
+        let mut guard = self.account.lock().await;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+
+        let pet = account.get_pet()
+            .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
+
+        let spd = account.spd.as_ref().expect("No SPD after login");
+        let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap().to_string();
+        let dsid = spd.get("DsPrsId").or_else(|| spd.get("dsid"))
+            .and_then(|v| {
+                if let Some(s) = v.as_string() {
+                    Some(s.to_string())
+                } else if let Some(i) = v.as_signed_integer() {
+                    Some(i.to_string())
+                } else if let Some(i) = v.as_unsigned_integer() {
+                    Some(i.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        // Build persist data before delegates call (while we have SPD access)
+        let hashed_password_hex = account.hashed_password.as_ref()
+            .map(|p| encode_hex(p))
+            .unwrap_or_default();
+        let mut spd_bytes = Vec::new();
+        plist::to_writer_binary(&mut spd_bytes, spd)
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
+        let spd_base64 = base64_encode(&spd_bytes);
+
+        let account_persist = AccountPersistData {
+            username: self.username.clone(),
+            hashed_password_hex,
+            pet: pet.clone(),
+            adsid: adsid.clone(),
+            dsid: dsid.clone(),
+            spd_base64,
+        };
+
+        // Request both IDS (for messaging) and MobileMe (for contacts CardDAV URL)
+        let delegates = login_apple_delegates(
+            &*account,
+            None,
+            &*os_config,
+            &[LoginDelegate::IDS, LoginDelegate::MobileMe],
+        ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) })?;
+
+        let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
+        let fresh_user = authenticate_apple(ids_delegate, &*os_config).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("IDS authentication failed: {}", e) })?;
+
+        // Resolve identity: reuse existing or generate new
+        let identity = match existing_identity {
+            Some(wrapped) => {
+                info!("Reusing existing identity (avoiding new device notification)");
+                wrapped.inner.clone()
+            }
+            None => {
+                info!("Generating new identity (first login)");
+                IDSNGMIdentity::new()
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to create identity: {}", e)
+                    })?
+            }
+        };
+
+        // Decide whether to reuse existing registration or register fresh.
+        let users = match existing_users {
+            Some(ref wrapped) if !wrapped.inner.is_empty() => {
+                let has_valid_registration = wrapped.inner[0]
+                    .registration.get(MADRID_SERVICE.name)
+                    .map(|r| r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false))
+                    .unwrap_or(false);
+                let has_required_services = wrapped.inner[0].registration.contains_key(MADRID_SERVICE.name)
+                    && wrapped.inner[0].registration.contains_key(MULTIPLEX_SERVICE.name)
+                    && wrapped.inner[0].registration.contains_key(FACETIME_SERVICE.name)
+                    && wrapped.inner[0].registration.contains_key(VIDEO_SERVICE.name);
+                // Also validate MULTIPLEX cert isn't expired and data_hash
+                // (sub_services + client_data) hasn't changed since registration.
+                // A stale MULTIPLEX registration makes the bridge invisible to
+                // contacts querying IDS for keysharing sub-service targets.
+                let multiplex_valid = wrapped.inner[0]
+                    .registration.get(MULTIPLEX_SERVICE.name)
+                    .map(|r| {
+                        let not_expired = r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false);
+                        let hash_matches = r.data_hash == MULTIPLEX_SERVICE.hash_data();
+                        if !not_expired { warn!("StatusKit: MULTIPLEX registration expired — will re-register (peer iOS may take ~5min to refresh keysharing routing)"); }
+                        if !hash_matches { warn!("StatusKit: MULTIPLEX data_hash changed (sub_services or client_data updated) — will re-register (peer iOS may take ~5min to refresh keysharing routing)"); }
+                        not_expired && hash_matches
+                    })
+                    .unwrap_or(false);
+
+                if has_valid_registration && has_required_services && multiplex_valid {
+                    info!("Reusing existing registration (still valid for iMessage services, skipping register endpoint)");
+                    let mut existing = wrapped.inner.clone();
+                    existing[0].auth_keypair = fresh_user.auth_keypair.clone();
+                    existing
+                } else {
+                    info!(
+                        "Existing registration missing required services or expired, must re-register with full 4-service bundle"
+                    );
+                    let mut users = vec![fresh_user];
+                    // Single register() call with all four
+                    // services (MADRID, MULTIPLEX, FACETIME, VIDEO). Peer iOS
+                    // gates unprompted StatusKit reshare on seeing a 4-service
+                    // IDS identity.
+                    register(
+                        &*os_config,
+                        &*conn.state.read().await,
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+                        &mut users,
+                        &identity,
+                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("4-service registration failed: {}", e) })?;
+                    let registered: Vec<&str> = users[0].registration.keys().map(|s| s.as_str()).collect();
+                    info!("Re-registration OK — services registered: [{}]", registered.join(", "));
+                    users
+                }
+            }
+            _ => {
+                let mut users = vec![fresh_user];
+                if users[0].registration.is_empty() {
+                    info!("Registering identity (first login) with full 4-service bundle...");
+                    register(
+                        &*os_config,
+                        &*conn.state.read().await,
+                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+                        &mut users,
+                        &identity,
+                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
+                    let registered: Vec<&str> = users[0].registration.keys().map(|s| s.as_str()).collect();
+                    info!("First-login registration OK — services registered: [{}]", registered.join(", "));
+                }
+                users
+            }
+        };
+
+        // Take ownership of the account to create a TokenProvider.
+        // The MobileMe delegate from `delegates` is seeded into the WrappedTokenProvider
+        // so the first get_contacts_url() / create_keychain_clients() call doesn't
+        // need to re-fetch.
+        let owned_account = guard.take()
+            .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
+        let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
+        let token_provider = TokenProvider::new(account_arc.clone(), os_config.clone());
+
+        // Store the MobileMe delegate in the WrappedTokenProvider as opaque plist
+        // bytes. The `MobileMeDelegateResponse` type is not `Serialize`, so we
+        // manually build a `plist::Value` that matches its serde representation
+        // (`{"tokens": {...}, "com.apple.mobileme": {...}}`). We can access the
+        // public fields of `delegates.mobileme` via field syntax without naming
+        // the type — Rust field access on expressions of unnameable types is
+        // permitted. The parse_mme_delegate() helper deserializes back into
+        // MobileMeDelegateResponse at call sites where a typed value is needed.
+        let mme_delegate_bytes = if let Some(mobileme) = &delegates.mobileme {
+            let mut tokens_dict = plist::Dictionary::new();
+            for (k, v) in &mobileme.tokens {
+                tokens_dict.insert(k.clone(), plist::Value::String(v.clone()));
+            }
+            let mut root = plist::Dictionary::new();
+            root.insert("tokens".to_string(), plist::Value::Dictionary(tokens_dict));
+            root.insert(
+                "com.apple.mobileme".to_string(),
+                plist::Value::Dictionary(mobileme.config.clone()),
+            );
+            let mut buf = Vec::new();
+            plist::Value::Dictionary(root).to_writer_xml(&mut buf)
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to serialize MobileMe delegate: {}", e),
+                })?;
+            Some(buf)
+        } else {
+            None
+        };
+
+        Ok(IDSUsersWithIdentityRecord {
+            users: Arc::new(WrappedIDSUsers { inner: users }),
+            identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
+            token_provider: Some(Arc::new(WrappedTokenProvider {
+                inner: token_provider,
+                account: account_arc,
+                os_config: os_config.clone(),
+                mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
+                keychain_clients_cache: tokio::sync::Mutex::new(None),
+                mme_self_heal_lock: tokio::sync::Mutex::new(()),
+            })),
+            account_persist: Some(account_persist),
+        })
+    }
+}
+
+/// Remove this profile's current APNs device from Apple IDS. The caller must
+/// retain the users, APNs state, and credentials until this returns success so
+/// a transient network or Apple error remains retryable.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn deregister_account(
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+    users: &WrappedIDSUsers,
+) -> Result<(), WrappedError> {
+    let aps = connection.inner.state.read().await;
+    deregister_ids(&*config.config, &aps, &users.inner)
+        .await
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to deregister the IDS device: {}", error),
+        })
+}
+
+/// Refresh the saved four-service IDS bundle exactly once without constructing
+/// an `IMClient` or entering `ResourceManager`'s retry loop. This is a
+/// Rust-only JSON-RPC helper, not part of the generated UniFFI surface.
+pub async fn refresh_registration_once(
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+    users: &WrappedIDSUsers,
+    identity: &WrappedIDSNGMIdentity,
+) -> Result<Arc<WrappedIDSUsers>, WrappedError> {
+    let mut refreshed_users = users.inner.clone();
+    register(
+        config.config.as_ref(),
+        &*connection.inner.state.read().await,
+        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+        &mut refreshed_users,
+        &identity.inner,
+    )
+    .await
+    .map_err(|error| WrappedError::GenericError {
+        msg: format!("registration refresh failed: {error}"),
+    })?;
+    Ok(Arc::new(WrappedIDSUsers {
+        inner: refreshed_users,
+    }))
+}
+
+// ============================================================================
+// Attachment download helper
+// ============================================================================
+
+/// Fetch an iMessage MMCS `AuthorizeGetResponse` body via the APNs auth
+/// dance, without invoking the `MMCSFile::get_attachment` (which
+/// calls the panic-prone `get_mmcs`).
+///
+/// This is the same protocol rustpush uses at
+/// `third_party/rustpush/src/imessage/messages.rs` in
+/// `MMCSFile::get_attachment` up through line 1381, inlined into the
+/// wrapper so we can stop at the point where rustpush would hand off to
+/// `get_mmcs` and instead route the bytes through
+/// `manual_ford::manual_ford_download_asset`.
+///
+/// Returns the raw response bytes — the caller decodes them as an
+/// `mmcsp::AuthorizeGetResponse` and runs them through the manual
+/// download.
+async fn fetch_imessage_mmcs_authorize_body(
+    mmcs: &rustpush::MMCSFile,
+    conn: &rustpush::APSConnectionResource,
+) -> Result<Vec<u8>, String> {
+    use futures::FutureExt;
+    use plist::Value;
+    use rand::Rng;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct RequestMMCSDownload {
+        #[serde(rename = "mO")]
+        object: String,
+        #[serde(rename = "mS")]
+        signature: plist::Data,
+        v: u64,
+        ua: String,
+        c: u64,
+        i: u32,
+        #[serde(rename = "cH")]
+        headers: String,
+        #[serde(rename = "mR")]
+        domain: String,
+        #[serde(rename = "cV")]
+        cv: u32,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct MMCSDownloadResponse {
+        #[serde(rename = "cB")]
+        response: plist::Data,
+        #[serde(rename = "mU")]
+        #[allow(dead_code)]
+        object: String,
+    }
+
+    // User agents / client info strings — must exactly match rustpush's
+    // `MMCSFile::get_attachment` construction so the MMCS server accepts
+    // our auth request.
+    let mme_client_info = conn
+        .os_config
+        .get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)");
+    let mini_ua = conn.os_config.get_version_ua();
+
+    // Strip the last `/{object}` segment from the URL to produce the
+    // MMCS domain — rustpush does this to build the `mR` field.
+    let domain = mmcs.url.replace(&format!("/{}", &mmcs.object), "");
+
+    let msg_id: u32 = rand::thread_rng().gen();
+    let header = format!("x-mme-client-info:{}", mme_client_info);
+    let request_download = RequestMMCSDownload {
+        object: mmcs.object.to_string(),
+        c: 151,
+        ua: mini_ua,
+        headers: [
+            "x-apple-mmcs-proto-version:5.0",
+            "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
+            "x-apple-mmcs-plist-version:v1.0",
+            &header,
+            "",
+        ]
+        .join("\n"),
+        v: 8,
+        domain,
+        cv: 2,
+        i: msg_id,
+        signature: mmcs.signature.to_vec().into(),
+    };
+
+    // Subscribe BEFORE send to avoid the race where the response arrives
+    // before the receiver is registered.
+    let recv = conn.subscribe().await;
+
+    // The send_message now takes `impl Serialize` and handles plist
+    // encoding internally (was: pre-serialized Vec<u8> + plist_to_bin at the
+    // call site). The id parameter is also i32 now, not u32.
+    conn.send_message("com.apple.madrid", request_download, Some(msg_id as i32))
+        .await
+        .map_err(|e| format!("APNs send_message: {e}"))?;
+
+    // Wait for a Notification on com.apple.madrid where `c == 151` and
+    // `i == msg_id`. Topic filtering is done by sha1-hash compare, which
+    // we can't easily replicate without `rustpush::util::sha1`, so we
+    // check the parsed payload fields directly and trust APNs routing
+    // to only deliver com.apple.madrid messages on this subscription.
+    let predicate = move |msg: rustpush::APSMessage| -> Option<Value> {
+        // The APSPackedValue::Into<Value> maps each packed-attribute
+        // kind to its corresponding plist::Value variant (aps.rs:31-42),
+        // so MMCS auth responses with a Dict-encoded payload arrive as
+        // Value::Dictionary, while Data-encoded payloads arrive as
+        // Value::Data carrying raw plist bytes. Accept both — matches
+        // the get_message helper, which doesn't constrain the
+        // variant.
+        let rustpush::APSMessage::Notification { payload, .. } = msg else { return None };
+        let parsed = match payload {
+            plist::Value::Data(bytes) => plist::from_bytes::<Value>(&bytes).ok()?,
+            v => v,
+        };
+        let dict = parsed.as_dictionary()?;
+        let c = dict.get("c")?.as_unsigned_integer()?;
+        let i_val = dict.get("i")?;
+        let i = i_val
+            .as_unsigned_integer()
+            .map(|v| v as u32)
+            .or_else(|| i_val.as_signed_integer().map(|v| v as u32))?;
+        if c == 151 && i == msg_id {
+            Some(parsed)
+        } else {
+            None
+        }
+    };
+
+    // The `wait_for_timeout` future can in principle panic on malformed
+    // APNs messages (rustpush's aps internals have `unwrap`s). Wrap in
+    // catch_unwind so a panic here returns an Err instead of crashing
+    // the bridge.
+    let wait_fut = conn.wait_for_timeout(recv, predicate);
+    let reader = match std::panic::AssertUnwindSafe(wait_fut).catch_unwind().await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(format!("APNs wait_for_timeout: {e}")),
+        Err(_) => return Err("APNs wait_for_timeout panicked".to_string()),
+    };
+
+    let apns_response: MMCSDownloadResponse =
+        plist::from_value(&reader).map_err(|e| format!("plist decode response: {e}"))?;
+    let body: Vec<u8> = apns_response.response.into();
+    Ok(body)
+}
+
+/// Download any MMCS (non-inline) attachments from the message and convert them
+/// to inline data in the wrapped message, so the Go side can upload them to Matrix.
+///
+/// This function reimplements the `MMCSFile::get_attachment` at
+/// the wrapper layer so we can use our V1+V2-capable
+/// `manual_ford_download_asset` instead of rustpush's panicking
+/// `get_mmcs`. Master worked because Cameron's rustpush fork had the
+/// 94f7b8e Ford fix baked into `get_mmcs`; after the refactor's source
+/// swap to plain rustpush (which doesn't have the fix), calling
+/// `att.get_attachment` on V2-Ford or dedup'd records panics. Routing
+/// the bytes through the manual path gets us back to master's behavior
+/// without patching rustpush.
+async fn download_mmcs_attachments(
+    wrapped: &mut WrappedMessage,
+    msg_inst: &MessageInst,
+    conn: &rustpush::APSConnectionResource,
+) {
+    let parts = match &msg_inst.message {
+        Message::Message(normal) => Some(&normal.parts),
+        Message::React(react) => match &react.reaction {
+            ReactMessageType::React {
+                reaction: Reaction::Sticker { body, .. },
+                ..
+            }
+            | ReactMessageType::Extension { body, .. } => Some(body),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(parts) = parts else { return };
+    let mut att_idx = 0;
+    for indexed_part in &parts.0 {
+        if let MessagePart::Attachment(att) = &indexed_part.part {
+            if let AttachmentType::MMCS(mmcs) = &att.a_type {
+                if att_idx < wrapped.attachments.len() {
+                    match download_one_mmcs_attachment(mmcs, conn, &att.name).await {
+                        Ok(buf) => {
+                            info!("Downloaded MMCS attachment: {} ({} bytes)", att.name, buf.len());
+                            wrapped.attachments[att_idx].is_inline = true;
+                            wrapped.attachments[att_idx].inline_data = Some(buf);
+                        }
+                        Err(e) => error!("Failed to download MMCS attachment {}: {}", att.name, e),
+                    }
+                }
+            }
+            att_idx += 1;
+        }
+    }
+}
+
+/// Download one MMCS attachment via the wrapper-level path, with bounded
+/// retries on transient failures.
+///
+/// The `send_message` (aps.rs:1319) schedules a connection reload via
+/// `do_reload()` whenever its 15-second ack wait times out (aps.rs:1349). The
+/// caller is expected to retry so the reloaded connection can serve the next
+/// attempt — not retrying is what made the first transient APNs blip fatal.
+///
+/// Retries: 3 attempts total with 500 ms / 1 s / 2 s backoff between them.
+/// Only genuinely transient errors retry; Ford SIV mismatches, chunk OOB, and
+/// decode errors return immediately.
+async fn download_one_mmcs_attachment(
+    mmcs: &rustpush::MMCSFile,
+    conn: &rustpush::APSConnectionResource,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match download_one_mmcs_attachment_once(mmcs, conn, name).await {
+            Ok(bytes) => {
+                if attempt > 1 {
+                    info!(
+                        "MMCS download succeeded for {} on attempt {}/{}",
+                        name, attempt, MAX_ATTEMPTS
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                let transient = e.contains("Send timeout")
+                    || e.contains("try again")
+                    || e.contains("APNs wait_for_timeout")
+                    || e.contains("connection")
+                    || e.contains("container fetch")
+                    || e.contains("HTTP");
+                if !transient || attempt == MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                warn!(
+                    "MMCS download attempt {}/{} for {} failed: {} — retrying",
+                    attempt, MAX_ATTEMPTS, name, e
+                );
+                last_err = e;
+                // Backoff 500 ms, 1 s, 2 s — gives the do_reload()
+                // time to re-establish the APS connection between tries.
+                let backoff_ms = 500u64 * (1u64 << (attempt - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+        }
+    }
+    Err(format!(
+        "MMCS download exhausted {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    ))
+}
+
+/// One attempt of the MMCS download pipeline: APNs auth handshake → manual
+/// V1+V2 Ford-capable chunk decode → iMessage outer AES-256-CTR unwrap.
+///
+/// Equivalent to the `MMCSFile::get_attachment` but bypasses the
+/// panicking `get_mmcs` call at its tail.
+///
+/// iMessage MMCS differs from CloudKit MMCS in one important way: the file
+/// bytes are additionally wrapped in an `IMessageContainer` layer (AES-256-CTR
+/// with `MMCSFile.key` and a zero nonce). rustpush handles this by passing a
+/// `WriteContainer` impl through to `get_mmcs` that decrypts during chunk
+/// writes. Since our manual path returns the assembled chunk plaintext without
+/// that hook, we apply the outer unwrap here as a post-processing step.
+async fn download_one_mmcs_attachment_once(
+    mmcs: &rustpush::MMCSFile,
+    conn: &rustpush::APSConnectionResource,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    // Step 1: APNs auth handshake → AuthorizeGetResponse body bytes.
+    let body = fetch_imessage_mmcs_authorize_body(mmcs, conn).await?;
+
+    // Step 2: decrypt via the same V1+V2-capable manual path used by
+    // CloudKit downloads. Pass an empty Ford key because iMessage MMCS
+    // chunk encryption uses the per-chunk `meta.encryption_key` field
+    // (V1 AES-128-CFB) — there's no outer Ford SIV layer on the iMessage
+    // side.
+    let user_agent = conn.os_config.get_normal_ua("IMTransferAgent/1000");
+    let chunked_plaintext = manual_ford::manual_ford_download_asset(
+        &body,
+        &mmcs.signature,
+        &[],
+        &user_agent,
+        name,
+    )
+    .await?;
+
+    // Step 3: iMessage outer unwrap — AES-256-CTR(mmcs.key, zero_iv)
+    // over the full assembled plaintext. This mirrors what the
+    // `IMessageContainer` does on the write path during `get_mmcs`.
+    // Matches `third_party/rustpush/src/imessage/messages.rs`
+    // `IMessageContainer::new(&self.key, writer, true)` at line 1341.
+    if mmcs.key.len() != 32 {
+        return Err(format!(
+            "iMessage MMCS key has unexpected length {}: expected 32 for AES-256-CTR",
+            mmcs.key.len()
+        ));
+    }
+    let iv = [0u8; 16];
+    let unwrapped = openssl::symm::decrypt(
+        openssl::symm::Cipher::aes_256_ctr(),
+        &mmcs.key,
+        Some(&iv),
+        &chunked_plaintext,
+    )
+    .map_err(|e| format!("iMessage outer AES-256-CTR unwrap: {e}"))?;
+
+    Ok(unwrapped)
+}
+
+/// Await `fut`, converting an escaping panic into `None`.
+///
+/// Upstream rustpush signals several routine "it isn't there" outcomes with a
+/// panic instead of an error — `FetchedRecords::get_record`'s
+/// `.expect("No record found?")` when CloudKit returns no matching record, the
+/// `unwrap()`s in the MMCS Ford paths — so any call into those from a
+/// long-lived task has to opt out of unwinding or the task dies with it.
+///
+/// `what` names the call site, because the panic's own message is very likely
+/// suppressed: `init_logger`'s hook silences panics originating in
+/// `icloud/mmcs.rs` and `icloud/cloudkit.rs`, which is where these land.
+async fn guard_panic<F: std::future::Future>(what: &str, fut: F) -> Option<F::Output> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            error!(
+                "{} panicked inside upstream rustpush — contained here; continuing without it",
+                what
+            );
+            None
+        }
+    }
+}
+
+/// Download the group photo for an IconChange message via MMCS.
+/// Apple delivers group photo changes as MMCS file transfers inside IconChange
+/// APNs messages — NOT via CloudKit. This downloads the photo inline so the
+/// Go side can use msg.icon_change_photo_data directly without any CloudKit
+/// round-trip (which would fail for Apple-set photos anyway).
+async fn download_icon_change_photo(
+    wrapped: &mut WrappedMessage,
+    msg_inst: &MessageInst,
+    conn: &rustpush::APSConnectionResource,
+) {
+    if let Message::IconChange(change) = &msg_inst.message {
+        if let Some(mmcs_file) = &change.file {
+            let att = Attachment {
+                a_type: AttachmentType::MMCS(mmcs_file.clone()),
+                part: 0,
+                uti_type: String::new(),
+                mime: String::from("image/jpeg"),
+                name: String::from("group_photo"),
+                iris: false,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            // This is upstream's V1-only `get_mmcs` path — unlike ordinary
+            // attachments, which go through the manual Ford downloader in
+            // `download_one_mmcs_attachment_once` — so it can panic rather
+            // than return an error. It runs on the APNs process task, so an
+            // escaping panic would unwind the receive loop.
+            //
+            // `get_attachment` writes into `buf` progressively, so on a panic
+            // `buf` may hold a truncated image that is indistinguishable from
+            // a complete one. Drop it rather than ship a corrupt avatar to
+            // Matrix; the message itself still goes through.
+            let result = guard_panic(
+                "IconChange group-photo MMCS download",
+                att.get_attachment(conn, &mut buf, |_, _| {}),
+            )
+            .await;
+            match result {
+                Some(Ok(())) => {
+                    info!("Downloaded group photo via MMCS ({} bytes)", buf.len());
+                    wrapped.icon_change_photo_data = Some(buf);
+                }
+                Some(Err(e)) => {
+                    error!("Failed to download group photo via MMCS: {}", e);
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedFaceTimeClient {
+    inner: Arc<rustpush::facetime::FTClient>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedFaceTimeClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    /// Set the bridge user's FaceTime display name (resolved Go-side:
+    /// facetime_display_name override → Apple SPD name → handle). Stamped onto
+    /// the bridge webview's LetMeIn nickname in auto_approve_bridge_letmein so
+    /// peers see the user's name instead of the raw temp:<uuid> pseud.
+    pub fn set_self_display_name(&self, name: String) {
+        if let Ok(mut g) = FACETIME_SELF_DISPLAY_NAME.write() {
+            *g = if name.trim().is_empty() { None } else { Some(name) };
+        }
+    }
+
+    pub async fn use_link_for(&self, old_usage: String, usage: String) -> Result<(), WrappedError> {
+        self.inner.use_link_for(&old_usage, &usage).await?;
+        Ok(())
+    }
+
+    pub async fn get_link_for_usage(&self, handle: String, usage: String) -> Result<String, WrappedError> {
+        Ok(self.inner.get_link_for_usage(&handle, &usage).await?)
+    }
+
+    pub async fn clear_links(&self) -> Result<(), WrappedError> {
+        self.inner.clear_links().await?;
+        Ok(())
+    }
+
+    pub async fn delete_link(&self, pseud: String) -> Result<(), WrappedError> {
+        self.inner.delete_link(&pseud).await?;
+        Ok(())
+    }
+
+    pub async fn get_session_link(&self, guid: String) -> Result<String, WrappedError> {
+        Ok(self.inner.get_session_link(&guid).await?)
+    }
+
+    // Deterministically binds the FTLink (matched by handle + usage) to a
+    // session group_id by setting link.session_link. Without this, the
+    // rotation-slot links (e.g. "next", "nextincomingcall") have
+    // session_link=None until the first letmein-tap, and
+    // auto_approve_bridge_letmein falls through to member/ringing heuristics.
+    // Under cold-start or stale-state conditions those heuristics miss and
+    // the approver creates a fresh empty session, producing the "0 people"
+    // symptom.
+    pub async fn bind_bridge_link_to_session(
+        &self,
+        handle: String,
+        usage: String,
+        group_id: String,
+    ) -> Result<(), WrappedError> {
+        let mut state = self.inner.state.write().await;
+        let pseud = state
+            .links
+            .iter()
+            .find(|(_, link)| link.handle == handle && link.usage.as_deref() == Some(&usage))
+            .map(|(pseud, _)| pseud.clone())
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!("No FaceTime link found for handle={} usage={}", handle, usage),
+            })?;
+        if let Some(link) = state.links.get_mut(&pseud) {
+            link.session_link = Some(group_id);
+        }
+        Ok(())
+    }
+
+    pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
+        // Call rustpush directly. We previously wrapped this with a
+        // strip-own-from-session.members pattern to stop the wire ring from
+        // fanning out to the owner's other Apple devices (Mac, iPad). The
+        // motivation was tap-routing fragility: when the Mac auto-answered
+        // via Continuity, it sent RespondedElsewhere back to the bridge,
+        // which cleared is_ringing_inaccurate, which broke the
+        // auto_approve_bridge_letmein ringing-group fallback for link taps.
+        //
+        // bind_bridge_link_to_session (added alongside this change) pins the
+        // bridge FaceTime link's session_link to the outgoing session the
+        // moment it's created, so the letmein approver's linked_group branch
+        // matches deterministically regardless of is_ringing_inaccurate. The
+        // strip's original justification is moot.
+        //
+        // Empirically the strip also correlated with the callee not ringing
+        // (own was absent from update_context.members and fanout_groupmembers
+        // in the Invitation wire, which we suspect Apple's FT routing
+        // rejected). Straight rustpush sends a well-formed Invitation. Side
+        // effect: owner's devices ring too; caller dismisses on the device
+        // they don't want. Future: suppress own-device ring via a follow-up
+        // RespondedElsewhere once we've confirmed the callee ring is stable.
+        self.inner
+            .create_session(group_id, handle, &participants)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("FTClient::create_session failed: {:?}", e),
+            })?;
+        Ok(())
+    }
+
+    // Create a FaceTime session without ringing any participant. Used by the
+    // portal-room !im facetime flow: session is allocated + registered with
+    // Apple's relay (so the join link is valid), but no Invitation wire is
+    // fanned out. The contact's phone rings only when the caller taps the
+    // link — that JoinEvent triggers maybe_fire_pending_ring which calls
+    // ft.ring() with the queued targets.
+    //
+    // Difference from create_session:
+    // - is_ringing_inaccurate starts false, so prop_up_conv's !ring branch
+    //   doesn't divert into RespondedElsewhere (facetime.rs:708).
+    // - prop_up_conv(session, false) so the wire message carries no
+    //   ConversationMessageType::Invitation on any target (facetime.rs:759).
+    //
+    // Net effect on Apple's side: session allocated + propped (state=live)
+    // but nobody's device rings.
+    pub async fn create_session_no_ring(
+        &self,
+        group_id: String,
+        handle: String,
+        participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        use rustpush::facetime::{FTMember, FTMode, FTSession};
+        use std::collections::HashMap;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let members = participants
+            .iter()
+            .chain(std::iter::once(&handle))
+            .map(|p| FTMember {
+                nickname: None,
+                handle: p.clone(),
+            })
+            .collect();
+
+        let session = FTSession {
+            group_id: group_id.clone(),
+            my_handles: vec![handle.clone()],
+            participants: HashMap::new(),
+            link: None,
+            members,
+            report_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+            start_time: Some(now_ms),
+            last_rekey: None,
+            is_propped: false,
+            is_ringing_inaccurate: false,
+            mode: Some(FTMode::Outgoing),
+            recent_member_adds: HashMap::new(),
+        };
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(group_id.clone(), session);
+        let session = state.sessions.get_mut(&group_id).expect("just inserted");
+
+        self.inner
+            .ensure_allocations(session, &[])
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("ensure_allocations failed: {:?}", e),
+            })?;
+        self.inner
+            .prop_up_conv(session, false)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("prop_up_conv(ring=false) failed: {:?}", e),
+            })?;
+        Ok(())
+    }
+
+    pub async fn add_members(
+        &self,
+        session_id: String,
+        handles: Vec<String>,
+        letmein: bool,
+        to_members: Option<Vec<String>>,
+    ) -> Result<(), WrappedError> {
+        let mut session = {
+            let state = self.inner.state.read().await;
+            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("FaceTime session not found: {}", session_id),
+            })?
+        };
+
+        let members = handles
+            .into_iter()
+            .map(|handle| rustpush::facetime::FTMember {
+                nickname: None,
+                handle,
+            })
+            .collect::<Vec<_>>();
+
+        self.inner.add_members(&mut session, members, letmein, to_members).await?;
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    pub async fn remove_members(&self, session_id: String, handles: Vec<String>) -> Result<(), WrappedError> {
+        let mut session = {
+            let state = self.inner.state.read().await;
+            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("FaceTime session not found: {}", session_id),
+            })?
+        };
+
+        let members = handles
+            .into_iter()
+            .map(|handle| rustpush::facetime::FTMember {
+                nickname: None,
+                handle,
+            })
+            .collect::<Vec<_>>();
+
+        self.inner.remove_members(&mut session, members).await?;
+
+        let mut state = self.inner.state.write().await;
+        state.sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    pub async fn ring(&self, session_id: String, targets: Vec<String>, letmein: bool) -> Result<(), WrappedError> {
+        let session = {
+            let state = self.inner.state.read().await;
+            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("FaceTime session not found: {}", session_id),
+            })?
+        };
+        self.inner.ring(&session, &targets, letmein).await?;
+        Ok(())
+    }
+
+    // Queue a ring that fires as soon as a participant *other than the
+    // caller* joins this session. The portal !facetime command uses this so
+    // the contact's phone doesn't ring until the caller has actually tapped
+    // the join link. caller_handle is the session creator's own handle;
+    // join events from that handle are ignored so the implicit self-join
+    // from create_session does not fire the ring immediately. Entries
+    // self-expire after ttl_secs to avoid orphan rings.
+    pub async fn register_pending_ring(
+        &self,
+        session_id: String,
+        caller_handle: String,
+        targets: Vec<String>,
+        ttl_secs: u64,
+    ) -> Result<(), WrappedError> {
+        let mut map = pending_ft_rings().lock().await;
+        map.insert(session_id, PendingFTRing {
+            caller_handle,
+            targets,
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+        });
+        Ok(())
+    }
+
+    pub async fn list_delegated_letmein_requests(&self) -> Vec<WrappedLetMeInRequest> {
+        let delegated = self.inner.delegated_requests.lock().await;
+        delegated
+            .iter()
+            .map(|(uuid, request)| WrappedLetMeInRequest {
+                delegation_uuid: uuid.clone(),
+                pseud: request.pseud.clone(),
+                requestor: request.requestor.clone(),
+                nickname: request.nickname.clone(),
+                usage: request.usage.clone(),
+            })
+            .collect()
+    }
+
+    pub async fn respond_delegated_letmein(
+        &self,
+        delegation_uuid: String,
+        approved_group: Option<String>,
+    ) -> Result<(), WrappedError> {
+        let request = {
+            let delegated = self.inner.delegated_requests.lock().await;
+            delegated.get(&delegation_uuid).cloned().ok_or(WrappedError::GenericError {
+                msg: format!("Delegated LetMeIn request not found: {}", delegation_uuid),
+            })?
+        };
+        self.inner.respond_letmein(request, approved_group.as_deref()).await?;
+        Ok(())
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedPasswordsClient {
+    inner: Arc<rustpush::passwords::PasswordManager<BridgeDefaultAnisetteProvider>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedPasswordsClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn sync_passwords(&self) -> Result<(), WrappedError> {
+        self.inner.sync_passwords(&self.inner.conn).await?;
+        Ok(())
+    }
+
+    pub async fn accept_invite(&self, invite_id: String) -> Result<(), WrappedError> {
+        self.inner.accept_invite(&invite_id).await?;
+        Ok(())
+    }
+
+    pub async fn decline_invite(&self, invite_id: String) -> Result<(), WrappedError> {
+        self.inner.decline_invite(&invite_id).await?;
+        Ok(())
+    }
+
+    pub async fn query_handle(&self, handle: String) -> Result<bool, WrappedError> {
+        Ok(self.inner.query_handle(&handle).await?)
+    }
+
+    pub async fn create_group(&self, name: String) -> Result<String, WrappedError> {
+        Ok(self.inner.create_group(&name).await?)
+    }
+
+    pub async fn rename_group(&self, id: String, new_name: String) -> Result<(), WrappedError> {
+        self.inner.rename_group(&id, &new_name).await?;
+        Ok(())
+    }
+
+    pub async fn remove_group(&self, id: String) -> Result<(), WrappedError> {
+        self.inner.remove_group(&id).await?;
+        Ok(())
+    }
+
+    pub async fn invite_user(&self, group_id: String, handle: String) -> Result<(), WrappedError> {
+        self.inner.invite_user(&group_id, &handle).await?;
+        Ok(())
+    }
+
+    pub async fn remove_user(&self, group_id: String, handle: String) -> Result<(), WrappedError> {
+        self.inner.remove_user(&group_id, &handle).await?;
+        Ok(())
+    }
+
+    pub async fn list_password_raw_entry_refs(&self) -> Vec<WrappedPasswordEntryRef> {
+        self.inner
+            .get_password_entries::<rustpush::passwords::PasswordRawEntry>()
+            .await
+            .into_iter()
+            .map(|(id, (group, _))| WrappedPasswordEntryRef { id, group })
+            .collect()
+    }
+
+    pub async fn get_password_site_counts(&self, site: String) -> WrappedPasswordSiteCounts {
+        let cfg = self.inner.get_password_for_site(site).await;
+        WrappedPasswordSiteCounts {
+            website_meta_count: if cfg.website_meta.is_some() { 1 } else { 0 },
+            password_count: cfg.passwords.len() as u64,
+            password_meta_count: cfg.passwords_meta.len() as u64,
+            passkey_count: cfg.passkeys.len() as u64,
+        }
+    }
+
+    pub async fn upsert_password_raw_entry(
+        &self,
+        id: String,
+        site: String,
+        account: String,
+        secret_data: Vec<u8>,
+        group: Option<String>,
+    ) -> Result<(), WrappedError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let entry = rustpush::passwords::PasswordRawEntry {
+            cdat: now_ms,
+            mdat: now_ms,
+            srvr: site,
+            acct: account,
+            agrp: "com.apple.cfnetwork".to_string(),
+            data: secret_data,
+        };
+        self.inner
+            .insert_password_entry::<rustpush::passwords::PasswordRawEntry>(&id, &entry, group)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_password_raw_entry(&self, id: String, group: Option<String>) -> Result<(), WrappedError> {
+        self.inner
+            .delete_password_entry::<rustpush::passwords::PasswordRawEntry>(&id, group)
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedStatusKitClient {
+    pub(crate) inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
+    interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedStatusKitClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn roll_keys(&self) {
+        self.inner.roll_keys().await;
+    }
+
+    pub async fn reset_keys(&self) {
+        self.inner.reset_keys().await;
+    }
+
+    pub async fn share_status(&self, active: bool, mode: Option<String>) -> Result<(), WrappedError> {
+        let status = if active {
+            rustpush::statuskit::StatusKitStatus::new_active()
+        } else {
+            rustpush::statuskit::StatusKitStatus::new_away(mode.ok_or(WrappedError::GenericError {
+                msg: "Mode is required when sharing away status".into(),
+            })?)
+        };
+        self.inner.share_status(&status).await?;
+        Ok(())
+    }
+
+    pub async fn invite_to_channel(
+        &self,
+        sender_handle: String,
+        handles: Vec<WrappedStatusKitInviteHandle>,
+    ) -> Result<(), WrappedError> {
+        let mapped = handles
+            .into_iter()
+            .map(|h| {
+                (
+                    h.handle,
+                    rustpush::statuskit::StatusKitPersonalConfig {
+                        allowed_modes: h.allowed_modes,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.inner.invite_to_channel(&sender_handle, mapped).await?;
+        Ok(())
+    }
+
+    pub async fn request_handles(&self, handles: Vec<String>) {
+        let token = self.inner.request_handles(&handles).await;
+        self.interests.lock().await.push(token);
+    }
+
+    pub async fn clear_interest_tokens(&self) {
+        self.interests.lock().await.clear();
+    }
+
+    /// Returns one "from" handle (e.g. "mailto:user@icloud.com" or "tel:+1…")
+    /// for every peer the bridge holds a StatusKit key for — every entry in the
+    /// persisted `keys` map, deduped by handle.
+    ///
+    /// Both callers want exactly this set: the alias matchup links every keyed
+    /// peer to a portal so an incoming status can be ROUTED, and the re-invite
+    /// sweep skips every peer we already hold a key for. We deliberately do NOT
+    /// gate on `recent_channels.last_msg_ns`. Keys pulled from CloudKit (or
+    /// received via reshare) all start as placeholders (last_msg_ns == 1) and
+    /// only flip to "live" once a status is actually received — so gating on
+    /// live-status deadlocked the CloudKit-pull model: a bridge with hundreds
+    /// of valid keys reported ZERO handles, the alias matchup never ran (its
+    /// log: "no known peer handles, skipping" → presence never routed), AND the
+    /// re-invite sweep subtracted nothing and re-invited every keyed peer each
+    /// pass (the Apple-IDS pounding that manifests as receive-side deafness).
+    /// Holding a key is the correct criterion for both jobs, regardless of
+    /// whether that channel has carried a status yet.
+    ///
+    /// Since the StatusKitSharedDevice::from is private, this reads the
+    /// plist file directly.
+    pub async fn get_known_handles(&self) -> Vec<String> {
+        let state_path = subsystem_state_path("statuskit-state.plist");
+        let data = match std::fs::read(&state_path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let value = match plist::from_bytes::<plist::Value>(&data) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let Some(dict) = value.as_dictionary() else { return Vec::new() };
+        let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) else {
+            return Vec::new();
+        };
+
+        // One "from" handle per keyed peer, deduped. No last_msg_ns gate — see
+        // the doc comment above: every entry in keys_dict is a peer we hold a
+        // key for, which is exactly what both consumers (alias matchup +
+        // re-invite suppression) need, whether or not a live status has landed.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut handles = Vec::new();
+        for (_channel_id, entry) in keys_dict {
+            let Some(entry_dict) = entry.as_dictionary() else { continue };
+            let Some(from_str) = entry_dict.get("from").and_then(|v| v.as_string()) else { continue };
+            if seen.insert(from_str.to_string()) {
+                handles.push(from_str.to_string());
+            }
+        }
+        handles
+    }
+
+}
+
+#[derive(uniffi::Record)]
+pub struct SharedAlbumInfo {
+    pub albumguid: String,
+    pub name: Option<String>,
+    pub fullname: Option<String>,
+    pub email: Option<String>,
+    pub subscriptiondate: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct SharedAssetInfo {
+    pub assetguid: String,
+    pub filename: String,
+    pub date_created: String,
+    pub media_type: String,
+    pub width: String,
+    pub height: String,
+    pub size: String,
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedSharedStreamsClient {
+    inner: Arc<rustpush::sharedstreams::SharedStreamClient<BridgeDefaultAnisetteProvider>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedSharedStreamsClient {
+    pub async fn export_state_json(&self) -> Result<String, WrappedError> {
+        let state = self.inner.state.read().await;
+        serialize_state_json(&*state)
+    }
+
+    pub async fn list_album_ids(&self) -> Vec<String> {
+        let state = self.inner.state.read().await;
+        state.albums.iter().map(|album| album.albumguid.clone()).collect()
+    }
+
+    pub async fn get_changes(&self) -> Result<Vec<String>, WrappedError> {
+        Ok(self.inner.get_changes().await?)
+    }
+
+    pub async fn subscribe(&self, album: String) -> Result<(), WrappedError> {
+        self.inner.subscribe(&album).await?;
+        Ok(())
+    }
+
+    pub async fn unsubscribe(&self, album: String) -> Result<(), WrappedError> {
+        self.inner.unsubscribe(&album).await?;
+        Ok(())
+    }
+
+    pub async fn subscribe_token(&self, token: String) -> Result<(), WrappedError> {
+        self.inner.subscribe_token(&token).await?;
+        Ok(())
+    }
+
+    pub async fn get_album_summary(&self, album: String) -> Result<Vec<String>, WrappedError> {
+        Ok(self.inner.get_album_summary(&album).await?)
+    }
+
+    pub async fn get_assets_json(&self, album: String, assets: Vec<String>) -> Result<String, WrappedError> {
+        let details = self.inner.get_assets(&album, &assets).await?;
+        serde_json::to_string(&details).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to encode asset details: {}", e),
+        })
+    }
+
+    pub async fn delete_assets(&self, album: String, assets: Vec<String>) -> Result<(), WrappedError> {
+        self.inner.delete_asset(&album, assets).await?;
+        Ok(())
+    }
+
+    pub async fn list_albums(&self) -> Vec<SharedAlbumInfo> {
+        let state = self.inner.state.read().await;
+        state.albums.iter().map(|a| SharedAlbumInfo {
+            albumguid: a.albumguid.clone(),
+            name: a.name.clone(),
+            fullname: a.fullname.clone(),
+            email: a.email.clone(),
+            subscriptiondate: a.subscriptiondate.clone(),
+        }).collect()
+    }
+
+    pub async fn get_album_assets(&self, album: String) -> Result<Vec<SharedAssetInfo>, WrappedError> {
+        let guids = self.inner.get_album_summary(&album).await?;
+        if guids.is_empty() {
+            return Ok(vec![]);
+        }
+        let details = self.inner.get_assets(&album, &guids).await?;
+        Ok(details.iter().map(|d| {
+            let primary = d.files.iter().max_by_key(|f| f.size.parse::<u64>().unwrap_or(0));
+            let media_type = if d.collectionmetadata.video_duration.is_some() {
+                "video".to_string()
+            } else {
+                "image".to_string()
+            };
+            SharedAssetInfo {
+                assetguid: d.assetguid.clone(),
+                filename: d.filename.clone(),
+                date_created: format!("{:?}", d.collectionmetadata.date_created),
+                media_type,
+                width: primary.map(|f| f.width.clone()).unwrap_or_default(),
+                height: primary.map(|f| f.height.clone()).unwrap_or_default(),
+                size: primary.map(|f| f.size.clone()).unwrap_or_default(),
+            }
+        }).collect())
+    }
+
+    pub async fn download_file(&self, album: String, asset_guid: String) -> Result<Vec<u8>, WrappedError> {
+        let details = self.inner.get_assets(&album, &[asset_guid.clone()]).await?;
+        let asset = details.into_iter().next().ok_or(WrappedError::GenericError {
+            msg: format!("Asset {} not found in album {}", asset_guid, album),
+        })?;
+        let primary = asset.files.into_iter()
+            .max_by_key(|f| f.size.parse::<u64>().unwrap_or(0))
+            .ok_or(WrappedError::GenericError {
+                msg: "Asset has no files".to_string(),
+            })?;
+        let mut buf = Cursor::new(Vec::new());
+        self.inner.get_file(&mut [(&primary, &mut buf)], |_, _| {}).await?;
+        Ok(buf.into_inner())
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct Client {
+    client: Arc<IMClient>,
+    conn: rustpush::APSConnection,
+    os_config: Arc<dyn OSConfig>,
+    receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    token_provider: Option<Arc<WrappedTokenProvider>>,
+    cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>>>,
+    cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>>>,
+    facetime_client: tokio::sync::Mutex<Option<Arc<WrappedFaceTimeClient>>>,
+    passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
+    statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
+    sharedstreams_client: tokio::sync::Mutex<Option<Arc<WrappedSharedStreamsClient>>>,
+    /// Cached Profiles client (Name & Photo Sharing). Initialized lazily the
+    /// first time a shared profile needs to be fetched from CloudKit.
+    profiles_client: tokio::sync::Mutex<Option<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>>>,
+    /// Shared handle to the raw StatusKit client, used by the APNs receive
+    /// loop to intercept presence messages before iMessage handling. Set by
+    /// `init_statuskit()`; the loop no-ops when unset.
+    shared_statuskit: Arc<tokio::sync::RwLock<Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>>>,
+    /// Shared callback for presence updates delivered by StatusKit. Populated
+    /// alongside `shared_statuskit` by `init_statuskit()`.
+    status_callback: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>>,
+    /// Subscription tokens held to keep presence channels open. Cleared by
+    /// `unsubscribe_all_status()`.
+    statuskit_interest_tokens: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
+}
+
+/// Backdate the liveness stamp the Go receive-wedge watchdog polls, so its
+/// next tick sees a wedge and rebuilds the client.
+///
+/// `WrappedAPSConnection::seconds_since_last_inbound` reports `now - stamp`,
+/// and `runReceiveWedgeWatchdog` (pkg/connector/client.go) rebuilds once that
+/// crosses `receiveWedgeRecoverySecs`. When nothing is consuming APNs frames
+/// any more, the stamp would reach the threshold on its own — but only after
+/// the entire threshold has elapsed with inbound messages hitting the floor.
+/// Backdating collapses that to the watchdog's next 60s tick.
+///
+/// One hour is deliberately far past any plausible value of that constant
+/// (600s today) so the two stay decoupled, while still producing a readable
+/// `idle_secs` in the watchdog's log line.
+fn force_receive_wedge(last_inbound_ms: &AtomicU64) {
+    const FORCE_WEDGE_BACKDATE_MS: u64 = 60 * 60 * 1000;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    last_inbound_ms.store(
+        now_ms.saturating_sub(FORCE_WEDGE_BACKDATE_MS),
+        Ordering::Relaxed,
+    );
+}
+
+/// Held by the APNs process task for its entire life. Its `Drop` fires on
+/// every exit, but only *acts* when the task is unwinding on a panic —
+/// `thread::panicking()` is false on a normal return and on the `abort()` that
+/// teardown uses, so a clean shutdown stays silent.
+///
+/// It exists because a dead process task is close to invisible from the
+/// outside: no task consumes APNs frames, the drain exits on its next frame,
+/// and inbound messages simply stop. The guards in the loop should make this
+/// unreachable; this is what happens if one of them ever misses.
+///
+/// NOTE: this backdate alone is not sufficient, and must not be relied on by
+/// itself. The drain task stamps `last_inbound_ms` on every frame BEFORE it
+/// discovers the receiver is gone, so the first frame to arrive after this
+/// fires — a keepalive Pong, so within ~60s on a live transport — overwrites
+/// it. `force_receive_wedge` is therefore applied AGAIN at that detection
+/// point in the drain, which is the write that actually survives. This one
+/// covers the window before the drain notices.
+struct ProcessTaskUnwindSentinel {
+    last_inbound_ms: Arc<AtomicU64>,
+}
+
+impl Drop for ProcessTaskUnwindSentinel {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        error!(
+            "APNs process task is UNWINDING ON A PANIC — inbound message processing has stopped \
+             for this connection. Forcing the receive-wedge watchdog to rebuild the client on its \
+             next tick instead of waiting out the full idle threshold."
+        );
+        force_receive_wedge(&self.last_inbound_ms);
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn new_client(
+    connection: &WrappedAPSConnection,
+    users: &WrappedIDSUsers,
+    identity: &WrappedIDSNGMIdentity,
+    config: &WrappedOSConfig,
+    token_provider: Option<Arc<WrappedTokenProvider>>,
+    message_callback: Box<dyn MessageCallback>,
+    update_users_callback: Box<dyn UpdateUsersCallback>,
+) -> Result<Arc<Client>, WrappedError> {
+    ensure_crypto_provider();
+    let conn = connection.inner.clone();
+    let users_clone = users.inner.clone();
+    let identity_clone = identity.inner.clone();
+    let config_clone = config.config.clone();
+
+    // Keep the upstream `state/id_cache.plist` layout for compatibility, but
+    // anchor it explicitly beneath IBLUE_DATA_DIR. Relying on process cwd made
+    // the cache profile-local only because the TypeScript supervisor happened
+    // to chdir the child; embedders and future launch changes must not be able
+    // to merge two Apple accounts into one IDS key cache.
+    let ids_state_dir = PathBuf::from(subsystem_state_path("state"));
+    std::fs::create_dir_all(&ids_state_dir).map_err(|error| {
+        WrappedError::GenericError {
+            msg: format!("Failed to create private IDS state directory: {error}"),
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &ids_state_dir,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to protect IDS state directory: {error}"),
+        })?;
+    }
+    let ids_cache_path = ids_state_dir.join("id_cache.plist");
+
+    // FACETIME + VIDEO are in the bundle so the IdentityResource's `services`
+    // slice contains them. Without that, the `get_main_service` (called
+    // on every FT `cache_keys`) hits its `expect("Topic {topic} not found!")`
+    // and panics out of the FFI. The earlier best-effort separate-register
+    // workaround registered FT/Video in the IDSUser but didn't update
+    // `services`, so the panic still fired.
+    //
+    // Trade-off: `register()` is all-or-nothing, so an Apple non-zero status
+    // for any service in this bundle fails the whole call. For status 6005
+    // rustpush wraps that in `PushError::DoNotRetry`, and the ResourceManager
+    // transitions the shared IdentityResource to `Closed` — which would
+    // permanently break iMessage send too. We accept this risk because Apple
+    // has not been observed to 6005 FT/Video for this account.
+    let client = Arc::new(
+        IMClient::new(
+            conn.clone(),
+            users_clone,
+            identity_clone,
+            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+            ids_cache_path,
+            config_clone.clone(),
+            Box::new(move |updated_keys| {
+                update_users_callback.update_users(Arc::new(WrappedIDSUsers {
+                    inner: updated_keys,
+                }));
+                debug!("Updated IDS keys");
+            }),
+        )
+        .await,
+    );
+
+    // Start receive loop.
+    //
+    // Architecture: two tasks connected by an unbounded mpsc channel.
+    //
+    // 1. **Drain task** — reads from the tokio broadcast channel as fast as
+    //    possible and forwards every APSMessage into the mpsc.  Because it does
+    //    zero processing, it will almost never lag behind the broadcast.  If it
+    //    *does* lag (broadcast capacity 9999 exhausted), it logs the count and
+    //    continues — there is nothing we can do about already-dropped broadcast
+    //    messages, but we won't compound the loss by being slow.
+    //
+    // 2. **Process task** — reads from the mpsc (unbounded, so no back-pressure
+    //    on the drain task) and handles each message: decrypting, downloading
+    //    MMCS attachments, and calling the Go callback.  Transient errors are
+    //    retried with exponential back-off.  This task can take as long as it
+    //    needs without risking broadcast lag.
+    let client_for_recv = client.clone();
+    let callback = Arc::new(message_callback);
+
+    // Pre-warm FaceTime so incoming FT APNs notifications are consumed even
+    // before any explicit !facetime command initializes the subsystem.
+    let facetime_state_path = subsystem_state_path("facetime-state.plist");
+    let facetime_state = read_plist_state::<rustpush::facetime::FTState>(&facetime_state_path).unwrap_or_default();
+    let facetime_state_path_for_closure = facetime_state_path.clone();
+    let prewarmed_facetime = Arc::new(WrappedFaceTimeClient {
+        inner: Arc::new(
+            rustpush::facetime::FTClient::new(
+                facetime_state,
+                Box::new(move |state| persist_plist_state(&facetime_state_path_for_closure, state)),
+                conn.clone(),
+                client.identity.clone(),
+                config_clone.clone(),
+            )
+            .await,
+        ),
+    });
+
+    // Shared StatusKit state: init_statuskit() populates these Arc<RwLock>s,
+    // and the receive loop below reads them on every message. The raw
+    // StatusKit client gets first crack at incoming APNs messages so presence
+    // updates are consumed before iMessage handling.
+    let shared_statuskit_for_recv: Arc<tokio::sync::RwLock<Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    let status_callback_for_recv: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
+    // Shared reconnect timestamp: set when APNs reconnects (generated_signal
+    // fires) or when the drain task starts listening (initial connection).
+    // Messages arriving within RECONNECT_WINDOW_MS of a (re)connect are
+    // marked as stored — they were cached by Apple's servers while offline.
+    const RECONNECT_WINDOW_MS: u64 = 30_000; // 30 seconds
+    // Initialize to 0 — the drain task sets it to now() right before
+    // entering the receive loop. This ensures the window starts when we're
+    // actually listening for messages, not when receive() is called (which
+    // can be 20-30s earlier during Go startup).
+    let reconnected_at = Arc::new(AtomicU64::new(0));
+
+    // Weak handle to OUR Client, set after Client is constructed below.
+    // The receive loop upgrades this on each iteration to call back into
+    // Client::populate_inline_share_profile (mirrors how IconChange is
+    // downloaded inline). Weak avoids the receive task keeping Client alive.
+    let client_weak_for_loop: Arc<tokio::sync::OnceCell<std::sync::Weak<Client>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+
+    let receive_handle = tokio::spawn({
+        let conn = connection.inner.clone();
+        let conn_for_download = connection.inner.clone();
+        let last_inbound_ms = connection.last_inbound_ms.clone();
+        let reconnected_at = reconnected_at.clone();
+        let sk_for_recv = shared_statuskit_for_recv.clone();
+        let status_cb_for_recv = status_callback_for_recv.clone();
+        let ft_for_recv = prewarmed_facetime.inner.clone();
+        let client_weak_for_loop = client_weak_for_loop.clone();
+        async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
+            let pending = Arc::new(AtomicU64::new(0));
+
+            // --- Drain task: broadcast → mpsc + reconnect detection ------
+            // Combines message draining AND reconnect detection in a SINGLE
+            // task using select!. This eliminates the scheduling race from
+            // the old two-task approach: resource_state changes are handled
+            // in the same task that receives messages, so reconnected_at is
+            // always updated before the next message is forwarded.
+            let drain_pending = pending.clone();
+            let drain_handle = tokio::spawn({
+                let conn = conn.clone();
+                let reconnected_at = reconnected_at.clone();
+                let last_inbound_ms = last_inbound_ms.clone();
+                async move {
+                    let mut recv = conn.messages_cont.subscribe();
+                    let mut state = conn.resource_state.subscribe();
+                    // Mark the initial resource_state value as seen so we
+                    // only trigger on future transitions.
+                    state.borrow_and_update();
+                    // Set reconnected_at NOW — right when we start listening.
+                    // Covers stored messages delivered on first connect.
+                    let start_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    reconnected_at.store(start_ms, Ordering::Relaxed);
+                    info!("Drain task started, marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+
+                    // APNs inbound-liveness watchdog (backstop for silent
+                    // receive-path stalls). A healthy APS connection delivers a
+                    // frame through messages_cont at least every ~60s — at
+                    // minimum the keepalive Pong for rustpush's 60s Ping. If we
+                    // see NOTHING for APNS_STALL_TIMEOUT, the receive path has
+                    // silently wedged: e.g. a half-open courier socket where
+                    // read_exact() blocks forever, and the keepalive's own
+                    // do_reload() can't fire because its Ping send() is stuck on
+                    // the dead write half (observed in production: inbound dead
+                    // for 22h+, the process otherwise fully alive — pings, state
+                    // saves, backfill all running — only a manual restart
+                    // recovered). On stall we force a TRANSPORT-ONLY reconnect
+                    // via request_update(): the ResourceManager aborts the
+                    // wedged generation (util.rs select! → current_resource.abort)
+                    // and regenerates (open_socket + do_connect + topic refilter).
+                    // This is the SAME lever the keepalive's do_reload() uses. It
+                    // does NOT re-register IDS — re-registration is only
+                    // force_reregister_identity()/refresh_now(), deliberately NOT
+                    // wired to reconnect (see 1938e1a: re-registering on every APS
+                    // reconnect smeared FaceTime across 38 stale registrations and
+                    // broke calls both ways). Conservative: a 5-minute threshold
+                    // (>= 5 missed keepalive cycles) so it never fires on a
+                    // healthy-but-quiet link, and last_inbound resets after firing
+                    // so forced reconnects are spaced >= APNS_STALL_TIMEOUT apart
+                    // even if the link stays down (repeating request_update is
+                    // harmless — the ResourceManager is already retrying).
+                    const APNS_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+                    // SECOND failure mode (distinct from the dead socket above):
+                    // the transport stays fully alive — keepalive Pongs flow every
+                    // ~60s and the APS Acks for the user's OWN outgoing messages
+                    // come back fine — but Apple has silently stopped routing
+                    // com.apple.madrid push NOTIFICATIONS (incoming messages /
+                    // receipts) to this connection's token. Symptom: "I can send
+                    // but I stop receiving", restart fixes it (observed across
+                    // multiple users; one Raspberry-Pi bridge sent fine for ~19h
+                    // while receiving nothing). The half-open-socket watchdog above
+                    // CANNOT see this: last_inbound is reset by every messages_cont
+                    // frame, including the Pongs and send-Acks that keep arriving on
+                    // a live-but-deaf socket — so it never trips. We therefore track
+                    // notifications SEPARATELY (reset only on a real Notification
+                    // frame) and, when the transport is provably alive yet no
+                    // notification has arrived for a long window, force a
+                    // TRANSPORT-ONLY reconnect to re-assert the topic filter
+                    // (do_connect re-sends SetState + filter(current_topics); the
+                    // madrid interest is held for the connection's lifetime by
+                    // IMClient's _interest_token, so it survives the reconnect).
+                    // Same request_update() lever as above → no IDS re-registration.
+                    // We can't distinguish "deaf" from "genuinely quiet" without an
+                    // active probe, so the threshold is deliberately long (1h): a
+                    // deaf link self-heals within the hour instead of never, and a
+                    // truly idle link just sees one harmless reconnect per hour
+                    // (well within normal reconnect cadence — not Apple-visible spam).
+                    const APNS_RECEIVE_STALL_TIMEOUT: Duration = Duration::from_secs(3600);
+                    let mut last_inbound = tokio::time::Instant::now();
+                    let mut last_notification = tokio::time::Instant::now();
+                    let mut watchdog_tick = tokio::time::interval(Duration::from_secs(30));
+                    watchdog_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            // Reconnect detection: resource_state → Generating
+                            // fires BEFORE generate() establishes the new
+                            // connection, so reconnected_at is set before any
+                            // stored messages can arrive on messages_cont.
+                            result = state.changed() => {
+                                if result.is_err() {
+                                    info!("Resource state sender dropped, stopping drain task");
+                                    break;
+                                }
+                                let current = state.borrow_and_update().clone();
+                                if matches!(current, ResourceState::Generating) {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64;
+                                    reconnected_at.store(now, Ordering::Relaxed);
+                                    info!("APNs reconnecting (Generating), marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+                                }
+                                if matches!(current, ResourceState::Closed) {
+                                    // Connection closed (e.g. Disconnect → close()). Exit so
+                                    // this DETACHED drain task releases its Arc clone of the
+                                    // connection. Otherwise, in the wedged case it runs
+                                    // forever (it otherwise only breaks when a frame arrives
+                                    // and the process task is gone — and no frame arrives when
+                                    // wedged), pinning the courier socket open until process
+                                    // exit. With this, the socket's last strong ref drops once
+                                    // the (GC-finalized) Go connection handle is also gone.
+                                    info!("APS resource closed, stopping drain task");
+                                    break;
+                                }
+                                // NOTE: previously re-registered the full IDS bundle
+                                // (refresh_now()) on every APS reconnect to rebind the
+                                // madrid push token. REMOVED — re-registering the whole
+                                // 4-service bundle (incl. FACETIME/VIDEO) on every network
+                                // flap accumulated dozens of stale FaceTime registrations
+                                // under the bridge's own handle (38 observed). Callees
+                                // could no longer resolve a single clean identity for the
+                                // bridge, so calls presented/answered as an unresolvable
+                                // UUID and failed in both directions (no ring outbound,
+                                // hangup inbound). It also never fixed the "bridge not
+                                // connecting" report it was added for — that was a flaky
+                                // network, not stale IDS routing.
+                            }
+                            // Message drain: forward APNs messages to process task
+                            result = recv.recv() => {
+                                match result {
+                                    Ok(msg) => {
+                                        // Any inbound APS frame (real message OR a
+                                        // keepalive Pong) proves the TRANSPORT is
+                                        // alive — feed the half-open-socket watchdog.
+                                        last_inbound = tokio::time::Instant::now();
+                                        // One epoch-ms stamp for this frame, reused below
+                                        // (avoids a second SystemTime::now() per frame):
+                                        // mirrored into the connection-scoped atomic the
+                                        // Go receive-watchdog polls (it can't see the
+                                        // local Instant above, and Pongs never reach Go),
+                                        // and handed to the process task as drain_ts.
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        last_inbound_ms.store(now_ms, Ordering::Relaxed);
+                                        // A real IDS Notification (incoming message,
+                                        // receipt, typing on madrid) additionally
+                                        // proves Apple's push ROUTING to this token is
+                                        // live. Pongs and our own send-Acks do NOT —
+                                        // they are exactly what masks a live-but-deaf
+                                        // socket from the watchdog above. matches! does
+                                        // not move msg (no bindings), so it stays
+                                        // available to forward below.
+                                        if matches!(msg, rustpush::APSMessage::Notification { .. }) {
+                                            last_notification = tokio::time::Instant::now();
+                                        }
+                                        drain_pending.fetch_add(1, Ordering::Relaxed);
+                                        if tx.send((msg, now_ms)).is_err() {
+                                            // The receiver only drops if the process task
+                                            // ended — either it unwound on a panic (see
+                                            // ProcessTaskUnwindSentinel) or the whole
+                                            // receive task was aborted during teardown.
+                                            // Either way this is the end of inbound message
+                                            // processing for this client, not routine
+                                            // bookkeeping, so log it at a level that shows
+                                            // up by default.
+                                            error!(
+                                                "APNs process task is gone — no further inbound \
+                                                 frames will be processed on this connection; \
+                                                 stopping drain"
+                                            );
+                                            // This is the write that matters. `now_ms` was
+                                            // already stored above, BEFORE we knew the
+                                            // receiver was gone — so it just overwrote any
+                                            // backdate the sentinel set when the process
+                                            // task unwound, and left the watchdog counting
+                                            // a fresh threshold from this very frame. Undo
+                                            // that here, at the one point that definitively
+                                            // knows nothing is consuming frames any more,
+                                            // so it holds regardless of how the process
+                                            // task died. Nothing writes this atomic after
+                                            // the break.
+                                            force_receive_wedge(&last_inbound_ms);
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        // Lagged means frames WERE arriving fast enough
+                                        // that we fell behind — the link is alive and
+                                        // almost certainly carrying real notifications,
+                                        // so refresh both timers to avoid a spurious
+                                        // re-filter during a genuine burst.
+                                        last_inbound = tokio::time::Instant::now();
+                                        last_notification = tokio::time::Instant::now();
+                                        // Frames were flowing (we lagged) → link is alive;
+                                        // refresh the Go receive-watchdog's signal too, so
+                                        // a burst can never be mistaken for a wedge.
+                                        last_inbound_ms.store(
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis() as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        error!(
+                                            "APS broadcast receiver lagged — {} messages were DROPPED by the \
+                                             broadcast channel before we could read them. Real-time messages \
+                                             may have been lost. Consider increasing broadcast capacity or \
+                                             investigating processing backlog (pending={}).",
+                                            n,
+                                            drain_pending.load(Ordering::Relaxed),
+                                        );
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        info!("Broadcast channel closed, stopping drain task");
+                                        break;
+                                    }
+                                }
+                            }
+                            // APNs inbound-liveness watchdog tick. Lowest priority
+                            // under `biased` — real message draining and reconnect
+                            // detection always win; this arm only gets polled when
+                            // no frame is pending, i.e. exactly the stall case.
+                            _ = watchdog_tick.tick() => {
+                                let idle = last_inbound.elapsed();
+                                if idle >= APNS_STALL_TIMEOUT {
+                                    warn!(
+                                        "APNs receive watchdog: no inbound frames for {}s (a healthy link sees a keepalive Pong every ~60s) — forcing TRANSPORT-ONLY APS reconnect via request_update (no IDS re-registration). If inbound resumes after this line, the receive path had silently wedged.",
+                                        idle.as_secs()
+                                    );
+                                    conn.request_update().await;
+                                    // Space forced reconnects >= APNS_STALL_TIMEOUT apart
+                                    // and give regeneration time to deliver frames before
+                                    // we would consider firing again. Reset BOTH timers:
+                                    // the regenerated link starts clean, and we don't
+                                    // want the deaf-link branch below to fire on the
+                                    // pre-reconnect notification gap.
+                                    //
+                                    // last_inbound_ms (the connection-scoped atomic the Go
+                                    // receive-wedge watchdog reads) is DELIBERATELY NOT
+                                    // reset here — only real liveness (an Ok frame or a
+                                    // Lagged burst) resets it. That divergence is the whole
+                                    // point: it lets the Go watchdog measure TRUE silence
+                                    // and escalate to a full rebuild when this request_update
+                                    // keeps failing (the reconnect-storm case), instead of
+                                    // being masked by our own 300s re-fire spacing.
+                                    last_inbound = tokio::time::Instant::now();
+                                    last_notification = tokio::time::Instant::now();
+                                } else if last_notification.elapsed() >= APNS_RECEIVE_STALL_TIMEOUT {
+                                    // Transport is alive (a frame arrived within
+                                    // APNS_STALL_TIMEOUT — the `if` above didn't trip)
+                                    // but no real IDS notification has come through for
+                                    // APNS_RECEIVE_STALL_TIMEOUT. Either Apple silently
+                                    // stopped routing madrid pushes to this token, or
+                                    // the link is genuinely idle — we can't tell, so we
+                                    // re-assert the topic filter the cheap way: a
+                                    // transport-only reconnect (re-runs do_connect →
+                                    // SetState + filter(current_topics)). Recovers a
+                                    // lapsed subscription; a no-op-cost reconnect if the
+                                    // link was merely quiet.
+                                    let deaf = last_notification.elapsed();
+                                    warn!(
+                                        "APNs receive-routing watchdog: transport alive (inbound frame within {}s) but ZERO IDS notifications for {}s — Apple's madrid push routing to this token may have silently lapsed (the 'I can send but stopped receiving' failure). Forcing TRANSPORT-ONLY APS reconnect via request_update to re-assert the topic filter (no IDS re-registration). Harmless if the link was simply idle.",
+                                        idle.as_secs(),
+                                        deaf.as_secs()
+                                    );
+                                    conn.request_update().await;
+                                    // Reset only the notification timer so re-filters are
+                                    // spaced >= APNS_RECEIVE_STALL_TIMEOUT apart; the
+                                    // reconnect refreshes last_inbound on its own.
+                                    last_notification = tokio::time::Instant::now();
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // --- Process task: mpsc → handle + callback -----------------
+            // Armed for the lifetime of the loop below; see the type's docs.
+            // Only fires if this task unwinds on a panic.
+            let _unwind_sentinel = ProcessTaskUnwindSentinel {
+                last_inbound_ms: last_inbound_ms.clone(),
+            };
+            const MAX_RETRIES: u32 = 5;
+            const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+
+            while let Some((msg, drain_ts)) = rx.recv().await {
+                // Diagnostic — log at the earliest APS dispatch point every
+                // keysharing-topic message we receive, BEFORE any workaround
+                // or handle() logic. Lets us distinguish "peers aren't sending
+                // / APS dropping" (zero of these logs after restart) from
+                // "receive path broken after message arrives". Suppresses the
+                // well-understood noise commands (c=255 server ACK, c=120 IDS
+                // per-target retry error, c=97 keysharing noise) to avoid
+                // drowning the real signal in server retry traffic.
+                if let rustpush::APSMessage::Notification { topic: t, payload: ref p, ref channel, .. } = msg {
+                    let ks_hash: [u8; 20] = openssl::sha::sha1(
+                        "com.apple.private.alloy.status.keysharing".as_bytes(),
+                    );
+                    let ps_hash: [u8; 20] = openssl::sha::sha1(
+                        "com.apple.private.alloy.status.personal".as_bytes(),
+                    );
+                    if t == ks_hash || t == ps_hash {
+                        let cmd = if let plist::Value::Dictionary(d) = p {
+                            d.get("c").and_then(|v| v.as_unsigned_integer())
+                        } else {
+                            None
+                        };
+                        let is_noise = matches!(cmd, Some(255) | Some(120) | Some(97));
+                        if !is_noise {
+                            let topic_name = if t == ks_hash { "status.keysharing" } else { "status.personal" };
+                            let shape = match p {
+                                plist::Value::Data(_) => "Data",
+                                plist::Value::Dictionary(_) => "Dictionary",
+                                _ => "Other",
+                            };
+                            info!(
+                                "StatusKit diag: APS message received — topic={} payload_shape={} c={:?} has_channel={}",
+                                topic_name, shape, cmd, channel.is_some()
+                            );
+                        }
+                    }
+                }
+
+                // StatusKit gets first crack at the APNs message. If it
+                // consumes the message (presence update on a subscribed
+                // channel), we dispatch to the Go callback and skip iMessage
+                // handling. Only active when init_statuskit() has been
+                // called; otherwise falls through.
+                let sk_opt = sk_for_recv.read().await.clone();
+                if let Some(sk) = sk_opt {
+                    // Wrapper-only workaround for the silent-drop.
+                    // statuskit.rs:719 destructures payload as Value::Data and
+                    // returns Ok(None) for keysharing-topic notifications whose
+                    // payload arrived as Value::Dictionary — which is the typical
+                    // case because aps.rs:880 greedily plist-decodes payload bytes
+                    // into a Dictionary before reaching handle(). Without this
+                    // intercept, peer keysharing replies are dropped at the
+                    // destructure and state.keys never grows.
+                    //
+                    // We bypass handle() for that exact shape (keysharing topic +
+                    // non-Data payload), call identity.receive_message directly
+                    // (which accepts any Value variant via plist::from_value at
+                    // identity_manager.rs:771), and construct a
+                    // StatusKitSharedDevice via serde with a built Dictionary —
+                    // mirroring the construction at statuskit.rs:776–781
+                    // but routed through Deserialize so the private fields stay
+                    // private. The device is inserted into the public
+                    // sk.state.keys map and persisted via the same code path
+                    // the update_state callback uses.
+                    // Normalize StatusKit payloads: statuskit.rs:719
+                    // destructures with Value::Data, but aps.rs:880 greedily
+                    // decodes plist bytes into Dictionary. The workaround below
+                    // handles Dictionary payloads. Conversely, Data payloads
+                    // whose bytes ARE valid plist fail in receive_message's
+                    // plist::from_value (it sees Data, not a Dictionary). Fix
+                    // both directions: decode Data→Dictionary so ALL StatusKit
+                    // messages go through the workaround's Dictionary path.
+                    // Normalize Data→Dictionary for the keysharing topic only:
+                    // the silent-drop bug at statuskit.rs:719 is specific
+                    // to keysharing-payload destructuring. The other three StatusKit
+                    // topics (presence.mode.status, presence.channel.management,
+                    // status.personal) flow through sk.handle() natively and were
+                    // working at 31ad87b — don't divert them into our workaround.
+                    let sk_msg = {
+                        let sk_topics: [[u8; 20]; 1] = [
+                            openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes()),
+                        ];
+                        if let rustpush::APSMessage::Notification { topic: t, payload: plist::Value::Data(ref bytes), .. } = msg {
+                            if sk_topics.contains(&t) {
+                                if let Ok(decoded) = plist::from_bytes::<plist::Value>(bytes) {
+                                    if matches!(decoded, plist::Value::Dictionary(_)) {
+                                        let rustpush::APSMessage::Notification { id, topic, token, channel, .. } = msg.clone() else { unreachable!() };
+                                        Some(rustpush::APSMessage::Notification { id, topic, token, payload: decoded, channel })
+                                    } else { None }
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    };
+                    let sk_msg_ref = sk_msg.as_ref().unwrap_or(&msg);
+
+                    let mut workaround_consumed = false;
+                    if let rustpush::APSMessage::Notification {
+                        topic: msg_topic,
+                        payload,
+                        ..
+                    } = sk_msg_ref
+                    {
+                        let keysharing_topic_hash: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.private.alloy.status.keysharing".as_bytes(),
+                        );
+                        if *msg_topic == keysharing_topic_hash
+                            && !matches!(payload, plist::Value::Data(_))
+                        {
+                            // Extract command byte from payload for diagnostics
+                            // before the async block moves msg.
+                            let diag_cmd_workaround = if let plist::Value::Dictionary(ref d) = payload {
+                                d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8)
+                            } else {
+                                None
+                            };
+
+                            // c=255 = server ACK for our own outgoing invite.
+                            // c=120 = IDS per-target error (recipient unreachable,
+                            //         key-refresh needed, etc.) — one per failing
+                            //         target, repeated as Apple retries delivery.
+                            // Both are non-keysharing envelopes (no P/E/sT), so
+                            // the workaround's decrypt path produces nothing
+                            // useful. Skip to avoid log spam.
+                            if diag_cmd_workaround == Some(255) || diag_cmd_workaround == Some(120) {
+                                debug!(
+                                    "StatusKit workaround: skipping c={} server ACK/error on keysharing topic",
+                                    diag_cmd_workaround.unwrap()
+                                );
+                                // Don't set workaround_consumed — let it fall
+                                // through to rustpush's handle() which also skips
+                                // these via its own suppression path.
+                            } else {
+
+                            let diag_has_sP = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("sP") } else { false };
+                            let diag_has_P = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("P") } else { false };
+                            let diag_has_E = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("E") } else { false };
+                            let diag_has_t = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("t") } else { false };
+
+                            let result: Result<bool, String> = async {
+                                use prost::Message as _;
+                                let recv = sk
+                                    .identity
+                                    .receive_message(
+                                        sk_msg_ref.clone(),
+                                        &["com.apple.private.alloy.status.keysharing"],
+                                    )
+                                    .await
+                                    .map_err(|e| format!("identity.receive_message: {e}"))?;
+                                let Some(recv) = recv else {
+                                    warn!("StatusKit workaround: receive_message returned None (c={:?} sP={} P={} E={} t={}) — topic mismatch or not a Notification",
+                                        diag_cmd_workaround, diag_has_sP, diag_has_P, diag_has_E, diag_has_t);
+                                    return Ok::<bool, String>(false);
+                                };
+                                let Some(message_unenc) = recv.message_unenc else {
+                                    // TPP-confirmed noise: c=97 on keysharing topic has
+                                    // plist keys [cT,h,e,U,c,hs,s,b] — no IDS envelope
+                                    // fields (sP/tP/P/t/E). Not a peer keysharing reply.
+                                    // Log for future protocol analysis; do NOT fire
+                                    // on_keys_received (would cause reciprocate-invite
+                                    // storm on every noise packet). Return Ok(false)
+                                    // so rustpush's handle() still gets a chance.
+                                    if recv.command == 97 {
+                                        let raw_keys = if let plist::Value::Dictionary(ref d) = payload {
+                                            d.keys().cloned().collect::<Vec<_>>().join(", ")
+                                        } else { "<non-dict>".into() };
+                                        debug!("StatusKit c=97 noise observed (sender={:?}, payload keys=[{}])",
+                                            recv.sender, raw_keys);
+                                        return Ok(false);
+                                    }
+                                    // c=255 ACKs and other non-encrypted messages lack P/E/t fields,
+                                    // so the decryption block in receive_message is skipped entirely.
+                                    warn!("StatusKit workaround: message_unenc is None (c={} sender={:?} sP={} P={} E={} t={}) — no decrypted payload; likely server ACK or missing IDS keys",
+                                        recv.command, recv.sender, diag_has_sP, diag_has_P, diag_has_E, diag_has_t);
+                                    return Ok(false);
+                                };
+                                let Some(sender) = recv.sender else {
+                                    warn!("StatusKit workaround: sender is None (c={}) — message has no sP field", recv.command);
+                                    return Ok(false);
+                                };
+
+                                #[derive(serde::Deserialize)]
+                                struct LocalRawShared {
+                                    #[serde(rename = "r")]
+                                    keys: String,
+                                    #[serde(rename = "p")]
+                                    personal_config: String,
+                                    #[serde(rename = "c")]
+                                    channel: String,
+                                }
+                                let parsed: LocalRawShared = message_unenc
+                                    .plist()
+                                    .map_err(|e| format!("plist parse raw shared: {e}"))?;
+
+                                let keys_bytes = BASE64_STANDARD
+                                    .decode(&parsed.keys)
+                                    .map_err(|e| format!("keys base64: {e}"))?;
+                                let pc_bytes = BASE64_STANDARD
+                                    .decode(&parsed.personal_config)
+                                    .map_err(|e| format!("personal_config base64: {e}"))?;
+
+                                let share_message =
+                                    rustpush::statuskit::statuskitp::SharedMessage::decode(
+                                        std::io::Cursor::new(keys_bytes),
+                                    )
+                                    .map_err(|e| format!("SharedMessage decode: {e}"))?;
+
+                                let sig_key_arr: [u8; 32] = share_message
+                                    .sig_key
+                                    .clone()
+                                    .try_into()
+                                    .map_err(|v: Vec<u8>| {
+                                        format!("sig_key length {} != 32", v.len())
+                                    })?;
+                                let compact = rustpush::CompactECKey::<openssl::pkey::Public>::decompress(sig_key_arr);
+                                let der_bytes = compact
+                                    .public_key_to_der()
+                                    .map_err(|e| format!("public_key_to_der: {e}"))?;
+
+                                let shared_keys =
+                                    share_message.keys.unwrap_or_default().keys;
+                                if shared_keys.is_empty() {
+                                    return Err("share_message.keys.keys is empty".into());
+                                }
+                                let key_data_array: Vec<plist::Value> = shared_keys
+                                    .iter()
+                                    .map(|k| plist::Value::Data(k.encode_to_vec()))
+                                    .collect();
+                                let key_count = key_data_array.len();
+
+                                let pc_value: plist::Value = plist::from_bytes(&pc_bytes)
+                                    .map_err(|e| format!("personal_config plist: {e}"))?;
+
+                                let mut dict = plist::Dictionary::new();
+                                dict.insert(
+                                    "from".into(),
+                                    plist::Value::String(sender.clone()),
+                                );
+                                dict.insert(
+                                    "signature".into(),
+                                    plist::Value::Data(der_bytes),
+                                );
+                                dict.insert(
+                                    "keys".into(),
+                                    plist::Value::Array(key_data_array),
+                                );
+                                dict.insert("personal_config".into(), pc_value);
+
+                                let device: rustpush::statuskit::StatusKitSharedDevice =
+                                    plist::from_value(&plist::Value::Dictionary(dict))
+                                        .map_err(|e| {
+                                            format!("StatusKitSharedDevice deserialize: {e}")
+                                        })?;
+
+                                let mut state_w = sk.state.write().await;
+                                let prev = state_w
+                                    .keys
+                                    .insert(parsed.channel.clone(), device);
+                                let total = state_w.keys.len();
+                                drop(state_w);
+
+                                let action = if prev.is_some() { "replaced" } else { "added" };
+                                let state_path =
+                                    subsystem_state_path("statuskit-state.plist");
+                                persist_plist_state(
+                                    &state_path,
+                                    &*sk.state.read().await,
+                                );
+
+                                info!(
+                                    "StatusKit workaround {action} channel for {} (keys_in_msg={}, state.keys total={}) — Dictionary-payload bypass",
+                                    sender, key_count, total
+                                );
+                                if let Some(cb) =
+                                    status_cb_for_recv.read().await.as_ref()
+                                {
+                                    // Stamp the sender into the Go-side
+                                    // presence→portal cache BEFORE
+                                    // on_keys_received triggers the
+                                    // resubscribe. Peer iOS fans reshares to
+                                    // every handle alias on the same channel;
+                                    // the rustpush HashMap only keeps the last
+                                    // `from`, so without this, presence
+                                    // updates for overwritten aliases have
+                                    // no portal mapping. Channel id is
+                                    // forwarded so the Go side can cluster
+                                    // (channel_id ↔ aliases) across reshares.
+                                    cb.on_reshare_sender(sender.clone(), parsed.channel.clone());
+                                    cb.on_keys_received();
+                                }
+                                Ok(true)
+                            }
+                            .await;
+
+                            match result {
+                                Ok(true) => {
+                                    workaround_consumed = true;
+                                }
+                                Ok(false) => {
+                                    // Detailed diagnostics already logged inside the async block.
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "StatusKit workaround failed: {} — falling back to upstream handle()",
+                                        e
+                                    );
+                                }
+                            }
+                            } // else (non-c=255)
+                        }
+
+                        // --- status.personal handler ---
+                        // Contacts broadcast their Focus state directly via IDS on
+                        // this topic whenever it changes. Unlike the Shared Channels
+                        // path (keysharing + presence.mode.status), this doesn't
+                        // require a prior key exchange — the IDS encryption is
+                        // sufficient. This catches contacts whose devices distributed
+                        // channel keys before the bridge was registered.
+                        let personal_topic_hash: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.private.alloy.status.personal".as_bytes(),
+                        );
+                        if *msg_topic == personal_topic_hash
+                            && !matches!(payload, plist::Value::Data(_))
+                            && !workaround_consumed
+                        {
+                            let personal_result: Result<bool, String> = async {
+                                let recv = sk
+                                    .identity
+                                    .receive_message(
+                                        sk_msg_ref.clone(),
+                                        &["com.apple.private.alloy.status.personal"],
+                                    )
+                                    .await
+                                    .map_err(|e| format!("personal receive_message: {e}"))?;
+                                let Some(recv) = recv else {
+                                    return Ok(false);
+                                };
+                                let Some(message) = recv.message_unenc else {
+                                    return Ok(false);
+                                };
+                                let Some(sender) = recv.sender else {
+                                    return Ok(false);
+                                };
+
+                                // Mirror the rustpush PrivateStatusMessage structs.
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PTag { #[serde(rename = "a")] bundle: String, #[serde(rename = "b")] id: Option<String> }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PState { #[serde(rename = "b")] r#type: String }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PActive { #[serde(rename = "d")] tag: PTag, #[serde(rename = "c")] state: PState }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PStatusState { #[serde(rename = "a", default)] active: Vec<PActive> }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PUpdate { #[serde(rename = "c")] state: PStatusState }
+                                #[derive(serde::Deserialize, Debug)]
+                                struct PMessage { #[serde(rename = "d")] update: PUpdate }
+
+                                let parsed: PMessage = message.plist()
+                                    .map_err(|e| format!("personal plist parse: {e}"))?;
+
+                                // Determine Focus state: if any active mode exists,
+                                // user is in Focus; otherwise available.
+                                let focus_active = &parsed.update.state.active;
+                                let (available, mode) = if focus_active.is_empty() {
+                                    (true, None)
+                                } else {
+                                    // Use the first active Focus mode's identifier.
+                                    let mode_id = focus_active[0].tag.id.clone()
+                                        .or_else(|| Some(focus_active[0].state.r#type.clone()));
+                                    (false, mode_id)
+                                };
+
+                                info!(
+                                    "StatusKit personal status from {}: available={} mode={:?} (active_modes={})",
+                                    sender, available, mode, focus_active.len()
+                                );
+
+                                if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                    cb.on_status_update(sender, mode, available);
+                                }
+                                Ok(true)
+                            }.await;
+
+                            match personal_result {
+                                Ok(true) => { workaround_consumed = true; }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!("StatusKit personal handler failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    if workaround_consumed {
+                        pending.fetch_sub(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    // Extract the APNs topic before spawning the thread so we can
+                    // check it later for key-sharing detection (msg is moved into
+                    // the spawned thread and unavailable afterwards).
+                    let msg_topic = if let rustpush::APSMessage::Notification { topic, .. } = &msg {
+                        Some(*topic)
+                    } else {
+                        None
+                    };
+                    // Snapshot the set of channel IDs in state.keys before handle()
+                    // so we can detect whether a keysharing APNs message added a new
+                    // channel. Using a HashSet (not len()) so that a re-key — where
+                    // invite_to_channel replaces an existing channel id via
+                    // HashMap::insert — is also detected even though len() would not
+                    // change.
+                    let keys_before: std::collections::HashSet<String> =
+                        sk.state.read().await.keys.keys().cloned().collect();
+                    // handle() is async and may panic (statuskit.rs:736 "Channel not
+                    // found!"). Spawn as a tokio task on the main runtime so panics
+                    // surface as JoinError rather than crashing the loop, AND so the
+                    // task has access to the main runtime's tokio primitives — the
+                    // IDS identity manager, reqwest HTTP client, and background
+                    // refresh tasks are all bound to this runtime. Running handle()
+                    // on a separate runtime (prior implementation) caused
+                    // receive_message to silently fail its key lookups because the
+                    // HTTP requests and tokio mutexes couldn't complete properly in
+                    // an isolated current-thread runtime.
+                    let sk_clone = sk.clone();
+                    let sk_msg_for_handle = sk_msg_ref.clone();
+                    let handle_result = tokio::task::spawn(async move {
+                        sk_clone.handle(sk_msg_for_handle).await
+                    }).await;
+                    // Build a human-readable topic label for diagnostic log lines.
+                    let topic_label = if let Some(t) = msg_topic {
+                        let ks: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+                        let ps: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                        let cm: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes());
+                        let sp: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes());
+                        if t == ks { "keysharing" } else if t == ps { "presence" } else if t == cm { "channel-mgmt" } else if t == sp { "personal" } else { "unknown" }
+                    } else {
+                        "no-topic"
+                    };
+                    let diag_cmd = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                        plist::from_bytes::<plist::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.into_dictionary())
+                            .and_then(|d| d.get("c").and_then(|c| c.as_unsigned_integer()).map(|v| v as u8))
+                    } else {
+                        None
+                    };
+                    match handle_result {
+                        Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
+                            if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                cb.on_status_update(user, mode, allowed);
+                            } else {
+                                warn!("StatusKit: status update arrived before callback installed — dropping (user={}, mode={:?})", user, mode);
+                            }
+                            pending.fetch_sub(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Ok(Ok(None)) => {
+                            // A Notification on the PRESENCE topic (presence.mode.status)
+                            // that handle() couldn't decode — almost always a peer who
+                            // rotated their StatusKit channel key, leaving our pulled copy
+                            // stale. Signal the Go side to force a rate-limited CloudKit
+                            // re-pull for the fresh key. (Personal-status uses IDS keys,
+                            // not channel keys, so a re-pull can't help it — only
+                            // presence.mode.status is the stale-key signal. Over-firing is
+                            // bounded by the Go-side cooldown.)
+                            let presence_topic: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                            if msg_topic == Some(presence_topic) {
+                                let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                    plist::from_bytes::<plist::Value>(payload)
+                                        .ok()
+                                        .and_then(|v| v.into_dictionary())
+                                        .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
+                                } else {
+                                    None
+                                };
+                                warn!("StatusKit: presence.mode.status update could not be decoded (likely stale peer key) — signalling decrypt-failure re-pull, sender={:?}", df_sender);
+                                if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                    cb.on_status_decrypt_failed(df_sender);
+                                }
+                            }
+                            // Not a StatusKit presence update — but check whether it
+                            // was a key-sharing message. Only fire on_keys_received
+                            // if state.keys gained a new channel id.
+                            let keysharing_topic: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+                            if let Some(topic) = msg_topic {
+                                if topic == keysharing_topic {
+                                    let keys_after: std::collections::HashSet<String> =
+                                        sk.state.read().await.keys.keys().cloned().collect();
+                                    let new_channels: Vec<&String> = keys_after.difference(&keys_before).collect();
+                                    if !new_channels.is_empty() {
+                                        // Extract sP (sender participant) from the raw IDS
+                                        // envelope so we can stamp this reshare's sender
+                                        // into the Go-side cache. Peer iOS fans each
+                                        // reshare to every alias of our account with the
+                                        // SAME channel id but DIFFERENT sP, and rustpush
+                                        // state.keys overwrites on each — without stamping
+                                        // here, the aliases processed by rustpush's handle()
+                                        // (not the Dictionary-payload workaround) get lost
+                                        // the same way the workaround case used to, just
+                                        // silently. Mirrors the workaround stamping at the
+                                        // cb.on_reshare_sender call above.
+                                        let upstream_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                            plist::from_bytes::<plist::Value>(payload)
+                                                .ok()
+                                                .and_then(|v| v.into_dictionary())
+                                                .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
+                                        } else {
+                                            None
+                                        };
+                                        info!("StatusKit key-sharing message received — state.keys gained {} new channel(s), sender={:?}", new_channels.len(), upstream_sender);
+                                        if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
+                                            if let Some(sender) = upstream_sender {
+                                                // Fire one callback per newly-added
+                                                // channel so the Go-side cluster
+                                                // captures (channel_id, sender) for
+                                                // each. A single keysharing message
+                                                // typically adds exactly one channel,
+                                                // but iterating handles the rare
+                                                // multi-channel case correctly.
+                                                for channel_id in &new_channels {
+                                                    cb.on_reshare_sender(sender.clone(), (*channel_id).clone());
+                                                }
+                                            }
+                                            cb.on_keys_received();
+                                        } else {
+                                            warn!("StatusKit: keysharing reshare arrived before callback installed — dropping on_keys_received (peer subscribe will not refresh until next reshare); sender={:?}", upstream_sender);
+                                        }
+                                    } else {
+                                        // Parse the command byte and IDS envelope field presence
+                                        // from the raw payload for diagnostics.
+                                        let (cmd_byte, ids_fields) =
+                                            if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                                if let Ok(plist::Value::Dictionary(d)) = plist::from_bytes::<plist::Value>(payload) {
+                                                    let c = d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8);
+                                                    let sp = d.contains_key("sP");
+                                                    let tp = d.contains_key("tP");
+                                                    let p  = d.contains_key("P");
+                                                    let t  = d.contains_key("t");
+                                                    let e  = d.contains_key("E");
+                                                    (c, Some((sp, tp, p, t, e)))
+                                                } else {
+                                                    (None, None)
+                                                }
+                                            } else {
+                                                (None, None)
+                                            };
+                                        // c=255 = server ACK for our own outgoing invite; suppress.
+                                        // c=227 = peer re-invite for an existing channel (expected
+                                        //         re-key). HashMap::insert replaces the entry in
+                                        //         place, so HashSet diff yields no growth. Log at
+                                        //         INFO when keys_before is non-empty.
+                                        // c=97  = unknown command on keysharing topic. Log all
+                                        //         plist keys at WARN so we can see whether this is
+                                        //         a real iOS keysharing message in a different format
+                                        //         than the expected c=227. Other commands also logged.
+                                        let is_silent = cmd_byte.map(|c| c == 255).unwrap_or(false);
+                                        let is_reinvite = cmd_byte.map(|c| c == 227).unwrap_or(false)
+                                            && !keys_before.is_empty();
+                                        // Non-Notification APS frames (ACKs, connection state,
+                                        // keepalives) flow through the keysharing subscription and
+                                        // reach this path, but they can never carry a real
+                                        // keysharing invite payload — cmd_byte and IDS fields are
+                                        // all unknown, and the diagnostic just adds noise. Only
+                                        // warn when the msg actually is a Notification and we
+                                        // managed to parse a command byte (else there is nothing
+                                        // informative to say).
+                                        let is_notification = matches!(
+                                            &msg,
+                                            rustpush::APSMessage::Notification { payload: plist::Value::Data(_), .. }
+                                        );
+                                        if is_reinvite {
+                                            info!("StatusKit peer re-invite received for existing channel (c=227) — keys replaced in place");
+                                        } else if !is_silent && is_notification && cmd_byte.is_some() {
+                                            let all_keys = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                                plist::from_bytes::<plist::Value>(payload)
+                                                    .ok()
+                                                    .and_then(|v| v.into_dictionary())
+                                                    .map(|d| d.keys().cloned().collect::<Vec<_>>().join(", "))
+                                                    .unwrap_or_else(|| "<unparseable>".into())
+                                            } else {
+                                                "<not a notification>".into()
+                                            };
+                                            warn!(
+                                                "StatusKit inbound keysharing message (c={}) did not grow state.keys — plist keys: [{}]  IDS fields: sP={} tP={} P={} t={} E={}",
+                                                cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                                                all_keys,
+                                                ids_fields.map(|(sp,_,_,_,_)| if sp {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,tp,_,_,_)| if tp {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,_,p,_,_)|  if p  {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,_,_,t,_)|  if t  {"Y"} else {"N"}).unwrap_or("?"),
+                                                ids_fields.map(|(_,_,_,_,e)|  if e  {"Y"} else {"N"}).unwrap_or("?"),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Err(rustpush::PushError::VerificationFailed)) => {
+                            warn!("StatusKit signature verification failed (c={:?} topic={}) — key ratchet mismatch, will resolve on next keysharing message", diag_cmd, topic_label);
+                        }
+                        Ok(Err(e)) => {
+                            warn!("StatusKit handle error (c={:?} topic={}): {:?}", diag_cmd, topic_label, e);
+                        }
+                        Err(_) => {
+                            warn!("StatusKit handle panicked (c={:?} topic={}) — channel may lack shared keys", diag_cmd, topic_label);
+                        }
+                    }
+                }
+
+                // Consume FaceTime APNs events to keep FT state live and
+                // surface incoming-call attempts to Go as synthetic notice
+                // triggers. ft_handle_with_join_recovery wraps the rustpush
+                // handle() and falls back to local decoding for cmd 207/209
+                // when Apple sends them without the context.message field —
+                // see the helper's docstring for why.
+                //
+                // Retry on SendTimedOut: the rustpush handle_letmein sends a
+                // delegation message_session INSIDE handle() — if APNs flaps
+                // at that moment, the entire LetMeIn is dropped before our
+                // auto_approve even runs. A single retry after 2s usually
+                // lands on the reconnected APNs.
+                let ft_result = {
+                    let first = ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await;
+                    if matches!(&first, Err(rustpush::PushError::SendTimedOut)) {
+                        warn!("FaceTime handle SendTimedOut, retrying in 2s");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await
+                    } else {
+                        first
+                    }
+                };
+                match ft_result {
+                    Ok(Some(ft_message)) => {
+                        if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
+                            if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
+                                warn!("FaceTime auto-approve LetMeIn failed: {:?}", e);
+                            }
+                        }
+                        if let rustpush::facetime::FTMessage::JoinEvent { guid, handle, .. } = &ft_message {
+                            maybe_fire_pending_ring(ft_for_recv.as_ref(), guid, handle).await;
+                        }
+                        if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message).await {
+                            callback.on_message(wrapped);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("FaceTime handle error: {:?}", e);
+                    }
+                }
+
+                let mut retries = 0u32;
+                let mut backoff = INITIAL_BACKOFF;
+
+                loop {
+                    // handle() decrypts inbound messages, which routes through
+                    // IdentityManager::get_key_for_sender — a lookup for a
+                    // SINGLE sender URI (identity_manager.rs:834). That is the
+                    // shape that trips the upstream chunks(0) panic in
+                    // ids/user.rs:984, and unlike the bridge's own lookup call
+                    // sites this one is internal to rustpush, so ids_guard
+                    // cannot wrap it — meaning no bisection and no quarantine
+                    // here, just the catch. Matches how the StatusKit path is
+                    // protected (spawn → JoinError, above).
+                    //
+                    // Tradeoff, stated honestly: the bridge survives, but the
+                    // frame is dropped, and a sender that panics the lookup
+                    // will do so on every message it sends. Whether those
+                    // messages resurface depends on CloudKit backfill picking
+                    // them up, which is not guaranteed. Staying up and losing
+                    // one sender's messages beats losing every sender's.
+                    use futures::FutureExt;
+                    let handled = std::panic::AssertUnwindSafe(
+                        client_for_recv.handle(msg.clone())
+                    ).catch_unwind().await;
+                    let handled = match handled {
+                        Ok(res) => res,
+                        Err(_) => {
+                            error!(
+                                "iMessage handle() panicked (likely an IDS key lookup for the sender) \
+                                 — dropping this frame to keep the receive loop alive"
+                            );
+                            break;
+                        }
+                    };
+                    match handled {
+                        Ok(Some(msg_inst)) => {
+                            // BACKSTOP GUARD. Everything from here to
+                            // `callback.on_message` runs on the APNs process
+                            // task and sits OUTSIDE handle()'s guard above, yet
+                            // it reaches straight into the two subsystems that
+                            // signal "not there" with a panic rather than an
+                            // error: the IDS identity manager (certify_delivery)
+                            // and rustpush's CloudKit/MMCS download paths.
+                            //
+                            // A panic escaping this arm unwinds the process task
+                            // outright. The drain task's next `tx.send` then
+                            // fails ("Process task gone"), the drain exits, and
+                            // NOTHING consumes APNs frames until the Go-side
+                            // receive-wedge watchdog rebuilds the client — every
+                            // message Apple pushes in that window is lost. It
+                            // was invisible on top of that, because the panic
+                            // hook drops panics originating in cloudkit.rs/
+                            // mmcs.rs whether or not anything catches them.
+                            //
+                            // The individual calls below carry their own
+                            // narrower guards, so the ordinary failure degrades
+                            // gracefully: the message still reaches Matrix, just
+                            // without an avatar or a group photo. This outer
+                            // guard exists for the call site nobody has thought
+                            // about yet — losing one message beats losing every
+                            // message for the length of a watchdog cycle.
+                            //
+                            // Scope, precisely: this covers the POST-handle()
+                            // body only. The StatusKit and FaceTime sections
+                            // earlier in this same loop iteration are outside
+                            // it, and are not uniformly guarded — StatusKit's
+                            // sk.handle() goes through spawn → JoinError, but
+                            // the receive_message workaround above it and
+                            // FaceTime's ft.handle() do not. A panic there
+                            // still unwinds the task. What limits the damage in
+                            // that case is force_receive_wedge (via the
+                            // sentinel and the drain's send-failure branch),
+                            // which turns it into a ~60s rebuild rather than a
+                            // full watchdog threshold — containment here,
+                            // fast recovery there.
+                            //
+                            // Also worth stating: for a panic that is
+                            // deterministic in the message (one peer sending a
+                            // shape that always trips this body), containment
+                            // means those messages are dropped indefinitely
+                            // rather than wedging the bridge. That is the
+                            // better trade, but it is a trade — the error!
+                            // below is the only signal, since the receive path
+                            // now stays healthy from the watchdog's point of
+                            // view.
+                            let processed = {
+                                use futures::FutureExt;
+                                let body = async {
+                                    // Certify delivery back to the sender when the
+                                    // incoming message carries a certified context.
+                                    // Without this, the sender's device displays a
+                                    // "not delivered" indicator even though we
+                                    // received and decrypted the message successfully.
+                                    if let Some(ref context) = msg_inst.certified_context {
+                                        if let Err(e) = client_for_recv
+                                            .identity
+                                            .certify_delivery("com.apple.madrid", context, msg_inst.send_delivered)
+                                            .await
+                                        {
+                                            warn!("Failed to certify delivery for {}: {:?}", msg_inst.id, e);
+                                        }
+                                    }
+
+                                    // Diagnostic: surface profile-sharing arrivals so we can confirm
+                                    // APNs is actually delivering them. Logged here, before the
+                                    // has_payload gate, so a future filter regression can't hide it.
+                                    match &msg_inst.message {
+                                        Message::ShareProfile(p) => info!(
+                                            "received Message::ShareProfile from {:?} (record_key_len={}, has_poster={})",
+                                            msg_inst.sender,
+                                            p.cloud_kit_record_key.len(),
+                                            p.poster.is_some()
+                                        ),
+                                        Message::UpdateProfile(u) => info!(
+                                            "received Message::UpdateProfile from {:?} (share_contacts={}, has_embedded_profile={})",
+                                            msg_inst.sender,
+                                            u.share_contacts,
+                                            u.profile.is_some()
+                                        ),
+                                        Message::UpdateProfileSharing(s) => info!(
+                                            "received Message::UpdateProfileSharing from {:?} (version={}, dismissed={}, all={})",
+                                            msg_inst.sender,
+                                            s.version,
+                                            s.shared_dismissed.len(),
+                                            s.shared_all.len()
+                                        ),
+                                        _ => {}
+                                    }
+
+                                    if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
+                                        let mut wrapped = message_inst_to_wrapped(&msg_inst);
+
+                                        // Mark as stored if within the post-reconnect window.
+                                        // Uses the drain timestamp (when the message was received
+                                        // from APNs) instead of now, so MMCS download time and
+                                        // retry backoff don't push messages past the window.
+                                        let reconn = reconnected_at.load(Ordering::Relaxed);
+                                        if reconn > 0 {
+                                            let delta = drain_ts.saturating_sub(reconn);
+                                            wrapped.is_stored_message = delta < RECONNECT_WINDOW_MS;
+                                            if wrapped.is_stored_message {
+                                                info!("Stored message detected: uuid={} delta={}ms (window={}ms)", wrapped.uuid, delta, RECONNECT_WINDOW_MS);
+                                            }
+                                        }
+
+                                        // Download MMCS attachments so Go receives inline data
+                                        download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                        // Download group photo for IconChange messages via MMCS
+                                        if wrapped.is_icon_change && !wrapped.group_photo_cleared {
+                                            download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                        }
+                                        // Download Name & Photo Sharing profile from CloudKit
+                                        // (mirrors the IconChange MMCS pattern: fetch in Rust,
+                                        // hand Go ready-to-display name + avatar bytes).
+                                        if wrapped.is_share_profile {
+                                            if let Some(client_arc) = client_weak_for_loop
+                                                .get()
+                                                .and_then(|w| w.upgrade())
+                                            {
+                                                client_arc.populate_inline_share_profile(&msg_inst, &mut wrapped).await;
+                                            }
+                                        }
+                                        callback.on_message(wrapped);
+                                    }
+                                };
+                                std::panic::AssertUnwindSafe(body).catch_unwind().await
+                            };
+                            if processed.is_err() {
+                                error!(
+                                    "post-handle processing panicked for message {} — dropping it \
+                                     to keep the APNs process task alive. Receiving continues; the \
+                                     breadcrumb above names the upstream file:line if the panic \
+                                     came from the suppressed MMCS/CloudKit set.",
+                                    msg_inst.id
+                                );
+                            }
+                            break; // success
+                        }
+                        Ok(None) => {
+                            break; // message intentionally ignored by handle()
+                        }
+                        Err(e) => {
+                            // Classify: retryable vs permanent
+                            let is_permanent = matches!(
+                                e,
+                                rustpush::PushError::BadMsg
+                                    | rustpush::PushError::DoNotRetry(_)
+                                    | rustpush::PushError::VerificationFailed
+                            );
+
+                            if is_permanent || retries >= MAX_RETRIES {
+                                error!(
+                                    "Failed to handle APS message after {} attempt(s) (permanent={}): {:?}",
+                                    retries + 1,
+                                    is_permanent,
+                                    e
+                                );
+                                break;
+                            }
+
+                            retries += 1;
+                            warn!(
+                                "Transient error handling APS message (attempt {}/{}), retrying in {:?}: {:?}",
+                                retries,
+                                MAX_RETRIES,
+                                backoff,
+                                e
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, Duration::from_secs(15));
+                        }
+                    }
+                }
+
+                pending.fetch_sub(1, Ordering::Relaxed);
+            }
+
+            drain_handle.abort();
+            info!("Receive loop exited");
+        }
+    });
+
+    let client = Arc::new(Client {
+        client,
+        conn: connection.inner.clone(),
+        os_config: config_clone,
+        receive_handle: tokio::sync::Mutex::new(Some(receive_handle)),
+        token_provider,
+        cloud_messages_client: tokio::sync::Mutex::new(None),
+        cloud_keychain_client: tokio::sync::Mutex::new(None),
+        facetime_client: tokio::sync::Mutex::new(Some(prewarmed_facetime)),
+        passwords_client: tokio::sync::Mutex::new(None),
+        statuskit_client: tokio::sync::Mutex::new(None),
+        sharedstreams_client: tokio::sync::Mutex::new(None),
+        profiles_client: tokio::sync::Mutex::new(None),
+        shared_statuskit: shared_statuskit_for_recv,
+        status_callback: status_callback_for_recv,
+        statuskit_interest_tokens: tokio::sync::Mutex::new(Vec::new()),
+    });
+    // Hand the receive loop a Weak<Client> so it can call back into
+    // populate_inline_share_profile without preventing Client drop.
+    let _ = client_weak_for_loop.set(Arc::downgrade(&client));
+    Ok(client)
+}
+
+impl Client {
+    pub(crate) async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+        // Fast path: return cached client without doing any slow work.
+        // IMPORTANT: the lock is released before any network calls so that
+        // tokio timeouts can fire and concurrent callers are never blocked by
+        // a slow initialisation in progress.
+        {
+            let locked = self.cloud_messages_client.lock().await;
+            if let Some(client) = &*locked {
+                return Ok(client.clone());
+            }
+        }
+
+        info!("Cloud client init: no cached client, initializing now");
+
+        // All slow work happens here WITHOUT holding cloud_messages_client.
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+
+        let dsid = tp.get_dsid().await?;
+        let adsid = tp.get_adsid().await?;
+        let mme_delegate = tp.parse_mme_delegate().await?;
+        let account = tp.get_account();
+        let os_config = tp.get_os_config();
+        let anisette = account.lock().await.anisette.clone();
+
+        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone()).ok_or(
+            WrappedError::GenericError {
+                msg: "Failed to create CloudKitState".into(),
+            },
+        )?;
+        let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+            state: rustpush::DebugRwLock::new(cloudkit_state),
+            anisette: anisette.clone(),
+            config: os_config.clone(),
+            token_provider: tp.inner.clone(),
+        });
+
+        let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+            Ok(data) => match plist::from_bytes(&data) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+                None
+            }
+        };
+        if keychain_state.is_none() {
+            keychain_state = Some(
+                rustpush::keychain::KeychainClientState::new(dsid, adsid, &mme_delegate)
+                    .ok_or(WrappedError::GenericError {
+                        msg: "Missing KeychainSync config in MobileMe delegate".into(),
+                    })?
+            );
+        }
+        let path_for_closure = keychain_state_path.clone();
+
+        let keychain = Arc::new(rustpush::keychain::KeychainClient {
+            anisette,
+            token_provider: tp.inner.clone(),
+            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+            config: os_config,
+            update_state: Box::new(move |state| {
+                if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+                    warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+                }
+            }),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: cloudkit.clone(),
+        });
+
+        // All pre-init network steps (TLK share refresh, keychain sync, zone
+        // key prewarm, record count) have been removed: rustpush's keychain
+        // and CloudKit functions block the tokio executor thread (synchronous
+        // network I/O inside async futures), so tokio::time::timeout cannot
+        // fire — causing indefinite hangs regardless of the timeout value.
+        //
+        // The client is constructed immediately with cached on-disk state.
+        // PCS key errors encountered during sync_records are handled lazily
+        // by recover_cloud_pcs_state, which retries the keychain sync then.
+
+        let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
+            cloudkit, keychain.clone(),
+        ));
+        info!("Cloud client init: complete");
+
+        // Write path: acquire the lock briefly to store the result.
+        // If another task raced and initialized first, use their result.
+        let mut locked = self.cloud_messages_client.lock().await;
+        if let Some(existing) = &*locked {
+            info!("Cloud client init: another task initialized first, using their result");
+            return Ok(existing.clone());
+        }
+        *locked = Some(cloud_messages.clone());
+        *self.cloud_keychain_client.lock().await = Some(keychain);
+        Ok(cloud_messages)
+    }
+
+    async fn get_or_init_cloud_keychain_client(&self) -> Result<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+        let _ = self.get_or_init_cloud_messages_client().await?;
+        self.cloud_keychain_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(WrappedError::GenericError {
+                msg: "No keychain client available".into(),
+            })
+    }
+
+    async fn recover_cloud_pcs_state(&self, context: &str) -> Result<(), WrappedError> {
+        info!("{}: starting keychain resync recovery", context);
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        // refresh_recoverable_tlk_shares removed: fetch_shares_for blocks the
+        // tokio thread (no timeout possible). sync_keychain covers the same
+        // key material via a different Cuttlefish path.
+        sync_keychain_with_retries(&keychain, 6, context).await
+    }
+
+    async fn get_or_init_profiles_client(&self) -> Result<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+        let mut locked = self.profiles_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+        // ProfilesClient shares the CloudKit handle owned by the keychain
+        // client — initialize cloud messages first so both are available.
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        let cloudkit = keychain.client.clone();
+        let profiles = Arc::new(rustpush::name_photo_sharing::ProfilesClient::new(cloudkit));
+        *locked = Some(profiles.clone());
+        info!("ProfilesClient initialized");
+        Ok(profiles)
+    }
+
+    /// Inline-fetch a Name & Photo Sharing profile from CloudKit during the
+    /// receive loop and stuff the decrypted name + avatar bytes onto the
+    /// outgoing WrappedMessage. Mirrors `download_icon_change_photo` so the
+    /// Go side never has to make a follow-up FFI call to render the ghost.
+    /// Failures are logged and left silent — the keys remain on the wrapped
+    /// message so a Go-side periodic re-fetch can recover later.
+    async fn populate_inline_share_profile(
+        &self,
+        _msg_inst: &MessageInst,
+        wrapped: &mut WrappedMessage,
+    ) {
+        // Drive off the wrapped fields rather than re-matching on
+        // msg_inst.message — populate_share_profile_keys already pulled the
+        // keys out of the standalone (Message::ShareProfile / UpdateProfile)
+        // and embedded (NormalMessage.embedded_profile / React.embedded_profile)
+        // cases, so by the time we get here the keys are uniformly available.
+        let (record_key, decryption_key, has_poster) = match (
+            wrapped.share_profile_record_key.as_ref(),
+            wrapped.share_profile_decryption_key.as_ref(),
+        ) {
+            (Some(rk), Some(dk)) => (rk.clone(), dk.clone(), wrapped.share_profile_has_poster),
+            _ => return,
+        };
+        // ALWAYS None — never ask CloudKit for the poster (see the note on
+        // `fetch_profile`, which does the same for the same reasons). We only
+        // consume the name and the avatar; the synthesised `SharedPoster` this
+        // used to build could not produce a usable poster and actively broke
+        // the fetch it rode along with.
+        let share_msg = rustpush::ShareProfileMessage {
+            cloud_kit_record_key: record_key,
+            cloud_kit_decryption_record_key: decryption_key,
+            poster: None,
+        };
+
+        let key_prefix: String = share_msg.cloud_kit_record_key.chars().take(8).collect();
+        let profiles = match self.get_or_init_profiles_client().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    "inline ShareProfile fetch: ProfilesClient init failed (record_key={}…): {:?}",
+                    key_prefix, e
+                );
+                return;
+            }
+        };
+        // Unlike `fetch_profile`, which Go calls on its own goroutine, this
+        // runs on the APNs *process task*. A panic escaping here unwinds that
+        // task outright: the drain task's next `tx.send` then fails, nothing
+        // consumes APNs frames, and every message Apple pushes is lost until
+        // the Go receive-wedge watchdog rebuilds the client. `get_record`
+        // panics whenever the peer has rotated or deleted the record we cached
+        // a key for, which is routine. Keys stay on the wrapped message either
+        // way, so the Go-side periodic refresh can still recover the profile.
+        match guard_panic("inline ShareProfile CloudKit fetch", profiles.get_record(&share_msg)).await {
+            Some(Ok(record)) => {
+                info!(
+                    "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
+                    key_prefix,
+                    record.name.name,
+                    record.image.as_ref().map(|v| v.len()).unwrap_or(0)
+                );
+                wrapped.share_profile_display_name = Some(record.name.name);
+                wrapped.share_profile_first_name = Some(record.name.first);
+                wrapped.share_profile_last_name = Some(record.name.last);
+                wrapped.share_profile_avatar = record.image;
+            }
+            Some(Err(e)) => {
+                warn!(
+                    "inline ShareProfile fetch failed (record_key={}…, peer_has_poster={}): {:?}",
+                    key_prefix, has_poster, e
+                );
+            }
+            None => {
+                warn!(
+                    "inline ShareProfile fetch panicked in upstream CloudKit (record_key={}…, \
+                     peer_has_poster={}) — the record was almost certainly rotated or deleted; \
+                     treating it as a fetch failure",
+                    key_prefix, has_poster
+                );
+            }
+        }
+    }
+
+    async fn get_or_init_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
+        let mut locked = self.facetime_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let state_path = subsystem_state_path("facetime-state.plist");
+        let state = read_plist_state::<rustpush::facetime::FTState>(&state_path).unwrap_or_default();
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedFaceTimeClient {
+            inner: Arc::new(
+                rustpush::facetime::FTClient::new(
+                    state,
+                    Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                    self.conn.clone(),
+                    self.client.identity.clone(),
+                    self.os_config.clone(),
+                )
+                .await,
+            ),
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    async fn get_or_init_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
+        let mut locked = self.passwords_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        let cloudkit = keychain.client.clone();
+        let state_path = subsystem_state_path("passwords-state.plist");
+        let state = read_plist_state::<rustpush::passwords::PasswordState>(&state_path).unwrap_or_default();
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedPasswordsClient {
+            inner: rustpush::passwords::PasswordManager::new(
+                keychain,
+                cloudkit,
+                self.client.identity.clone(),
+                self.conn.clone(),
+                state,
+                Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                Box::new(|_, _| {}),
+            )
+            .await,
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    pub(crate) async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+        // Fast path: return cached client without holding the lock during init.
+        {
+            let locked = self.statuskit_client.lock().await;
+            if let Some(client) = &*locked {
+                return Ok(client.clone());
+            }
+        }
+
+        // Slow path: StatusKitClient::new() calls request_topics which can
+        // block the tokio thread. Build the client WITHOUT holding the mutex
+        // so concurrent callers are not blocked.
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let state_path = subsystem_state_path("statuskit-state.plist");
+        let state = match read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path) {
+            Some(s) => {
+                info!(
+                    "StatusKit state: loaded {} peer key(s), my_key={}, path={}",
+                    s.keys.len(),
+                    s.my_key.is_some(),
+                    state_path
+                );
+                s
+            }
+            None => {
+                info!(
+                    "StatusKit state: plist absent or unreadable at {} — starting with empty state",
+                    state_path
+                );
+                rustpush::statuskit::StatusKitState::default()
+            }
+        };
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedStatusKitClient {
+            inner: rustpush::statuskit::StatusKitClient::new(
+                state,
+                Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                tp.inner.clone(),
+                self.conn.clone(),
+                self.os_config.clone(),
+                self.client.identity.clone(),
+            )
+            .await,
+            interests: tokio::sync::Mutex::new(Vec::new()),
+        });
+
+        // Write path: re-acquire briefly to store result; handle race.
+        let mut locked = self.statuskit_client.lock().await;
+        if let Some(existing) = &*locked {
+            return Ok(existing.clone());
+        }
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+
+    async fn get_or_init_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
+        let mut locked = self.sharedstreams_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.get_dsid().await?;
+        let mme_delegate = tp.parse_mme_delegate().await?;
+        let account = tp.get_account();
+        let anisette = account.lock().await.anisette.clone();
+        let state_path = subsystem_state_path("sharedstreams-state.plist");
+        let state = read_plist_state::<rustpush::sharedstreams::SharedStreamsState>(&state_path)
+            .or_else(|| rustpush::sharedstreams::SharedStreamsState::new(dsid, &mme_delegate))
+            .ok_or(WrappedError::GenericError {
+                msg: "Failed to initialize Shared Streams state".into(),
+            })?;
+        let state_path_for_closure = state_path.clone();
+
+        let wrapped = Arc::new(WrappedSharedStreamsClient {
+            inner: Arc::new(
+                rustpush::sharedstreams::SharedStreamClient::new(
+                    state,
+                    Box::new(move |state| persist_plist_state(&state_path_for_closure, state)),
+                    tp.inner.clone(),
+                    self.conn.clone(),
+                    anisette,
+                    self.os_config.clone(),
+                )
+                .await,
+            ),
+        });
+        *locked = Some(wrapped.clone());
+        Ok(wrapped)
+    }
+}
+
+// Plain (non-FFI) impl for internal helpers that use rustpush types
+// (MessageInst, SendJob, PushError) not safe to cross the uniffi boundary.
+impl Client {
+    /// Resolve the exact iMessage recipients that `IMClient::send` will use
+    /// before uploading an attachment to MMCS. A successful lookup is reused
+    /// by the subsequent send through rustpush's one-minute cache floor, so
+    /// this reorders the existing directory request instead of adding one.
+    ///
+    /// Without this guard, `Attachment::new_mmcs` transferred the complete file
+    /// first and only then discovered `NoValidTargets`, leaving an orphaned
+    /// Apple upload for an action that could never be delivered.
+    async fn preflight_mmcs_upload_targets(
+        &self,
+        conversation: &WrappedConversation,
+        handle: &str,
+    ) -> Result<(), rustpush::PushError> {
+        const TOPIC: &str = "com.apple.madrid";
+
+        let handles = self.client.identity.get_handles().await;
+        let targets = mmcs_preflight_targets(conversation, handle, &handles);
+        self.client
+            .identity
+            .cache_keys(
+                TOPIC,
+                &targets,
+                handle,
+                false,
+                &rustpush::ids::user::QueryOptions {
+                    required_for_message: true,
+                    result_expected: true,
+                },
+            )
+            .await?;
+
+        let cache = self.client.identity.cache.lock().await;
+        let delivery_targets = cache.get_participants_targets(TOPIC, handle, &targets);
+        if targets.iter().any(|target| !handles.contains(target))
+            && !delivery_targets
+                .iter()
+                .any(|target| !handles.contains(&target.participant))
+        {
+            return Err(rustpush::PushError::NoValidTargets);
+        }
+        Ok(())
+    }
+
+    /// Force-refresh the MobileMe delegate and clear the cached CloudKit
+    /// clients. Call this when a CloudKit sync fails with TokenMissing.
+    ///
+    /// Sequence matters here:
+    ///
+    ///   1. Refresh the PET first. The `refresh_mme` (auth.rs:176)
+    ///      calls `get_gsa_token("com.apple.gs.idms.pet")` on line 179 and
+    ///      errors `TokenMissing` if the PET is absent/expired. Apple PETs
+    ///      have a ~24h TTL so after an overnight idle + bridge restart the
+    ///      PET loaded from disk is stale, making `refresh_mme` always fail
+    ///      with Token missing — the exact daily-auth-breaks symptom. The
+    ///      persisted `AccountUsername` + `AccountHashedPasswordHex` + SPD
+    ///      let us silently re-run `login_email_pass` via
+    ///      `refresh_pet_token` to fetch a fresh PET from Apple without
+    ///      user interaction.
+    ///
+    ///   2. Refresh the MME delegate. Now that the PET is fresh this hits
+    ///      the normal success path and we get a new `cloudKitToken`.
+    ///
+    ///   3. Reset the cached CloudKit clients so the next sync picks up
+    ///      the new delegate.
+    ///
+    /// Internal helper: not exposed via FFI. All call sites are inside this
+    /// crate's Client impls.
+    ///
+    /// Rate limiting: `refresh_pet_token` hits Apple's GSA SRP endpoint
+    /// (`login_email_pass`). CloudKit's caller loop can retry this helper
+    /// many times per minute when Apple rejects the session. Without a
+    /// circuit breaker we'd hammer Apple's auth endpoint at dozens of
+    /// SRP handshakes per minute, which is exactly the pattern Apple's
+    /// anti-abuse flags as credential stuffing — risk of account lockout.
+    ///
+    /// Two guards:
+    ///   * `LAST_PET_REFRESH_MS`: global min-interval. Skip if a PET
+    ///     refresh attempt happened in the last 60 s.
+    ///   * `PET_REFRESH_STUCK_UNTIL_MS`: set to a future timestamp when
+    ///     Apple returns `NeedsDevice2FA`. Further refresh calls no-op
+    ///     until the cooldown elapses (1 h) or the process restarts.
+    ///     Without this, every CloudKit retry triggers a fresh SRP attempt
+    ///     knowing full well Apple is going to demand 2FA again.
+    async fn refresh_mme_and_reset_cloud_client(&self) {
+        use std::sync::atomic::AtomicU64;
+
+        static LAST_PET_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+        static PET_REFRESH_STUCK_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+        const MIN_INTERVAL_MS: u64 = 60_000;
+        const STUCK_COOLDOWN_MS: u64 = 60 * 60 * 1000; // 1 h
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        if let Some(tp) = &self.token_provider {
+            let stuck_until = PET_REFRESH_STUCK_UNTIL_MS.load(Ordering::Relaxed);
+            let last = LAST_PET_REFRESH_MS.load(Ordering::Relaxed);
+            let skip_pet = now_ms < stuck_until || now_ms.saturating_sub(last) < MIN_INTERVAL_MS;
+
+            if skip_pet {
+                if now_ms < stuck_until {
+                    warn!(
+                        "Skipping refresh_pet_token: Apple returned NeedsDevice2FA recently; \
+                         cooldown active for {}s more (manual re-login required)",
+                        (stuck_until - now_ms) / 1000
+                    );
+                } else {
+                    info!(
+                        "Skipping refresh_pet_token: last attempt {}s ago; min interval {}s",
+                        now_ms.saturating_sub(last) / 1000,
+                        MIN_INTERVAL_MS / 1000
+                    );
+                }
+            } else {
+                LAST_PET_REFRESH_MS.store(now_ms, Ordering::Relaxed);
+                // Detect NeedsDevice2FA by inspecting the account state after the
+                // refresh call. refresh_pet_token is infallible by design
+                // (swallows errors), so we can't rely on its return — we have to
+                // look at the resulting token map.
+                if let Err(e) = tp.refresh_pet_token().await {
+                    warn!("refresh_pet_token before MME refresh failed: {:?}", e);
+                }
+                // If the PET slot is still empty after refresh, Apple is
+                // blocking us (most commonly NeedsDevice2FA). Set the cooldown
+                // so subsequent CloudKit TokenMissing retries don't redo SRP.
+                // We can't inspect the FetchedToken's expiration (private
+                // field) — presence alone is a good proxy because
+                // login_email_pass only writes the map on success.
+                let pet_present = {
+                    let account = tp.account.lock().await;
+                    account.tokens.contains_key("com.apple.gs.idms.pet")
+                };
+                if !pet_present {
+                    PET_REFRESH_STUCK_UNTIL_MS
+                        .store(now_ms + STUCK_COOLDOWN_MS, Ordering::Relaxed);
+                    warn!(
+                        "PET refresh produced no valid PET — engaging {}m cooldown to \
+                         avoid hammering Apple auth (manual re-login likely required)",
+                        STUCK_COOLDOWN_MS / 60_000
+                    );
+                }
+            }
+
+            // Always attempt refresh_mme — it's a cheap MobileMe call that
+            // uses whatever PET is currently in memory. If nothing changed
+            // it'll just log the same Token missing warning once.
+            if let Err(e) = tp.inner.refresh_mme().await {
+                warn!("refresh_mme failed during cloud-client recovery: {}", e);
+            } else {
+                info!("Cloud client recovery: refreshed MobileMe delegate");
+            }
+        }
+        self.reset_cloud_client().await;
+    }
+
+    /// Retry recoverable send failures while reusing the same MessageInst (and
+    /// therefore the same UUID). For SendTimedOut this prevents duplicate UUIDs.
+    /// For NoValidTargets, one forced cache refresh prevents rustpush's one-hour
+    /// negative-cache lifetime from hiding a target that became available after
+    /// Apple's registration/rate-limit state changed. The cache itself enforces
+    /// its one-minute minimum refresh interval, so this cannot pound IDS.
+    async fn send_with_flap_retry(
+        &self,
+        msg: &mut rustpush::MessageInst,
+    ) -> Result<rustpush::SendJob, rustpush::PushError> {
+        const MAX_TIMEOUT_RETRIES: u32 = 2;
+        let mut timeout_retries = 0;
+        let mut target_refresh_attempted = false;
+        // The Matrix bridge historically used one immediate forced refresh to
+        // recover from rustpush's negative cache. iBlue instead performs a
+        // sparse, durable-cooldown preflight. Retrying here would amplify one
+        // empty Apple directory response into up to three IDS queries.
+        let allow_target_refresh = std::env::var_os("IBLUE_NO_VALID_TARGET_RETRY").is_none();
+        loop {
+            match self.client.send(msg).await {
+                Ok(job) => return Ok(job),
+                Err(rustpush::PushError::SendTimedOut) if timeout_retries < MAX_TIMEOUT_RETRIES => {
+                    timeout_retries += 1;
+                    warn!(
+                        "SendTimedOut retry {}/{} for uuid={}; reusing MessageInst",
+                        timeout_retries,
+                        MAX_TIMEOUT_RETRIES,
+                        msg.id
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        1000 * timeout_retries as u64,
+                    ))
+                    .await;
+                }
+                Err(rustpush::PushError::NoValidTargets)
+                    if allow_target_refresh && !target_refresh_attempted => {
+                    target_refresh_attempted = true;
+                    let handles = self.client.identity.get_handles().await;
+                    let targets = msg.get_send_participants(&handles);
+                    let sender = msg.sender.as_deref().ok_or(rustpush::PushError::BadMsg)?;
+                    let topic = if msg.message.is_sms() {
+                        "com.apple.private.alloy.sms"
+                    } else {
+                        "com.apple.madrid"
+                    };
+                    warn!(
+                        "NoValidTargets for uuid={}; requesting one bounded IDS cache refresh",
+                        msg.id
+                    );
+                    self.client.identity.cache_keys(
+                        topic,
+                        &targets,
+                        sender,
+                        true,
+                        &rustpush::ids::user::QueryOptions {
+                            required_for_message: true,
+                            result_expected: true,
+                        },
+                    ).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+fn normalize_reply_target(
+    reply_guid: Option<String>,
+    reply_part: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let normalized_part = reply_guid.as_ref().map(|_| {
+        reply_part
+            .filter(|part| !part.is_empty())
+            .unwrap_or_else(|| "0".to_string())
+    });
+    (reply_guid, normalized_part)
+}
+
+fn leave_group_participants(mut participants: Vec<String>, handle: &str) -> Vec<String> {
+    participants.retain(|participant| participant != handle);
+    participants
+}
+
+/// Build the same target set as `IMClient::send` without transmitting the
+/// probe message. This deliberately delegates to `MessageInst::prepare_send`
+/// so sender fanout and participant behavior cannot drift from rustpush.
+fn mmcs_preflight_targets(
+    conversation: &WrappedConversation,
+    handle: &str,
+    handles: &[String],
+) -> Vec<String> {
+    let mut probe = MessageInst::new(
+        conversation.into(),
+        handle,
+        Message::Message(NormalMessage::new(String::new(), MessageType::IMessage)),
+    );
+    probe.prepare_send(handles)
+}
+
+fn inline_relay_attachment(
+    data: Vec<u8>,
+    mime: String,
+    uti_type: String,
+    filename: String,
+) -> Attachment {
+    Attachment {
+        a_type: AttachmentType::Inline(data),
+        part: 0,
+        uti_type,
+        mime,
+        name: filename,
+        iris: false,
+    }
+}
+
+#[cfg(test)]
+mod reply_target_tests {
+    use super::{
+        inline_relay_attachment, leave_group_participants, message_inst_to_wrapped,
+        mmcs_preflight_targets, normalize_reply_target, AttachmentType, ConversationData, Message,
+        MessageInst, ReactMessage, ReactMessageType, Reaction, WrappedConversation,
+    };
+
+    fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
+        ReactMessage {
+            to_uuid: "target-guid".to_string(),
+            to_part: part,
+            reaction: ReactMessageType::React {
+                reaction: Reaction::Laugh,
+                enable: true,
+            },
+            to_text: text.to_string(),
+            embedded_profile: None,
+        }
+    }
+
+    #[test]
+    fn missing_reply_part_defaults_to_first_part() {
+        assert_eq!(
+            normalize_reply_target(Some("target-guid".to_string()), None),
+            (Some("target-guid".to_string()), Some("0".to_string())),
+        );
+        assert_eq!(normalize_reply_target(None, Some("4".to_string())), (None, None));
+    }
+
+    #[test]
+    fn stop_typing_remains_a_typing_event() {
+        let message = MessageInst::new(
+            ConversationData {
+                participants: vec!["mailto:friend@example.com".to_string()],
+                cv_name: None,
+                sender_guid: None,
+                after_guid: None,
+            },
+            "mailto:self@example.com",
+            Message::Typing(false, None),
+        );
+        let wrapped = message_inst_to_wrapped(&message);
+        assert!(wrapped.is_typing);
+        assert_eq!(wrapped.typing_active, Some(false));
+    }
+
+    #[test]
+    fn leave_group_omits_every_copy_of_the_local_handle() {
+        assert_eq!(
+            leave_group_participants(
+                vec![
+                    "mailto:self@example.com".to_string(),
+                    "mailto:friend@example.com".to_string(),
+                    "mailto:self@example.com".to_string(),
+                ],
+                "mailto:self@example.com",
+            ),
+            vec!["mailto:friend@example.com".to_string()],
+        );
+    }
+
+    #[test]
+    fn tapback_range_length_uses_nsstring_utf16_units() {
+        assert_eq!(
+            reaction_target("hello", Some(0)).associated_message_range_length(),
+            5
+        );
+        assert_eq!(
+            reaction_target("\u{fffc}", Some(0)).associated_message_range_length(),
+            1
+        );
+        assert_eq!(
+            reaction_target("😀", Some(0)).associated_message_range_length(),
+            2
+        );
+        assert_eq!(
+            reaction_target("ignored", None).associated_message_range_length(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn mmcs_preflight_uses_the_send_recipient_and_sender_fanout_set() {
+        let conversation = WrappedConversation {
+            participants: vec!["mailto:friend@example.com".to_string()],
+            group_name: None,
+            sender_guid: None,
+            is_sms: false,
+        };
+        assert_eq!(
+            mmcs_preflight_targets(
+                &conversation,
+                "mailto:self@example.com",
+                &["mailto:self@example.com".to_string()],
+            ),
+            vec![
+                "mailto:friend@example.com".to_string(),
+                "mailto:self@example.com".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn relay_attachment_keeps_bytes_inline_for_the_mms_serializer() {
+        let attachment = inline_relay_attachment(
+            vec![1, 2, 3],
+            "image/png".to_string(),
+            "public.png".to_string(),
+            "image.png".to_string(),
+        );
+        assert!(
+            matches!(attachment.a_type, AttachmentType::Inline(ref data) if data == &[1, 2, 3])
+        );
+        assert_eq!(attachment.mime, "image/png");
+        assert_eq!(attachment.uti_type, "public.png");
+        assert_eq!(attachment.name, "image.png");
+    }
+}
+
+/// Per-address evidence from one bounded Madrid directory lookup. A fresh
+/// cache entry alone is insufficient for the canary: it may predate this
+/// invocation. `response_entry_returned` proves this invocation replaced or
+/// created the entry, including Apple's explicit empty-identity response.
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedIdsLookupTarget {
+    pub address: String,
+    pub cache_entry_fresh: bool,
+    pub response_entry_returned: bool,
+    pub identity_count: u64,
+    pub correlation_identifier_present: bool,
+}
+
+/// Diagnostic outcome for a strict, non-bisecting lookup invocation. iBlue's
+/// native process also disables rustpush's internal error retry, so `attempts`
+/// is one for every non-empty request and never expands per target.
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedIdsLookupReport {
+    pub targets: Vec<WrappedIdsLookupTarget>,
+    pub error: Option<String>,
+    pub panicked: bool,
+    pub timed_out: bool,
+    pub attempts: u64,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Client {
+    /// Reset the cached CloudKit client so the next CloudKit operation
+    /// re-initializes it with fresh auth tokens.  Call this after a sync
+    /// failure (e.g. TokenMissing) before retrying.
+    pub async fn reset_cloud_client(&self) {
+        *self.cloud_messages_client.lock().await = None;
+        *self.cloud_keychain_client.lock().await = None;
+        *self.profiles_client.lock().await = None;
+    }
+
+    /// Retry an MMCS attachment download from a previously-captured descriptor
+    /// blob. Called by the Go-side AttachmentRetrier when a push-time download
+    /// failed and the queued row is due for another attempt. Internally reuses
+    /// download_one_mmcs_attachment so the Layer-1 3-attempt retry with
+    /// exponential backoff applies to each invocation.
+    pub async fn retry_mmcs_from_descriptor(
+        &self,
+        descriptor_json: String,
+        name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let descriptor: MmcsDescriptor =
+            serde_json::from_str(&descriptor_json).map_err(|e| WrappedError::GenericError {
+                msg: format!("retry_mmcs_from_descriptor: decode descriptor JSON: {e}"),
+            })?;
+        let mmcs = descriptor
+            .to_file()
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("retry_mmcs_from_descriptor: rebuild MMCSFile: {e}"),
+            })?;
+        download_one_mmcs_attachment(&mmcs, &self.conn, &name)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("retry_mmcs_from_descriptor {name}: {e}"),
+            })
+    }
+
+    /// Reset the cached Shared Streams client and force-refresh the MME
+    /// delegate so the next operation gets fresh auth tokens.
+    pub async fn reset_sharedstreams_client(&self) {
+        *self.sharedstreams_client.lock().await = None;
+        if let Some(tp) = &self.token_provider {
+            let _ = tp.inner.refresh_mme().await;
+        }
+    }
+
+    /// Initialize the StatusKit presence system. Must be called after login
+    /// when a TokenProvider is available. The callback receives presence
+    /// updates for subscribed handles via the APNs receive loop.
+    pub async fn init_statuskit(&self, callback: Box<dyn StatusCallback>) -> Result<(), WrappedError> {
+        // Reuse the existing get_or_init_statuskit_client() path so the
+        // WrappedStatusKitClient sub-client (used for share_status etc.)
+        // and the shared raw handle (used by the receive loop) both point
+        // at the same underlying StatusKitClient.
+        let wrapped = self.get_or_init_statuskit_client().await?;
+        *self.shared_statuskit.write().await = Some(wrapped.inner.clone());
+        *self.status_callback.write().await = Some(Arc::from(callback));
+        info!("StatusKit: callback registered, recv loop window closed");
+        info!("StatusKit initialized — presence system ready");
+
+        // Self-visibility diagnostic: query IDS for our own handle's
+        // keysharing identities and compare the returned push tokens against
+        // our own APS push token. If our token is absent, peer iOS cannot
+        // include us when querying for this handle and will never reshare
+        // their status key to us.
+        let my_token = self.conn.get_token().await;
+        let my_token_b64 = base64_encode(&my_token);
+        let handles = self.client.identity.get_handles().await;
+        info!(
+            "StatusKit self-visibility: our APS push token={}, our handles={:?}",
+            my_token_b64, handles
+        );
+        for handle in &handles {
+            match self
+                .client
+                .identity
+                .targets_for_handles(
+                    "com.apple.private.alloy.status.keysharing",
+                    std::slice::from_ref(handle),
+                    handle,
+                )
+                .await
+            {
+                Ok(targets) => {
+                    let mut self_visible = false;
+                    let mut token_list: Vec<String> = Vec::new();
+                    for t in &targets {
+                        let tok_b64 = base64_encode(&t.delivery_data.push_token);
+                        if t.delivery_data.push_token == my_token {
+                            self_visible = true;
+                            token_list.push(format!("{}(SELF)", tok_b64));
+                        } else {
+                            token_list.push(tok_b64);
+                        }
+                    }
+                    if self_visible {
+                        info!(
+                            "StatusKit self-visibility OK for {}: IDS returned {} target(s), our token is present — tokens=[{}]",
+                            handle,
+                            targets.len(),
+                            token_list.join(", ")
+                        );
+                    } else {
+                        warn!(
+                            "StatusKit self-visibility FAIL for {}: IDS returned {} target(s), our token is NOT present — peer iOS will never target this bridge when querying this handle. tokens=[{}]",
+                            handle,
+                            targets.len(),
+                            token_list.join(", ")
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "StatusKit self-visibility: IDS query for {} failed: {:?}",
+                        handle, e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Publish our own presence status. `active=true` → online;
+    /// `active=false` → away/DND (mode defaults to do-not-disturb).
+    pub async fn set_status(&self, active: bool) -> Result<(), WrappedError> {
+        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
+            msg: "StatusKit not initialized".into(),
+        })?;
+        let status = if active {
+            rustpush::statuskit::StatusKitStatus::new_active()
+        } else {
+            rustpush::statuskit::StatusKitStatus::new_away("com.apple.donotdisturb.mode.default".to_string())
+        };
+        sk.share_status(&status).await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to publish status: {}", e),
+        })
+    }
+
+    /// Subscribe to presence updates for the given handles (e.g. "tel:+1...",
+    /// "mailto:..."). The subscription is held internally until
+    /// `unsubscribe_all_status()` is called.
+    pub async fn subscribe_to_status(&self, handles: Vec<String>) -> Result<(), WrappedError> {
+        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
+            msg: "StatusKit not initialized".into(),
+        })?;
+
+        let ghost_count = handles.len();
+
+        const CHANNEL_BUDGET: usize = 15;
+
+        // PRUNE over-budget "from" handles before subscribing. A heavy
+        // re-registration churner accumulates dozens of dead StatusKit channels
+        // under ONE "from" handle (observed: 64 on a single handle). Because
+        // request_handles subscribes ALL of a handle's channels and CANNOT split
+        // them, such a handle forms a single SubscribeToChannels that exceeds
+        // Apple's ceiling — Apple bounces it ("Subscribe confirmed failed!") and
+        // that ONE peer's presence dies entirely (all 64 channels stay
+        // last_msg_ns==1 placeholders, never carrying a status), while every
+        // small-channel peer keeps working. request_channels (per-channel) would
+        // let us subscribe a subset, but APSChannelIdentifier lives in rustpush's
+        // private `aps` module and isn't constructible from here. So instead we
+        // prune state.keys down to <= CHANNEL_BUDGET channels per handle, keeping
+        // every LIVE channel (last_msg_ns>1) plus a ROTATING window of dead
+        // placeholders — no per-channel recency exists to identify the churner's
+        // *current* channel, so we rotate coverage across subscribes until it
+        // lands, after which liveness pins it. Pruned channels are provably dead
+        // husks; the CloudKit pull re-establishes the real ones and the next
+        // subscribe re-prunes. This also shrinks the bloated statuskit-state.plist.
+        {
+            let state_path = subsystem_state_path("statuskit-state.plist");
+            let mut chan_by_from: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut chan_live: std::collections::HashMap<String, bool> =
+                std::collections::HashMap::new();
+            if let Ok(data) = std::fs::read(&state_path) {
+                if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
+                    let root = value.as_dictionary();
+                    if let Some(keys_dict) =
+                        root.and_then(|d| d.get("keys")).and_then(|v| v.as_dictionary())
+                    {
+                        for (cid, entry) in keys_dict {
+                            if let Some(from_str) = entry
+                                .as_dictionary()
+                                .and_then(|d| d.get("from"))
+                                .and_then(|v| v.as_string())
+                            {
+                                chan_by_from
+                                    .entry(from_str.to_string())
+                                    .or_default()
+                                    .push(cid.clone());
+                            }
+                        }
+                    }
+                    if let Some(recents) = root
+                        .and_then(|d| d.get("recent_channels"))
+                        .and_then(|v| v.as_array())
+                    {
+                        for rc in recents {
+                            let Some(rc) = rc.as_dictionary() else { continue };
+                            let Some(id_bytes) = rc
+                                .get("identifier")
+                                .and_then(|v| v.as_dictionary())
+                                .and_then(|d| d.get("id"))
+                                .and_then(|v| v.as_data())
+                            else {
+                                continue;
+                            };
+                            let live = rc
+                                .get("last_msg_ns")
+                                .and_then(|v| v.as_unsigned_integer())
+                                .unwrap_or(0)
+                                > 1;
+                            chan_live.insert(base64_encode(id_bytes), live);
+                        }
+                    }
+                }
+            }
+
+            // Invite dates (CD_dateInvitationCreated) written by the CloudKit
+            // pull: channel_id -> raw seconds. The MOST-RECENT invite is the
+            // peer's current channel, so when dates are present we keep those
+            // deterministically and converge immediately. Before a dated pull has
+            // run (or for non-CloudKit keys), dates are absent and we fall back to
+            // rotating the placeholder window across subscribes.
+            let mut chan_date: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            {
+                let dates_path = subsystem_state_path("statuskit-channel-dates.plist");
+                if let Ok(data) = std::fs::read(&dates_path) {
+                    if let Ok(plist::Value::Dictionary(d)) =
+                        plist::from_bytes::<plist::Value>(&data)
+                    {
+                        for (cid, v) in d {
+                            if let Some(i) = v.as_signed_integer() {
+                                chan_date.insert(cid, i);
+                            }
+                        }
+                    }
+                }
+            }
+
+            static ROTATION: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let rot = ROTATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut prune: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut capped_handles = 0usize;
+            for (from, cids) in &chan_by_from {
+                if cids.len() <= CHANNEL_BUDGET {
+                    continue;
+                }
+                let mut sorted = cids.clone();
+                sorted.sort();
+                let mut keep: std::collections::HashSet<String> = sorted
+                    .iter()
+                    .filter(|c| *chan_live.get(*c).unwrap_or(&false))
+                    .take(CHANNEL_BUDGET)
+                    .cloned()
+                    .collect();
+                let mut placeholders: Vec<&String> = sorted
+                    .iter()
+                    .filter(|c| !*chan_live.get(*c).unwrap_or(&false))
+                    .collect();
+                let remaining = CHANNEL_BUDGET.saturating_sub(keep.len());
+                if remaining > 0 && !placeholders.is_empty() {
+                    // Prefer the most-recently-invited channels (current first)
+                    // when we have dates; otherwise rotate the window.
+                    let have_dates = placeholders
+                        .iter()
+                        .any(|c| chan_date.get(*c).copied().unwrap_or(0) > 0);
+                    if have_dates {
+                        placeholders.sort_by(|a, b| {
+                            chan_date
+                                .get(*b)
+                                .copied()
+                                .unwrap_or(0)
+                                .cmp(&chan_date.get(*a).copied().unwrap_or(0))
+                        });
+                        for c in placeholders.iter().take(remaining) {
+                            keep.insert((*c).clone());
+                        }
+                    } else {
+                        let start = rot.wrapping_mul(remaining) % placeholders.len();
+                        for i in 0..remaining.min(placeholders.len()) {
+                            keep.insert(placeholders[(start + i) % placeholders.len()].clone());
+                        }
+                    }
+                }
+                for c in cids {
+                    if !keep.contains(c) {
+                        prune.insert(c.clone());
+                    }
+                }
+                capped_handles += 1;
+                warn!(
+                    "StatusKit: over-budget from-handle {} has {} channels (> {} budget) — pruning {} dead placeholder channel(s) to avoid a SubscribeToChannels bounce (keeping {}, rot={})",
+                    from,
+                    cids.len(),
+                    CHANNEL_BUDGET,
+                    cids.len() - keep.len(),
+                    keep.len(),
+                    rot,
+                );
+            }
+            if !prune.is_empty() {
+                let mut state = sk.state.write().await;
+                state.keys.retain(|cid, _| !prune.contains(cid));
+                state
+                    .recent_channels
+                    .retain(|rc| !prune.contains(&base64_encode(&rc.identifier.id)));
+                let remaining_keys = state.keys.len();
+                if let Err(e) = plist::to_file_xml(&state_path, &*state) {
+                    warn!("StatusKit: failed to persist pruned state: {}", e);
+                }
+                drop(state);
+                info!(
+                    "StatusKit: pruned {} dead channel(s) from {} over-budget handle(s); state.keys now {} channel(s)",
+                    prune.len(),
+                    capped_handles,
+                    remaining_keys,
+                );
+            }
+        }
+
+        // Count StatusKit channels per "from" handle from the (now-pruned)
+        // statuskit-state.plist. request_handles subscribes ALL channels for the
+        // handles we pass, and Apple bounces a single SubscribeToChannels that
+        // carries too many channels ("Subscribe confirmed failed!" from
+        // rustpush::aps), which silently kills ALL inbound presence for a
+        // heavily-keyed account. So we bin-pack handles into channel-budgeted
+        // chunks and subscribe each separately. The StatusKit channel-task
+        // accumulates per-channel interest (refcounts), so the union ends up
+        // subscribed; a short pause between chunks lets it drain and emit each
+        // batch as its own small SubscribeToChannels under Apple's ceiling.
+        let mut from_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        {
+            let state_path = subsystem_state_path("statuskit-state.plist");
+            if let Ok(data) = std::fs::read(&state_path) {
+                if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
+                    if let Some(keys_dict) = value
+                        .as_dictionary()
+                        .and_then(|d| d.get("keys"))
+                        .and_then(|v| v.as_dictionary())
+                    {
+                        for (_channel_id, entry) in keys_dict {
+                            if let Some(from_str) = entry
+                                .as_dictionary()
+                                .and_then(|d| d.get("from"))
+                                .and_then(|v| v.as_string())
+                            {
+                                *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Make sure every requested ghost handle is represented even if it has no
+        // key yet (so a future reshare for it still lands); it contributes 0
+        // channels and is therefore "free" in the budget.
+        for h in &handles {
+            from_counts.entry(h.clone()).or_insert(0);
+        }
+        let distinct_from = from_counts.len();
+
+        // Greedily bin-pack handles into chunks of <= CHANNEL_BUDGET channels. A
+        // single handle whose channel count exceeds the budget unavoidably forms
+        // its own (over-budget) chunk — request_handles cannot split one handle's
+        // channels — but that is rare and isolates the risk to that one peer.
+        //
+        // 15: the first cut at 30 cleared a 244-channel account, but an even more
+        // heavily-keyed account still got bounced ("Subscribe confirmed failed!")
+        // at 30, so Apple's per-SubscribeToChannels ceiling is lower than first
+        // estimated. Halving to 15 keeps each subscribe well under it. The cost is
+        // more chunks per subscribe (each paced 250ms apart) — acceptable because
+        // subscribe_to_status only runs on first-ready and on key arrival, not on
+        // a timer. If a user is STILL bounced, drop this further. (CHANNEL_BUDGET
+        // is declared above, shared with the over-budget prune.)
+        let mut chunks: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut cur_count = 0usize;
+        for (handle, count) in from_counts {
+            if cur_count + count > CHANNEL_BUDGET && !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+                cur_count = 0;
+            }
+            cur.push(handle);
+            cur_count += count;
+        }
+        if !cur.is_empty() {
+            chunks.push(cur);
+        }
+        let total_chunks = chunks.len();
+
+        // Subscribe the new chunks, THEN drop the old interest tokens. Holding the
+        // old tokens alive until the new ones are in place keeps shared channels at
+        // refcount >= 1, so we never trigger a bulk unsubscribe (which would itself
+        // overflow Apple's per-subscribe ceiling); only genuinely-removed channels
+        // (a small delta) get torn down when the old tokens finally drop.
+        let old_tokens = {
+            let mut tokens = self.statuskit_interest_tokens.lock().await;
+            std::mem::take(&mut *tokens)
+        };
+        let mut new_tokens = Vec::with_capacity(total_chunks);
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            new_tokens.push(sk.request_handles(&chunk).await);
+            if i + 1 < total_chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        {
+            let mut tokens = self.statuskit_interest_tokens.lock().await;
+            *tokens = new_tokens;
+        }
+        drop(old_tokens);
+
+        info!(
+            "Requested presence subscription in {} channel-budgeted chunk(s) ({} ghost handles, {} distinct from-handles)",
+            total_chunks, ghost_count, distinct_from,
+        );
+        Ok(())
+    }
+
+    /// Drop all presence subscriptions.
+    pub async fn unsubscribe_all_status(&self) {
+        self.statuskit_interest_tokens.lock().await.clear();
+        info!("Unsubscribed from all presence channels");
+    }
+
+    /// Resolve a handle to all known handles for the same person by querying
+    /// the IDS cache for a matching sender_correlation_identifier. If the handle
+    /// isn't in the cache yet, triggers an IDS query to populate it.
+    ///
+    /// Returns a list of handles that share the same Apple ID as the input.
+    /// For example, if the input is "mailto:user@icloud.com", the result might
+    /// include "tel:+12012337620" if they belong to the same person.
+    ///
+    /// The `known_handles` parameter is a list of ghost handles from the bridge
+    /// database — we check each one against the IDS cache for a matching
+    /// correlation ID.
+    pub async fn resolve_handle(&self, handle: String, known_handles: Vec<String>) -> Result<Vec<String>, WrappedError> {
+        use rustpush::ids::user::QueryOptions;
+
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
+            msg: "no handle available".into(),
+        })?.clone();
+
+        // Try IDS services in order. Each service's lookup may return zero
+        // keys for a hidden alias (e.g. an Apple-ID-linked mailto: that
+        // isn't registered for iMessage), so we walk down the list until
+        // one returns a correlation_id, then scan known_handles in that
+        // same service for matching ids.
+        //
+        // Only services that are actually registered in the bridge's
+        // IDS service list are valid here — passing a topic that
+        // isn't registered makes IdentityManager::get_main_service
+        // panic via .expect("Topic ... not found!"). The bridge
+        // registers MADRID + MULTIPLEX (which sub_serves status.keysharing
+        // and status.personal); presence.mode.status is APNs-interest
+        // only, not an IDS service, so we cannot validate_targets it.
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
+        ];
+
+        for (idx, &service) in SERVICES.iter().enumerate() {
+            // Madrid (first service) gets a batched lookup — the unknown
+            // handle plus every known ghost in one query. This matters
+            // for hidden Apple-ID aliases (e.g. mailto:aap724@…) that
+            // return LookupFailed (6001) when queried alone but get their
+            // correlation_id populated alongside successful sibling
+            // lookups in a batch.
+            let (targets, timeout_secs): (Vec<String>, u64) = if idx == 0 {
+                let mut t = Vec::with_capacity(known_handles.len() + 1);
+                t.push(handle.clone());
+                for k in &known_handles {
+                    if k != &handle {
+                        t.push(k.clone());
+                    }
+                }
+                (t, 15)
+            } else {
+                (vec![handle.clone()], 5)
+            };
+
+            // Bypass the EMPTY_REFRESH (1h) freshness filter via refresh=true.
+            // Why: validate_targets uses refresh=false, which keeps stale empty
+            // results "fresh" for an hour — so a handle Apple previously returned
+            // empty for is filtered out of the HTTP fetch and never re-queried.
+            // refresh=true drops the cutoff to REFRESH_MIN (60s). The resolver's
+            // rate gate caps how often this runs, so we don't pound Apple.
+            //
+            // Routed through ids_guard: for services after Madrid this queries a
+            // single URI, which is one of the two shapes that trips the upstream
+            // chunks(0) panic (ids/user.rs:984).
+            //
+            // Quarantine ENFORCED, and it matters most here. The madrid pass
+            // above is not a single-URI lookup: it is this handle plus every
+            // ghost in the bridge DB (client.go's `SELECT id FROM ghost`), so
+            // ONE poison handle anywhere in that set rides along in every
+            // resolution. A poison handle also never reaches put_keys, so it
+            // never gets a cache entry, so `does_not_need_refresh` never
+            // filters it out — without the quarantine it would trigger a full
+            // bisection on every presence update, forever. The per-handle rate
+            // gate (statusKitIDSAttemptCooldown) does not help: it paces calls
+            // between handles, not the attempts inside one bisection.
+            //
+            // Cost of enforcing: a contact whose lookup is quarantined has
+            // presence resolution suppressed until the TTL expires. That TTL
+            // (6h) matches the gate's own attempt cooldown (6h), so in the
+            // common case the negative-attempt stamp already suppresses a
+            // re-query for the same window and enforcing costs nothing extra.
+            let report = ids_guard::guarded_cache_keys(
+                &self.client.identity,
+                service,
+                &targets,
+                &my_handle,
+                true,
+                &QueryOptions::default(),
+                timeout_secs,
+                ids_guard::QuarantinePolicy::Enforce,
+            ).await;
+            if let Some(err) = &report.error {
+                info!("resolve_handle: cache_keys({}, n={}) failed: {}", service, targets.len(), err);
+            }
+
+            let cache = self.client.identity.cache.lock().await;
+            let correlation_id = match cache.get_correlation_id(service, &my_handle, &handle) {
+                Some(cid) if !cid.is_empty() => cid,
+                _ => {
+                    info!("resolve_handle: no correlation ID for {} in {} — trying next service", handle, service);
+                    continue; // try next service
+                }
+            };
+
+            // Scan known handles for matching correlation IDs in this service.
+            // The Madrid batch above populates correlation_ids for every
+            // known_handle that resolves; later services rely on the cache
+            // from prior message processing / StatusKit invite traffic.
+            let mut aliases = vec![];
+            for known_handle in &known_handles {
+                if known_handle == &handle {
+                    continue;
+                }
+                if let Some(cid) = cache.get_correlation_id(service, &my_handle, known_handle) {
+                    if cid == correlation_id {
+                        aliases.push(known_handle.clone());
+                    }
+                }
+            }
+
+            info!("resolve_handle: {} → {} alias(es) via {} (correlation {})", handle, aliases.len(), service, correlation_id);
+            return Ok(aliases);
+        }
+
+        info!("resolve_handle: no correlation ID for {} in any IDS service", handle);
+        Ok(vec![])
+    }
+
+    /// Like resolve_handle but reads ONLY from the in-memory IDS cache —
+    /// no network call, no validate_targets, no blocking. Returns the
+    /// tel: (or other) aliases that share the same sender_correlation_identifier
+    /// as `handle` according to data already cached from prior message processing.
+    /// Returns an empty Vec if the handle is not in the cache yet.
+    ///
+    /// Checks both `com.apple.madrid` (populated by iMessage traffic) and
+    /// `com.apple.private.alloy.status.keysharing` (populated by StatusKit
+    /// invite/receive). At fresh startup the Madrid cache is empty until an
+    /// iMessage is sent; the keysharing cache is populated as soon as
+    /// invite_to_channel runs. Falling through to keysharing lets the
+    /// periodic re-invite path find aliases on subsequent ticks.
+    pub async fn resolve_handle_cached(&self, handle: String, known_handles: Vec<String>) -> Vec<String> {
+        // Mirror resolve_handle's services list — see comment there.
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
+        ];
+
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = match my_handles.first() {
+            Some(h) => h.clone(),
+            None => return vec![],
+        };
+
+        let cache = self.client.identity.cache.lock().await;
+        for &service in SERVICES {
+            let correlation_id = match cache.get_correlation_id(service, &my_handle, &handle) {
+                Some(cid) if !cid.is_empty() => cid,
+                _ => continue,
+            };
+
+            let mut aliases = vec![];
+            for known_handle in &known_handles {
+                if known_handle == &handle {
+                    continue;
+                }
+                if let Some(cid) = cache.get_correlation_id(service, &my_handle, known_handle) {
+                    if cid == correlation_id {
+                        aliases.push(known_handle.clone());
+                    }
+                }
+            }
+            info!("resolve_handle_cached: {} → {} alias(es) via {} (correlation {})", handle, aliases.len(), service, correlation_id);
+            return aliases;
+        }
+
+        info!("resolve_handle_cached: {} not in IDS cache", handle);
+        vec![]
+    }
+
+    /// Vectorized resolve_handle: takes many unknown handles plus the full set
+    /// of known portal-bearing handles, makes ONE batched IDS call per service
+    /// covering all of them at once, then walks the cache to match each
+    /// unknown's correlation_id against the known handles.
+    ///
+    /// Returns a map of unknown_handle → list of sibling known_handles. Only
+    /// handles that resolved to at least one sibling appear in the map.
+    /// Unknowns Apple has nothing for are silently absent.
+    ///
+    /// Designed to back the per-sync alias-link pass: 12-hour cadence, called
+    /// after the StatusKit-CloudKit pull when state.keys is freshly populated.
+    /// Pays one network round-trip total regardless of how many unknowns —
+    /// the rate gate that protects per-presence resolution doesn't apply
+    /// here because the call is bounded and infrequent by design.
+    pub async fn batch_resolve_handles(
+        &self,
+        unknowns: Vec<String>,
+        known_handles: Vec<String>,
+    ) -> Result<HashMap<String, Vec<String>>, WrappedError> {
+        use rustpush::ids::user::QueryOptions;
+
+        if unknowns.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
+            msg: "no handle available".into(),
+        })?.clone();
+
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
+        ];
+
+        // Dedup unknowns and known siblings into separate vectors so we can
+        // apply different refresh policies. Unknowns get refresh=true (force
+        // Apple to re-query, bypassing EMPTY_REFRESH). Known siblings get
+        // refresh=false (cache-only when warm; only fetched if their entry
+        // is missing or genuinely stale per session_token_refresh_seconds).
+        // This is the difference between ~4 Apple lookups per cycle and ~28.
+        let mut unknown_targets: Vec<String> = Vec::with_capacity(unknowns.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for h in &unknowns {
+            if seen.insert(h.clone()) {
+                unknown_targets.push(h.clone());
+            }
+        }
+        let mut sibling_targets: Vec<String> = Vec::with_capacity(known_handles.len());
+        for h in &known_handles {
+            if seen.insert(h.clone()) {
+                sibling_targets.push(h.clone());
+            }
+        }
+
+        // Timeouts scale with each list's size separately. Unknowns are the
+        // small set (the ones we actually need fresh data for); known siblings
+        // are mostly cache hits, so this call is fast in steady state.
+        let unknown_timeout: u64 = ((unknown_targets.len() as u64 / 18) * 4 + 15).min(90);
+        let sibling_timeout: u64 = ((sibling_targets.len() as u64 / 18) * 4 + 15).min(90);
+
+        let mut results: HashMap<String, Vec<String>> = HashMap::new();
+
+        for &service in SERVICES {
+            // 1. Force-fresh fetch for the unknowns. refresh=true bypasses the
+            //    EMPTY_REFRESH cache filter so Apple is re-queried even if a
+            //    prior empty result is cached within the 1h window.
+            //
+            //    Routed through ids_guard so one unanswerable handle can no
+            //    longer take down the process (or, once caught, abort the rest
+            //    of the pass): it is isolated by bisection, quarantined, and
+            //    every other handle in the list still resolves.
+            let report = ids_guard::guarded_cache_keys(
+                &self.client.identity,
+                service,
+                &unknown_targets,
+                &my_handle,
+                true,
+                &QueryOptions::default(),
+                unknown_timeout,
+                ids_guard::QuarantinePolicy::Enforce,
+            ).await;
+            if let Some(err) = &report.error {
+                info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {}", service, unknown_targets.len(), err);
+                if !report.systemic {
+                    // Ordinary failure: skip this service entirely, exactly as
+                    // this loop did before the guard existed.
+                    continue;
+                }
+                // Systemic panic (broken registration, bad cache state). Skip
+                // the sibling query — it would walk into the same instant
+                // panic — but still run the correlation scan below: it is
+                // in-memory, issues no queries, and can only add results from
+                // entries earlier passes already cached.
+            }
+
+            // 2. Cache-only top-up for known siblings. refresh=false means each
+            //    sibling is filtered out if its cache entry is fresh — typical
+            //    case is cache hit for everyone (siblings have been queried
+            //    during normal message traffic). Only siblings with truly
+            //    missing/stale entries hit Apple.
+            if report.error.is_none() && !sibling_targets.is_empty() {
+                let sib = ids_guard::guarded_cache_keys(
+                    &self.client.identity,
+                    service,
+                    &sibling_targets,
+                    &my_handle,
+                    false,
+                    &QueryOptions::default(),
+                    sibling_timeout,
+                    ids_guard::QuarantinePolicy::Enforce,
+                ).await;
+                if let Some(err) = &sib.error {
+                    info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {}", service, sibling_targets.len(), err);
+                }
+            }
+
+            let cache = self.client.identity.cache.lock().await;
+            for unknown in &unknowns {
+                if results.contains_key(unknown) {
+                    continue;
+                }
+                let cid = match cache.get_correlation_id(service, &my_handle, unknown) {
+                    Some(c) if !c.is_empty() => c,
+                    _ => continue,
+                };
+                let mut aliases = vec![];
+                for known in &known_handles {
+                    if known == unknown {
+                        continue;
+                    }
+                    if let Some(other_cid) = cache.get_correlation_id(service, &my_handle, known) {
+                        if other_cid == cid {
+                            aliases.push(known.clone());
+                        }
+                    }
+                }
+                if !aliases.is_empty() {
+                    results.insert(unknown.clone(), aliases);
+                }
+            }
+        }
+
+        info!(
+            "batch_resolve_handles: resolved {}/{} unknowns (forced-fresh n={}, sibling cache-top-up n={})",
+            results.len(), unknowns.len(), unknown_targets.len(), sibling_targets.len()
+        );
+        Ok(results)
+    }
+
+    /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the
+    /// persisted state file. Must be called BEFORE init_statuskit() so the
+    /// StatusKit client loads the reset cursors on startup. Resetting to 1
+    /// causes Apple's APNs server to replay the most recently published status
+    /// for each channel (within the 7-day retention window), allowing the
+    /// bridge to learn the current presence of contacts on startup instead of
+    /// waiting for the next change. Keys and channel identifiers are preserved.
+    pub fn reset_statuskit_cursors(&self) {
+        let state_path = subsystem_state_path("statuskit-state.plist");
+        let mut state = read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path)
+            .unwrap_or_default();
+        let count = state.recent_channels.len();
+        for ch in state.recent_channels.iter_mut() {
+            ch.last_msg_ns = 1;
+        }
+        persist_plist_state(&state_path, &state);
+        info!("Reset {} StatusKit channel cursor(s) to 1 for replay", count);
+    }
+
+    /// Send our StatusKit key to the specified contact handles (via IDS
+    /// keysharing), establishing the mutual key exchange needed to receive
+    /// their Focus/DND status updates. Should be called after init_statuskit()
+    /// for handles that are not yet in the persisted key state. When the
+    /// contact's device receives our key, it should respond by sending its own
+    /// key, which the receive loop stores in the StatusKit state.
+    pub async fn invite_to_status_sharing(
+        &self,
+        sender_handle: String,
+        handles: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
+            msg: "StatusKit not initialized".into(),
+        })?;
+
+        match statuskitgo::invite_keysharing(&sk, &sender_handle, &handles).await {
+            Ok(_) => Ok(()),
+            // Peer isn't on the keysharing sub-service. Surface as a TYPED
+            // variant (compile-checked here against the rustpush enum) so the Go
+            // no-keys cache matches it with errors.Is, not a brittle string.
+            Err(rustpush::PushError::NoValidTargets) => Err(WrappedError::NoStatusKitTargets),
+            Err(e) => Err(WrappedError::GenericError {
+                msg: format!("StatusKit invite: {:?}", e),
+            }),
+        }
+    }
+
+
+    /// Fetch a shared iMessage profile (Name & Photo Sharing) from CloudKit.
+    /// `record_key` and `decryption_key` are obtained from an incoming
+    /// ShareProfile / UpdateProfile message.
+    pub async fn fetch_profile(
+        &self,
+        record_key: String,
+        decryption_key: Vec<u8>,
+        has_poster: bool,
+    ) -> Result<WrappedProfileRecord, WrappedError> {
+        let key_prefix: String = record_key.chars().take(8).collect();
+        let dec_len = decryption_key.len();
+        info!(
+            "fetch_profile: record_key={}… decryption_key_len={} has_poster={}",
+            key_prefix, dec_len, has_poster
+        );
+        let profiles = self.get_or_init_profiles_client().await?;
+        // ALWAYS None, even when the peer advertised a poster.
+        //
+        // This used to synthesise a `SharedPoster` with empty tags whenever
+        // `has_poster` was set, on the theory that upstream only checks
+        // `poster.is_some()` to decide whether to pull the wallpaper record.
+        // It checks it twice, and both are harmful to us:
+        //
+        //   1. `name_photo_sharing.rs` additionally requests the separate
+        //      `{record_key}-wp` record and calls `FetchedRecords::get_record`
+        //      on it. That returns `R`, not `Result<R>`, so an absent record
+        //      is not an error path — it is `.expect("No record found?")`.
+        //      Peers routinely advertise a poster whose `-wp` record we cannot
+        //      fetch, so this was a panic we asked for.
+        //
+        //   2. Even when the `-wp` record IS present, the decrypt does
+        //      `decrypt_verify("wm", &poster.wm, &poster.share_meta.message_tag)`
+        //      and rejects on `field.tag != tag`. `share_meta` is the struct we
+        //      synthesised, whose tags are empty, so the comparison against the
+        //      real HMAC could never match. It returned
+        //      `NickNameCryptoError("Decrypt tag mismatch!")` — which fails the
+        //      WHOLE record, taking the name and avatar down with it.
+        //
+        // So `has_poster == true` had exactly two outcomes: panic, or lose the
+        // profile. Asking for `poster: None` fetches only the record we
+        // actually read, and makes these profiles work for the first time.
+        // `has_poster` stays in the signature (it is a uniffi export and the Go
+        // side persists it per row) but is now diagnostic only.
+        let share_msg = rustpush::ShareProfileMessage {
+            cloud_kit_record_key: record_key,
+            cloud_kit_decryption_record_key: decryption_key,
+            poster: None,
+        };
+        // The cloudkit.rs `FetchedRecords::get_record` does
+        // `.expect("No record found?")` when CloudKit returns a response
+        // with no matching record id. That's a normal outcome when the
+        // peer rotated/deleted their shared-profile record after we cached
+        // its key, but that panic → crosses the FFI boundary →
+        // takes the bridge down (and systemd restarts into the same row,
+        // crashloop). `guard_panic` turns the panic into an error so the
+        // Go-side periodic refresh logs+skips the stale row.
+        let record = match guard_panic("fetch_profile CloudKit fetch", profiles.get_record(&share_msg)).await {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => {
+                warn!(
+                    "fetch_profile failed (record_key={}…, has_poster={}): {:?}",
+                    key_prefix, has_poster, e
+                );
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to fetch profile: {:?}", e),
+                });
+            }
+            None => {
+                warn!(
+                    "fetch_profile panicked in upstream CloudKit (record_key={}…, peer_has_poster={}) — likely record rotated/deleted; treating as fetch error",
+                    key_prefix, has_poster
+                );
+                return Err(WrappedError::GenericError {
+                    msg: "Shared profile record not found in CloudKit (rotated/deleted)".to_string(),
+                });
+            }
+        };
+        Ok(WrappedProfileRecord {
+            display_name: record.name.name,
+            first_name: record.name.first,
+            last_name: record.name.last,
+            avatar: record.image,
+        })
+    }
+
+    pub async fn get_handles(&self) -> Vec<String> {
+        self.client.identity.get_handles().await
+    }
+
+    /// Returns the list of IDS service names present in this user's registration
+    /// map (e.g. "com.apple.madrid", "com.apple.private.alloy.multiplex1").
+    /// StatusKit key exchange requires "com.apple.private.alloy.multiplex1" to
+    /// appear in this list; if it doesn't, we never subscribe to the keysharing
+    /// topic and contacts' c=227 replies never reach us.
+    pub async fn get_registered_services(&self) -> Vec<String> {
+        let users = self.client.identity.users.read().await;
+        if users.is_empty() {
+            return vec![];
+        }
+        users[0].registration.keys().cloned().collect()
+    }
+
+    /// Get iCloud auth headers (Authorization + anisette) for MobileMe API calls.
+    /// Returns None if no token provider is available.
+    pub async fn get_icloud_auth_headers(&self) -> Result<Option<HashMap<String, String>>, WrappedError> {
+        match &self.token_provider {
+            Some(tp) => Ok(Some(tp.get_icloud_auth_headers().await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the contacts CardDAV URL from the MobileMe delegate.
+    /// Returns None if no token provider is available.
+    pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
+        match &self.token_provider {
+            Some(tp) => Ok(tp.get_contacts_url().await?),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the DSID for this account.
+    pub async fn get_dsid(&self) -> Result<Option<String>, WrappedError> {
+        match &self.token_provider {
+            Some(tp) => Ok(Some(tp.get_dsid().await?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
+        self.get_or_init_facetime_client().await
+    }
+
+    pub async fn get_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
+        self.get_or_init_passwords_client().await
+    }
+
+    pub async fn get_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+        self.get_or_init_statuskit_client().await
+    }
+
+    pub async fn get_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
+        self.get_or_init_sharedstreams_client().await
+    }
+
+    /// Reports whether any device on this Apple account OTHER than us is
+    /// registered to relay text messages — Apple's Text Message Forwarding.
+    ///
+    /// This mirrors, exactly, how a carrier send resolves its targets
+    /// (aps_client.rs `send`): an SMS-flagged message is retargeted to our OWN
+    /// handle, queried on the `com.apple.private.alloy.sms` topic with the same
+    /// QueryOptions the send uses, and the resulting delivery handles then have
+    /// our own push token removed ("do not send to self",
+    /// identity_manager.rs:922-926). Whatever remains is the set of devices that
+    /// would actually carry the text. If that set is empty the send still returns
+    /// Ok with an empty target list, and the message is silently discarded — which
+    /// is the failure this predicate exists to detect.
+    ///
+    /// Deliberately NOT keyed off PrivateDeviceInfo::sub_services. That field is
+    /// populated from the dependent-registration response (user.rs:870) but is
+    /// never consulted by rustpush for routing — the only routing uses of
+    /// sub_services are on the static IDSService definition, describing which
+    /// topics we register for. Reading relay capability out of it would be our own
+    /// invention rather than what Apple actually routes on.
+    ///
+    /// Fails closed on every inconclusive shape — lookup error, caught panic,
+    /// and an absent or stale cache entry. iBlue must not turn a failed iMessage
+    /// into a successful-looking SMS unless IDS positively proves that another
+    /// device on this account can relay it.
+    pub async fn has_sms_relay(&self, handle: String) -> bool {
+        const SMS_TOPIC: &str = "com.apple.private.alloy.sms";
+
+        // Prime the cache through the guarded seam, as validate_targets does, so a
+        // panicking lookup cannot take the process down. Same QueryOptions the send
+        // uses, so we are asking the question the send asks.
+        let report = ids_guard::guarded_cache_keys(
+            &self.client.identity,
+            SMS_TOPIC,
+            std::slice::from_ref(&handle),
+            &handle,
+            false,
+            &rustpush::ids::user::QueryOptions { required_for_message: true, result_expected: true },
+            30,
+            ids_guard::QuarantinePolicy::Bypass,
+        )
+        .await;
+        // Both failure shapes, not just `error`. A one-element target list can
+        // never exceed MAX_QUARANTINE_PER_PASS, so a caught panic lands in
+        // `poisoned` with `error` left None (ids_guard.rs classify_and_record).
+        if let Some(err) = &report.error {
+            warn!("has_sms_relay: relay lookup failed; refusing unproven SMS fallback: {}", err);
+            return false;
+        }
+        if !report.poisoned.is_empty() {
+            warn!("has_sms_relay: relay lookup panicked; refusing unproven SMS fallback");
+            return false;
+        }
+
+        let my_token = self.conn.get_token().await;
+        let cache = self.client.identity.cache.lock().await;
+
+        // An empty get_keys cannot tell "IDS says there are no relay devices" from
+        // "nothing was cached" — no entry, expired entry, or a response that named
+        // no URIs all read the same. Only a FRESH entry licenses a negative answer;
+        // anything else means the question went unanswered. An unanswered probe
+        // is not permission to report a fallback send as successful.
+        if !cache.does_not_need_refresh(SMS_TOPIC, &handle, &handle, false) {
+            warn!("has_sms_relay: no fresh relay entry cached; refusing unproven SMS fallback");
+            return false;
+        }
+
+        let relays = cache
+            .get_keys(SMS_TOPIC, &handle, &handle)
+            .into_iter()
+            .filter(|data| data.push_token != my_token)
+            .count();
+        drop(cache);
+
+        if relays == 0 {
+            info!("has_sms_relay: IDS reports no text-message relay on this account");
+            return false;
+        }
+        true
+    }
+
+    pub async fn validate_targets(
+        &self,
+        targets: Vec<String>,
+        handle: String,
+    ) -> Vec<String> {
+        // Callers pass a single identifier here (contact_merge.go:86), which is
+        // one of the shapes that trips the upstream chunks(0) panic. Prime the
+        // cache through the guarded seam first, then read it back with the same
+        // filter upstream applies (identity_manager.rs:866-870). Request refresh
+        // so an empty answer does not remain authoritative for an hour; the cache
+        // still enforces rustpush's one-minute minimum between forced refreshes.
+        //
+        // Two deliberate deltas from the old `identity.validate_targets(..)
+        // .unwrap_or_default()` call, both safer at this call site:
+        //   * On a failed lookup this returns whatever is already cached
+        //     instead of empty. Empty means "not reachable on iMessage" to
+        //     resolveSendTarget (contact_merge.go:108), which reroutes the
+        //     message to an alternate number — a worse outcome during a
+        //     transient IDS outage than answering from cache.
+        //   * A 30s per-attempt timeout where there was none. The old call
+        //     could block the send path indefinitely.
+        //
+        // Quarantine BYPASSED here on purpose. This backs resolveSendTarget on
+        // the outbound path (contact_merge.go:108): a suppressed handle reads
+        // as "not reachable on iMessage" and silently reroutes the message to
+        // an alternate number for the quarantine window. The quarantine buys
+        // no safety at this call site anyway — a single-target lookup that
+        // panics is caught, returns empty, and costs exactly one attempt with
+        // or without an entry.
+        let report = ids_guard::guarded_cache_keys(
+            &self.client.identity,
+            "com.apple.madrid",
+            &targets,
+            &handle,
+            true,
+            &rustpush::ids::user::QueryOptions::default(),
+            30,
+            ids_guard::QuarantinePolicy::Bypass,
+        ).await;
+        if let Some(err) = &report.error {
+            info!("validate_targets: cache_keys(n={}) failed: {}", targets.len(), err);
+        }
+        let cache = self.client.identity.cache.lock().await;
+        targets
+            .iter()
+            .filter(|t| !cache.get_keys("com.apple.madrid", &handle, t).is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Invoke the normal APNs-tunnel IDS lookup once, without ids_guard's
+    /// panic bisection and without a fallback transport. The caller gets cache
+    /// evidence even when the lookup errors, panics, or times out, but must only
+    /// send when both required addresses were returned by this invocation with
+    /// at least one live identity.
+    pub async fn lookup_targets_once(
+        &self,
+        targets: Vec<String>,
+        handle: String,
+    ) -> WrappedIdsLookupReport {
+        use futures::FutureExt;
+
+        const TOPIC: &str = "com.apple.madrid";
+        if targets.is_empty() {
+            return WrappedIdsLookupReport {
+                targets: Vec::new(),
+                error: Some("strict IDS lookup requires at least one target".to_string()),
+                panicked: false,
+                timed_out: false,
+                attempts: 0,
+            };
+        }
+
+        let before = {
+            let cache = self.client.identity.cache.lock().await;
+            targets
+                .iter()
+                .map(|target| cache.get_cached_at_ms(TOPIC, &handle, target))
+                .collect::<Vec<_>>()
+        };
+
+        let options = rustpush::ids::user::QueryOptions::default();
+        let lookup = self.client.identity.cache_keys(
+            TOPIC,
+            &targets,
+            &handle,
+            true,
+            &options,
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            std::panic::AssertUnwindSafe(lookup).catch_unwind(),
+        )
+        .await;
+        let (error, panicked, timed_out) = match outcome {
+            Ok(Ok(Ok(()))) => (None, false, false),
+            Ok(Ok(Err(error))) => (Some(error.to_string()), false, false),
+            Ok(Err(_)) => (Some("IDS lookup panicked".to_string()), true, false),
+            Err(_) => (
+                Some("IDS lookup timed out after 30 seconds".to_string()),
+                false,
+                true,
+            ),
+        };
+
+        let cache = self.client.identity.cache.lock().await;
+        let inspected = targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let cached_at = cache.get_cached_at_ms(TOPIC, &handle, target);
+                WrappedIdsLookupTarget {
+                    address: target.clone(),
+                    cache_entry_fresh: cache.does_not_need_refresh(TOPIC, &handle, target, false),
+                    response_entry_returned: cached_at.is_some() && cached_at != before[index],
+                    identity_count: cache.get_keys(TOPIC, &handle, target).len() as u64,
+                    correlation_identifier_present: cache
+                        .get_correlation_id(TOPIC, &handle, target)
+                        .is_some(),
+                }
+            })
+            .collect();
+
+        WrappedIdsLookupReport {
+            targets: inspected,
+            error,
+            panicked,
+            timed_out,
+            attempts: 1,
+        }
+    }
+
+    /// Run a read-only, directly signed HTTPS IDS lookup. Normal iMessage sends
+    /// continue to use the APNs-tunnel cache; this exists to compare Apple's
+    /// response across the two supported `id-query` transports.
+    pub async fn validate_targets_http(
+        &self,
+        targets: Vec<String>,
+        handle: String,
+    ) -> Result<Vec<String>, WrappedError> {
+        self.client
+            .identity
+            .validate_targets_http(&targets, &handle)
+            .await
+            .map_err(WrappedError::from)
+    }
+
+    pub async fn send_message(
+        &self,
+        conversation: WrappedConversation,
+        text: String,
+        html: Option<String>,
+        subject: Option<String>,
+        effect: Option<String>,
+        handle: String,
+        reply_guid: Option<String>,
+        reply_part: Option<String>,
+        scheduled_ms: Option<u64>,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms && !self.has_sms_relay(handle.clone()).await {
+            return Err(WrappedError::NoSmsRelay);
+        }
+        let (reply_guid, reply_part) = normalize_reply_target(reply_guid, reply_part);
+        let conv: ConversationData = (&conversation).into();
+        let service = if conversation.is_sms {
+            MessageType::SMS {
+                is_phone: false,
+                using_number: handle.clone(),
+                from_handle: None,
+            }
+        } else {
+            MessageType::IMessage
+        };
+
+        // Parse rich link encoded as prefix: \x00RL\x01original_url\x01url\x01title\x01summary\x00actual_text
+        let (actual_text, link_meta) = if text.starts_with("\x00RL\x01") {
+            let rest = &text[4..]; // skip "\x00RL\x01"
+            if let Some(end) = rest.find('\x00') {
+                let metadata = &rest[..end];
+                let actual = rest[end + 1..].to_string();
+                let fields: Vec<&str> = metadata.splitn(4, '\x01').collect();
+                let original_url_str = fields.first().copied().unwrap_or("");
+                let url_str = fields.get(1).copied().unwrap_or("");
+                let title_str = fields.get(2).copied().unwrap_or("");
+                let summary_str = fields.get(3).copied().unwrap_or("");
+
+                let original_url = NSURL {
+                    base: "$null".to_string(),
+                    relative: original_url_str.to_string(),
+                };
+                let url = if url_str.is_empty() {
+                    None
+                } else {
+                    Some(NSURL {
+                        base: "$null".to_string(),
+                        relative: url_str.to_string(),
+                    })
+                };
+                let title = if title_str.is_empty() { None } else { Some(title_str.to_string()) };
+                let summary = if summary_str.is_empty() { None } else { Some(summary_str.to_string()) };
+
+                info!("Sending rich link: url={}, title={:?}", original_url_str, title);
+
+                let lm = LinkMeta {
+                    data: LPLinkMetadata {
+                        image_metadata: None,
+                        version: 1,
+                        icon_metadata: None,
+                        original_url: Some(original_url),
+                        url,
+                        title,
+                        summary,
+                        image: None,
+                        icon: None,
+                        images: None,
+                        icons: None,
+                        is_incomplete: None,
+                        uses_activity_pub: None,
+                        is_encoded_for_local_use: None,
+                        collaboration_type: None,
+                        specialization2: None,
+                    },
+                    attachments: vec![],
+                };
+                (actual, Some(lm))
+            } else {
+                (text, None)
+            }
+        } else {
+            (text, None)
+        };
+
+        let parts = if let Some(ref html_str) = html {
+            parse_html_to_parts(html_str, &actual_text)
+        } else {
+            None
+        };
+
+        let schedule = scheduled_ms.map(|ms| ScheduleMode { ms, schedule: true });
+
+        let normal = if let Some(parts) = parts {
+            NormalMessage {
+                parts,
+                effect,
+                reply_guid: reply_guid.clone(),
+                reply_part: reply_part.clone(),
+                service: service.clone(),
+                subject,
+                app: None,
+                link_meta,
+                voice: false,
+                scheduled: schedule,
+                embedded_profile: None,
+            }
+        } else {
+            let mut n = NormalMessage::new(actual_text.clone(), service.clone());
+            n.link_meta = link_meta;
+            n.effect = effect;
+            n.subject = subject;
+            n.reply_guid = reply_guid.clone();
+            n.reply_part = reply_part.clone();
+            n.scheduled = schedule;
+            n
+        };
+        let mut msg = MessageInst::new(
+            conv.clone(),
+            &handle,
+            Message::Message(normal),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Send one iMessage containing ordered text, mention, and attachment
+    /// parts. This mirrors BlueBubbles' private-API multipart operation while
+    /// using the public rustpush message model instead of Messages.framework.
+    pub async fn send_multipart_message(
+        &self,
+        conversation: WrappedConversation,
+        parts: Vec<WrappedMultipartPart>,
+        handle: String,
+        subject: Option<String>,
+        effect: Option<String>,
+        reply_guid: Option<String>,
+        reply_part: Option<String>,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms && !self.has_sms_relay(handle.clone()).await {
+            return Err(WrappedError::NoSmsRelay);
+        }
+        let (reply_guid, reply_part) = normalize_reply_target(reply_guid, reply_part);
+        if parts.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No multipart message parts provided".to_string(),
+            });
+        }
+
+        // Validate every part before starting any MMCS upload so malformed
+        // requests cannot leave a prefix of the attachments orphaned.
+        for part in &parts {
+            if part.data.is_some() {
+                if part.filename.as_deref().unwrap_or("").is_empty()
+                    || part.mime_type.as_deref().unwrap_or("").is_empty()
+                    || part.uti_type.as_deref().unwrap_or("").is_empty()
+                {
+                    return Err(WrappedError::GenericError {
+                        msg: format!(
+                            "Multipart attachment part {} is missing filename, MIME type, or UTI",
+                            part.part_index
+                        ),
+                    });
+                }
+            } else if part.text.as_deref().unwrap_or("").is_empty() {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Multipart part {} has no text or attachment", part.part_index),
+                });
+            }
+            if part.mention.is_some() && part.text.as_deref().unwrap_or("").is_empty() {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Multipart mention part {} has no text", part.part_index),
+                });
+            }
+        }
+
+        let conv: ConversationData = (&conversation).into();
+        let service = if conversation.is_sms {
+            MessageType::SMS {
+                is_phone: false,
+                using_number: handle.clone(),
+                from_handle: None,
+            }
+        } else {
+            MessageType::IMessage
+        };
+        let has_attachments = parts.iter().any(|part| part.data.is_some());
+        if has_attachments && !conversation.is_sms {
+            self.preflight_mmcs_upload_targets(&conversation, &handle)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to resolve multipart attachment targets: {e}"),
+                })?;
+        }
+        let mut message_parts = Vec::with_capacity(parts.len());
+
+        for part in parts {
+            let part_index = usize::try_from(part.part_index).map_err(|_| {
+                WrappedError::GenericError {
+                    msg: format!("Multipart part index {} is too large", part.part_index),
+                }
+            })?;
+
+            // BlueBubbles' helper gives filePath precedence when a part also
+            // contains text, so match that behavior here.
+            let message_part = if let Some(data) = part.data {
+                let mime = part.mime_type.expect("validated multipart MIME type");
+                let uti_type = part.uti_type.expect("validated multipart UTI type");
+                let filename = part.filename.expect("validated multipart filename");
+                let attachment = if conversation.is_sms {
+                    inline_relay_attachment(data, mime, uti_type, filename)
+                } else {
+                    let prepared = MMCSFile::prepare_put(Cursor::new(&data))
+                        .await
+                        .map_err(|e| WrappedError::GenericError {
+                            msg: format!("Failed to prepare multipart MMCS upload: {e}"),
+                        })?;
+                    Attachment::new_mmcs(
+                        &self.conn,
+                        &prepared,
+                        Cursor::new(&data),
+                        &mime,
+                        &uti_type,
+                        &filename,
+                        |_current, _total| {},
+                    )
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to upload multipart attachment: {e}"),
+                    })?
+                };
+                MessagePart::Attachment(attachment)
+            } else {
+                let text = part.text.expect("validated multipart text");
+                match part.mention.filter(|mention| !mention.is_empty()) {
+                    Some(mention) => MessagePart::Mention(mention, text),
+                    None => MessagePart::Text(text, Default::default()),
+                }
+            };
+            message_parts.push(IndexedMessagePart {
+                part: message_part,
+                idx: Some(part_index),
+                ext: None,
+            });
+        }
+
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Message(NormalMessage {
+                parts: MessageParts(message_parts),
+                effect,
+                reply_guid,
+                reply_part,
+                service,
+                subject,
+                app: None,
+                link_meta: None,
+                voice: false,
+                scheduled: None,
+                embedded_profile: None,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send multipart message: {e}"),
+            })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_tapback(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        target_part: u64,
+        target_text: String,
+        reaction: u32,
+        emoji: Option<String>,
+        remove: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let reaction_val = match (reaction, &emoji) {
+            (0, _) => Reaction::Heart,
+            (1, _) => Reaction::Like,
+            (2, _) => Reaction::Dislike,
+            (3, _) => Reaction::Laugh,
+            (4, _) => Reaction::Emphasize,
+            (5, _) => Reaction::Question,
+            (6, Some(em)) => Reaction::Emoji(em.clone()),
+            _ => Reaction::Heart,
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::React(ReactMessage {
+                to_uuid: target_uuid,
+                to_part: Some(target_part),
+                reaction: ReactMessageType::React { reaction: reaction_val, enable: !remove },
+                to_text: target_text,
+                embedded_profile: None,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send tapback: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_typing(
+        &self,
+        conversation: WrappedConversation,
+        typing: bool,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, None));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_typing_with_app(
+        &self,
+        conversation: WrappedConversation,
+        typing: bool,
+        handle: String,
+        bundle_id: String,
+        icon: Vec<u8>,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let app = TypingApp { bundle_id, icon };
+        let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, Some(app)));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing with app: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_read_receipt(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        for_uuid: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::Read);
+        msg.id = for_uuid;
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send read receipt: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_delivery_receipt(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::Delivered);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send delivery receipt: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_edit(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        edit_part: u64,
+        new_text: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Edit(EditMessage {
+                tuuid: target_uuid,
+                edit_part,
+                new_parts: MessageParts(vec![IndexedMessagePart {
+                    part: MessagePart::Text(new_text, Default::default()),
+                    idx: None,
+                    ext: None,
+                }]),
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send edit: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_unsend(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        edit_part: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Unsend(UnsendMessage {
+                tuuid: target_uuid,
+                edit_part,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unsend: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Send a MoveToRecycleBin message to notify other Apple devices that a chat was deleted.
+    pub async fn send_move_to_recycle_bin(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        chat_guid: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        // Strip mailto:/tel: prefixes and exclude the sender's own handle.
+        // Apple's OperatedChat.ptcpts contains only the OTHER party's handles,
+        // not the user's own handle. Including it causes the Mac to not
+        // recognise the chat being deleted.
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let operated_chat = OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
+        };
+        let delete_msg = MoveToRecycleBinMessage {
+            target: DeleteTarget::Chat(operated_chat.clone()),
+            recoverable_delete_date: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let mut msg = MessageInst::new(conv, &handle, Message::MoveToRecycleBin(delete_msg));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin: {}", e) })?;
+        // Note: We intentionally do NOT send PermanentDelete. MoveToRecycleBin
+        // moves the chat to Apple's "Recently Deleted" (30-day retention),
+        // respecting the user's recycle bin. The chat can be restored with
+        // !restore-chat which re-uploads the record to CloudKit.
+        Ok(())
+    }
+
+    /// Send a RecoverChat APNs message (command 182) to notify other Apple
+    /// devices that a chat has been recovered from the recycle bin.
+    /// This is the inverse of send_move_to_recycle_bin.
+    pub async fn send_recover_chat(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        chat_guid: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let operated_chat = OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
+        };
+        let mut msg = MessageInst::new(conv, &handle, Message::RecoverChat(operated_chat));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send RecoverChat: {}", e) })?;
+        Ok(())
+    }
+
+    /// Restore a chat record to CloudKit so it reappears on Apple devices.
+    /// Re-uploads the chat data using save_chats, which creates or overwrites
+    /// the record in chatManateeZone. Used by restore-chat to sync un-deletion
+    /// back to Apple devices.
+    pub async fn restore_cloud_chat(
+        &self,
+        record_name: String,
+        chat_identifier: String,
+        group_id: String,
+        style: i64,
+        service: String,
+        display_name: Option<String>,
+        participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let chat = rustpush::cloud_messages::CloudChat {
+            style,
+            is_filtered: 0,
+            successful_query: 1,
+            state: 3,
+            chat_identifier,
+            group_id: group_id.clone(),
+            service_name: service,
+            original_group_id: group_id,
+            properties: None,
+            participants: participants.into_iter().map(|uri| rustpush::cloud_messages::CloudParticipant { uri }).collect(),
+            prop001: Default::default(),
+            last_read_message_timestamp: 0,
+            last_addressed_handle: String::new(),
+            guid: String::new(),
+            display_name,
+            proto001: None,
+            group_photo_guid: None,
+            group_photo: None,
+        };
+        let mut chats = std::collections::HashMap::new();
+        chats.insert(record_name.clone(), chat);
+        let results = cloud_messages.save_chats(chats).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to restore CloudKit chat: {}", e) })?;
+        // Check individual result
+        if let Some(Err(e)) = results.get(&record_name) {
+            return Err(WrappedError::GenericError { msg: format!("Failed to save restored chat record: {}", e) });
+        }
+        Ok(())
+    }
+
+    /// Delete chat records from CloudKit so they don't reappear during future syncs.
+    pub async fn delete_cloud_chats(
+        &self,
+        chat_ids: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        cloud_messages.delete_chats(&chat_ids).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit chats: {}", e) })?;
+        Ok(())
+    }
+
+    /// Delete message records from CloudKit so they don't reappear during future syncs.
+    pub async fn delete_cloud_messages(
+        &self,
+        message_ids: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        cloud_messages.delete_messages(&message_ids).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit messages: {}", e) })?;
+        Ok(())
+    }
+
+    /// Purge the recoverable-delete zones from CloudKit to prevent deleted
+    /// messages from resurrecting. After MoveToRecycleBin, Apple parks records
+    /// in recoverableMessageDeleteZone; nuking that zone ensures they stay dead.
+    pub async fn purge_recoverable_zones(&self) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+        container.perform_operations_checked(
+            &CloudKitSession::new(),
+            &[
+                ZoneDeleteOperation::new(container.private_zone("recoverableMessageDeleteZone".to_string())),
+                ZoneDeleteOperation::new(container.private_zone("chatBotRecoverableMessageDeleteZone".to_string())),
+            ],
+            IsolationLevel::Operation,
+        ).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to purge recoverable zones: {}", e) })?;
+        Ok(())
+    }
+
+    /// List chat records from Apple's "Recently Deleted" recycle bin.
+    /// Paginates through all known recoverable-delete zones and returns all
+    /// non-tombstone chat records found there.
+    pub async fn list_recoverable_chats(&self) -> Result<Vec<WrappedCloudSyncChat>, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit_proto::CloudKitRecord;
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudChat};
+
+        info!("list_recoverable_chats: starting recycle bin query");
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut all_chats = Vec::new();
+        let mut seen_record_names = std::collections::HashSet::new();
+        // Accumulate diagnostics so they appear in the final summary log
+        // (which we KNOW gets output even if per-page logs are lost).
+        let mut zone_diag: Vec<String> = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let mut zone_total_changes = 0usize;
+            let mut zone_tombstones = 0usize;
+            let mut zone_non_chat = 0usize;
+            let mut zone_pcs_err = 0usize;
+            let mut zone_panic = 0usize;
+            let mut zone_incomplete = 0usize;
+            let mut zone_accepted = 0usize;
+            let mut zone_pages = 0usize;
+            let mut zone_last_status = 0i32;
+
+            debug!("list_recoverable_chats: fetching zone encryption config for {}", zone_name);
+
+            for page in 0..256 {
+                zone_pages = page + 1;
+                let zone_id = container.private_zone(zone_name.to_string());
+                let key = container
+                    .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to get zone key for {}: {}", zone_name, e),
+                    })?;
+
+                debug!("list_recoverable_chats: performing FetchRecordChanges on {} page {}", zone_name, page);
+
+                let (_assets, response) = container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to fetch recoverable chats from {} page {}: {}", zone_name, page, e),
+                    })?;
+
+                let changes_count = response.change.len();
+                let status = response.status();
+                zone_last_status = status;
+                zone_total_changes += changes_count;
+                debug!("list_recoverable_chats: zone={} page={} changes={} status={}", zone_name, page, changes_count, status);
+
+                for change in &response.change {
+                    let id_proto = match change.identifier.as_ref() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let id_value = match id_proto.value.as_ref() {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let identifier = id_value.name().to_string();
+
+                    let record = match &change.record {
+                        Some(r) => r,
+                        None => {
+                            zone_tombstones += 1;
+                            debug!("list_recoverable_chats: tombstone record {} in {}", identifier, zone_name);
+                            continue;
+                        }
+                    };
+
+                    let record_type = record
+                        .r#type
+                        .as_ref()
+                        .map(|t| t.name().to_string())
+                        .unwrap_or_else(|| "<missing>".to_string());
+                    let field_names = recoverable_record_field_names(&record.record_field);
+                    if !record_looks_chat_like(&record.record_field) {
+                        zone_non_chat += 1;
+                        debug!("list_recoverable_chats: skipping non-chat record {} in {} type={} fields={:?}", identifier, zone_name, record_type, field_names);
+                        continue;
+                    }
+
+                    let pcskey = match pcs_keys_for_record(record, &key) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            zone_pcs_err += 1;
+                            warn!("list_recoverable_chats: skipping record {} in {}: PCS key error: {}", identifier, zone_name, e);
+                            continue;
+                        }
+                    };
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CloudChat::from_record_encrypted(&record.record_field, Some(&pcskey))
+                    }));
+
+                    match result {
+                        Ok(chat) => {
+                            if !seen_record_names.insert(identifier.clone()) {
+                                continue;
+                            }
+                            if let Some(chat) = wrap_recoverable_chat(identifier.clone(), chat) {
+                                zone_accepted += 1;
+                                if record_type != CloudChat::record_type() {
+                                    info!(
+                                        "list_recoverable_chats: accepted recycle-bin record {} in {} with nonstandard type {}",
+                                        identifier, zone_name, record_type
+                                    );
+                                }
+                                all_chats.push(chat);
+                            } else {
+                                zone_incomplete += 1;
+                                warn!(
+                                    "list_recoverable_chats: skipping record {} in {}: chat-like fields decoded to incomplete chat (type={}, fields={:?})",
+                                    identifier,
+                                    zone_name,
+                                    record_type,
+                                    recoverable_record_field_names(&record.record_field),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            zone_panic += 1;
+                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                                      else { "unknown panic".to_string() };
+                            warn!(
+                                "list_recoverable_chats: skipping record {} in {}: deserialization panic: {} (type={}, fields={:?})",
+                                identifier,
+                                zone_name,
+                                msg,
+                                record_type,
+                                recoverable_record_field_names(&record.record_field),
+                            );
+                        }
+                    }
+                }
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+
+            zone_diag.push(format!(
+                "{}:pages={},changes={},status={},tombstones={},non_chat={},pcs_err={},panic={},incomplete={},accepted={}",
+                zone_name, zone_pages, zone_total_changes, zone_last_status,
+                zone_tombstones, zone_non_chat, zone_pcs_err, zone_panic, zone_incomplete, zone_accepted
+            ));
+        }
+
+        // Single summary line with ALL diagnostic info embedded.
+        // This line is confirmed to appear in logs — embed everything here.
+        info!("list_recoverable_chats: found {} chat(s) in recycle bin [{}]", all_chats.len(), zone_diag.join(" | "));
+        Ok(all_chats)
+    }
+
+    /// Read all message GUIDs from Apple's recoverableMessageDeleteZone.
+    /// These are the UUIDs of individually deleted messages (moved to trash).
+    /// When an entire chat is deleted, ALL its messages end up here.
+    /// Returns the list of message GUIDs that can be matched against
+    /// cloud_message.uuid to identify deleted chats.
+    /// Reads both recoverable message zones and returns message GUIDs.
+    /// These GUIDs match cloud_message.guid in the local DB. Entries may also
+    /// include base64-encoded metadata after `guid|...`; GUID-only callers can
+    /// safely ignore the suffix.
+    pub async fn list_recoverable_message_guids(&self) -> Result<Vec<String>, WrappedError> {
+        use std::collections::HashSet;
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloudkit_proto::CloudKitRecord;
+        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+        info!("list_recoverable_message_guids: starting");
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut guids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut zone_diag = Vec::new();
+        let mut successful_zones = 0usize;
+        let mut zone_errors = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let zone_id = container.private_zone(zone_name.to_string());
+            let key = match container
+                .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                .await
+            {
+                Ok(key) => {
+                    successful_zones += 1;
+                    key
+                }
+                Err(e) => {
+                    let err = format!("{}: {}", zone_name, e);
+                    warn!("list_recoverable_message_guids: failed to get zone key for {}", err);
+                    zone_errors.push(err);
+                    continue;
+                }
+            };
+
+            let mut zone_guid_count = 0usize;
+            for page in 0..256 {
+                let zone_id = container.private_zone(zone_name.to_string());
+                let (_assets, response) = match container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let err = format!("{} page {}: {}", zone_name, page, e);
+                        warn!("list_recoverable_message_guids: failed to fetch {}", err);
+                        zone_errors.push(err);
+                        break;
+                    }
+                };
+
+                let changes_count = response.change.len();
+                let status = response.status();
+
+                for change in &response.change {
+                    let identifier = change.identifier.as_ref()
+                        .and_then(|i| i.value.as_ref())
+                        .map(|v| v.name().to_string())
+                        .unwrap_or_default();
+                    let record = match &change.record {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    let record_type = record.r#type.as_ref()
+                        .map(|t| t.name().to_string())
+                        .unwrap_or_default();
+                    if record_type != "recoverableMessage" {
+                        continue;
+                    }
+
+                    let pcskey = match pcs_keys_for_record(record, &key) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
+                    }));
+                    if let Ok(msg) = result {
+                        if !msg.guid.is_empty() && seen.insert(msg.guid.clone()) {
+                            guids.push(encode_recoverable_message_entry(&msg.guid, &identifier, &msg));
+                            zone_guid_count += 1;
+                        }
+                    }
+                }
+
+                info!("list_recoverable_message_guids: zone={} page={} changes={} status={} guids_so_far={}", zone_name, page, changes_count, status, guids.len());
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+            zone_diag.push(format!("{}:{}", zone_name, zone_guid_count));
+        }
+
+        if successful_zones == 0 && !zone_errors.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: format!("Failed to read recoverable message zones: {}", zone_errors.join(" | ")),
+            });
+        }
+
+        info!("list_recoverable_message_guids: found {} deleted message GUID(s) [{}]", guids.len(), zone_diag.join(" | "));
+        Ok(guids)
+    }
+
+    /// Raw diagnostic dump of the recoverable zone. Returns a human-readable
+    /// string describing every change record in the zone (not just chat-like
+    /// ones). Used by the !debug-recycle-bin bridgebot command.
+    pub async fn debug_recoverable_zones(&self) -> Result<String, WrappedError> {
+        use rustpush::cloudkit::{FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+
+        let mut lines = Vec::new();
+
+        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+            let mut token: Option<Vec<u8>> = None;
+            let mut total_changes = 0usize;
+
+            // Try to get zone encryption config — if this fails, report the error
+            let zone_id = container.private_zone(zone_name.to_string());
+            let key_result = container
+                .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                .await;
+            let _key = match key_result {
+                Ok(k) => {
+                    lines.push(format!("✅ Zone {} — encryption config OK", zone_name));
+                    k
+                }
+                Err(e) => {
+                    lines.push(format!("❌ Zone {} — encryption config FAILED: {}", zone_name, e));
+                    continue;
+                }
+            };
+
+            for page in 0..10 {
+                let zone_id = container.private_zone(zone_name.to_string());
+                let fetch_result = container
+                    .perform(
+                        &CloudKitSession::new(),
+                        FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+                    )
+                    .await;
+
+                let (_assets, response) = match fetch_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        lines.push(format!("  ❌ Page {} fetch FAILED: {}", page, e));
+                        break;
+                    }
+                };
+
+                let status = response.status();
+                let changes = response.change.len();
+                total_changes += changes;
+                lines.push(format!("  Page {}: {} changes, status={}", page, changes, status));
+
+                for change in &response.change {
+                    let id = change.identifier.as_ref()
+                        .and_then(|i| i.value.as_ref())
+                        .map(|v| v.name().to_string())
+                        .unwrap_or_else(|| "<no-id>".to_string());
+
+                    match &change.record {
+                        None => {
+                            lines.push(format!("    [tombstone] {}", id));
+                        }
+                        Some(record) => {
+                            let rtype = record.r#type.as_ref()
+                                .map(|t| t.name().to_string())
+                                .unwrap_or_else(|| "<missing>".to_string());
+                            let fields = recoverable_record_field_names(&record.record_field);
+                            let chat_like = record_looks_chat_like(&record.record_field);
+                            lines.push(format!("    [record] {} type={} chat_like={} fields={:?}", id, rtype, chat_like, fields));
+                        }
+                    }
+                }
+
+                let next_token = response.sync_continuation_token().to_vec();
+                if status == 3 || next_token.is_empty() {
+                    break;
+                }
+                token = Some(next_token);
+            }
+
+            lines.push(format!("  Total: {} changes in {}", total_changes, zone_name));
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    pub async fn send_attachment(
+        &self,
+        conversation: WrappedConversation,
+        data: Vec<u8>,
+        mime: String,
+        uti_type: String,
+        filename: String,
+        handle: String,
+        reply_guid: Option<String>,
+        reply_part: Option<String>,
+        body: Option<String>,
+        effect: Option<String>,
+        is_audio_message: bool,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms && !self.has_sms_relay(handle.clone()).await {
+            return Err(WrappedError::NoSmsRelay);
+        }
+        let (reply_guid, reply_part) = normalize_reply_target(reply_guid, reply_part);
+        let conv: ConversationData = (&conversation).into();
+        // Detect voice messages by UTI (CAF files from OGG→CAF remux are voice recordings)
+        let is_voice = is_audio_message || uti_type == "com.apple.coreaudio-format";
+        let service = if conversation.is_sms {
+            MessageType::SMS {
+                is_phone: false,
+                using_number: handle.clone(),
+                from_handle: None,
+            }
+        } else {
+            MessageType::IMessage
+        };
+
+        // Apple iMessage attachments use MMCS. Resolve the exact send target
+        // set first so a missing recipient cannot orphan a completed upload.
+        // SMS/MMS relay messages instead carry inline bytes; rustpush's relay
+        // serializer rejects MMCS descriptors for that branch.
+        let attachment = if conversation.is_sms {
+            inline_relay_attachment(data, mime, uti_type, filename)
+        } else {
+            self.preflight_mmcs_upload_targets(&conversation, &handle)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to resolve attachment targets: {e}"),
+                })?;
+            let prepared = MMCSFile::prepare_put(Cursor::new(&data))
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to prepare MMCS upload: {}", e),
+                })?;
+            Attachment::new_mmcs(
+                &self.conn,
+                &prepared,
+                Cursor::new(&data),
+                &mime,
+                &uti_type,
+                &filename,
+                |_current, _total| {},
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to upload attachment: {}", e),
+            })?
+        };
+
+        let parts = vec![IndexedMessagePart {
+            part: MessagePart::Attachment(attachment.clone()),
+            idx: None,
+            ext: None,
+        }];
+
+        // Captions are sent via the subject field in the iMessage plist,
+        // not as a separate text part in the XML body.
+        let subject = body.clone().filter(|s| !s.is_empty());
+
+        let mut msg = MessageInst::new(
+            conv.clone(),
+            &handle,
+            Message::Message(NormalMessage {
+                parts: MessageParts(parts),
+                effect,
+                reply_guid: reply_guid.clone(),
+                reply_part: reply_part.clone(),
+                service,
+                subject,
+                app: None,
+                link_meta: None,
+                voice: is_voice,
+                scheduled: None,
+                embedded_profile: None,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Cancel a previously scheduled message.
+    pub async fn send_unschedule(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Unschedule,
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unschedule: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Rename an iMessage group chat. Delivers a RenameMessage to all participants
+    /// so the group name updates on all of the user's Apple devices.
+    pub async fn send_rename_group(
+        &self,
+        conversation: WrappedConversation,
+        new_name: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError { msg: "Group rename is only available for iMessage chats".to_string() });
+        }
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::RenameMessage(RenameMessage { new_name }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send rename: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Update the participant list for an iMessage group chat.
+    /// `new_participants` must be the FULL new list of all participants (not
+    /// just the delta). `group_version` should be strictly increasing; using
+    /// the current Unix timestamp in seconds is a safe default when the exact
+    /// protocol counter is unknown.
+    pub async fn send_change_participants(
+        &self,
+        conversation: WrappedConversation,
+        mut new_participants: Vec<String>,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError { msg: "Participant changes are only available for iMessage chats".to_string() });
+        }
+        if !new_participants.contains(&handle) {
+            new_participants.push(handle.clone());
+        }
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::ChangeParticipants(ChangeParticipantMessage {
+                new_participants,
+                group_version,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send participant change: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Leave an iMessage group chat. Apple represents this as the same command
+    /// 190 participant-change payload used by add/remove, except the sender is
+    /// deliberately absent from the complete target participant list.
+    pub async fn send_leave_group(
+        &self,
+        conversation: WrappedConversation,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError {
+                msg: "Leaving is only available for iMessage group chats".to_string(),
+            });
+        }
+        let conv: ConversationData = (&conversation).into();
+        let remaining = leave_group_participants(conv.participants.clone(), &handle);
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::ChangeParticipants(ChangeParticipantMessage {
+                new_participants: remaining,
+                group_version,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to leave group: {}", e),
+            })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Upload `photo_data` to MMCS and deliver an IconChange message to set the
+    /// group chat photo on all of the user's Apple devices. The image should be
+    /// a 570×570 PNG as Apple expects. `group_version` should be strictly
+    /// increasing; using the current Unix timestamp in seconds is a safe default.
+    pub async fn send_icon_change(
+        &self,
+        conversation: WrappedConversation,
+        photo_data: Vec<u8>,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError { msg: "Group icons are only available for iMessage chats".to_string() });
+        }
+        // Prepare the MMCS encryption envelope (computes signature/key).
+        let cursor = Cursor::new(&photo_data);
+        let prepared = MMCSFile::prepare_put(cursor).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare icon MMCS upload: {}", e) })?;
+
+        // Upload to Apple's MMCS servers and get back the file descriptor.
+        let cursor2 = Cursor::new(&photo_data);
+        let mmcs = MMCSFile::new(&self.conn, &prepared, cursor2, |_current, _total| {}).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload icon to MMCS: {}", e) })?;
+
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::IconChange(IconChangeMessage {
+                file: Some(mmcs),
+                group_version,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon change: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Deliver an IconChange message that clears (removes) the group chat photo
+    /// on all of the user's Apple devices.
+    pub async fn send_icon_clear(
+        &self,
+        conversation: WrappedConversation,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError { msg: "Group icons are only available for iMessage chats".to_string() });
+        }
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::IconChange(IconChangeMessage {
+                file: None,
+                group_version,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon clear: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Broadcast a PeerCacheInvalidate to all participants in the conversation.
+    /// Receiving clients respond by refreshing their IDS key cache for the sender,
+    /// which resolves delivery failures caused by stale/rotated identity keys.
+    pub async fn send_peer_cache_invalidate(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::PeerCacheInvalidate);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send peer cache invalidate: {}", e) })?;
+        Ok(())
+    }
+
+    /// Force a fresh `register()` against Apple's IDS for the bridge's current
+    /// identity bundle (MADRID + MULTIPLEX + FACETIME + VIDEO).
+    ///
+    /// This re-uploads the same NGM keys with refreshed registration metadata
+    /// (cert expiry, validation token, push token binding). It does NOT
+    /// generate new NGM keys — that's a relog-level operation. The use case
+    /// here is forcing Apple's IDS server to re-broadcast the bridge's
+    /// identity to recently-talking peers, in case peer-side caches got
+    /// stuck on stale routing or stale FaceTime call-type classification.
+    ///
+    /// Implementation: read current users, swap them in via `update_users`
+    /// (which internally calls `manager.refresh_now()` → `register()` against
+    /// the bundled services). Same path the resource manager takes when
+    /// registration expires; just triggered on demand.
+    pub async fn force_reregister_identity(&self) -> Result<u32, WrappedError> {
+        let current_users: Vec<rustpush::IDSUser> = self
+            .client
+            .identity
+            .users
+            .read()
+            .await
+            .clone();
+        let registered_count = current_users
+            .first()
+            .map(|u| u.registration.len() as u32)
+            .unwrap_or(0);
+        self.client
+            .identity
+            .update_users(current_users)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("force_reregister_identity failed: {:?}", e),
+            })?;
+        Ok(registered_count)
+    }
+
+    /// The "clear identity cache" operation: drop the bridge's local
+    /// IDS key cache (id_cache.plist), then re-register the identity bundle so
+    /// the cache rebuilds against Apple's current state.
+    ///
+    /// Recovery path for a smeared/stale registration set (e.g. the dozens of
+    /// stale FaceTime registrations the reverted May-19 reconnect re-reg churn
+    /// left under the own handle, which break calls). invalidate_id_cache()
+    /// clears the cached lookups; the immediate re-register re-establishes the
+    /// identity so the bridge isn't left in a cache-wiped, unregistered state.
+    /// Returns the number of services in the rebuilt registration.
+    pub async fn clear_identity_cache(&self) -> Result<u32, WrappedError> {
+        // 1. Drop the local IDS key cache.
+        self.client.identity.invalidate_id_cache().await;
+
+        // 2. Re-register (update_users → refresh_now → register) so the
+        //    identity is re-established and the cache rebuilds.
+        let current_users: Vec<rustpush::IDSUser> = self
+            .client
+            .identity
+            .users
+            .read()
+            .await
+            .clone();
+        let registered_count = current_users
+            .first()
+            .map(|u| u.registration.len() as u32)
+            .unwrap_or(0);
+        self.client
+            .identity
+            .update_users(current_users)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("clear_identity_cache: re-register failed: {:?}", e),
+            })?;
+        info!("clear_identity_cache: invalidated IDS key cache and re-registered identity bundle ({} services)", registered_count);
+        Ok(registered_count)
+    }
+
+    pub async fn send_sms_activation(
+        &self,
+        conversation: WrappedConversation,
+        enable: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::EnableSmsActivation(enable));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS activation: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_sms_confirm_sent(
+        &self,
+        conversation: WrappedConversation,
+        sms_status: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::SmsConfirmSent(sms_status));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS confirm sent: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_message_read_on_device(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::MessageReadOnDevice);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message-read-on-device: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_mark_unread(
+        &self,
+        conversation: WrappedConversation,
+        for_uuid: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError { msg: "Mark unread is only available for iMessage chats".to_string() });
+        }
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::MarkUnread);
+        // MarkUnread serializes this ID into the `r` field as the message being
+        // marked. A fresh control UUID would mark nothing on recipient devices.
+        msg.id = for_uuid;
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send mark unread: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_error_message(
+        &self,
+        conversation: WrappedConversation,
+        for_uuid: String,
+        error_status: u64,
+        status_str: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Error(rustpush::ErrorMessage {
+                for_uuid,
+                status: error_status,
+                status_str,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send error message: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_update_extension(
+        &self,
+        conversation: WrappedConversation,
+        for_uuid: String,
+        extension: WrappedStickerExtension,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let ext = PartExtension::Sticker {
+            msg_width: extension.msg_width,
+            rotation: extension.rotation,
+            sai: extension.sai,
+            scale: extension.scale,
+            update: Some(false),
+            sli: extension.sli,
+            normalized_x: extension.normalized_x,
+            normalized_y: extension.normalized_y,
+            version: extension.version,
+            hash: extension.hash,
+            safi: extension.safi,
+            effect_type: extension.effect_type,
+            sticker_id: extension.sticker_id,
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::UpdateExtension(UpdateExtensionMessage { for_uuid, ext }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update extension: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_permanent_delete_messages(
+        &self,
+        conversation: WrappedConversation,
+        message_uuids: Vec<String>,
+        is_scheduled: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::PermanentDelete(PermanentDeleteMessage {
+                target: DeleteTarget::Messages(message_uuids),
+                is_scheduled,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send permanent delete (messages): {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_permanent_delete_chat(
+        &self,
+        conversation: WrappedConversation,
+        chat_guid: String,
+        is_scheduled: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let target = DeleteTarget::Chat(OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
+        });
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::PermanentDelete(PermanentDeleteMessage { target, is_scheduled }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send permanent delete (chat): {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_update_profile(
+        &self,
+        conversation: WrappedConversation,
+        profile: Option<WrappedShareProfileData>,
+        share_contacts: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mapped_profile = profile.map(|p| {
+            let poster = match (p.low_res_wallpaper_tag, p.wallpaper_tag, p.message_tag) {
+                (Some(low), Some(wall), Some(msg)) => Some(SharedPoster {
+                    low_res_wallpaper_tag: low,
+                    wallpaper_tag: wall,
+                    message_tag: msg,
+                }),
+                _ => None,
+            };
+            ShareProfileMessage {
+                cloud_kit_decryption_record_key: p.cloud_kit_decryption_record_key,
+                cloud_kit_record_key: p.cloud_kit_record_key,
+                poster,
+            }
+        });
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::UpdateProfile(UpdateProfileMessage {
+                profile: mapped_profile,
+                share_contacts,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update profile: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_share_profile(
+        &self,
+        conversation: WrappedConversation,
+        cloud_kit_record_key: String,
+        cloud_kit_decryption_record_key: Vec<u8>,
+        low_res_wallpaper_tag: Option<Vec<u8>>,
+        wallpaper_tag: Option<Vec<u8>>,
+        message_tag: Option<Vec<u8>>,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let poster = match (low_res_wallpaper_tag, wallpaper_tag, message_tag) {
+            (Some(low), Some(wall), Some(msg)) => Some(SharedPoster {
+                low_res_wallpaper_tag: low,
+                wallpaper_tag: wall,
+                message_tag: msg,
+            }),
+            _ => None,
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::ShareProfile(ShareProfileMessage {
+                cloud_kit_decryption_record_key,
+                cloud_kit_record_key,
+                poster,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send share profile: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_update_profile_sharing(
+        &self,
+        conversation: WrappedConversation,
+        shared_dismissed: Vec<String>,
+        shared_all: Vec<String>,
+        version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::UpdateProfileSharing(UpdateProfileSharingMessage {
+                shared_dismissed,
+                shared_all,
+                version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update profile sharing: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_notify_anyways(
+        &self,
+        conversation: WrappedConversation,
+        for_uuid: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError { msg: "Notify Anyway is only available for iMessage chats".to_string() });
+        }
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::NotifyAnyways);
+        // Command 113 has no encrypted body; the envelope UUID is the message
+        // whose Focus override is being requested.
+        msg.id = for_uuid;
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send notify anyways: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_set_transcript_background(
+        &self,
+        conversation: WrappedConversation,
+        group_version: u64,
+        image_data: Option<Vec<u8>>,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let chat_id = conv.sender_guid.clone();
+        let mmcs_file = if let Some(data) = image_data {
+            let prepared = MMCSFile::prepare_put(Cursor::new(&data)).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare transcript background MMCS upload: {}", e) })?;
+            let uploaded = MMCSFile::new(&self.conn, &prepared, Cursor::new(&data), |_current, _total| {}).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload transcript background to MMCS: {}", e) })?;
+            Some(uploaded)
+        } else {
+            None
+        };
+        let update = SetTranscriptBackgroundMessage::from_mmcs(mmcs_file, group_version, chat_id);
+        let mut msg = MessageInst::new(conv, &handle, Message::SetTranscriptBackground(update));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send transcript background update: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn cloud_sync_chats(
+        &self,
+        continuation_token: Option<String>,
+    ) -> Result<WrappedCloudSyncChatsPage, WrappedError> {
+        let token = decode_continuation_token(continuation_token)?;
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        const MAX_SYNC_ATTEMPTS: usize = 4;
+        let mut sync_result = None;
+        let mut last_pcs_err: Option<rustpush::PushError> = None;
+        let mut cm_handle = cloud_messages;
+
+        for attempt in 0..MAX_SYNC_ATTEMPTS {
+            match cm_handle.sync_chats(token.clone()).await {
+                Ok(result) => {
+                    sync_result = Some(result);
+                    break;
+                }
+                Err(err) if is_pcs_recoverable_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit chats sync hit PCS key error on attempt {}/{}: {}",
+                        attempt_no,
+                        MAX_SYNC_ATTEMPTS,
+                        err
+                    );
+                    last_pcs_err = Some(err);
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.recover_cloud_pcs_state("CloudKit chats sync").await?;
+                        continue;
+                    }
+                }
+                Err(err) if is_token_missing_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit chats sync hit TokenMissing on attempt {}/{} — refreshing MobileMe delegate",
+                        attempt_no, MAX_SYNC_ATTEMPTS
+                    );
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.refresh_mme_and_reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit chats: {}", err),
+                    });
+                }
+                Err(err) => {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit chats: {}", err),
+                    });
+                }
+            }
+        }
+
+        let (next_token, chats, status) = match sync_result {
+            Some(result) => result,
+            None => {
+                let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to sync CloudKit chats after PCS recovery retries: {}", err),
+                });
+            }
+        };
+
+        let updated_timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|dur| dur.as_millis() as u64)
+            .unwrap_or_default();
+
+        let mut normalized = Vec::with_capacity(chats.len());
+        for (record_name, chat_opt) in chats {
+            if let Some(chat) = chat_opt {
+                let cloud_chat_id = if chat.chat_identifier.is_empty() {
+                    record_name.clone()
+                } else {
+                    chat.chat_identifier.clone()
+                };
+                normalized.push(WrappedCloudSyncChat {
+                    record_name,
+                    cloud_chat_id,
+                    group_id: chat.group_id,
+                    style: chat.style,
+                    service: chat.service_name,
+                    display_name: chat.display_name,
+                    participants: chat.participants.into_iter().map(|p| p.uri).collect(),
+                    deleted: false,
+                    updated_timestamp_ms,
+                    group_photo_guid: chat.group_photo_guid,
+                    is_filtered: chat.is_filtered,
+                });
+            } else {
+                normalized.push(WrappedCloudSyncChat {
+                    cloud_chat_id: record_name.clone(),
+                    group_id: String::new(),
+                    style: 0,
+                    record_name,
+                    service: String::new(),
+                    display_name: None,
+                    participants: vec![],
+                    deleted: true,
+                    updated_timestamp_ms,
+                    group_photo_guid: None,
+                    is_filtered: 0,
+                });
+            }
+        }
+
+        Ok(WrappedCloudSyncChatsPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            chats: normalized,
+        })
+    }
+
+    /// Dump ALL CloudKit chat records as raw JSON (paginating until done).
+    /// Returns a JSON array of objects with record_name + all CloudChat fields.
+    pub async fn cloud_dump_chats_json(&self) -> Result<String, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        let mut all_records: Vec<serde_json::Value> = Vec::new();
+        let mut token: Option<Vec<u8>> = None;
+
+        for page in 0..256 {
+            let (next_token, chats, status) = cloud_messages.sync_chats(token).await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("CloudKit chat dump page {} failed: {}", page, e),
+                })?;
+
+            for (record_name, chat_opt) in &chats {
+                let mut obj = if let Some(chat) = chat_opt {
+                    serde_json::to_value(chat).unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::json!({"deleted": true})
+                };
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("_record_name".to_string(), serde_json::Value::String(record_name.clone()));
+                }
+                all_records.push(obj);
+            }
+
+            info!("CloudKit chat dump page {}: {} records, status={}", page, chats.len(), status);
+
+            if status == 3 {
+                break;
+            }
+            token = Some(next_token);
+        }
+
+        serde_json::to_string_pretty(&all_records).map_err(|e| WrappedError::GenericError {
+            msg: format!("JSON serialization failed: {}", e),
+        })
+    }
+
+    pub async fn cloud_sync_messages(
+        &self,
+        continuation_token: Option<String>,
+    ) -> Result<WrappedCloudSyncMessagesPage, WrappedError> {
+        let token = decode_continuation_token(continuation_token)?;
+        info!(
+            "cloud_sync_messages: token={}, token_bytes={}",
+            if token.is_some() { "present" } else { "nil" },
+            token.as_ref().map_or(0, |t| t.len())
+        );
+        let mut cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        const MAX_SYNC_ATTEMPTS: usize = 4;
+        let mut sync_result = None;
+        let mut last_pcs_err: Option<rustpush::PushError> = None;
+
+        for attempt in 0..MAX_SYNC_ATTEMPTS {
+            let cm_spawn = Arc::clone(&cloud_messages);
+            let tok_spawn = token.clone();
+            let spawn_result = tokio::task::spawn(async move {
+                cm_spawn.sync_messages(tok_spawn).await
+            }).await;
+
+            match spawn_result {
+                Ok(Ok(result)) => {
+                    info!(
+                        "cloud_sync_messages: sync_messages returned {} records, status={}",
+                        result.1.len(), result.2
+                    );
+                    sync_result = Some(result);
+                    break;
+                }
+                Ok(Err(err)) if is_pcs_recoverable_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit messages sync hit PCS key error on attempt {}/{}: {}",
+                        attempt_no,
+                        MAX_SYNC_ATTEMPTS,
+                        err
+                    );
+                    last_pcs_err = Some(err);
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.recover_cloud_pcs_state("CloudKit messages sync").await?;
+                        continue;
+                    }
+                }
+                Ok(Err(err)) if is_token_missing_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit messages sync hit TokenMissing on attempt {}/{} — refreshing MobileMe delegate",
+                        attempt_no, MAX_SYNC_ATTEMPTS
+                    );
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.refresh_mme_and_reset_cloud_client().await;
+                        cloud_messages = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit messages: {}", err),
+                    });
+                }
+                Ok(Err(err)) => {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit messages: {}", err),
+                    });
+                }
+                Err(join_err) => {
+                    warn!(
+                        "cloud_sync_messages: sync_messages panicked on attempt {}/{} \
+                         (malformed CloudKit record); trying per-record fallback. panic={}",
+                        attempt + 1, MAX_SYNC_ATTEMPTS, join_err
+                    );
+                    match sync_messages_fallback(&cloud_messages, token.clone()).await {
+                        Ok(result) => {
+                            sync_result = Some(result);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("cloud_sync_messages: fallback also failed: {}; returning empty done page", e);
+                            return Ok(WrappedCloudSyncMessagesPage {
+                                continuation_token: None,
+                                status: 0,
+                                done: true,
+                                messages: vec![],
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let (next_token, messages, status) = match sync_result {
+            Some(result) => result,
+            None => {
+                let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to sync CloudKit messages after PCS recovery retries: {}", err),
+                });
+            }
+        };
+
+        let mut normalized = Vec::with_capacity(messages.len());
+        let mut skipped_messages = 0usize;
+        for (record_name, msg_opt) in messages {
+            if let Some(msg) = msg_opt {
+                // Skip system/service messages (group renames, participant changes,
+                // location sharing, etc.). IS_SYSTEM_MESSAGE covers explicit system
+                // notifications; IS_SERVICE_MESSAGE covers service-generated inline
+                // notifications (e.g. "You named the conversation"). Neither type
+                // is user-authored content.
+                if msg.flags.intersects(
+                    rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE
+                    | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE
+                ) {
+                    skipped_messages += 1;
+                    continue;
+                }
+                // Wrap per-message normalization in catch_unwind so one bad
+                // CloudKit record doesn't fail the entire page.
+                let rn = record_name.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let guid = if msg.guid.is_empty() {
+                        rn.clone()
+                    } else {
+                        msg.guid.clone()
+                    };
+                    let text = msg.msg_proto.text.clone();
+                    let subject = msg.msg_proto.subject.clone();
+
+                    // Extract tapback/reaction info from proto fields
+                    let tapback_type = msg.msg_proto.associated_message_type;
+                    let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
+                    let tapback_emoji = msg.msg_proto_4.as_ref()
+                        .and_then(|p4| p4.associated_message_emoji.clone());
+
+                    // Extract attachment GUIDs from attributedBody
+                    let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                        .as_ref()
+                        .map(|body| extract_attachment_guids_from_attributed_body(body))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
+                        .collect();
+
+                    // Also extract from messageSummaryInfo to capture companion
+                    // transfers (e.g. Live Photo MOV) not in attributedBody.
+                    if let Some(ref summary) = msg.msg_proto.message_summary_info {
+                        for sg in extract_attachment_guids_from_summary_info(summary) {
+                            if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                                && !attachment_guids.contains(&sg)
+                            {
+                                attachment_guids.push(sg);
+                            }
+                        }
+                    }
+
+                    let date_read_ms = msg.msg_proto.date_read
+                        .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
+                        .unwrap_or(0);
+
+                    let has_body = msg.msg_proto.attributed_body.is_some();
+
+                    let (reply_guid, reply_part) = parse_cloud_reply(
+                        msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                    );
+
+                    WrappedCloudSyncMessage {
+                        record_name: rn,
+                        guid,
+                        cloud_chat_id: msg.chat_id.clone(),
+                        sender: msg.sender.clone(),
+                        is_from_me: msg
+                            .flags
+                            .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+                        text,
+                        subject,
+                        service: msg.service.clone(),
+                        timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
+                        deleted: false,
+                        tapback_type,
+                        tapback_target_guid,
+                        tapback_emoji,
+                        attachment_guids,
+                        date_read_ms,
+                        msg_type: msg.r#type,
+                        has_body,
+                        reply_guid,
+                        reply_part,
+                    }
+                }));
+
+                match result {
+                    Ok(wrapped) => normalized.push(wrapped),
+                    Err(panic_val) => {
+                        let panic_msg = if let Some(s) = panic_val.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_val.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        warn!(
+                            "Skipping CloudKit message {} due to normalization panic: {}",
+                            record_name, panic_msg
+                        );
+                        skipped_messages += 1;
+                    }
+                }
+            } else {
+                normalized.push(WrappedCloudSyncMessage {
+                    guid: record_name.clone(),
+                    record_name,
+                    cloud_chat_id: String::new(),
+                    sender: String::new(),
+                    is_from_me: false,
+                    text: None,
+                    subject: None,
+                    service: String::new(),
+                    timestamp_ms: 0,
+                    deleted: true,
+                    tapback_type: None,
+                    tapback_target_guid: None,
+                    tapback_emoji: None,
+                    attachment_guids: vec![],
+                    date_read_ms: 0,
+                    msg_type: 0,
+                    has_body: false,
+                    reply_guid: None,
+                    reply_part: None,
+                });
+            }
+        }
+
+        if skipped_messages > 0 {
+            warn!(
+                "CloudKit message sync: skipped {} message(s) due to normalization errors",
+                skipped_messages
+            );
+        }
+
+        // reply_count surfaces whether CloudKit records actually carry the
+        // msgProto2.reply field (the upstream struct comments it "always empty
+        // afaict??"). A non-zero count on a thread with known replies confirms
+        // backfill reply chains have real data to resolve.
+        let reply_count = normalized.iter().filter(|m| m.reply_guid.is_some()).count();
+        info!(
+            "CloudKit message sync page: {} messages normalized, {} skipped, {} with reply",
+            normalized.len(), skipped_messages, reply_count
+        );
+
+        Ok(WrappedCloudSyncMessagesPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            messages: normalized,
+        })
+    }
+
+    /// Sync CloudKit attachment zone and return metadata for all attachments.
+    /// Returns a page of attachment metadata (record_name → attachment info).
+    /// Paginate with continuation_token until done == true.
+    ///
+    /// Parses records as our local `CloudAttachmentWithAvid` instead of
+    /// the `CloudAttachment` type so we get the `avid` field (Live Photo
+    /// MOV companion) without needing a rustpush patch. Same on-the-wire
+    /// record type ("attachment"), same PCS-encrypted record fields —
+    /// `cm`, `lqa`, and `avid` are decoded by the CloudKit field-name
+    /// matcher on our struct the same way they'd be on the base type + an
+    /// extra field. Ford key registration uses both `lqa.protection_info`
+    /// AND `avid.protection_info`.
+    pub async fn cloud_sync_attachments(
+        &self,
+        continuation_token: Option<String>,
+    ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
+        use rustpush::PushError;
+
+        let token = decode_continuation_token(continuation_token)?;
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        // Hand-rolled sync with NO_ASSETS — matches master's
+        // sync_attachments → sync_records → FetchRecordChangesOperation(..., &NO_ASSETS) path.
+        //
+        // DO NOT use ALL_ASSETS here. ALL_ASSETS asks the server to include
+        // download authorization for every asset field in every returned record.
+        // The server silently omits records whose MMCS assets are unavailable
+        // (expired, pending GC, or otherwise un-authorizable). Those records ARE
+        // present in the zone and returned by NO_ASSETS — they just can't have
+        // their asset download URLs generated.
+        //
+        // NOTE: Investigation confirmed that NO_ASSETS vs ALL_ASSETS does NOT
+        // explain the 4 missing records — master (also NO_ASSETS) misses the
+        // same 4. The root cause is still under investigation. See the
+        // QueryRecords diagnostic at the end of the final page.
+        //
+        // Ford keys come from lqa.protection_info (PCS-encrypted record field,
+        // NOT the asset download content), so NO_ASSETS vs ALL_ASSETS makes no
+        // difference to Ford key population.
+        //
+        // We parse records as CloudAttachmentWithAvid (our local type
+        // that declares the avid field) so sync-time has_avid detection
+        // AND avid Ford key caching work in one pass.
+        // SLEDGEHAMMER: the whole container+zone_key+perform call chain runs
+        // inside a spawned task. The omnisette crate has an unconditional
+        // `panic!()` on any non-`AnisetteNotProvisioned` error from
+        // `get_headers` (remote_anisette_v3.rs:417), and MMCS/PCS paths
+        // below it have their own scattered `.expect()` calls. Any of
+        // these can fire mid-sync and abort the entire page, silently
+        // losing its records because the continuation token hasn't
+        // advanced yet.
+        //
+        // Retry up to 4 times with the SAME continuation token. Between
+        // attempts, on panic (JoinError), fully reset the cloud client
+        // (cloud_messages_client + cloud_keychain_client → None) so the
+        // next get_or_init builds a fresh omnisette provider with fresh
+        // state. On final failure, return an empty done-page so Go's
+        // loop breaks without advancing the persisted token — the
+        // next sync cycle will retry the same page from DB state.
+        const ATT_SYNC_RETRIES: usize = 4;
+        let mut cm_handle = cloud_messages;
+        // All of these are populated on a successful perform() and consumed
+        // after the retry loop. Types are inferred from the first Some(...)
+        // assignment so we don't have to hard-code the crate paths.
+        let mut perform_result = None;
+        let mut last_perform_err: Option<String> = None;
+        let mut container_holder = None;
+        let mut zone_id_holder = None;
+        let mut zone_key_holder = None;
+        for attempt in 0..ATT_SYNC_RETRIES {
+            // Re-fetch container + zone_key INSIDE the retry so a reset
+            // cloud_messages_client picks up a fresh container, fresh keychain,
+            // fresh omnisette state on retry.
+            let container = match cm_handle.get_container().await {
+                Ok(c) => c,
+                Err(e) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: get_container() failed on attempt {}/{}: {}",
+                        attempt_no, ATT_SYNC_RETRIES, e
+                    );
+                    last_perform_err = Some(format!("get_container: {}", e));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        // TokenMissing means the seeded MME delegate lacks the
+                        // token CloudKit init needs (mmeAuthToken). A plain
+                        // reset_cloud_client would reload the same delegate
+                        // and fail identically; force-refresh the delegate so
+                        // the re-init actually sees fresh tokens.
+                        if is_token_missing_error(&e) {
+                            self.refresh_mme_and_reset_cloud_client().await;
+                        } else {
+                            self.reset_cloud_client().await;
+                        }
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let zone_id_local = container.private_zone("attachmentManateeZone".to_string());
+            let zone_key_local = match container
+                .get_zone_encryption_config(&zone_id_local, &cm_handle.keychain, &MESSAGES_SERVICE)
+                .await
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: zone_key fetch failed on attempt {}/{}: {}",
+                        attempt_no, ATT_SYNC_RETRIES, e
+                    );
+                    last_perform_err = Some(format!("zone_key: {}", e));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        if is_token_missing_error(&e) {
+                            self.refresh_mme_and_reset_cloud_client().await;
+                        } else {
+                            self.reset_cloud_client().await;
+                        }
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                    break;
+                }
+            };
+
+            let c = Arc::clone(&container);
+            let z = zone_id_local.clone();
+            let tok = token.clone();
+            let join = tokio::task::spawn(async move {
+                // Construct request directly (not via ::new helper) so we can set
+                // newest_first: Some(true), matching master's sync_records path.
+                // The ::new helper hard-codes newest_first: Some(false), which
+                // causes the CloudKit server to return a different (incomplete)
+                // record set — empirically 4 records are omitted when false.
+                c.perform(
+                    &CloudKitSession::new(),
+                    FetchRecordChangesOperation(rustpush::cloudkit_proto::RetrieveChangesRequest {
+                        sync_continuation_token: tok,
+                        zone_identifier: Some(z),
+                        requested_changes_types: Some(3),
+                        assets_to_download: Some(NO_ASSETS.clone()),
+                        newest_first: Some(true),
+                        ..Default::default()
+                    }),
+                )
+                .await
+            })
+            .await;
+            match join {
+                Ok(Ok(ok)) => {
+                    perform_result = Some(ok);
+                    container_holder = Some(container);
+                    zone_id_holder = Some(zone_id_local);
+                    zone_key_holder = Some(zone_key_local);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: perform() returned error on attempt {}/{}: {}",
+                        attempt_no, ATT_SYNC_RETRIES, e
+                    );
+                    last_perform_err = Some(format!("{}", e));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        if is_token_missing_error(&e) {
+                            self.refresh_mme_and_reset_cloud_client().await;
+                        } else {
+                            self.reset_cloud_client().await;
+                        }
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                }
+                Err(join_err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "cloud_sync_attachments: perform() panicked on attempt {}/{} \
+                         (likely upstream omnisette/anisette panic); resetting cloud client and retrying with same token. panic={}",
+                        attempt_no, ATT_SYNC_RETRIES, join_err
+                    );
+                    last_perform_err = Some(format!("panic: {}", join_err));
+                    if attempt_no < ATT_SYNC_RETRIES {
+                        self.reset_cloud_client().await;
+                        cm_handle = self.get_or_init_cloud_messages_client().await?;
+                        continue;
+                    }
+                }
+            }
+        }
+        let (_assets, response) = match perform_result {
+            Some(r) => r,
+            None => {
+                let err_msg = last_perform_err.unwrap_or_else(|| "unknown".into());
+                warn!(
+                    "cloud_sync_attachments: perform() failed after {} attempts ({}); returning empty done page to let caller skip",
+                    ATT_SYNC_RETRIES, err_msg
+                );
+                return Ok(WrappedCloudSyncAttachmentsPage {
+                    continuation_token: None,
+                    status: 0,
+                    done: true,
+                    attachments: vec![],
+                });
+            }
+        };
+        let container = container_holder.expect("container set on success");
+        let zone_id = zone_id_holder.expect("zone_id set on success");
+        let mut zone_key = zone_key_holder.expect("zone_key set on success");
+        let cloud_messages = cm_handle;
+
+        let status = response.status();
+        let next_token = response.sync_continuation_token().to_vec();
+
+        let mut normalized = Vec::with_capacity(response.change.len());
+        let mut ford_cached = 0usize;
+        let mut refreshed_zone_key_config = false;
+        let mut pcs_skipped = 0usize;
+        // Silent drop path counters. These three `continue`s used to produce
+        // no logs at all, making it impossible to tell from the outside
+        // whether a missing attachment was (a) never in the change feed, (b)
+        // a tombstone (deletion), or (c) a different record type. Always
+        // summarized at the end of the sync page.
+        let mut no_identifier = 0usize;
+        let mut no_record_tombstone = 0usize;
+        let mut wrong_type = 0usize;
+        // `cm_decode_fail` = records whose `cm` field (GZipWrapper<AttachmentMeta>)
+        // panicked or returned None on decode. A failed `cm` means we have no
+        // aguid / no attachment metadata, so the record must be skipped — but
+        // we now log WHY and increment a counter, instead of silently dropping
+        // inside a whole-record `catch_unwind`.
+        //
+        // `lqa_decode_fail` = records whose `lqa` field (Asset, the primary
+        // MMCS blob) panicked on decode. Unlike `cm`, a failed `lqa` does NOT
+        // drop the record — we still emit the record with a missing Ford key,
+        // so Go sees the aguid in attachments_json and the download path can
+        // attempt Ford recovery. This is the fix for the 4-record regression:
+        // the `Asset::from_value_encrypted` path unwraps `protection_info`
+        // twice (cloudkit-proto/src/lib.rs:273), which panics on any record
+        // whose lqa has `protection_info=None` or `protection_info.protection_info=None`.
+        // The previous catch_unwind(from_record_encrypted) caught that panic
+        // but nuked the whole record, losing `cm` along with `lqa`.
+        let mut cm_decode_fail = 0usize;
+        let mut lqa_decode_fail = 0usize;
+        for change in &response.change {
+            let identifier = match change.identifier.as_ref().and_then(|i| i.value.as_ref()) {
+                Some(v) => v.name().to_string(),
+                None => {
+                    no_identifier += 1;
+                    continue;
+                }
+            };
+            let record = match &change.record {
+                Some(r) => r,
+                None => {
+                    // CloudKit change feed returns identifier without a record
+                    // body when the record has been deleted. The deletion
+                    // applies to the zone regardless of record type, so we log
+                    // the record_name to help correlate with any missing
+                    // attachments in the bridge.
+                    no_record_tombstone += 1;
+                    info!(
+                        "cloud_sync_attachments: tombstone (deleted record) {}",
+                        identifier
+                    );
+                    continue;
+                }
+            };
+            if record.r#type.as_ref().and_then(|t| t.name.as_deref())
+                != Some(<rustpush::cloud_messages::CloudAttachment as rustpush::cloudkit_proto::CloudKitRecord>::record_type())
+            {
+                wrong_type += 1;
+                continue;
+            }
+
+            // Master's PCS-record-key-missing refresh retry pattern:
+            // when `pcs_keys_for_record` returns PCSRecordKeyMissing, the
+            // zone encryption config is likely stale (a new key was
+            // rotated after our cache was seeded). Clear the zone config
+            // cache, re-fetch, and retry once. For other PCS-related
+            // errors (ShareKeyNotFound, DecryptionKeyNotFound,
+            // MasterKeyNotFound), gracefully skip the record with a warn.
+            // Without this, my sync was silently skipping records whose
+            // Ford keys master would have recovered — producing gaps in
+            // the cache that showed up as "all cached keys exhausted"
+            // failures during Ford dedup recovery.
+            // The decode_record_protection path uses .unwrap()/.expect() and
+            // can panic when zone-key lookup fails. Wrap in catch_unwind so a
+            // single bad record skips gracefully instead of aborting the whole
+            // page and freezing the continuation token forever.
+            let pcs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pcs_keys_for_record(record, &zone_key)
+            }));
+            let pcskey_opt = match pcs_result {
+                Err(_panic) => {
+                    // pcs_keys_for_record panicked — the decode_record_protection path
+                    // uses byte comparison (key.compress() vs stored pub_key) which
+                    // fails when the zone was key-rotated and the old key is missing
+                    // from zone_keys but still in the keychain.
+                    //
+                    // Fall back to decrypt_with_keychain, which does a format-agnostic
+                    // keychain lookup (base64 of stored pub_key bytes) and succeeds
+                    // where the byte comparison fails. This is the wrapper-layer
+                    // re-implementation of the aecc7ed fix from the vendored tree.
+                    if let Some(protection) = &record.protection_info {
+                        let record_protection = PCSShareProtection::from_protection_info(protection);
+                        let keychain_state = cloud_messages.keychain.state.read().await;
+                        let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            record_protection.decrypt_with_keychain(&keychain_state, &MESSAGES_SERVICE, false)
+                        }));
+                        match fallback {
+                            Ok(Ok((pcs_keys, _))) => {
+                                let record_id = record.record_identifier.clone().expect("no record id");
+                                info!(
+                                    "cloud_sync_attachments: fallback decrypt_with_keychain succeeded for {}",
+                                    identifier
+                                );
+                                Some(PCSEncryptor { keys: pcs_keys, record_id })
+                            }
+                            Ok(Err(e)) => {
+                                pcs_skipped += 1;
+                                warn!(
+                                    "cloud_sync_attachments: pcs panic + fallback failed for {}: {}",
+                                    identifier, e
+                                );
+                                None
+                            }
+                            Err(_) => {
+                                pcs_skipped += 1;
+                                warn!(
+                                    "cloud_sync_attachments: pcs panic + fallback panicked for {}",
+                                    identifier
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        pcs_skipped += 1;
+                        warn!(
+                            "cloud_sync_attachments: pcs_keys_for_record panicked for {} (no protection_info for fallback)",
+                            identifier
+                        );
+                        None
+                    }
+                }
+                Ok(Ok(k)) => Some(k),
+                Ok(Err(PushError::PCSRecordKeyMissing)) if !refreshed_zone_key_config => {
+                    info!("cloud_sync_attachments: PCSRecordKeyMissing for {}, refreshing zone config", identifier);
+                    container.clear_cache_zone_encryption_config(&zone_id).await;
+                    refreshed_zone_key_config = true;
+                    match container
+                        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                        .await
+                    {
+                        Ok(new_key) => {
+                            zone_key = new_key;
+                            let retry_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                pcs_keys_for_record(record, &zone_key)
+                            }));
+                            match retry_result {
+                                Err(_panic) => {
+                                    pcs_skipped += 1;
+                                    warn!(
+                                        "cloud_sync_attachments: pcs_keys_for_record panicked on retry for {}, skipping",
+                                        identifier
+                                    );
+                                    None
+                                }
+                                Ok(Ok(k)) => Some(k),
+                                Ok(Err(e)) => {
+                                    pcs_skipped += 1;
+                                    warn!(
+                                        "cloud_sync_attachments: PCS key still missing after refresh for {}: {}",
+                                        identifier, e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("cloud_sync_attachments: zone config refresh failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                Ok(Err(err))
+                    if matches!(
+                        err,
+                        PushError::PCSRecordKeyMissing
+                            | PushError::ShareKeyNotFound(_)
+                            | PushError::DecryptionKeyNotFound(_)
+                            | PushError::MasterKeyNotFound
+                    ) =>
+                {
+                    pcs_skipped += 1;
+                    warn!(
+                        "cloud_sync_attachments: skipping {} due to PCS key error: {}",
+                        identifier, err
+                    );
+                    None
+                }
+                Ok(Err(e)) => {
+                    pcs_skipped += 1;
+                    warn!("cloud_sync_attachments: unexpected PCS error for {}: {}", identifier, e);
+                    None
+                }
+            };
+            let pcskey = match pcskey_opt {
+                Some(k) => k,
+                None => continue,
+            };
+
+            // Per-field manual decode.
+            //
+            // Previously this call used the derive-generated
+            // `<CloudAttachment as CloudKitRecord>::from_record_encrypted`
+            // inside a whole-record `catch_unwind`. That path has two
+            // load-bearing panic sites in rustpush's code that silently
+            // nuked entire records:
+            //
+            //   1. `Asset::from_value_encrypted`
+            //      (cloudkit-proto/src/lib.rs:273) double-unwraps
+            //      `asset.protection_info` and `.protection_info`. Any
+            //      record whose `lqa` Asset is missing either nested Option
+            //      panics immediately.
+            //   2. `GZipWrapper::from_bytes`
+            //      (cloud_messages.rs:211) calls `.expect("ungzip fialed")`.
+            //      Any record whose `cm` field decrypts to non-gzip bytes
+            //      panics immediately.
+            //
+            // The old catch_unwind caught the panic but then `continue`d,
+            // dropping the entire record — so the aguid never reached Go,
+            // `attMap` never saw it, and the bridge ingest code logged
+            // "Attachment GUID not found in attachment zone". That's the
+            // observed regression for the 4 stubborn aguids.
+            //
+            // Fix: decode each field independently with its own
+            // catch_unwind. `cm` is required (no aguid → skip record);
+            // `lqa` and `avid` are best-effort (missing Asset just means
+            // we emit the record without a Ford key).
+            let find_field = |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
+                record
+                    .record_field
+                    .iter()
+                    .find(|f| {
+                        f.identifier
+                            .as_ref()
+                            .and_then(|i| i.name.as_deref())
+                            == Some(name)
+                    })
+                    .and_then(|f| f.value.as_ref())
+            };
+
+            let field_names: Vec<String> = record
+                .record_field
+                .iter()
+                .filter_map(|f| f.identifier.as_ref().and_then(|i| i.name.clone()))
+                .collect();
+
+            // Decode `cm` (GZipWrapper<AttachmentMeta>).
+            // We pull the GZipWrapper out, then move the inner AttachmentMeta.
+            let cm_opt: Option<rustpush::cloud_messages::AttachmentMeta> = match find_field("cm") {
+                None => None,
+                Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    <rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>
+                        as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(
+                        v, &pcskey, "cm",
+                    )
+                })) {
+                    Ok(Some(gzw)) => Some(gzw.0),
+                    Ok(None) => None,
+                    Err(_panic) => {
+                        // from_bytes panic (ungzip or plist parse). Log and
+                        // fall through — counted as cm_decode_fail below.
+                        warn!(
+                            "cloud_sync_attachments: {} — cm decode panicked (likely ungzip/plist). fields={:?}",
+                            identifier, field_names
+                        );
+                        None
+                    }
+                },
+            };
+            let cm = match cm_opt {
+                Some(cm) => cm,
+                None => {
+                    cm_decode_fail += 1;
+                    warn!(
+                        "cloud_sync_attachments: skipping {} — cm field missing or undecodable. fields={:?}",
+                        identifier, field_names
+                    );
+                    continue;
+                }
+            };
+
+            // Decode `lqa` (Asset). Best-effort: on failure we still emit
+            // the record so Go sees the aguid in attMap. The Ford download
+            // path will attempt recovery later if needed.
+            //
+            // `lqa_outcome` distinguishes three states: Ok(asset present),
+            // Ok(None) = field absent (fine, not counted), Err = present
+            // but decode panicked or returned None (counted + logged).
+            let lqa_field = find_field("lqa");
+            let lqa_opt: Option<rustpush::cloudkit_proto::Asset> = match lqa_field {
+                None => None,
+                Some(v) => {
+                    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "lqa")
+                    }));
+                    match decoded {
+                        Ok(Some(asset)) => Some(asset),
+                        Ok(None) => {
+                            lqa_decode_fail += 1;
+                            warn!(
+                                "cloud_sync_attachments: {} aguid={} — lqa present but from_value_encrypted returned None; emitting record without Ford key",
+                                identifier, cm.guid
+                            );
+                            None
+                        }
+                        Err(_panic) => {
+                            lqa_decode_fail += 1;
+                            warn!(
+                                "cloud_sync_attachments: {} aguid={} — lqa decode panicked (likely None protection_info); emitting record without Ford key. fields={:?}",
+                                identifier, cm.guid, field_names
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+
+            // Decode `avid` (Live Photo MOV companion, Asset). Best-effort.
+            // Same panic risk as lqa.
+            let avid_asset: Option<rustpush::cloudkit_proto::Asset> = match find_field("avid") {
+                None => None,
+                Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "avid")
+                })) {
+                    Ok(parsed) => parsed,
+                    Err(_panic) => {
+                        warn!(
+                            "cloud_sync_attachments: {} aguid={} — avid decode panicked; treating as no Live Photo",
+                            identifier, cm.guid
+                        );
+                        None
+                    }
+                },
+            };
+
+            let has_avid = avid_asset
+                .as_ref()
+                .and_then(|a| a.size)
+                .unwrap_or(0)
+                > 0;
+            let avid_ford_key = avid_asset
+                .as_ref()
+                .and_then(|a| a.protection_info.as_ref())
+                .and_then(|p| p.protection_info.as_ref())
+                .cloned();
+
+            let ford_key = lqa_opt
+                .as_ref()
+                .and_then(|lqa| lqa.protection_info.as_ref())
+                .and_then(|p| p.protection_info.as_ref())
+                .cloned();
+
+            // Register BOTH lqa and avid Ford keys into the wrapper cache
+            // immediately. Matches master's sync_attachments cache-population
+            // loop. Also propagated to Go's cache via the Go-side register.
+            if let Some(ref k) = ford_key {
+                register_ford_key(k.clone());
+                ford_cached += 1;
+            }
+            if let Some(ref k) = avid_ford_key {
+                register_ford_key(k.clone());
+                ford_cached += 1;
+            }
+
+            // Per-record log at INFO so the exact aguids reaching Go can be
+            // grep'd. `grep cloud_sync_attachments: att` against the journal
+            // will list every aguid → record_name pair the bridge normalized.
+            // Missing a specific aguid from this list = CloudKit change feed
+            // isn't returning it, and the fix is not in the sync loop.
+            info!(
+                "cloud_sync_attachments: att guid={} record={} mime={:?} size={} lqa_ok={} avid_ok={}",
+                cm.guid,
+                identifier,
+                cm.mime_type,
+                cm.total_bytes,
+                lqa_opt.is_some(),
+                avid_asset.is_some(),
+            );
+            normalized.push(WrappedCloudAttachmentInfo {
+                guid: cm.guid.clone(),
+                mime_type: cm.mime_type.clone(),
+                uti_type: cm.uti.clone(),
+                filename: cm.transfer_name.clone().or_else(|| cm.filename.clone()),
+                file_size: cm.total_bytes,
+                record_name: identifier,
+                hide_attachment: cm.hide_attachment,
+                has_avid,
+                ford_key,
+                avid_ford_key,
+            });
+        }
+
+        info!(
+            "cloud_sync_attachments: {} normalized, {} ford_cached, {} pcs_skipped, {} no_id, {} tombstones, {} wrong_type, {} cm_decode_fail, {} lqa_decode_fail, {} total_change_entries",
+            normalized.len(),
+            ford_cached,
+            pcs_skipped,
+            no_identifier,
+            no_record_tombstone,
+            wrong_type,
+            cm_decode_fail,
+            lqa_decode_fail,
+            response.change.len()
+        );
+
+        Ok(WrappedCloudSyncAttachmentsPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            attachments: normalized,
+        })
+    }
+
+    /// QueryRecords fallback for attachmentManateeZone.
+    ///
+    /// FetchRecordChanges misses some live records — confirmed on both master and
+    /// refactor, same count regardless of newest_first/NO_ASSETS. QueryRecords
+    /// queries current zone state without relying on the change-feed token and
+    /// returns records the feed omits.
+    ///
+    /// Call once after the full cloud_sync_attachments loop completes, passing
+    /// the record_names of all attachments already collected from the change feed.
+    /// Returns only records NOT in known_record_names, processed with the same
+    /// PCS + cm/lqa/avid decode logic as cloud_sync_attachments.
+    pub async fn cloud_query_attachments_fallback(
+        &self,
+        known_record_names: Vec<String>,
+    ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
+        use rustpush::cloudkit::{pcs_keys_for_record, CloudKitOp, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
+        use rustpush::PushError;
+        use rustpush::cloudkit_proto;
+
+        struct RawQueryOp(cloudkit_proto::QueryRetrieveRequest);
+        impl CloudKitOp for RawQueryOp {
+            type Response = cloudkit_proto::QueryRetrieveResponse;
+            fn set_request(&self, output: &mut cloudkit_proto::RequestOperation) {
+                output.query_retrieve_request = Some(self.0.clone());
+            }
+            fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
+                response.query_retrieve_response.clone().unwrap_or_default()
+            }
+            fn flow_control_key() -> &'static str { "CKDQueryOperation" }
+            fn link() -> &'static str { "https://gateway.icloud.com/ckdatabase/api/client/query/retrieve" }
+            fn operation() -> cloudkit_proto::operation::Type {
+                cloudkit_proto::operation::Type::QueryRetrieveType
+            }
+            fn tags() -> bool { false }
+        }
+
+        let seen_ids: std::collections::HashSet<String> = known_record_names.into_iter().collect();
+
+        let mut cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = match cloud_messages.get_container().await {
+            Ok(c) => c,
+            Err(e) if is_token_missing_error(&e) => {
+                warn!("cloud_query_attachments_fallback: get_container TokenMissing — refreshing MobileMe delegate and retrying");
+                self.refresh_mme_and_reset_cloud_client().await;
+                cloud_messages = self.get_or_init_cloud_messages_client().await?;
+                cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+                    msg: format!("cloud_query_attachments_fallback: get_container failed after MME refresh: {}", e),
+                })?
+            }
+            Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: get_container failed: {}", e) }),
+        };
+        let zone_id = container.private_zone("attachmentManateeZone".to_string());
+        let mut zone_key = match container
+            .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: zone_key failed: {}", e) }),
+        };
+
+        let mut normalized: Vec<WrappedCloudAttachmentInfo> = Vec::new();
+        let mut pcs_skipped = 0usize;
+        let mut cm_decode_fail = 0usize;
+        let mut lqa_decode_fail = 0usize;
+        let mut ford_cached = 0usize;
+        let mut refreshed_zone_key_config = false;
+        let mut qr_continuation: Option<Vec<u8>> = None;
+        let mut qr_page = 0usize;
+
+        loop {
+            qr_page += 1;
+            let c = Arc::clone(&container);
+            let z = zone_id.clone();
+            let qr_cont = qr_continuation.clone();
+            let join = tokio::task::spawn(async move {
+                c.perform(&CloudKitSession::new(), RawQueryOp(cloudkit_proto::QueryRetrieveRequest {
+                    query: Some(cloudkit_proto::Query {
+                        types: vec![cloudkit_proto::record::Type { name: Some("attachment".to_string()) }],
+                        filters: vec![],
+                        sorts: vec![],
+                        ..Default::default()
+                    }),
+                    zone_identifier: Some(z),
+                    assets_to_download: Some(NO_ASSETS.clone()),
+                    continuation_marker: qr_cont,
+                    ..Default::default()
+                })).await
+            }).await;
+
+            let qr = match join {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!("cloud_query_attachments_fallback: page {} failed: {}", qr_page, e);
+                    break;
+                }
+                Err(e) => {
+                    warn!("cloud_query_attachments_fallback: page {} panicked: {}", qr_page, e);
+                    break;
+                }
+            };
+            let next_marker = qr.continuation_marker.clone();
+
+            for qresult in &qr.query_results {
+                let record = match &qresult.record { Some(r) => r, None => continue };
+                let identifier = match record.record_identifier.as_ref()
+                    .and_then(|i| i.value.as_ref())
+                    .and_then(|v| v.name.as_deref())
+                {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if seen_ids.contains(&identifier) {
+                    continue;
+                }
+                info!("cloud_query_attachments_fallback: new record not in change feed: {}", identifier);
+
+                let pcs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pcs_keys_for_record(record, &zone_key)
+                }));
+                let pcskey_opt = match pcs_result {
+                    Err(_panic) => {
+                        if let Some(protection) = &record.protection_info {
+                            let record_protection = PCSShareProtection::from_protection_info(protection);
+                            let keychain_state = cloud_messages.keychain.state.read().await;
+                            let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                record_protection.decrypt_with_keychain(&keychain_state, &MESSAGES_SERVICE, false)
+                            }));
+                            match fallback {
+                                Ok(Ok((pcs_keys, _))) => {
+                                    let record_id = record.record_identifier.clone().expect("no record id");
+                                    Some(PCSEncryptor { keys: pcs_keys, record_id })
+                                }
+                                Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: pcs panic + fallback failed for {}: {}", identifier, e); None }
+                                Err(_) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: pcs panic + fallback panicked for {}", identifier); None }
+                            }
+                        } else {
+                            pcs_skipped += 1;
+                            warn!("cloud_query_attachments_fallback: pcs panicked for {} (no protection_info)", identifier);
+                            None
+                        }
+                    }
+                    Ok(Ok(k)) => Some(k),
+                    Ok(Err(PushError::PCSRecordKeyMissing)) if !refreshed_zone_key_config => {
+                        container.clear_cache_zone_encryption_config(&zone_id).await;
+                        refreshed_zone_key_config = true;
+                        match container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await {
+                            Ok(new_key) => {
+                                zone_key = new_key;
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pcs_keys_for_record(record, &zone_key))) {
+                                    Err(_) => { pcs_skipped += 1; None }
+                                    Ok(Ok(k)) => Some(k),
+                                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: PCS still missing after refresh for {}: {}", identifier, e); None }
+                                }
+                            }
+                            Err(e) => { warn!("cloud_query_attachments_fallback: zone config refresh failed: {}", e); None }
+                        }
+                    }
+                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: PCS error for {}: {}", identifier, e); None }
+                };
+                let pcskey = match pcskey_opt { Some(k) => k, None => continue };
+
+                let find_field = |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
+                    record.record_field.iter()
+                        .find(|f| f.identifier.as_ref().and_then(|i| i.name.as_deref()) == Some(name))
+                        .and_then(|f| f.value.as_ref())
+                };
+                let field_names: Vec<String> = record.record_field.iter()
+                    .filter_map(|f| f.identifier.as_ref().and_then(|i| i.name.clone()))
+                    .collect();
+
+                let cm_opt: Option<rustpush::cloud_messages::AttachmentMeta> = match find_field("cm") {
+                    None => None,
+                    Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        <rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>
+                            as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "cm")
+                    })) {
+                        Ok(Some(gzw)) => Some(gzw.0),
+                        Ok(None) => None,
+                        Err(_panic) => { warn!("cloud_query_attachments_fallback: {} cm decode panicked. fields={:?}", identifier, field_names); None }
+                    },
+                };
+                let cm = match cm_opt {
+                    Some(cm) => cm,
+                    None => { cm_decode_fail += 1; warn!("cloud_query_attachments_fallback: skipping {} — cm missing/undecodable. fields={:?}", identifier, field_names); continue; }
+                };
+
+                let lqa_opt: Option<rustpush::cloudkit_proto::Asset> = match find_field("lqa") {
+                    None => None,
+                    Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "lqa")
+                    })) {
+                        Ok(Some(asset)) => Some(asset),
+                        Ok(None) => { lqa_decode_fail += 1; None }
+                        Err(_panic) => { lqa_decode_fail += 1; warn!("cloud_query_attachments_fallback: {} lqa decode panicked", identifier); None }
+                    },
+                };
+
+                let avid_asset: Option<rustpush::cloudkit_proto::Asset> = match find_field("avid") {
+                    None => None,
+                    Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "avid")
+                    })) {
+                        Ok(parsed) => parsed,
+                        Err(_panic) => { warn!("cloud_query_attachments_fallback: {} avid decode panicked", identifier); None }
+                    },
+                };
+
+                let has_avid = avid_asset.as_ref().and_then(|a| a.size).unwrap_or(0) > 0;
+                let avid_ford_key = avid_asset.as_ref().and_then(|a| a.protection_info.as_ref()).and_then(|p| p.protection_info.as_ref()).cloned();
+                let ford_key = lqa_opt.as_ref().and_then(|lqa| lqa.protection_info.as_ref()).and_then(|p| p.protection_info.as_ref()).cloned();
+
+                if let Some(ref k) = ford_key { register_ford_key(k.clone()); ford_cached += 1; }
+                if let Some(ref k) = avid_ford_key { register_ford_key(k.clone()); ford_cached += 1; }
+
+                info!(
+                    "cloud_query_attachments_fallback: att guid={} record={} mime={:?} size={} lqa_ok={} avid_ok={}",
+                    cm.guid, identifier, cm.mime_type, cm.total_bytes, lqa_opt.is_some(), avid_asset.is_some(),
+                );
+                normalized.push(WrappedCloudAttachmentInfo {
+                    guid: cm.guid.clone(),
+                    mime_type: cm.mime_type.clone(),
+                    uti_type: cm.uti.clone(),
+                    filename: cm.transfer_name.clone().or_else(|| cm.filename.clone()),
+                    file_size: cm.total_bytes,
+                    record_name: identifier,
+                    hide_attachment: cm.hide_attachment,
+                    has_avid,
+                    ford_key,
+                    avid_ford_key,
+                });
+            }
+
+            match next_marker {
+                Some(m) if !m.is_empty() => { qr_continuation = Some(m); }
+                _ => break,
+            }
+        }
+
+        info!(
+            "cloud_query_attachments_fallback: {} new records across {} pages, {} pcs_skipped, {} cm_fail, {} lqa_fail, {} ford_cached",
+            normalized.len(), qr_page, pcs_skipped, cm_decode_fail, lqa_decode_fail, ford_cached
+        );
+
+        Ok(WrappedCloudSyncAttachmentsPage {
+            continuation_token: None,
+            status: 3,
+            done: true,
+            attachments: normalized,
+        })
+    }
+
+    /// Download an attachment from CloudKit by its record name.
+    /// Returns the raw file bytes.
+    ///
+    /// # Ford dedup recovery
+    ///
+    /// First tries the `download_attachment` path. If that path panics
+    /// (which happens when MMCS serves a deduplicated Ford blob encrypted
+    /// with a different record's key — the `.unwrap()` at the top of
+    /// `get_mmcs`'s SIV decrypt), the panic is caught here and the wrapper
+    /// retries manually by iterating cached Ford keys. For each cached key,
+    /// we fetch the record, mutate `lqa.protection_info.protection_info` to
+    /// inject the candidate key, and call `container.get_assets(...)`
+    /// directly. This matches the 94f7b8e fix's semantics without touching
+    /// rustpush source.
+    pub async fn cloud_download_attachment(
+        &self,
+        record_name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        // Hand-rolled mirror of the `download_attachment` path that
+        // replicates master's Ford-registration-before-get_assets pattern:
+        //
+        //   1. perform_operations(FetchRecordOperation::many(ALL_ASSETS))
+        //   2. parse records as CloudAttachmentWithAvid (lqa + avid)
+        //   3. register BOTH lqa.protection_info and avid.protection_info
+        //      Ford keys into the wrapper cache BEFORE get_assets runs
+        //   4. call container.get_assets(&records.assets, &record.lqa)
+        //
+        // This ensures that every attachment download contributes its
+        // record's own Ford keys to the cache even if sync never reached
+        // this record yet (new attachments, cross-device dedup where the
+        // source record hasn't been synced). Matches master's behavior
+        // at rustpush/src/imessage/cloud_messages.rs:download_attachment.
+        //
+        // Wrapped in catch_unwind so any SIV panic deep in get_mmcs (Ford
+        // dedup with a key not yet in the cache) falls through to
+        // `cloud_download_attachment_ford_recovery` for brute-force retry.
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("cloud_download_attachment {}: get_container: {e}", record_name),
+        })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment {}: zone key: {e}", record_name),
+            })?;
+
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment {}: perform_operations: {e}", record_name),
+            })?;
+        let records = FetchedRecords::new(&invoke);
+        let record: CloudAttachmentWithAvid = records.get_record(&record_name, Some(&zone_key));
+
+        // Register this record's Ford keys (lqa + avid) into the cache
+        // BEFORE the get_assets call — matches master's download_attachment
+        // behavior so the fordChecksum / brute-force fallback always has
+        // at least the current record's keys available.
+        if let Some(pi) = record
+            .lqa
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+        if let Some(pi) = record
+            .avid
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+
+        // Determine upfront whether this asset is Ford-encrypted by parsing
+        // the AuthorizeGetResponse body and checking if our file's
+        // wanted_chunks entry has a `ford_reference`. Only Ford-encrypted
+        // assets (typically videos) benefit from Ford dedup recovery —
+        // image attachments use V1 per-chunk encryption and DON'T have a
+        // Ford blob, so running recovery on them would brute-force cached
+        // keys against bytes that aren't Ford ciphertext (guaranteed to
+        // fail, pure wasted work).
+        //
+        // Master's retry was inside get_mmcs, scoped to the Ford container
+        // loop, so it naturally only fired on real Ford failures. The
+        // wrapper has to do this check explicitly.
+        let is_ford_asset = is_ford_encrypted_asset(&records.assets, &record.lqa);
+        // Diagnostic log so we can verify from logs that only Ford-encrypted
+        // records are entering the recovery path. If this ever shows
+        // is_ford=false for a record that still panics through Ford
+        // recovery, something's wrong with the gating.
+        info!(
+            "cloud_download_attachment {}: is_ford={} mime={:?} filename={:?}",
+            record_name,
+            is_ford_asset,
+            record.cm.0.mime_type.as_deref().unwrap_or("<none>"),
+            record.cm.0.transfer_name.as_deref().or(record.cm.0.filename.as_deref()).unwrap_or("<none>")
+        );
+
+        // Attempt 1 — get_assets with the record's own lqa, wrapped in
+        // catch_unwind so a panic doesn't take down the bridge.
+        let shared = SharedWriter::new();
+        let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+            vec![(&record.lqa, shared.clone())];
+        let fut = container.get_assets(&records.assets, assets_tuple);
+        let wrapped = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+
+        match wrapped {
+            Ok(Ok(())) => return Ok(shared.into_bytes()),
+            Ok(Err(e)) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+                });
+            }
+            Err(panic_payload) => {
+                // Surface what rustpush actually panicked on (the catch_unwind
+                // payload) — e.g. "No body!!" (Apple no longer serves the asset)
+                // vs "No signature?" (our stored record is missing a field).
+                let payload = panic_payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                    .unwrap_or("<non-string panic>");
+                if is_ford_asset {
+                    warn!(
+                        "cloud_download_attachment {}: Ford SIV panic ({}), attempting recovery with {} cached Ford keys",
+                        record_name,
+                        payload,
+                        ford_key_cache_size()
+                    );
+                } else {
+                    // Non-Ford asset (image / V1 per-chunk encryption). Don't
+                    // give up here — the manual download path below ALSO handles
+                    // plain V1 chunks (decrypt_v1_chunk with the per-chunk key
+                    // from the authorize response), so it can recover a V1 image
+                    // that the get_mmcs path panicked on. If the asset is truly
+                    // gone (Apple aged out the MMCS blob → no body / no
+                    // reference), recovery returns a descriptive, ATTACHMENT_
+                    // UNRECOVERABLE-tagged error the bridge can tombstone.
+                    warn!(
+                        "cloud_download_attachment {}: non-Ford get_assets panic ({}); attempting manual V1 recovery",
+                        record_name,
+                        payload
+                    );
+                }
+            }
+        }
+
+        // Attempt 2 — manual recovery. Handles V1 (per-chunk), V2 Ford, and
+        // Ford dedup (cross-batch brute force via the cached key set) in one
+        // pure-crypto pass. Reached for BOTH Ford and non-Ford panics: the
+        // manual path is a superset of the get_mmcs path.
+        self.cloud_download_attachment_ford_recovery_with_record(
+            container,
+            records,
+            record,
+            &record_name,
+        )
+        .await
+    }
+
+    /// Download an attachment to a file on disk instead of returning the bytes
+    /// over the FFI.
+    ///
+    /// uniffi lowers a returned `Vec<u8>` into a `RustBuffer` whose length and
+    /// capacity are `i32`, so any blob ≥ 2 GiB panics on the way out of
+    /// `cloud_download_attachment` ("buffer capacity cannot fit into a i32.")
+    /// even though the download itself succeeded — CloudKit reports such sizes
+    /// as a NEGATIVE (i32-wrapped) file_size, e.g. -1,676,737,818 for a ~2.6 GB
+    /// blob. The Go side routes those oversized attachments here: we run the
+    /// normal download path by calling `cloud_download_attachment` in-process
+    /// (a plain Rust call — no uniffi lowering, so no i32 panic), stream the
+    /// bytes to `dest_path`, and return only the length. Nothing large crosses
+    /// the FFI boundary. The caller reads the file back and removes it.
+    pub async fn cloud_download_attachment_to_file(
+        &self,
+        record_name: String,
+        dest_path: String,
+    ) -> Result<u64, WrappedError> {
+        let bytes = self.cloud_download_attachment(record_name.clone()).await?;
+        let len = bytes.len() as u64;
+        std::fs::write(&dest_path, &bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!(
+                "cloud_download_attachment_to_file {}: write {}: {e}",
+                record_name, dest_path
+            ),
+        })?;
+        Ok(len)
+    }
+
+    // Ford recovery helper lives in a separate non-uniffi impl block below
+    // (`impl WrappedClient { ford_recovery_download ... }`) — it takes
+    // non-FFI reference types and uniffi can't codegen wrappers for it.
+
+    /// Whether this build supports CloudKit avid (Live Photo MOV) downloads.
+    /// Always true now — the wrapper hand-rolls the avid path using our
+    /// local `CloudAttachmentWithAvid` record type and `container.get_assets`,
+    /// so it doesn't depend on any rustpush cargo feature or patch.
+    pub fn cloud_supports_avid_download(&self) -> bool {
+        true
+    }
+
+    /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
+    ///
+    /// The rustpush `CloudAttachment` type doesn't have an `avid`
+    /// field, so we fetch the record using our local `CloudAttachmentWithAvid`
+    /// (which declares the same `attachment` CloudKit record type plus the
+    /// extra `avid: Asset` field), register the record's Ford keys into
+    /// the wrapper cache, and call `container.get_assets` with
+    /// `&record.avid` as the target asset. Wrapped in catch_unwind for
+    /// SIV panic safety, and falls through to `cloud_download_avid_ford_recovery`
+    /// if the initial attempt panics on a MMCS dedup SIV failure.
+    pub async fn cloud_download_attachment_avid(
+        &self,
+        record_name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
+        use rustpush::cloud_messages::MESSAGES_SERVICE;
+
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("cloud_download_attachment_avid {}: get_container: {e}", record_name),
+        })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment_avid {}: zone key: {e}", record_name),
+            })?;
+
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.clone()]),
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("cloud_download_attachment_avid {}: perform_operations: {e}", record_name),
+            })?;
+        let records = FetchedRecords::new(&invoke);
+        let base_record: CloudAttachmentWithAvid = records.get_record(&record_name, Some(&zone_key));
+
+        // Register this record's Ford keys (both lqa and avid) into the
+        // wrapper cache so recovery has visibility if the initial attempt
+        // panics on a dedup mismatch.
+        if let Some(pi) = base_record
+            .lqa
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+        if let Some(pi) = base_record
+            .avid
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+
+        // Attempt 1 — record's own avid key.
+        let shared = SharedWriter::new();
+        let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+            vec![(&base_record.avid, shared.clone())];
+        let fut = container.get_assets(&records.assets, assets_tuple);
+        let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+        match result {
+            Ok(Ok(())) => return Ok(shared.into_bytes()),
+            Ok(Err(e)) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("cloud_download_attachment_avid {}: get_assets: {e}", record_name),
+                });
+            }
+            Err(_panic) => {
+                warn!(
+                    "cloud_download_attachment_avid {}: SIV panic, attempting Ford recovery \
+                     with {} cached keys",
+                    record_name,
+                    ford_key_cache_size()
+                );
+            }
+        }
+
+        // Attempt 2+ — Ford dedup recovery, same pattern as
+        // cloud_download_attachment_ford_recovery but targets record.avid.
+        self.cloud_download_avid_ford_recovery(container, &records, base_record, &record_name)
+            .await
+    }
+
+    /// Download a group photo from CloudKit by the chat's record name.
+    /// Returns the raw image bytes. The record_name is the CloudKit record
+    /// in chatManateeZone where the chat's "gp" asset is stored.
+    pub async fn cloud_download_group_photo(
+        &self,
+        record_name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        let shared = SharedWriter::new();
+        let mut files = HashMap::new();
+        files.insert(record_name.clone(), shared.clone());
+        cloud_messages.download_group_photo(files).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to download CloudKit group photo {}: {}", record_name, e),
+            })?;
+        Ok(shared.into_bytes())
+    }
+
+    /// Diagnostic: do a full fresh sync from scratch (no continuation token)
+    /// and return total record count + the newest message timestamps per chat.
+    /// This bypasses any stored token to check what CloudKit actually has.
+    pub async fn cloud_diag_full_count(
+        &self,
+    ) -> Result<String, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        
+        let mut token: Option<Vec<u8>> = None;
+        let mut total_records: usize = 0;
+        let mut total_deleted: usize = 0;
+        let mut chat_id_counts: HashMap<String, usize> = HashMap::new();
+        let mut newest_ts: i64 = 0;
+        let mut newest_guid = String::new();
+        let mut newest_chat = String::new();
+        
+        for page in 0..512 {
+            let (next_token, messages, status) = cloud_messages.sync_messages(token).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("diag sync page {} failed: {}", page, e) })?;
+            
+            let page_total = messages.len();
+            for (_record_name, msg_opt) in &messages {
+                if let Some(msg) = msg_opt {
+                    total_records += 1;
+                    let ts = apple_timestamp_ns_to_unix_ms(msg.time);
+                    let chat = &msg.chat_id;
+                    *chat_id_counts.entry(chat.clone()).or_insert(0) += 1;
+                    if ts > newest_ts {
+                        newest_ts = ts;
+                        newest_guid = msg.guid.clone();
+                        newest_chat = chat.clone();
+                    }
+                } else {
+                    total_deleted += 1;
+                }
+            }
+            info!("diag page {} => {} records (status={})", page, page_total, status);
+            
+            if status == 3 {
+                break;
+            }
+            token = Some(next_token);
+        }
+        
+        let unique_chats = chat_id_counts.len();
+        let result = format!(
+            "total_records={} deleted={} unique_chats={} newest_ts={} newest_guid={} newest_chat={}",
+            total_records, total_deleted, unique_chats, newest_ts, newest_guid, newest_chat
+        );
+        info!("CloudKit diag: {}", result);
+        Ok(result)
+    }
+
+    pub async fn cloud_fetch_recent_messages(
+        &self,
+        since_timestamp_ms: u64,
+        chat_id: Option<String>,
+        max_pages: u32,
+        max_results: u32,
+    ) -> Result<Vec<WrappedCloudSyncMessage>, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let since = since_timestamp_ms as i64;
+        let max_pages = if max_pages == 0 { 1 } else { max_pages };
+        let max_results = if max_results == 0 { 1 } else { max_results as usize };
+
+        let mut token: Option<Vec<u8>> = None;
+        let mut deduped: HashMap<String, WrappedCloudSyncMessage> = HashMap::new();
+
+        'pages: for _ in 0..max_pages {
+            const MAX_SYNC_ATTEMPTS: usize = 4;
+            let mut sync_result = None;
+            let mut last_pcs_err: Option<rustpush::PushError> = None;
+
+            for attempt in 0..MAX_SYNC_ATTEMPTS {
+                match fetch_main_zone_page_newest_first(&cloud_messages, token.clone()).await {
+                    Ok(result) => {
+                        sync_result = Some(result);
+                        break;
+                    }
+                    Err(err) if is_pcs_recoverable_error(&err) => {
+                        let attempt_no = attempt + 1;
+                        warn!(
+                            "CloudKit recent fetch hit PCS key error on attempt {}/{}: {}",
+                            attempt_no,
+                            MAX_SYNC_ATTEMPTS,
+                            err
+                        );
+                        last_pcs_err = Some(err);
+                        if attempt_no < MAX_SYNC_ATTEMPTS {
+                            self.recover_cloud_pcs_state("CloudKit recent fetch").await?;
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        return Err(WrappedError::GenericError {
+                            msg: format!("Failed to sync CloudKit messages: {}", err),
+                        });
+                    }
+                }
+            }
+
+            let (next_token, messages, status) = match sync_result {
+                Some(result) => result,
+                None => {
+                    let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit messages after PCS recovery retries: {}", err),
+                    });
+                }
+            };
+
+            for (record_name, msg_opt) in messages {
+                let Some(msg) = msg_opt else {
+                    continue;
+                };
+
+                // Skip system/service messages (group renames, participant changes, etc.)
+                if msg.flags.intersects(
+                    rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE
+                    | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE
+                ) {
+                    continue;
+                }
+
+                if let Some(ref wanted_chat) = chat_id {
+                    if &msg.chat_id != wanted_chat {
+                        continue;
+                    }
+                }
+
+                let timestamp_ms = apple_timestamp_ns_to_unix_ms(msg.time);
+                if timestamp_ms < since {
+                    continue;
+                }
+
+                let guid = if msg.guid.is_empty() {
+                    record_name.clone()
+                } else {
+                    msg.guid.clone()
+                };
+
+                let tapback_type = msg.msg_proto.associated_message_type;
+                let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
+                let tapback_emoji = msg.msg_proto_4.as_ref()
+                    .and_then(|p4| p4.associated_message_emoji.clone());
+
+                let date_read_ms = msg.msg_proto.date_read
+                    .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
+                    .unwrap_or(0);
+
+                // Extract attachment GUIDs from attributedBody + messageSummaryInfo
+                let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                    .as_ref()
+                    .map(|body| extract_attachment_guids_from_attributed_body(body))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
+                    .collect();
+                if let Some(ref summary) = msg.msg_proto.message_summary_info {
+                    for sg in extract_attachment_guids_from_summary_info(summary) {
+                        if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                            && !attachment_guids.contains(&sg)
+                        {
+                            attachment_guids.push(sg);
+                        }
+                    }
+                }
+
+                let (reply_guid, reply_part) = parse_cloud_reply(
+                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
+                );
+
+                deduped.insert(
+                    guid.clone(),
+                    WrappedCloudSyncMessage {
+                        record_name,
+                        guid,
+                        cloud_chat_id: msg.chat_id,
+                        sender: msg.sender,
+                        is_from_me: msg
+                            .flags
+                            .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+                        text: msg.msg_proto.text.clone(),
+                        subject: msg.msg_proto.subject.clone(),
+                        service: msg.service,
+                        timestamp_ms,
+                        deleted: false,
+                        tapback_type,
+                        tapback_target_guid,
+                        tapback_emoji,
+                        attachment_guids,
+                        date_read_ms,
+                        msg_type: msg.r#type,
+                        has_body: msg.msg_proto.attributed_body.is_some(),
+                        reply_guid,
+                        reply_part,
+                    },
+                );
+
+                if deduped.len() >= max_results {
+                    break 'pages;
+                }
+            }
+
+            if status == 3 {
+                break;
+            }
+            token = Some(next_token);
+        }
+
+        let mut output = deduped.into_values().collect::<Vec<_>>();
+        output.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.guid.cmp(&b.guid))
+        });
+        if output.len() > max_results {
+            output = output[output.len() - max_results..].to_vec();
+        }
+
+        Ok(output)
+    }
+
+    /// Test CloudKit Messages access: creates CloudKitClient + KeychainClient + CloudMessagesClient,
+    /// then tries to sync chats and messages. Logs results. Returns a summary string.
+    pub async fn test_cloud_messages(&self) -> Result<String, WrappedError> {
+        let tp = self.token_provider.as_ref()
+            .ok_or(WrappedError::GenericError { msg: "No TokenProvider available".into() })?;
+
+        info!("=== CloudKit Messages Test ===");
+
+        // Get needed credentials
+        let dsid = tp.get_dsid().await?;
+        let adsid = tp.get_adsid().await?;
+        let mme_delegate = tp.parse_mme_delegate().await?;
+        let account = tp.get_account();
+        let os_config = tp.get_os_config();
+
+        info!("DSID: {}, ADSID: {}", dsid, adsid);
+
+        // Get anisette client from the account
+        let anisette = account.lock().await.anisette.clone();
+
+        // Create CloudKitState
+        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
+            .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+
+        // Create CloudKitClient
+        let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+            state: rustpush::DebugRwLock::new(cloudkit_state),
+            anisette: anisette.clone(),
+            config: os_config.clone(),
+            token_provider: tp.inner.clone(),
+        });
+
+        // Create KeychainClientState
+        let keychain_state = rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+            .ok_or(WrappedError::GenericError { msg: "Failed to create KeychainClientState — missing KeychainSync config in MobileMe delegate".into() })?;
+
+        info!("KeychainClientState created successfully");
+
+        // Create KeychainClient
+        let keychain = Arc::new(rustpush::keychain::KeychainClient {
+            anisette: anisette.clone(),
+            token_provider: tp.inner.clone(),
+            state: rustpush::DebugRwLock::new(keychain_state),
+            config: os_config.clone(),
+            update_state: Box::new(|_state| {
+                // For now, don't persist keychain state
+                info!("Keychain state updated (not persisted yet)");
+            }),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: cloudkit.clone(),
+        });
+
+        // Try to sync the keychain (needed for PCS decryption keys)
+        info!("Syncing iCloud Keychain...");
+        match keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await {
+            Ok(()) => info!("Keychain sync successful"),
+            Err(e) => {
+                let msg = format!("Keychain sync failed: {}. This likely means we need to join the trust circle first.", e);
+                warn!("{}", msg);
+                return Ok(msg);
+            }
+        }
+
+        // Create CloudMessagesClient
+        let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit.clone(), keychain.clone());
+
+        // Try counting records first
+        info!("Counting CloudKit message records...");
+        match cloud_messages.count_records().await {
+            Ok(summary) => {
+                info!("CloudKit record counts — messages: {}, chats: {}, attachments: {}",
+                    summary.messages_summary.len(), summary.chat_summary.len(), summary.attachment_summary.len());
+            }
+            Err(e) => {
+                warn!("Failed to count records: {}", e);
+            }
+        }
+
+        // Try syncing chats
+        info!("Syncing CloudKit chats...");
+        let mut total_chats = 0;
+        let mut chat_names: Vec<String> = Vec::new();
+        match cloud_messages.sync_chats(None).await {
+            Ok((_token, chats, status)) => {
+                info!("Chat sync returned {} chats (status={})", chats.len(), status);
+                for (id, chat_opt) in &chats {
+                    if let Some(chat) = chat_opt {
+                        let name = chat.display_name.as_deref().unwrap_or("(unnamed)");
+                        let participants: Vec<&str> = chat.participants.iter().map(|p| p.uri.as_str()).collect();
+                        info!("  Chat: {} | id={} | svc={} | participants={:?}", name, chat.chat_identifier, chat.service_name, participants);
+                        chat_names.push(format!("{}: {} [{}]", id, name, chat.chat_identifier));
+                    } else {
+                        info!("  Chat {} deleted", id);
+                    }
+                    total_chats += 1;
+                }
+            }
+            Err(e) => {
+                let msg = format!("Chat sync failed: {}", e);
+                warn!("{}", msg);
+                return Ok(msg);
+            }
+        }
+
+        // Try syncing messages (first page)
+        info!("Syncing CloudKit messages (first page)...");
+        let mut total_messages = 0;
+        match cloud_messages.sync_messages(None).await {
+            Ok((_token, messages, status)) => {
+                info!("Message sync returned {} messages (status={})", messages.len(), status);
+                for (id, msg_opt) in messages.iter().take(20) {
+                    if let Some(msg) = msg_opt {
+                        let from_me = msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME);
+                        info!("  Msg: {} | chat={} | sender={} | from_me={} | svc={} | guid={}",
+                            id, msg.chat_id, msg.sender, from_me, msg.service, msg.guid);
+                    } else {
+                        info!("  Msg {} deleted", id);
+                    }
+                    total_messages += 1;
+                }
+                if messages.len() > 20 {
+                    info!("  ... and {} more messages", messages.len() - 20);
+                    total_messages = messages.len();
+                }
+            }
+            Err(e) => {
+                let msg = format!("Message sync failed: {}", e);
+                warn!("{}", msg);
+                return Ok(format!("Chats OK ({} chats), but message sync failed: {}", total_chats, e));
+            }
+        }
+
+        let summary = format!("CloudKit sync OK: {} chats, {} messages (first page)", total_chats, total_messages);
+        info!("{}", summary);
+        Ok(summary)
+    }
+
+    pub async fn stop(&self) {
+        let mut handle = self.receive_handle.lock().await;
+        if let Some(h) = handle.take() {
+            h.abort();
+        }
+    }
+}
+
+// Non-uniffi-exported helpers on `Client`. Methods here take reference types
+// (like `&CloudMessagesClient<...>` or `&str`) that uniffi can't generate FFI
+// wrappers for, so they live in a plain impl block that the FFI codegen
+// ignores.
+impl Client {
+    /// Ford dedup recovery using an already-fetched record + FetchedRecords.
+    /// This variant is called by `cloud_download_attachment` after its first
+    /// `get_assets` attempt panics — it reuses the existing record/assets
+    /// instead of re-fetching, which saves a CloudKit round-trip per download.
+    async fn cloud_download_attachment_ford_recovery_with_record(
+        &self,
+        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>>,
+        records: rustpush::cloudkit::FetchedRecords,
+        base_record: CloudAttachmentWithAvid,
+        record_name: &str,
+    ) -> Result<Vec<u8>, WrappedError> {
+        // Fully-manual Ford download. Bypasses the V1-only
+        // `get_mmcs` (which panics on V2 Ford records) and handles V1,
+        // V2, and dedup (cross-batch brute force via the cached key set)
+        // in a single pure-crypto pass.
+        //
+        // The outer `cloud_download_attachment` attempted the
+        // happy path first and catch_unwind'd its panic; we're here
+        // because that failed. Reached for BOTH Ford and non-Ford
+        // (plain V1) panics — the manual path handles all of them.
+        //
+        // Errors that mean the asset is no longer downloadable from
+        // CloudKit at all (Apple aged out the MMCS blob: no body, no
+        // matching reference, missing bundled_request_id/signature) are
+        // tagged "ATTACHMENT_UNRECOVERABLE:" so the Go side can persist a
+        // tombstone and stop re-attempting them on every sync sweep.
+        //
+        // What this function does NOT do that the get_mmcs path does:
+        //   - getComplete confirmation (CloudKit passes empty url, so
+        //     get_mmcs skips it too — see mmcs.rs:1260-1272)
+        //   - chunk-level HTTP range requests with streaming matcher
+        //     (we fetch each container body in full — simpler, same
+        //     result for typical attachment sizes)
+
+        let lqa = &base_record.lqa;
+        let bundled_id = lqa.bundled_request_id.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.bundled_request_id is None", record_name),
+            }
+        })?;
+        let signature = lqa.signature.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.signature is None", record_name),
+            }
+        })?;
+        let ford_key = lqa
+            .protection_info
+            .as_ref()
+            .and_then(|pi| pi.protection_info.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        // Find the AssetGetResponse for this asset's bundled_request_id.
+        let asset_response = records
+            .assets
+            .iter()
+            .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!(
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: no AssetGetResponse for bundled_request_id",
+                    record_name
+                ),
+            })?;
+        let body = asset_response.body.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!(
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: AssetGetResponse.body is None",
+                    record_name
+                ),
+            }
+        })?;
+
+        // User agent for MMCS fetches — CloudKit style (matches what
+        // the `get_assets` path constructs at cloudkit.rs:2080).
+        let user_agent = container
+            .client
+            .config
+            .get_normal_ua("CloudKit/1970");
+
+        info!(
+            "manual_ford_download {}: starting V1+V2 Ford path (ford_key_len={} cache_size={})",
+            record_name,
+            ford_key.len(),
+            ford_key_cache_size()
+        );
+
+        match manual_ford::manual_ford_download_asset(
+            body,
+            signature,
+            &ford_key,
+            &user_agent,
+            record_name,
+        )
+        .await
+        {
+            Ok(bytes) => {
+                warn!(
+                    "manual_ford_download {}: SUCCESS bytes={}",
+                    record_name,
+                    bytes.len()
+                );
+                Ok(bytes)
+            }
+            Err(e) => {
+                warn!("manual_ford_download {}: FAILED: {}", record_name, e);
+                // "no references entry matches signature" / a server "GONE"
+                // reason means the asset is no longer in Apple's authorize
+                // response — it's not coming back. Tag it so Go tombstones it.
+                // Plain network/HTTP failures stay un-tagged → retriable.
+                let unrecoverable = e.contains("no references entry matches")
+                    || e.contains("AuthorizeGetResponse")
+                    || e.to_ascii_lowercase().contains("gone");
+                let tag = if unrecoverable { "ATTACHMENT_UNRECOVERABLE: " } else { "" };
+                Err(WrappedError::GenericError {
+                    msg: format!("{}Manual Ford download for {}: {}", tag, record_name, e),
+                })
+            }
+        }
+    }
+
+    /// Ford dedup recovery path: fetch the CloudAttachment record, iterate
+    /// over every cached Ford key, mutate `Asset.protection_info` per attempt,
+    /// and retry `container.get_assets(...)` wrapped in `catch_unwind` until
+    /// one candidate SIV-decrypts cleanly. Matches the 94f7b8e fix's
+    /// cross-batch recovery semantics without modifying rustpush.
+    #[allow(dead_code)]
+    async fn cloud_download_attachment_ford_recovery(
+        &self,
+        cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
+        record_name: &str,
+    ) -> Result<Vec<u8>, WrappedError> {
+        use futures::FutureExt;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
+        use rustpush::cloud_messages::{CloudAttachment, MESSAGES_SERVICE};
+
+        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
+            msg: format!("Ford recovery: get_container failed: {e}"),
+        })?;
+        let zone = container.private_zone("attachmentManateeZone".to_string());
+        let zone_key = container
+            .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Ford recovery: get_zone_encryption_config failed: {e}"),
+            })?;
+
+        let invoke = container
+            .perform_operations(
+                &CloudKitSession::new(),
+                &FetchRecordOperation::many(&ALL_ASSETS, &zone, &[record_name.to_string()]),
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Ford recovery: perform_operations failed: {e}"),
+            })?;
+        let records = FetchedRecords::new(&invoke);
+        let base_record: CloudAttachment = records.get_record(record_name, Some(&zone_key));
+
+        // Register the record's own key in case sync hasn't touched it yet
+        // (e.g. direct download of a just-arrived attachment).
+        if let Some(pi) = base_record
+            .lqa
+            .protection_info
+            .as_ref()
+            .and_then(|p| p.protection_info.as_ref())
+        {
+            register_ford_key(pi.clone());
+        }
+
+        let cached_keys = ford_key_cache_values();
+        info!(
+            "Ford recovery {}: trying {} cached keys",
+            record_name,
+            cached_keys.len()
+        );
+
+        // Pre-flight: if the record's lqa has no bundled_request_id, the
+        // `get_assets` path would panic immediately at cloudkit.rs:2075 with "No
+        // bundled asset!" — no point iterating 900 keys. Bail out early with
+        // a clear error instead.
+        if base_record.lqa.bundled_request_id.is_none() {
+            warn!(
+                "Ford recovery {}: lqa.bundled_request_id is None (record not ALL_ASSETS-authorized?), skipping recovery",
+                record_name
+            );
+            return Err(WrappedError::GenericError {
+                msg: format!("Ford dedup recovery for {}: lqa asset has no bundled_request_id", record_name),
+            });
+        }
+
+        for (idx, alt_key) in cached_keys.iter().enumerate() {
+            // Clone per attempt so we can mutate `protection_info`
+            // independently and retry cleanly on panic.
+            let mut record = base_record.clone();
+            if let Some(pi) = record.lqa.protection_info.as_mut() {
+                pi.protection_info = Some(alt_key.clone());
+            } else {
+                continue;
+            }
+
+            let shared = SharedWriter::new();
+            let assets_tuple: Vec<(&rustpush::cloudkit_proto::Asset, SharedWriter)> =
+                vec![(&record.lqa, shared.clone())];
+
+            let fut = container.get_assets(&records.assets, assets_tuple);
+            let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+            match result {
+                Ok(Ok(())) => {
+                    let bytes = shared.into_bytes();
+                    warn!(
+                        "Ford dedup recovery SUCCESS: record={} attempt={}/{} bytes={}",
+                        record_name,
+                        idx + 1,
+                        cached_keys.len(),
+                        bytes.len()
+                    );
+                    return Ok(bytes);
+                }
+                Ok(Err(e)) => {
+                    debug!("Ford recovery attempt {} returned error: {}", idx + 1, e);
+                }
+                Err(_panic) => {
+                    debug!(
+                        "Ford recovery attempt {} panicked (wrong key, retrying)",
+                        idx + 1
+                    );
+                }
+            }
+        }
+
+        warn!(
+            "Ford dedup recovery FAILED: record={} tried={} all cached keys exhausted",
+            record_name,
+            cached_keys.len()
+        );
+        Err(WrappedError::GenericError {
+            msg: format!(
+                "Ford dedup recovery for {}: all {} cached keys failed SIV decrypt",
+                record_name,
+                cached_keys.len()
+            ),
+        })
+    }
+
+    /// Ford dedup recovery for the Live Photo MOV (`avid`) asset. Same
+    /// algorithm as `cloud_download_attachment_ford_recovery` but operates
+    /// on `record.avid` instead of `record.lqa`. Takes an already-fetched
+    /// `CloudAttachmentWithAvid` and `FetchedRecords` so we don't re-hit
+    /// the CloudKit record endpoint per attempt.
+    async fn cloud_download_avid_ford_recovery(
+        &self,
+        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>>,
+        records: &rustpush::cloudkit::FetchedRecords,
+        base_record: CloudAttachmentWithAvid,
+        record_name: &str,
+    ) -> Result<Vec<u8>, WrappedError> {
+        // Manual V1+V2 Ford download for the Live Photo (avid) asset.
+        // Same algorithm as the lqa recovery path, but targeting
+        // `base_record.avid` instead of `base_record.lqa`.
+        let avid = &base_record.avid;
+        let bundled_id = avid.bundled_request_id.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download (avid) {}: avid.bundled_request_id is None",
+                    record_name
+                ),
+            }
+        })?;
+        let signature = avid.signature.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!("manual_ford_download (avid) {}: avid.signature is None", record_name),
+            }
+        })?;
+        let ford_key = avid
+            .protection_info
+            .as_ref()
+            .and_then(|pi| pi.protection_info.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        let asset_response = records
+            .assets
+            .iter()
+            .find(|r| r.asset_id.as_ref() == Some(bundled_id))
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download (avid) {}: no AssetGetResponse for bundled_request_id",
+                    record_name
+                ),
+            })?;
+        let body = asset_response.body.as_ref().ok_or_else(|| {
+            WrappedError::GenericError {
+                msg: format!(
+                    "manual_ford_download (avid) {}: AssetGetResponse.body is None",
+                    record_name
+                ),
+            }
+        })?;
+
+        let user_agent = container
+            .client
+            .config
+            .get_normal_ua("CloudKit/1970");
+
+        info!(
+            "manual_ford_download (avid) {}: starting V1+V2 Ford path",
+            record_name
+        );
+
+        match manual_ford::manual_ford_download_asset(
+            body,
+            signature,
+            &ford_key,
+            &user_agent,
+            record_name,
+        )
+        .await
+        {
+            Ok(bytes) => {
+                warn!(
+                    "manual_ford_download (avid) {}: SUCCESS bytes={}",
+                    record_name,
+                    bytes.len()
+                );
+                Ok(bytes)
+            }
+            Err(e) => {
+                warn!("manual_ford_download (avid) {}: FAILED: {}", record_name, e);
+                Err(WrappedError::GenericError {
+                    msg: format!("Manual Ford download (avid) for {}: {}", record_name, e),
+                })
+            }
+        }
+    }
+}
+
+/// Fetch one page of messageManateeZone with newest-first ordering.
+/// Returns (next_token, messages_map, status) — same shape as sync_messages().
+///
+/// Standalone (not a method on Client) so uniffi doesn't try to generate FFI
+/// bindings for it. We call the CloudKit container directly (same pattern as
+/// list_recoverable_chats) so we can set newest_first=true without touching the
+/// vendored sync_messages path. This lets cloud_fetch_recent_messages find recent
+/// messages in the first ~50 pages instead of requiring 200+ oldest-first pages.
+async fn fetch_main_zone_page_newest_first(
+    cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
+    token: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
+    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+    use rustpush::cloudkit_proto::CloudKitRecord;
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+    let container = cloud_messages.get_container().await?;
+    let zone_id = container.private_zone("messageManateeZone".to_string());
+    let mut key = container
+        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+        .await?;
+
+    // Create the op then flip newest_first — the inner proto field is pub, so we
+    // can mutate it here without touching the vendored FetchRecordChangesOperation::new.
+    let mut op = FetchRecordChangesOperation::new(zone_id.clone(), token, &NO_ASSETS);
+    op.0.newest_first = Some(true);
+
+    let (_assets, response) = container.perform(&CloudKitSession::new(), op).await?;
+
+    let mut results = HashMap::new();
+    let mut refreshed = false;
+    for change in &response.change {
+        let identifier = change.identifier.as_ref().unwrap()
+            .value.as_ref().unwrap().name().to_string();
+        let Some(record) = &change.record else {
+            results.insert(identifier, None);
+            continue;
+        };
+        if record.r#type.as_ref().unwrap().name() != CloudMessage::record_type() {
+            continue;
+        }
+        let pcskey = match pcs_keys_for_record(record, &key) {
+            Ok(k) => Some(k),
+            Err(rustpush::PushError::PCSRecordKeyMissing) if !refreshed => {
+                container.clear_cache_zone_encryption_config(&zone_id).await;
+                key = container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await?;
+                refreshed = true;
+                match pcs_keys_for_record(record, &key) {
+                    Ok(k) => Some(k),
+                    Err(rustpush::PushError::PCSRecordKeyMissing) => {
+                        warn!("Skipping record {}: PCS key missing (newest-first fetch)", identifier);
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) if matches!(e,
+                rustpush::PushError::PCSRecordKeyMissing
+                | rustpush::PushError::ShareKeyNotFound(_)
+                | rustpush::PushError::DecryptionKeyNotFound(_)
+                | rustpush::PushError::MasterKeyNotFound
+            ) => {
+                warn!("Skipping record {} due to PCS key error: {}", identifier, e);
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(pcskey) = pcskey else { continue };
+        let item = CloudMessage::from_record_encrypted(
+            &record.record_field,
+            Some(&pcskey),
+        );
+        results.insert(identifier, Some(item));
+    }
+    Ok((response.sync_continuation_token().to_vec(), results, response.status()))
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Ok(mut handle) = self.receive_handle.try_lock() {
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+        }
+    }
+}
+
+/// Fallback for cloud_sync_messages when sync_messages panics on a malformed CloudKit record.
+/// Replicates sync_records logic for "messageManateeZone" but handles None proto fields
+/// gracefully (no .unwrap()) and wraps from_record_encrypted in catch_unwind per record.
+async fn sync_messages_fallback(
+    cloud_messages: &Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>,
+    token: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
+    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+    use rustpush::cloudkit_proto::CloudKitRecord;
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+    let container = cloud_messages.get_container().await?;
+    let zone_id = container.private_zone("messageManateeZone".to_string());
+    let key = container
+        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+        .await?;
+
+    let (_assets, response) = container
+        .perform(
+            &CloudKitSession::new(),
+            FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+        )
+        .await?;
+
+    let mut results: HashMap<String, Option<CloudMessage>> = HashMap::new();
+    let mut skipped = 0usize;
+
+    for change in &response.change {
+        // Graceful identifier extraction — no .unwrap()
+        let id_proto = match change.identifier.as_ref() {
+            Some(p) => p,
+            None => { warn!("sync_messages_fallback: skipping change with missing identifier"); skipped += 1; continue; }
+        };
+        let id_value = match id_proto.value.as_ref() {
+            Some(v) => v,
+            None => { warn!("sync_messages_fallback: skipping change with missing identifier value"); skipped += 1; continue; }
+        };
+        let identifier = id_value.name().to_string();
+
+        let record = match &change.record {
+            Some(r) => r,
+            None => { results.insert(identifier, None); continue; } // deleted record
+        };
+
+        // Graceful type check — no .unwrap()
+        if record.r#type.as_ref().map_or(true, |t| t.name() != CloudMessage::record_type()) {
+            continue;
+        }
+
+        let pcskey = match pcs_keys_for_record(record, &key) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!("sync_messages_fallback: skipping record {}: PCS key error: {}", identifier, e);
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // from_record_encrypted may panic on corrupt field data — catch it
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
+        }));
+
+        match result {
+            Ok(msg) => { results.insert(identifier, Some(msg)); }
+            Err(e) => {
+                let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                          else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                          else { "unknown panic".to_string() };
+                warn!("sync_messages_fallback: skipping record {}: deserialization panic: {}", identifier, msg);
+                skipped += 1;
+            }
+        }
+    }
+
+    if skipped > 0 {
+        warn!("sync_messages_fallback: skipped {} malformed record(s)", skipped);
+    }
+
+    Ok((
+        response.sync_continuation_token().to_vec(),
+        results,
+        response.status(),
+    ))
+}
+
+uniffi::setup_scaffolding!();

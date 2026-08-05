@@ -1,0 +1,118 @@
+# Display name template for iMessage contacts.
+# Available variables: {{.FirstName}}, {{.LastName}}, {{.Nickname}},
+# {{.Phone}}, {{.Email}}, {{.ID}}
+displayname_template: "{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastName}}{{end}}{{else if .Nickname}}{{.Nickname}}{{else if .Phone}}{{.Phone}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}"
+
+# Enable CloudKit message history backfill.
+# When true, the bridge will sync past messages from iCloud during setup.
+# Requires entering your device PIN during login to join the iCloud Keychain.
+# When false (default), only real-time messages are bridged — no PIN needed.
+cloudkit_backfill: false
+
+# Backfill source: "cloudkit" (default) syncs from iCloud.
+# "chatdb" reads the local macOS chat.db (requires Full Disk Access).
+backfill_source: cloudkit
+
+# Enable automatic video transcoding/remuxing of non-MP4 videos (e.g.
+# QuickTime .mov) to MP4 for broad Matrix client compatibility.
+# Requires ffmpeg to be installed on the system.
+video_transcoding: false
+
+# Enable automatic HEIC/HEIF to JPEG conversion for broad Matrix client
+# compatibility. Requires libheif to be installed on the system.
+heic_conversion: false
+
+# JPEG output quality for HEIC/HEIF conversion (1–100). Default is 95.
+heic_jpeg_quality: 95
+
+# Maximum attachment size to bridge, in MB. Attachments larger than this are
+# skipped entirely — not downloaded, transcoded, or uploaded. The default 100
+# matches Beeper's upload limit; the homeserver rejects anything larger, so
+# bridging it just wastes bandwidth, CPU, and memory for a guaranteed rejection.
+# Raise this ONLY if your homeserver accepts larger uploads (e.g. a self-hosted
+# Synapse with a higher max_upload_size) AND the host has the RAM to spare —
+# attachments are buffered in memory while downloading, so a high value on a
+# small host can exhaust memory. Default 100.
+max_attachment_size_mb: 100
+
+# Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing
+# messages during backfill. Each URL triggers up to three HTTP round-trips
+# (homeserver preview, page fetch, image download + re-upload) inline with
+# conversion — on a slow uplink this dominates backfill time. Set to false
+# to skip previews during backfill only; live inbound messages and outbound
+# edits still build previews normally.
+url_previews_in_backfill: true
+
+# Override the outgoing iMessage identity (what recipients see your messages "from").
+# Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
+# Leave empty to use the handle chosen during login.
+# Available handles are logged on startup.
+preferred_handle: ""
+
+# Override the display name pre-filled on the FaceTime web join page (the
+# `#n=…` fragment in the ring-notice link). If empty, the bridge reads
+# "First Last" from the Apple Account SPD; if that's also blank it falls
+# back to the bare iMessage handle (e.g. "+15551234567").
+facetime_display_name: ""
+
+# Disable bridge FaceTime integration. When true, !facetime* commands aren't
+# registered and inbound ring / missed / answered-elsewhere / peer-invite
+# notices are suppressed. Intended for users with their own Apple device who
+# answer FaceTime natively — the bridge wrapper adds nothing in that case.
+disable_facetime: false
+
+# Publish "available" to StatusKit once after startup. Peer iOS reciprocates
+# with a reshare, which is what gives the bridge the keys needed to decrypt
+# contacts' Focus/DND presence. Leaving this on dramatically improves the
+# chance of seeing others' Focus state in Matrix. Set to false to opt out.
+statuskit_share_on_startup: true
+
+# StatusKit surfaces iOS 18 Focus / Do Not Disturb state from your contacts.
+# When a contact turns on a Focus/DND, the bridge appends a 🌙 to their name in
+# the DM's chat title (e.g. "Alice 🌙") and removes it when they turn it off,
+# plus a Matrix ghost presence update. The title is a room-state change updated
+# in place, so it never bumps or unarchives the chat. Set this to false to
+# suppress the 🌙 indicator and presence updates while leaving StatusKit
+# registration / key exchange running normally (the IDS-layer 4-service
+# identity is unaffected, so peer reshare eligibility is kept).
+statuskit_notifications: true
+
+# DEVELOPMENT ONLY — leave this false in any real deployment.
+# Reverts the bridge's privacy protections so plaintext is observable for
+# debugging. When true:
+#   1. Logs are NOT anonymized — raw iMessage handles (phone/email) and full
+#      URLs appear verbatim instead of opaque tokens / scheme+host forms.
+#   2. The periodic body scrubber is disabled — plaintext message bodies
+#      cached locally (in the cloud_message table of corten-matrix.db)
+#      are no longer cleared after delivery to Matrix, so they persist.
+#   3. On the next CloudKit sync, rows that were already scrubbed are
+#      re-filled: the scrub flags are cleared and the CloudKit sync tokens
+#      are reset, forcing a full re-page that re-downloads the plaintext.
+# Only the CloudKit backfill source caches plaintext locally, so effects 2
+# and 3 are CloudKit-specific. Does NOT undo deletes/unsends, and does NOT
+# re-deliver anything to Matrix.
+debug_disable_privacy: false
+
+# Send read receipts to iMessage contacts when you read their messages in
+# Matrix. Set to false to stop iMessage contacts seeing when you have read
+# their messages. Incoming read receipts from iMessage contacts are unaffected.
+read_receipts: true
+
+# Send typing indicators to iMessage contacts while you compose a reply in
+# Matrix. Set to false to hide your typing from iMessage contacts. Incoming
+# typing indicators from iMessage contacts are unaffected.
+typing_notifications: true
+
+# External CardDAV server for contact name resolution.
+# Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
+# When configured, this is used instead of iCloud contacts.
+# Set up during install via the installer's CardDAV prompt.
+carddav:
+    # Email address — used for auto-discovery and as default username.
+    email: ""
+    # CardDAV server URL. Leave empty to auto-discover from email.
+    url: ""
+    # Username for authentication (defaults to email if empty).
+    username: ""
+    # Encrypted app password (set by the installer).
+    password_encrypted: ""

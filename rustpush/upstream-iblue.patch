@@ -1,0 +1,600 @@
+diff --git a/src/aps.rs b/src/aps.rs
+index 6301922..8204f8d 100644
+--- a/src/aps.rs
++++ b/src/aps.rs
+@@ -1,5 +1,5 @@
+ 
+-use std::{borrow::BorrowMut, cmp::min, collections::{HashMap, VecDeque}, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::{Cursor, Read, Write}, marker::PhantomData, net::ToSocketAddrs, ops::Index, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
++use std::{borrow::BorrowMut, cmp::min, collections::{HashMap, VecDeque}, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::{Cursor, Read, Write}, marker::PhantomData, ops::Index, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
+ 
+ use backon::ExponentialBuilder;
+ use deku::prelude::*;
+@@ -11,7 +11,7 @@ use prost::Message;
+ use rand::{Rng, RngCore};
+ use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer}};
+ use serde::{Deserialize, Serialize};
+-use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split}, net::{TcpListener, TcpStream}, select, sync::{broadcast::{self, Receiver, Sender, error::RecvError}, mpsc}, task::{self, JoinHandle}};
++use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split}, net::{TcpListener, TcpStream, lookup_host}, select, sync::{broadcast::{self, Receiver, Sender, error::RecvError}, mpsc}, task::{self, JoinHandle}};
+ use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream, rustls::pki_types::ServerName};
+ use async_recursion::async_recursion;
+ 
+@@ -1205,7 +1205,75 @@ pub struct APSConnectionResource {
+     sub_counter: AtomicU32,
+ }
+ 
+-const APNS_PORT: u16 = 5223;
++const APNS_PORTS: [u16; 2] = [5223, 443];
++const APNS_PORT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
++const APNS_OPEN_SOCKET_TIMEOUT: Duration = Duration::from_secs(60);
++
++async fn connect_apns_socket(
++    connector: &TlsConnector,
++    domain: &str,
++    hostname: &str,
++) -> Result<TlsStream<TcpStream>, PushError> {
++    let mut last_error = None;
++
++    for (index, port) in APNS_PORTS.iter().copied().enumerate() {
++        // Apple documents TCP 443 as the device fallback when 5223 is
++        // unavailable. Bound each attempt independently so a blackholed 5223
++        // path cannot consume the complete socket-open budget before 443.
++        let attempt = tokio::time::timeout(APNS_PORT_ATTEMPT_TIMEOUT, async {
++            // std::net::ToSocketAddrs performs blocking DNS on the Tokio worker.
++            // Resolve asynchronously, and let Tokio try every returned address
++            // instead of coupling APNs availability to the first DNS result.
++            let addresses: Vec<_> = lookup_host((domain, port)).await?.collect();
++            if addresses.is_empty() {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::NotFound,
++                    "APNs host resolved to no addresses",
++                ).into());
++            }
++
++            let socket = TcpStream::connect(addresses.as_slice()).await?;
++            let dnsname = ServerName::try_from(hostname.to_owned()).map_err(|err| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    format!("invalid APNs TLS hostname: {err}"),
++                )
++            })?;
++            let stream = connector.connect(dnsname, socket).await?;
++            Ok::<TlsStream<TcpStream>, PushError>(stream)
++        }).await;
++
++        match attempt {
++            Ok(Ok(stream)) => {
++                if index > 0 {
++                    info!("Connected to APNs on fallback TCP port {port}");
++                }
++                return Ok(stream);
++            }
++            Ok(Err(err)) => last_error = Some(err),
++            Err(_) => {
++                last_error = Some(std::io::Error::new(
++                    std::io::ErrorKind::TimedOut,
++                    format!(
++                        "APNs TCP port {port} attempt timed out after {} seconds",
++                        APNS_PORT_ATTEMPT_TIMEOUT.as_secs()
++                    ),
++                ).into());
++            }
++        }
++
++        if index + 1 < APNS_PORTS.len() {
++            info!("APNs TCP port {port} unavailable; trying fallback port");
++        }
++    }
++
++    Err(last_error.unwrap_or_else(|| {
++        std::io::Error::new(
++            std::io::ErrorKind::NotConnected,
++            "no APNs connection ports configured",
++        ).into()
++    }))
++}
+ 
+ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>, Option<APSPackedDecoder>), PushError> {
+     let certs = rustls_pemfile::certs(&mut Cursor::new(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")))?;
+@@ -1225,10 +1293,7 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
+ 
+     let domain = format!("{}-{}", rand::thread_rng().gen_range(1..hostcount), hostname);
+     
+-    let dnsname = ServerName::try_from(hostname).unwrap();
+-    
+-    let stream = TcpStream::connect((domain.as_str(), APNS_PORT).to_socket_addrs()?.next().unwrap()).await?;
+-    let stream = connector.connect(dnsname, stream).await?;
++    let stream = connect_apns_socket(&connector, domain.as_str(), hostname.as_str()).await?;
+ 
+     let mut encoder = None;
+     let mut decoder = None;
+@@ -1255,12 +1320,27 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
+ impl Resource for APSConnectionResource {
+     async fn generate(self: &Arc<Self>) -> Result<JoinHandle<()>, PushError> {
+         info!("Generating APS");
+-        let (socket, encoder, mut decoder) = match open_socket().await {
+-            Ok(e) => e,
+-            Err(err) => {
++        // APSConnectionResource::new performs its first generate before the
++        // ResourceManager exists, so the manager's regeneration timeout cannot
++        // protect initial startup. Bound the bag fetch, async DNS, TCP connect,
++        // and TLS handshake as one operation. Later failures enter the normal
++        // exponential reconnect path.
++        let (socket, encoder, mut decoder) = match tokio::time::timeout(
++            APNS_OPEN_SOCKET_TIMEOUT,
++            open_socket(),
++        ).await {
++            Ok(Ok(e)) => e,
++            Ok(Err(err)) => {
+                 error!("failed to connect to socket {err}!");
+                 return Err(err);
+             }
++            Err(_) => {
++                error!(
++                    "APNs socket setup timed out after {} seconds",
++                    APNS_OPEN_SOCKET_TIMEOUT.as_secs()
++                );
++                return Err(PushError::SendTimedOut);
++            }
+         };
+         info!("Generating Opened socket");
+ 
+diff --git a/src/icloud/keychain.rs b/src/icloud/keychain.rs
+index c8afb85..6594220 100644
+--- a/src/icloud/keychain.rs
++++ b/src/icloud/keychain.rs
+@@ -1107,7 +1107,7 @@ pub const KEYCHAIN_ZONES: &[&str] = &[
+ pub struct EscrowMetadata {
+     pub serial: String,
+     pub build: String,
+-    pub passcode_generation: u32,
++    #[serde(default)] pub passcode_generation: u32,
+     #[serde(rename = "com.apple.securebackup.timestamp")]
+     pub timestamp: String,
+     #[serde(rename = "bottleID")]
+@@ -1626,7 +1626,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
+                 modified = true;
+             }
+ 
++            let my_id = &state.user_identity.as_ref().unwrap().identifier;
+             for excluded in &trust.excludeds {
++                if excluded == my_id {
++                    warn!(
++                        "Ignoring exclusion of ourselves ({}) from peer {}",
++                        excluded,
++                        peer.0.hash.as_ref().unwrap()
++                    );
++                    continue;
++                }
+                 if current_state.excludeds.contains(excluded) { continue }
+                 if current_state.includeds.contains(excluded) {
+                     current_state.includeds.retain(|a| a != excluded);
+diff --git a/src/ids/identity_manager.rs b/src/ids/identity_manager.rs
+index 56c840e..7a1bcef 100644
+--- a/src/ids/identity_manager.rs
++++ b/src/ids/identity_manager.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
++use std::{collections::{HashMap, HashSet}, fs, io::{Cursor, Write}, path::{Path, PathBuf}, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
+ 
+ use backon::{ConstantBuilder, ExponentialBuilder};
+ use deku::{DekuContainerRead, DekuRead, DekuWrite};
+@@ -27,6 +27,28 @@ const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
+ const REFRESH_MIN: Duration = Duration::from_secs(60);
+ use deku::{DekuContainerWrite, DekuUpdate};
+ 
++fn protect_private_file(path: &Path) -> std::io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
++    }
++    Ok(())
++}
++
++fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
++    let mut options = fs::OpenOptions::new();
++    options.create(true).truncate(true).write(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let mut file = options.open(path)?;
++    protect_private_file(path)?;
++    file.write_all(contents)
++}
++
+ #[repr(C)]
+ #[derive(Clone)]
+ pub enum MessageTarget {
+@@ -41,11 +63,18 @@ struct CachedKeys {
+     at_ms: u64
+ }
+ 
++fn elapsed_since_cache_timestamp(now: SystemTime, at_ms: u64) -> Duration {
++    // Wall clocks can move backwards after sleep/NTP correction, especially
++    // on Windows. The entry was valid immediately before that correction, so
++    // treat a future-looking timestamp as zero age instead of panicking the
++    // IDS task or forcing an avoidable directory refresh.
++    now.duration_since(UNIX_EPOCH + Duration::from_millis(at_ms))
++        .unwrap_or(Duration::ZERO)
++}
++
+ impl CachedKeys {
+     fn get_stale_time(&self) -> Duration {
+-        SystemTime::now()
+-            .duration_since(UNIX_EPOCH + Duration::from_millis(self.at_ms))
+-            .expect("Time went backwards")
++        elapsed_since_cache_timestamp(SystemTime::now(), self.at_ms)
+     }
+ 
+     fn is_valid(&self) -> bool {
+@@ -70,6 +99,25 @@ impl CachedKeys {
+     }
+ }
+ 
++#[cfg(test)]
++mod cached_keys_tests {
++    use super::*;
++
++    #[test]
++    fn backwards_wall_clock_saturates_cached_key_age_to_zero() {
++        let before_adjustment = UNIX_EPOCH + Duration::from_secs(100);
++        let after_adjustment = UNIX_EPOCH + Duration::from_secs(95);
++        assert_eq!(
++            elapsed_since_cache_timestamp(after_adjustment, 100_000),
++            Duration::ZERO
++        );
++        assert_eq!(
++            elapsed_since_cache_timestamp(before_adjustment, 90_000),
++            Duration::from_secs(10)
++        );
++    }
++}
++
+ #[derive(Serialize, Deserialize, Debug, Default)]
+ pub struct CachedHandle {
+     keys: HashMap<String, CachedKeys>,
+@@ -182,6 +230,9 @@ pub struct KeyCache {
+ impl KeyCache {
+     pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) -> KeyCache {
+         let mut message_counter = HashMap::new();
++        if path.exists() {
++            protect_private_file(&path).expect("failed to protect IDS key cache");
++        }
+         if let Ok(data) = fs::read(&path) {
+             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
+                 loaded.cache_location = path;
+@@ -240,7 +291,7 @@ impl KeyCache {
+ 
+     pub fn save(&self) {
+         let saved = plist_to_string(self).unwrap();
+-        fs::write(&self.cache_location, saved).unwrap();
++        write_private_file(&self.cache_location, saved.as_bytes()).unwrap();
+     }
+ 
+     pub fn invalidate(&mut self, handle: &str, keys_for: &str) {
+@@ -313,6 +364,14 @@ impl KeyCache {
+         cached.keys.sender_correlation_identifier.clone()
+     }
+ 
++    /// Millisecond timestamp of the raw per-target cache entry, whether or not
++    /// that entry is still valid. Diagnostics compare this value before and
++    /// after one query to distinguish an entry returned by that response from
++    /// stale data that was already on disk.
++    pub fn get_cached_at_ms(&self, service: &str, handle: &str, keys_for: &str) -> Option<u64> {
++        self.cache.get(service)?.get(handle)?.keys.get(keys_for).map(|cached| cached.at_ms)
++    }
++
+     pub fn does_not_need_refresh(&self, service: &str, handle: &str, keys_for: &str, refresh: bool) -> bool {
+         let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
+             return false
+@@ -783,13 +842,25 @@ impl IdentityResource {
+             verification_failed,
+             ..
+         } = &mut payload {
+-            // determine whether or not to refresh keys based on encryption mode
+-            let ident = match self.get_key_for_sender(*topic, &target, &encryption, &sender, &token).await {
+-                Ok(ident) => Some(ident),
+-                Err(err) => {
+-                    error!("No identity for payload! {}", err);
+-                    *verification_failed = true;
+-                    None
++            // A newly registered account can be allowed to receive while IDS
++            // directory queries return an explicit empty identity list. During
++            // that cooldown, querying again for every inbound message prolongs
++            // the rate-limit and buys us nothing: decrypt_payload already has a
++            // deliberate unverified fallback when the peer directory record is
++            // unavailable. iBlue enables this mode explicitly per profile.
++            let ident = if std::env::var_os("IBLUE_IDS_PASSIVE").is_some() {
++                debug!("Passive IDS mode: decrypting {} from {} without a sender-key lookup", encryption, sender);
++                *verification_failed = true;
++                None
++            } else {
++                // determine whether or not to refresh keys based on encryption mode
++                match self.get_key_for_sender(*topic, &target, &encryption, &sender, &token).await {
++                    Ok(ident) => Some(ident),
++                    Err(err) => {
++                        error!("No identity for payload! {}", err);
++                        *verification_failed = true;
++                        None
++                    }
+                 }
+             };
+ 
+@@ -826,6 +897,16 @@ impl IdentityResource {
+     }
+ 
+     pub async fn cache_keys(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
++        // iBlue owns its sparse-probe and outbound retry policy above this
++        // library. In particular, its post-cooldown canary must represent one
++        // directory attempt, even when the APNs request fails. Keep rustpush's
++        // normal one-retry behavior for every other consumer.
++        if std::env::var_os("IBLUE_IDS_NO_LOOKUP_RETRY").is_some() {
++            return self
++                .cache_keys_once(topic, participants, handle, refresh, meta)
++                .await
++                .map_err(|e| PushError::DoNotRetry(Box::new(e)));
++        }
+         (|| async { self.cache_keys_once(topic, participants, handle, refresh, meta).await })
+             .retry(&ConstantBuilder::default().with_delay(Duration::ZERO).with_max_times(1))
+             .when(|e| !matches!(e, PushError::DoNotRetry(_))).await
+@@ -869,6 +950,31 @@ impl IdentityResource {
+         Ok(targets.iter().filter(|target| !key_cache.get_keys(&topic, handle, *target).is_empty()).map(|i| i.clone()).collect())
+     }
+ 
++    /// Validate targets with a directly signed HTTPS `id-query`, without
++    /// changing the normal APNs-tunnel lookup cache. This is intentionally a
++    /// diagnostic seam so callers can distinguish a transport-specific lookup
++    /// failure from an account-wide IDS directory response.
++    pub async fn validate_targets_http(&self, targets: &[String], handle: &str) -> Result<Vec<String>, PushError> {
++        const TOPIC: &'static str = "com.apple.madrid";
++        self.manager().await.ensure_ready().await?;
++        let users = self.users.read().await;
++        let user = self.user_by_handle(TOPIC, &users, handle).await?;
++        let results = user.query_http(
++            self.config.as_ref(),
++            &self.aps,
++            TOPIC,
++            self.get_main_service(TOPIC),
++            handle,
++            targets,
++            &QueryOptions::default(),
++        ).await?;
++        Ok(targets
++            .iter()
++            .filter(|target| results.get(*target).is_some_and(|result| !result.identities.is_empty()))
++            .cloned()
++            .collect())
++    }
++
+     pub async fn refresh_handles(&self, topic: &'static str, handle: &str, handles: &[DeliveryHandle]) -> Result<Vec<DeliveryHandle>, PushError> {
+         if handles.is_empty() {
+             return Ok(vec![])
+diff --git a/src/ids/user.rs b/src/ids/user.rs
+index df97ecc..c2c73c3 100644
+--- a/src/ids/user.rs
++++ b/src/ids/user.rs
+@@ -19,7 +19,7 @@ use crate::util::DebugMutex;
+ 
+ use rand::{Rng, RngCore};
+ 
+-use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
++use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, ungzip}};
+ 
+ 
+ #[repr(C)]
+@@ -804,21 +804,20 @@ impl IDSUser {
+             .send(&REQWEST).await?
+             .bytes().await?;
+ 
+-        info!("Got alias response {}", str::from_utf8(&bytes).expect("Bytes to urtf8"));
+-
+         #[derive(Deserialize)]
+         struct AliasResult {
+-            alias: String,
++            #[serde(default)]
++            alias: Option<String>,
+             status: u32,
+         }
+ 
+         let parsed: AliasResult = plist::from_bytes(&bytes)?;
+-        *alias = Some(parsed.alias);
+         if parsed.status != 0 {
+             return Err(PushError::AliasError(parsed.status))
+         }
++        *alias = Some(parsed.alias.ok_or(PushError::BadMsg)?);
+ 
+-        info!("Just took action {operation} on alias {} for handle {handle}", alias.as_ref().expect("No alias!"));
++        info!("Completed IDS alias action {operation}");
+ 
+         Ok(())
+     }
+@@ -997,6 +996,48 @@ impl IDSUser {
+ 
+         Ok(loaded.results.unwrap())
+     }
++
++    /// Run the same signed IDS `id-query` against its HTTPS bag URL instead of
++    /// tunnelling it through the live APNs connection. Apple clients and
++    /// independent tooling support both transports. Keeping this separate from
++    /// `query` makes it a read-only diagnostic: it does not mutate the key cache
++    /// or alter the normal send path.
++    pub async fn query_http(&self, config: &dyn OSConfig, aps: &APSConnectionResource, topic: &'static str, main_topic: &str, handle: &str, query: &[String], options: &QueryOptions) -> Result<HashMap<String, IDSLookupUser>, PushError> {
++        let body = plist_to_buf(&LookupReq { uris: query.to_vec() })?;
++
++        let mut request = options.add_headers(SignedRequest::new("id-query", Method::POST))
++            .header("x-id-self-uri", handle)
++            .header("x-push-token", &base64_encode(&aps.get_token().await))
++            .header("x-protocol-version", &self.protocol_version.to_string())
++            .header("user-agent", &format!("com.apple.madrid-lookup {}", config.get_version_ua()))
++            .header("content-type", "application/x-apple-plist")
++            .header("content-encoding", "gzip")
++            .header("accept-encoding", "gzip");
++        if main_topic != topic {
++            request = request.header("x-id-sub-service", topic);
++        }
++
++        let response = request
++            .body(gzip(&body)?)
++            .sign(&self.registration[main_topic].id_keypair, KeyType::Id, &*aps.state.read().await, None)?
++            .send(&REQWEST)
++            .await?
++            .bytes()
++            .await?;
++
++        // reqwest normally inflates a gzip response. Some IDS frontends omit
++        // or alter the content-encoding header, so retain the same tolerant
++        // fallback used by other rustpush Apple plist paths.
++        let loaded: IDSLookupResp = match plist::from_bytes(&response) {
++            Ok(value) => value,
++            Err(_) => plist::from_bytes(&ungzip(&response)?)?,
++        };
++        if loaded.status != 0 || loaded.results.is_none() {
++            return Err(PushError::LookupFailed(IDSError(loaded.status)))
++        }
++
++        Ok(loaded.results.unwrap())
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -1103,7 +1144,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
+         ("validation-data", Value::Data(config.generate_validation_data().await?))
+     ].into_iter()));
+ 
+-    let mut request = SignedRequest::new("id-register", Method::POST)
++    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)
+             .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
+             .header("x-protocol-version", &config.get_protocol_version().to_string())
+             .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
+@@ -1183,3 +1224,49 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
+ 
+     Ok(())
+ }
++
++/// Remove this APNs device's IDS registration by sending the same registration
++/// envelope with an empty service list. Apple calls this
++/// `_sendRegistrationAsDeregister`; the push token and account signatures must
++/// match the device being removed.
++pub async fn deregister(config: &dyn OSConfig, aps: &APSState, users: &[IDSUser]) -> Result<(), PushError> {
++    let register_meta = config.get_register_meta();
++    let body = Value::Dictionary(Dictionary::from_iter([
++        ("device-name", Value::String(config.get_device_name())),
++        ("hardware-version", Value::String(register_meta.hardware_version)),
++        ("language", Value::String("en-US".to_string())),
++        ("os-version", Value::String(register_meta.os_version)),
++        ("private-device-data", Value::Dictionary(config.get_private_data())),
++        ("services", Value::Array(Vec::new())),
++        ("software-version", Value::String(register_meta.software_version)),
++        ("validation-data", Value::Data(config.generate_validation_data().await?)),
++    ]));
++
++    let mut request = SignedRequest::new("id-register", Method::POST)
++        .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
++        .header("x-protocol-version", &config.get_protocol_version().to_string())
++        .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
++        .header("content-type", "application/x-apple-plist")
++        .header("content-encoding", "gzip")
++        .header("accept-encoding", "gzip")
++        .body(gzip_normal(&plist_to_buf(&body)?)?)
++        .sign(aps.keypair.as_ref().ok_or(PushError::APSNotReady("keypair"))?, KeyType::Push, aps, None)?;
++
++    for (idx, user) in users.iter().enumerate() {
++        request = request
++            .header(&format!("x-auth-user-id-{idx}"), &user.user_id)
++            .sign(&user.auth_keypair, KeyType::Auth, aps, Some(idx))?;
++    }
++
++    let response = request.send(&REQWEST).await?.bytes().await?;
++    let parsed: Value = plist::from_bytes(&response)?;
++    let status = parsed
++        .as_dictionary()
++        .and_then(|dictionary| dictionary.get("status"))
++        .and_then(Value::as_unsigned_integer)
++        .unwrap_or(u64::MAX);
++    if status != 0 {
++        return Err(PushError::RegisterFailed(IDSError(status)));
++    }
++    Ok(())
++}
+diff --git a/src/imessage/messages.rs b/src/imessage/messages.rs
+index f87deb5..5b5e763 100644
+--- a/src/imessage/messages.rs
++++ b/src/imessage/messages.rs
+@@ -1026,6 +1026,17 @@ pub struct ErrorMessage {
+ }
+ 
+ impl ReactMessage {
++    /// Apple's `amrln` is an NSRange length. Count UTF-16 code units, matching
++    /// NSString, rather than Rust's UTF-8 byte length. This matters for emoji
++    /// and even the U+FFFC attachment placeholder used by tapbacks.
++    pub fn associated_message_range_length(&self) -> u64 {
++        if self.to_part.is_none() {
++            u64::MAX
++        } else {
++            self.to_text.encode_utf16().count() as u64
++        }
++    }
++
+     fn get_text(&self) -> String {
+         self.reaction.get_text(&self.to_text)
+     }
+@@ -2184,7 +2195,7 @@ impl MessageInst {
+ 
+                 let raw = RawReactMessage {
+                     text: text,
+-                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
++                    amrln: react.associated_message_range_length(),
+                     amrlc: 0,
+                     amt: react.reaction.get_cmd(),
+                     participants: conversation.participants.clone(),
+diff --git a/src/lib.rs b/src/lib.rs
+index c71234a..cd85a7a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,11 +1,11 @@
+ 
+-mod activation;
++pub mod activation;
+ mod aps;
+ mod util;
+ mod imessage;
+ mod error;
+ mod auth;
+-mod ids;
++pub mod ids;
+ pub mod sharedstreams;
+ pub mod findmy;
+ pub mod facetime;
+@@ -48,7 +48,7 @@ pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdatePr
+ pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
+ use util::encode_hex;
+ pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure, NSAttributedString, NSString, NSDictionaryTypedCoder, NSNumber, coder_encode_flattened, coder_decode_flattened, StCollapsedValue};
+-pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
++pub use ids::user::{IDSUser, register, deregister, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
+ pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager, KeyCache};
+ pub use ids::CertifiedContext;
+ pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
+diff --git a/src/statuskit.rs b/src/statuskit.rs
+index a8fe25d..c9d3e90 100644
+--- a/src/statuskit.rs
++++ b/src/statuskit.rs
+@@ -116,7 +116,7 @@ pub struct StatusKitState {
+ impl StatusKitState {
+     fn build_aps_message_for(&self, channel: &APSChannelIdentifier, join: bool) -> APSChannel {
+         let Some(recent) = self.recent_channels.iter().find(|c| &c.identifier == channel) else {
+-            panic!("No saved channel for identifier!")
++            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };
+         };
+ 
+         APSChannel {
+@@ -733,7 +733,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
+                 let Some(channel) = &channel else { return Ok(None) };
+                 debug!("Got statuskit message {inner:?} on channel {}", encode_hex(&channel.id));
+                 let mut state = self.state.write().await;
+-                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };
++                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };
+ 
+                 let key = referenced_channel.get_key(inner.ratchet)?;
+ 

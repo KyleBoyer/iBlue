@@ -1,0 +1,75 @@
+# IDE / editor
+.idea/
+.vscode/
+
+# Config & runtime data (generated per-install)
+*.yaml
+!.pre-commit-config.yaml
+!example-config.yaml
+!example-registration.yaml
+*.session
+*.json
+**/credential.key
+**/credentials.enc
+!package.json
+!package-lock.json
+!tsconfig.json
+*.db*
+*.log
+
+# Docker (per-host compose + env, never commit). Dockerfile and
+# docker-compose.example.yml stay tracked.
+docker-compose.yml
+docker-compose.override.yml
+.env
+/secrets/
+
+# Built binaries
+/dist/
+/corten-matrix
+/corten-matrix-v2
+/mautrix-imessage
+/mautrix-imessage-v2
+/mautrix-imessage.app
+/extract-key
+/extract-key-intel
+/start
+/data/
+/dist-ts/
+/node_modules/
+/iblue-native
+/build/
+/bbctl
+
+# Local external worktrees / generated app workspace.
+# third_party/rustpush-upstream is where build.sh clones rustpush upstream and
+# overlays our PRIVATE clean-room (open-absinthe + apple-private-apis) — never
+# commit it or the private APIs would leak into the public bridge repo.
+/third_party/rustpush-upstream/
+/openbubbles-app-rustpush/
+/rustpush-master/
+
+# Rust build artifacts. librustpushgo.a IS the sealed clean-room as machine code.
+librustpushgo.a
+**/target/
+state/
+rustpush/certs/fairplay/
+
+
+# Development/test prompt files
+ENDTOEND_TEST_PROMPT.md
+RUSTPUSH_INTEGRATION_PROMPT.md
+prompts/
+corten-matrix.app/
+mautrix-imessage-v2.app/
+.build-commit
+.DS_Store
+.apl.history
+tools/apl/
+tools/extract-key-app/.build/
+tools/extract-key-app/ExtractKey.app/
+tools/nac-relay-app/.build/
+tools/nac-relay-app/NACRelay.app/
+!rustpush/open-absinthe/src/bin/
+_todo/
+.gocache/
