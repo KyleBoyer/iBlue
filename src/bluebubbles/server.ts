@@ -137,6 +137,7 @@ export class BlueBubblesServer {
     await this.app.register(multipart, {
       limits: { fileSize: 1024 * 1024 * 1024, files: 8, fields: 100 },
     });
+    this.configureBodyParsing();
     this.configureAuth();
     this.configureRoutes();
     this.configureErrors();
@@ -166,6 +167,27 @@ export class BlueBubblesServer {
       this.#socket.close(() => resolve());
     });
     await this.app.close();
+  }
+
+  // BlueBubbles clients send payload-free actions — typing, read receipts —
+  // as a JSON-typed POST with no body at all. Express accepts that; Fastify's
+  // default parser rejects an empty body outright, which surfaced as a 500 on
+  // /chat/:guid/typing. Treat an empty JSON body as an empty object, which is
+  // what every route's `asRecord` already expects.
+  private configureBodyParsing(): void {
+    this.app.addContentTypeParser<string>(
+      "application/json",
+      { parseAs: "string" },
+      (_request, body, done) => {
+        const text = body.trim();
+        if (text.length === 0) return done(null, {});
+        try {
+          done(null, JSON.parse(text));
+        } catch {
+          done(new RequestError(400, "Invalid JSON body", "VALIDATION_ERROR"), undefined);
+        }
+      },
+    );
   }
 
   private configureAuth(): void {

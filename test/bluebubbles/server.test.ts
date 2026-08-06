@@ -1383,6 +1383,21 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   );
   assert.equal(typing.status, 200);
 
+  // Clients announce typing as a JSON-typed POST carrying no body.
+  const typingWithoutBody = await fetch(
+    `${listening.address}/api/v1/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/typing?password=secret`,
+    { method: "POST", headers: { "content-type": "application/json" } },
+  );
+  assert.equal(typingWithoutBody.status, 200);
+  assert.equal(engine.typing.at(-1)?.active, true);
+
+  const malformedJson = await fetch(`${listening.address}/api/v1/message/text?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{not json",
+  });
+  assert.equal(malformedJson.status, 400);
+
   const unsent = await fetch(`${listening.address}/api/v1/message/sent-guid/unsend?password=secret`, {
     method: "POST",
     headers: { "content-type": "application/json" },
