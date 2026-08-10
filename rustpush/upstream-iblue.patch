@@ -5,23 +5,23 @@ index 4a1966f..c5c81f2 100644
 @@ -57,6 +57,10 @@ chrono = "0.4.41"
  bitflags = "2.9.1"
  x509-cert = "0.2.5"
-
+ 
 +[target.'cfg(target_os = "macos")'.dependencies]
 +core-foundation = "0.9.4"
 +security-framework-sys = { version = "2.14.0", features = ["OSX_10_13"] }
 +
  [build-dependencies]
  prost-build = { version = "0.12.0" }
-
+ 
 diff --git a/src/aps.rs b/src/aps.rs
 index 6301922..8204f8d 100644
 --- a/src/aps.rs
 +++ b/src/aps.rs
 @@ -1,5 +1,5 @@
-
+ 
 -use std::{borrow::BorrowMut, cmp::min, collections::{HashMap, VecDeque}, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::{Cursor, Read, Write}, marker::PhantomData, net::ToSocketAddrs, ops::Index, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
 +use std::{borrow::BorrowMut, cmp::min, collections::{HashMap, VecDeque}, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::{Cursor, Read, Write}, marker::PhantomData, ops::Index, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
-
+ 
  use backon::ExponentialBuilder;
  use deku::prelude::*;
 @@ -11,7 +11,7 @@ use prost::Message;
@@ -32,11 +32,11 @@ index 6301922..8204f8d 100644
 +use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split}, net::{TcpListener, TcpStream, lookup_host}, select, sync::{broadcast::{self, Receiver, Sender, error::RecvError}, mpsc}, task::{self, JoinHandle}};
  use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream, rustls::pki_types::ServerName};
  use async_recursion::async_recursion;
-
+ 
 @@ -1205,7 +1205,75 @@ pub struct APSConnectionResource {
      sub_counter: AtomicU32,
  }
-
+ 
 -const APNS_PORT: u16 = 5223;
 +const APNS_PORTS: [u16; 2] = [5223, 443];
 +const APNS_PORT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -107,19 +107,19 @@ index 6301922..8204f8d 100644
 +        ).into()
 +    }))
 +}
-
+ 
  async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>, Option<APSPackedDecoder>), PushError> {
      let certs = rustls_pemfile::certs(&mut Cursor::new(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")))?;
 @@ -1225,10 +1293,7 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
-
+ 
      let domain = format!("{}-{}", rand::thread_rng().gen_range(1..hostcount), hostname);
-
+     
 -    let dnsname = ServerName::try_from(hostname).unwrap();
--
+-    
 -    let stream = TcpStream::connect((domain.as_str(), APNS_PORT).to_socket_addrs()?.next().unwrap()).await?;
 -    let stream = connector.connect(dnsname, stream).await?;
 +    let stream = connect_apns_socket(&connector, domain.as_str(), hostname.as_str()).await?;
-
+ 
      let mut encoder = None;
      let mut decoder = None;
 @@ -1255,12 +1320,27 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
@@ -152,7 +152,7 @@ index 6301922..8204f8d 100644
 +            }
          };
          info!("Generating Opened socket");
-
+ 
 diff --git a/src/auth.rs b/src/auth.rs
 index 454eff9..f52ba36 100644
 --- a/src/auth.rs
@@ -179,7 +179,7 @@ index 454eff9..f52ba36 100644
 +        *self.mme_refreshed.lock().await = SystemTime::now();
 +    }
  }
-
+ 
  #[derive(Deserialize)]
 @@ -1447,4 +1464,3 @@ impl IdmsAuthListener {
          })
@@ -193,7 +193,7 @@ index 1be0a65..fa8b7aa 100644
 @@ -1,4 +1,4 @@
 -use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
 +use std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
-
+ 
  use aes::{cipher::consts::U16, Aes128, Aes256};
  use aes_gcm::{Aes256Gcm, AesGcm, Nonce, Tag, aead::{Aead, AeadMutInPlace}};
 @@ -7,7 +7,7 @@ use cloudkit_derive::CloudKitRecord;
@@ -221,7 +221,7 @@ index 1be0a65..fa8b7aa 100644
 @@ -44,6 +48,61 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
      capabilities_name: "com.apple.private.alloy"
  };
-
+ 
 +const FMF_PUSH_TOPIC: &str = "com.apple.mobileme.fmf3";
 +const FMF_IDS_TOPIC: &str = "com.apple.private.alloy.fmf";
 +const FMD_IDS_TOPIC: &str = "com.apple.private.alloy.fmd";
@@ -369,7 +369,7 @@ index 1be0a65..fa8b7aa 100644
 +        _ => decode_secure_friend_key_update(value).into_iter().collect(),
 +    }
  }
-
+ 
  impl FindMyShareState {
 @@ -216,6 +359,373 @@ pub struct FindMyClient<P: AnisetteProvider> {
      pub keychain: Arc<KeychainClient<P>>,
@@ -743,7 +743,7 @@ index 1be0a65..fa8b7aa 100644
 +        },
 +    })
  }
-
+ 
  const SEARCH_PARTY_CONTAINER: CloudKitContainer = CloudKitContainer {
 @@ -808,7 +1318,13 @@ impl<P: AnisetteProvider> FindMyClient<P> {
      pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
@@ -767,11 +767,11 @@ index 1be0a65..fa8b7aa 100644
 +            secure_friend_bootstrap_attempted: Mutex::new(HashMap::new()),
          })
      }
-
+ 
 @@ -831,6 +1348,19 @@ impl<P: AnisetteProvider> FindMyClient<P> {
          return Ok(locked.clone().unwrap())
      }
-
+ 
 +    /// Return the opaque location identifiers needed by the secure Find My
 +    /// Friends gateway. These identifiers are safe to pass back to Apple but
 +    /// must not be logged alongside the associated decryption keys.
@@ -787,11 +787,11 @@ index 1be0a65..fa8b7aa 100644
 +
      pub async fn sync_items(&self, fetch_shares: bool) -> Result<(), PushError> {
          let container = self.get_container().await?;
-
+         
 @@ -1134,6 +1664,180 @@ impl<P: AnisetteProvider> FindMyClient<P> {
          Ok(serde_json::from_slice(&description)?)
      }
-
+ 
 +    /// Ask the modern Find My Friends service to begin shallow location
 +    /// updates for a Messages share. Secure location identifiers are supplied
 +    /// by the peer's key-sharing handoff and may be empty while that handoff is
@@ -968,11 +968,11 @@ index 1be0a65..fa8b7aa 100644
 +
      pub async fn sync_item_positions(&self) -> Result<(), PushError> {
          self.sync_items(true).await?;
-
+ 
 @@ -1604,8 +2308,49 @@ impl<P: AnisetteProvider> FindMyClient<P> {
          } else { Ok(Some((payload_data.share_identifier, attrs)))}
      }
-
+ 
 +    async fn store_secure_friend_key_updates(&self, payload: &Value) -> Result<usize, PushError> {
 +        let updates = decode_secure_friend_key_updates(payload);
 +        let mut state = self.state.state.lock().await;
@@ -1023,7 +1023,7 @@ index 1be0a65..fa8b7aa 100644
 @@ -1626,7 +2371,63 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                  Ok::<(), PushError>(())
              };
-
+             
 -            if topic == "com.apple.private.alloy.findmy.itemsharing-crossaccount" {
 +            // Current macOS sends People secure-location key updates as a
 +            // FindMyMessaging Message on the FMD (and, on some versions, FMF)
@@ -1083,7 +1083,7 @@ index 1be0a65..fa8b7aa 100644
 +
 +            if topic == ITEM_SHARING_TOPIC {
                  let parsed: ItemSharingMessage = message.plist()?;
-
+ 
                  let payload_data: Value = plist::from_bytes(parsed.payload.as_ref())?;
 @@ -1668,15 +2469,22 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                  }
@@ -1103,7 +1103,7 @@ index 1be0a65..fa8b7aa 100644
                      do_app_ack().await?;
 -                    debug!("Importing find my token {p}!");
 +                    debug!("Importing Find My Friends Messages handoff token");
-
+ 
                      self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
 -                    debug!("Imported find my token {p}!");
 +                    debug!("Imported Find My Friends Messages handoff token");
@@ -1119,9 +1119,9 @@ index 1be0a65..fa8b7aa 100644
 +        } else {
 +            None
 +        };
-
+ 
          let token = self.aps.get_token().await;
-
+ 
 @@ -1941,7 +2754,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
                  "productType": meta.hardware_version,
                  "selectedFriend": self.selected_friend,
@@ -1133,7 +1133,7 @@ index 1be0a65..fa8b7aa 100644
              })
 @@ -1989,6 +2802,12 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
          }
-
+ 
          let raw_request: serde_json::Value = response.json().await?;
 +        debug!(
 +            "Find My Friends response for {path}: fields={:?}, following={}, locations={}",
@@ -1141,9 +1141,9 @@ index 1be0a65..fa8b7aa 100644
 +            raw_request.get("following").and_then(|value| value.as_array()).map_or(0, Vec::len),
 +            raw_request.get("locations").and_then(|value| value.as_array()).map_or(0, Vec::len),
 +        );
-
+ 
          let request: FindMyFriendsStateUpdate = serde_json::from_value(raw_request.clone())?;
-
+ 
 @@ -2066,4 +2885,73 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
          let _ = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
          Ok(())
@@ -1236,7 +1236,7 @@ index c8afb85..6594220 100644
 @@ -1626,7 +1626,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                  modified = true;
              }
-
+ 
 +            let my_id = &state.user_identity.as_ref().unwrap().identifier;
              for excluded in &trust.excludeds {
 +                if excluded == my_id {
@@ -1257,13 +1257,13 @@ index 56c840e..8884a63 100644
 @@ -1,4 +1,4 @@
 -use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
 +use std::{collections::{HashMap, HashSet}, fs, io::{Cursor, Write}, path::{Path, PathBuf}, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
-
+ 
  use backon::{ConstantBuilder, ExponentialBuilder};
  use deku::{DekuContainerRead, DekuRead, DekuWrite};
 @@ -27,6 +27,28 @@ const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
  const REFRESH_MIN: Duration = Duration::from_secs(60);
  use deku::{DekuContainerWrite, DekuUpdate};
-
+ 
 +fn protect_private_file(path: &Path) -> std::io::Result<()> {
 +    #[cfg(unix)]
 +    {
@@ -1292,7 +1292,7 @@ index 56c840e..8884a63 100644
 @@ -41,11 +63,18 @@ struct CachedKeys {
      at_ms: u64
  }
-
+ 
 +fn elapsed_since_cache_timestamp(now: SystemTime, at_ms: u64) -> Duration {
 +    // Wall clocks can move backwards after sleep/NTP correction, especially
 +    // on Windows. The entry was valid immediately before that correction, so
@@ -1309,12 +1309,12 @@ index 56c840e..8884a63 100644
 -            .expect("Time went backwards")
 +        elapsed_since_cache_timestamp(SystemTime::now(), self.at_ms)
      }
-
+ 
      fn is_valid(&self) -> bool {
 @@ -70,6 +99,25 @@ impl CachedKeys {
      }
  }
-
+ 
 +#[cfg(test)]
 +mod cached_keys_tests {
 +    use super::*;
@@ -1348,18 +1348,18 @@ index 56c840e..8884a63 100644
              if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                  loaded.cache_location = path;
 @@ -240,7 +291,7 @@ impl KeyCache {
-
+ 
      pub fn save(&self) {
          let saved = plist_to_string(self).unwrap();
 -        fs::write(&self.cache_location, saved).unwrap();
 +        write_private_file(&self.cache_location, saved.as_bytes()).unwrap();
      }
-
+ 
      pub fn invalidate(&mut self, handle: &str, keys_for: &str) {
 @@ -320,6 +371,14 @@ impl KeyCache {
          cached.keys.sender_correlation_identifier.clone()
      }
-
+ 
 +    /// Millisecond timestamp of the raw per-target cache entry, whether or not
 +    /// that entry is still valid. Diagnostics compare this value before and
 +    /// after one query to distinguish an entry returned by that response from
@@ -1403,10 +1403,10 @@ index 56c840e..8884a63 100644
 +                    }
                  }
              };
-
+ 
 @@ -824,6 +895,16 @@ impl IdentityResource {
      }
-
+ 
      pub async fn cache_keys(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
 +        // iBlue owns its sparse-probe and outbound retry policy above this
 +        // library. In particular, its post-cooldown canary must represent one
@@ -1424,7 +1424,7 @@ index 56c840e..8884a63 100644
 @@ -869,6 +950,31 @@ impl IdentityResource {
          Ok(targets.iter().filter(|target| !key_cache.get_keys(&topic, handle, *target).is_empty()).map(|i| i.clone()).collect())
      }
-
+ 
 +    /// Validate targets with a directly signed HTTPS `id-query`, without
 +    /// changing the normal APNs-tunnel lookup cache. This is intentionally a
 +    /// diagnostic seam so callers can distinguish a transport-specific lookup
@@ -1460,14 +1460,14 @@ index 17e6aa0..f6c32a2 100644
 @@ -10,7 +10,7 @@ use num_bigint::{BigInt, Sign};
  pub mod user;
  pub mod identity_manager;
-
+ 
 -#[derive(Deserialize, Debug)]
 +#[derive(Deserialize, Debug, Clone)]
  #[serde(untagged)]
  pub enum MessageBody {
      Plist(Value),
 @@ -102,4 +102,4 @@ pub struct CertifiedContext {
-
+ 
  pub mod idsp {
      include!(concat!(env!("OUT_DIR"), "/idsp.rs"));
 -}
@@ -1480,17 +1480,17 @@ index df97ecc..e3070a8 100644
 @@ -1,4 +1,4 @@
 -use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
 +use std::{collections::{BTreeSet, HashMap}, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
-
+ 
  use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
  use hkdf::Hkdf;
 @@ -19,7 +19,7 @@ use crate::util::DebugMutex;
-
+ 
  use rand::{Rng, RngCore};
-
+ 
 -use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
 +use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, ungzip}};
-
-
+ 
+ 
  #[repr(C)]
 @@ -661,6 +661,12 @@ pub struct ParsedClientData {
      pub ngm_public_identity: Option<CompactECKey<Public>>,
@@ -1503,12 +1503,12 @@ index df97ecc..e3070a8 100644
 +    #[serde(default)]
 +    pub supports_findmy_plugin_messages: bool,
  }
-
+ 
  pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>
 @@ -804,21 +810,20 @@ impl IDSUser {
              .send(&REQWEST).await?
              .bytes().await?;
-
+ 
 -        info!("Got alias response {}", str::from_utf8(&bytes).expect("Bytes to urtf8"));
 -
          #[derive(Deserialize)]
@@ -1518,23 +1518,23 @@ index df97ecc..e3070a8 100644
 +            alias: Option<String>,
              status: u32,
          }
-
+ 
          let parsed: AliasResult = plist::from_bytes(&bytes)?;
 -        *alias = Some(parsed.alias);
          if parsed.status != 0 {
              return Err(PushError::AliasError(parsed.status))
          }
 +        *alias = Some(parsed.alias.ok_or(PushError::BadMsg)?);
-
+ 
 -        info!("Just took action {operation} on alias {} for handle {handle}", alias.as_ref().expect("No alias!"));
 +        info!("Completed IDS alias action {operation}");
-
+ 
          Ok(())
      }
 @@ -988,9 +993,83 @@ impl IDSUser {
          }
          let request = request?;
-
+ 
 -        debug!("receieved apns query {:?}", plist::from_bytes::<Value>(&request)?);
 +        fn collect_client_data_keys(value: &Value, keys: &mut BTreeSet<String>) {
 +            match value {
@@ -1557,7 +1557,7 @@ index df97ecc..e3070a8 100644
 +                _ => {}
 +            }
 +        }
-
+ 
 +        let raw_response: Value = plist::from_bytes(&request)?;
 +        let mut client_data_keys = BTreeSet::new();
 +        collect_client_data_keys(&raw_response, &mut client_data_keys);
@@ -1619,14 +1619,14 @@ index df97ecc..e3070a8 100644
 @@ -1103,7 +1182,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
          ("validation-data", Value::Data(config.generate_validation_data().await?))
      ].into_iter()));
-
+ 
 -    let mut request = SignedRequest::new("id-register", Method::POST)
 +    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)
              .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
              .header("x-protocol-version", &config.get_protocol_version().to_string())
              .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
 @@ -1183,3 +1262,49 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
-
+ 
      Ok(())
  }
 +
@@ -1681,7 +1681,7 @@ index f87deb5..5b5e763 100644
 +++ b/src/imessage/messages.rs
 @@ -1026,6 +1026,17 @@ pub struct ErrorMessage {
  }
-
+ 
  impl ReactMessage {
 +    /// Apple's `amrln` is an NSRange length. Count UTF-16 code units, matching
 +    /// NSString, rather than Rust's UTF-8 byte length. This matters for emoji
@@ -1698,7 +1698,7 @@ index f87deb5..5b5e763 100644
          self.reaction.get_text(&self.to_text)
      }
 @@ -2184,7 +2195,7 @@ impl MessageInst {
-
+ 
                  let raw = RawReactMessage {
                      text: text,
 -                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
@@ -1711,7 +1711,7 @@ index c71234a..cd85a7a 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -1,11 +1,11 @@
-
+ 
 -mod activation;
 +pub mod activation;
  mod aps;
@@ -1744,7 +1744,7 @@ index a8fe25d..c9d3e90 100644
 -            panic!("No saved channel for identifier!")
 +            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };
          };
-
+ 
          APSChannel {
 @@ -733,7 +733,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                  let Some(channel) = &channel else { return Ok(None) };
@@ -1752,6 +1752,6 @@ index a8fe25d..c9d3e90 100644
                  let mut state = self.state.write().await;
 -                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };
 +                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };
-
+ 
                  let key = referenced_channel.get_key(inner.ratchet)?;
-
+ 
