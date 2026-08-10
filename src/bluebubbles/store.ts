@@ -629,6 +629,7 @@ export class BlueBubblesStore {
     partCount?: number;
     appBalloon?: IncomingAppBalloon;
     pollParticipantHandle?: string;
+    richLink?: IBlueRichLink;
   }): BlueBubblesMessage {
     const conversation = this.conversationForChat(params.chatGuid);
     if (!conversation) throw new Error(`chat does not exist: ${params.chatGuid}`);
@@ -661,6 +662,7 @@ export class BlueBubblesStore {
           ...(params.pollParticipantHandle
             ? { pollParticipantHandle: params.pollParticipantHandle }
             : {}),
+          ...(params.richLink ? { richLink: params.richLink } : {}),
         }),
       );
     const message = this.getMessage(params.guid);
@@ -1671,6 +1673,7 @@ export class BlueBubblesStore {
       partCount?: number;
       didNotifyRecipient?: boolean;
       pollParticipantHandle?: string;
+      richLink?: IBlueRichLink;
     };
     const attachments = this.#attachmentsByMessage
       .all(row.guid) as unknown as AttachmentRow[];
@@ -1687,7 +1690,7 @@ export class BlueBubblesStore {
     const richLinkArtworkRow = decodedRichLink?.artworkAttachmentIndex === undefined
       ? undefined
       : attachments[decodedRichLink.artworkAttachmentIndex];
-    const richLink = decodedRichLink
+    const decodedRichLinkValue = decodedRichLink
       ? {
         ...decodedRichLink.value,
         ...(richLinkArtworkRow
@@ -1700,6 +1703,7 @@ export class BlueBubblesStore {
           : {}),
       } satisfies IBlueRichLink
       : undefined;
+    const richLink = raw.richLink ?? decodedRichLinkValue;
     const visibleAttachments = attachments.flatMap((attachment, index) => {
       if (attachment.mime_type === RICH_LINK_METADATA_MIME) return [];
       const artworkMimeType = index === decodedRichLink?.artworkAttachmentIndex

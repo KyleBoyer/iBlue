@@ -398,6 +398,42 @@ export class BlueBubblesServer {
         count: MESSAGE_FLAIRS.length,
       }));
 
+    this.app.post("/api/v1/iblue/rich-link", async (request) => {
+      const body = asRecord(request.body);
+      const originalUrl = requiredString(body, "originalUrl");
+      let artwork: { attachmentGuid: string; path: string; mimeType: string } | undefined;
+      if (typeof body.artworkAttachmentGuid === "string") {
+        const stored = this.service.store.getAttachment(body.artworkAttachmentGuid);
+        if (!stored?.path) throw new RequestError(404, "Artwork attachment not found!", "NOT_FOUND");
+        artwork = {
+          attachmentGuid: body.artworkAttachmentGuid,
+          path: stored.path,
+          mimeType: stored.response.mimeType,
+        };
+      }
+      const appleMusic = asRecord(body.appleMusic);
+      const appleMusicPlayback = Object.keys(appleMusic).length > 0
+        ? {
+          storefrontIdentifier: requiredString(appleMusic, "storefrontIdentifier"),
+          storeIdentifier: requiredString(appleMusic, "storeIdentifier"),
+          name: requiredString(appleMusic, "name"),
+          artist: requiredString(appleMusic, "artist"),
+          album: requiredString(appleMusic, "album"),
+          previewUrl: requiredString(appleMusic, "previewUrl"),
+        }
+        : undefined;
+      const message = await this.service.sendRichLink({
+        chatGuid: requiredString(body, "chatGuid"),
+        originalUrl,
+        ...(typeof body.url === "string" ? { url: body.url } : {}),
+        ...(typeof body.title === "string" ? { title: body.title } : {}),
+        ...(typeof body.summary === "string" ? { summary: body.summary } : {}),
+        ...(artwork ? { artwork } : {}),
+        ...(appleMusicPlayback ? { appleMusicPlayback } : {}),
+      });
+      return success(message, "Rich link sent!");
+    });
+
     this.app.get<{ Params: { messageGuid: string } }>(
       "/api/v1/iblue/poll/:messageGuid",
       async (request, reply) => {
@@ -406,6 +442,25 @@ export class BlueBubblesServer {
         return success(poll, "Successfully fetched poll!");
       },
     );
+    this.app.post("/api/v1/iblue/poll", async (request) => {
+      const body = asRecord(request.body);
+      if (!Array.isArray(body.options)
+        || body.options.length < 2
+        || body.options.length > 32
+        || body.options.some((value) => typeof value !== "string" || !value.trim())) {
+        throw new RequestError(
+          400,
+          "options must contain between 2 and 32 non-empty poll option strings",
+          "VALIDATION_ERROR",
+        );
+      }
+      const message = await this.service.sendPoll({
+        chatGuid: requiredString(body, "chatGuid"),
+        options: body.options.map((value) => (value as string).trim()),
+        ...(typeof body.title === "string" ? { title: body.title.trim() } : {}),
+      });
+      return success(message, "Poll sent!");
+    });
     this.app.post<{ Params: { messageGuid: string } }>(
       "/api/v1/iblue/poll/:messageGuid/vote",
       async (request) => {

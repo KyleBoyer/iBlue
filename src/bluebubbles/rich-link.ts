@@ -11,6 +11,69 @@ export interface DecodedRichLink {
   artworkMimeType?: string;
 }
 
+export interface OutboundRichLinkInput {
+  originalUrl: string;
+  url?: string;
+  title?: string;
+  summary?: string;
+  artworkMimeType?: string;
+  artworkDataBase64?: string;
+  artworkAttachmentGuid?: string;
+  appleMusicPlayback?: {
+    storefrontIdentifier: string;
+    storeIdentifier: string;
+    name: string;
+    artist: string;
+    album: string;
+    previewUrl: string;
+  };
+}
+
+export function encodeRichLinkTransport(input: OutboundRichLinkInput): {
+  transportText: string;
+  richLink: IBlueRichLink;
+} {
+  const url = input.url ?? input.originalUrl;
+  const music = appleMusicLink(url);
+  const metadata = Buffer.from(JSON.stringify({
+    originalUrl: input.originalUrl,
+    url,
+    ...(input.title ? { title: input.title } : {}),
+    ...(input.summary ? { summary: input.summary } : {}),
+    ...(input.artworkMimeType ? { artworkMimeType: input.artworkMimeType } : {}),
+    ...(input.artworkDataBase64 ? { artworkDataBase64: input.artworkDataBase64 } : {}),
+    ...(input.appleMusicPlayback
+      ? {
+        appleMusicStorefrontIdentifier: input.appleMusicPlayback.storefrontIdentifier,
+        appleMusicStoreIdentifier: input.appleMusicPlayback.storeIdentifier,
+        appleMusicName: input.appleMusicPlayback.name,
+        appleMusicArtist: input.appleMusicPlayback.artist,
+        appleMusicAlbum: input.appleMusicPlayback.album,
+        appleMusicPreviewUrl: input.appleMusicPlayback.previewUrl,
+      }
+      : {}),
+  }), "utf8").toString("base64");
+  return {
+    transportText: `\x00RL2\x01${metadata}\x00${url}`,
+    richLink: {
+      provider: music ? "apple-music" : "generic",
+      originalUrl: input.originalUrl,
+      url,
+      ...(input.title ? { title: input.title } : {}),
+      ...(input.summary ? { summary: input.summary } : {}),
+      ...(input.artworkAttachmentGuid && input.artworkMimeType
+        ? {
+          artwork: {
+            attachmentGuid: input.artworkAttachmentGuid,
+            mimeType: input.artworkMimeType,
+          },
+        }
+        : {}),
+      ...(music ? { appleMusic: music } : {}),
+    },
+  };
+}
+
 function appleMusicLink(value: string): IBlueAppleMusicLink | undefined {
   let url: URL;
   try {

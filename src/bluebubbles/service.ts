@@ -33,7 +33,8 @@ import {
 } from "./guid.js";
 import { BlueBubblesScheduler } from "./scheduler.js";
 import { BlueBubblesStore, type QueryOptions } from "./store.js";
-import { encodePollVote } from "./polls.js";
+import { encodePollDefinition, encodePollVote } from "./polls.js";
+import { encodeRichLinkTransport } from "./rich-link.js";
 
 export interface BlueBubblesEvent {
   type: string;
@@ -325,6 +326,96 @@ export class BlueBubblesService extends EventEmitter {
     }
     this.scheduleSnapshot();
     return { message, poll: this.store.getPoll(body.messageGuid) ?? poll };
+  }
+
+  async sendPoll(body: {
+    chatGuid: string;
+    options: readonly string[];
+    title?: string;
+  }): Promise<BlueBubblesMessage> {
+    this.requireOutboundIds("send a poll");
+    const from = this.handles[0];
+    if (!from) throw new Error("The account has no registered sending handle!");
+    const encoded = encodePollDefinition(stripTransport(from), body.options, body.title ?? "");
+    const result = await this.engine.sendMessage({
+      conversation: this.resolveConversation(body.chatGuid),
+      text: encoded.transportText,
+      from,
+    });
+    this.#beginOutgoingAnnouncement(result.guid);
+    let message: BlueBubblesMessage;
+    try {
+      message = this.store.insertOutgoing({
+        guid: result.guid,
+        chatGuid: body.chatGuid,
+        text: "\ufffc",
+        appBalloon: encoded.balloon,
+      });
+      this.#publishOutgoing(result.guid, "new-message", message);
+    } finally {
+      this.#finishOutgoingAnnouncement(result.guid);
+    }
+    this.scheduleSnapshot();
+    return message;
+  }
+
+  async sendRichLink(body: {
+    chatGuid: string;
+    originalUrl: string;
+    url?: string;
+    title?: string;
+    summary?: string;
+    artwork?: { attachmentGuid: string; path: string; mimeType: string };
+    appleMusicPlayback?: {
+      storefrontIdentifier: string;
+      storeIdentifier: string;
+      name: string;
+      artist: string;
+      album: string;
+      previewUrl: string;
+    };
+  }): Promise<BlueBubblesMessage> {
+    this.requireOutboundIds("send a rich link");
+    const artworkDataBase64 = body.artwork
+      ? (await readFile(body.artwork.path)).toString("base64")
+      : undefined;
+    const encoded = encodeRichLinkTransport({
+      originalUrl: body.originalUrl,
+      ...(body.url ? { url: body.url } : {}),
+      ...(body.title ? { title: body.title } : {}),
+      ...(body.summary ? { summary: body.summary } : {}),
+      ...(body.artwork
+        ? {
+          artworkMimeType: body.artwork.mimeType,
+          artworkDataBase64: artworkDataBase64!,
+          artworkAttachmentGuid: body.artwork.attachmentGuid,
+        }
+        : {}),
+      ...(body.appleMusicPlayback ? { appleMusicPlayback: body.appleMusicPlayback } : {}),
+    });
+    const result = await this.engine.sendMessage({
+      conversation: this.resolveConversation(body.chatGuid),
+      text: encoded.transportText,
+    });
+    this.#beginOutgoingAnnouncement(result.guid);
+    let message: BlueBubblesMessage;
+    try {
+      message = this.store.insertOutgoing({
+        guid: result.guid,
+        chatGuid: body.chatGuid,
+        text: body.url ?? body.originalUrl,
+        appBalloon: {
+          bundleId: "com.apple.messages.URLBalloonProvider",
+          isLive: false,
+        },
+        richLink: encoded.richLink,
+      });
+      this.#publishOutgoing(result.guid, "new-message", message);
+    } finally {
+      this.#finishOutgoingAnnouncement(result.guid);
+    }
+    this.scheduleSnapshot();
+    return message;
   }
 
   async sendAttachment(

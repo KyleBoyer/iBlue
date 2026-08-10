@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { IncomingAttachment } from "../../src/types.js";
-import { decodeRichLink } from "../../src/bluebubbles/rich-link.js";
+import { decodeRichLink, encodeRichLinkTransport } from "../../src/bluebubbles/rich-link.js";
 
 function attachment(mimeType: string, value: string): IncomingAttachment {
   return {
@@ -56,5 +56,30 @@ test("non-Music previews remain generic rich links", () => {
     url: "https://example.com",
     title: "Example",
     summary: "A summary",
+  });
+});
+
+test("outbound rich links carry artwork in the native transport envelope", () => {
+  const url = "https://music.apple.com/us/album/example/123?i=456";
+  const encoded = encodeRichLinkTransport({
+    originalUrl: url,
+    title: "Example — Artist",
+    artworkMimeType: "image/png",
+    artworkDataBase64: Buffer.from("png").toString("base64"),
+    artworkAttachmentGuid: "artwork-guid",
+    appleMusicPlayback: {
+      storefrontIdentifier: "143441",
+      storeIdentifier: "456",
+      name: "Example",
+      artist: "Artist",
+      album: "Example - Single",
+      previewUrl: "https://audio.example/preview.m4a",
+    },
+  });
+  assert.ok(encoded.transportText.startsWith("\x00RL2\x01"));
+  assert.equal(encoded.richLink.provider, "apple-music");
+  assert.deepEqual(encoded.richLink.artwork, {
+    attachmentGuid: "artwork-guid",
+    mimeType: "image/png",
   });
 });

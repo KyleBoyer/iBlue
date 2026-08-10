@@ -1676,7 +1676,7 @@ index df97ecc..e3070a8 100644
 +    Ok(())
 +}
 diff --git a/src/imessage/messages.rs b/src/imessage/messages.rs
-index f87deb5..2021f42 100644
+index f87deb5..9ae1556 100644
 --- a/src/imessage/messages.rs
 +++ b/src/imessage/messages.rs
 @@ -843,6 +843,10 @@ impl Reaction {
@@ -1727,6 +1727,15 @@ index f87deb5..2021f42 100644
                      amrlc: 0,
                      amt: react.reaction.get_cmd(),
                      participants: conversation.participants.clone(),
+@@ -2237,7 +2255,7 @@ impl MessageInst {
+                             balloon_part = Some(gzip(&BaseBalloonBody {
+                                 attachments: link_meta.attachments.clone().into_iter().map(|i| i.into()).collect(),
+                                 payload: plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&RichLink {
+-                                    rich_link_is_placeholder: true,
++                                    rich_link_is_placeholder: false,
+                                     rich_link_metadata: link_meta.data.clone(),
+                                 })?)?)?.into(),
+                             }.to_bin()?)?);
 @@ -2897,6 +2915,23 @@ impl MessageInst {
      }
  }
@@ -1751,6 +1760,67 @@ index f87deb5..2021f42 100644
  impl fmt::Display for MessageInst {
      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
          write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+diff --git a/src/imessage/rawmessages.rs b/src/imessage/rawmessages.rs
+index 34eaeb8..583d106 100644
+--- a/src/imessage/rawmessages.rs
++++ b/src/imessage/rawmessages.rs
+@@ -574,16 +574,28 @@ pub struct RichLinkImageAttachmentSubstitute {
+     #[serde(rename = "MIMEType")]
+     pub mime_type: String,
+     pub rich_link_image_attachment_substitute_index: u64,
++    pub image_type: Option<u8>,
++    pub has_single_dominant_color: Option<bool>,
+ }
+ 
+-
+ #[derive(Serialize, Deserialize, Clone)]
+ #[serde(rename_all_fields = "camelCase", tag = "$class")]
+ pub enum LPSpecializationMetadata {
+     LPPasswordsInviteMetadata {
+         group_name: String,
+         url_parameters: String,
+-    }
++    },
++    LPiTunesMediaSongMetadata {
++        store_front_identifier: String,
++        store_identifier: String,
++        name: String,
++        artist: String,
++        album: String,
++        offers: Option<NSArray<String>>,
++        #[serde(rename = "previewURL")]
++        preview_url: NSURL,
++        artwork: Option<RichLinkImageAttachmentSubstitute>,
++    },
+ }
+ 
+ #[repr(C)]
+@@ -598,17 +610,17 @@ pub struct LPLinkMetadata {
+     #[serde(rename = "URL")]
+     pub url: Option<NSURL>,
+     pub title: Option<String>,
++    pub original_title: Option<String>,
+     pub summary: Option<String>,
+     pub image: Option<RichLinkImageAttachmentSubstitute>,
+     pub icon: Option<RichLinkImageAttachmentSubstitute>,
+     pub images: Option<NSArray<LPImageMetadata>>,
+     pub icons: Option<NSArray<LPIconMetadata>>,
+-
+     pub is_incomplete: Option<bool>,
+     pub uses_activity_pub: Option<bool>,
+     pub is_encoded_for_local_use: Option<bool>,
+     pub collaboration_type: Option<u32>,
+-    pub specialization2: Option<LPSpecializationMetadata>,
++    pub specialization: Option<LPSpecializationMetadata>,
+ }
+ 
+ 
+@@ -626,5 +638,3 @@ pub struct BaseBalloonBody {
+     #[serde(rename = "__attachments__")]
+     pub attachments: Vec<Data>,
+ }
+-
+-
 diff --git a/src/lib.rs b/src/lib.rs
 index c71234a..cd85a7a 100644
 --- a/src/lib.rs
@@ -1800,3 +1870,43 @@ index a8fe25d..c9d3e90 100644
  
                  let key = referenced_channel.get_key(inner.ratchet)?;
  
+diff --git a/src/util.rs b/src/util.rs
+index 3c7f312..45c0f87 100644
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -1188,12 +1188,13 @@ const CLASS_SPECS: &[ClassData] = &[
+             "originalURL",
+             "URL",
+             "title",
++            "originalTitle",
+             "summary",
+             "image",
+             "icon",
+             "images",
+             "icons",
+-            "specialization2"
++            "specialization"
+         ]
+     },
+     ClassData {
+@@ -1204,6 +1205,20 @@ const CLASS_SPECS: &[ClassData] = &[
+             "urlParameters"
+         ]
+     },
++    ClassData {
++        name: "LPiTunesMediaSongMetadata",
++        classes: &["LPiTunesMediaSongMetadata", "LPSpecializationMetadata", "NSObject"],
++        uid_fields: &[
++            "storeFrontIdentifier",
++            "storeIdentifier",
++            "name",
++            "artist",
++            "album",
++            "offers",
++            "previewURL",
++            "artwork"
++        ]
++    },
+     ClassData {
+         name: "RichLink",
+         classes: &["RichLink", "NSObject"],

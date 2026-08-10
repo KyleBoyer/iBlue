@@ -97,8 +97,16 @@ the rest of `/api/v1`:
 | `GET` | `/api/v1/iblue/location/live?address=...` | Refresh Find My and return the current position for active location shares, optionally filtered to one phone number or email address. |
 | `GET` | `/api/v1/iblue/location/:messageGuid` | Fetch the normalized snapshot or pin associated with one message. |
 | `GET` | `/api/v1/iblue/message/flair` | List friendly message-flair names, display labels, categories, and their exact Apple effect identifiers. |
+| `POST` | `/api/v1/iblue/rich-link` | Send a rich URL preview, optionally reusing a stored artwork attachment. |
 | `GET` | `/api/v1/iblue/poll/:messageGuid` | Fetch an Apple Messages poll definition plus its aggregated current votes. |
+| `POST` | `/api/v1/iblue/poll` | Author and send an Apple Messages poll using `{chatGuid, options, title?}`. |
 | `POST` | `/api/v1/iblue/poll/:messageGuid/vote` | Replace the sending profile's complete selection set using `{optionIdentifiers: string[]}`; an empty array clears its votes. |
+
+Apple Music sends use the same song specialization as the Music app, including
+catalog offers and the preview control. Supply `chatGuid`, `originalUrl`, a
+previously stored `artworkAttachmentGuid`, and an `appleMusic` object containing
+`storefrontIdentifier`, `storeIdentifier`, `name`, `artist`, `album`, and
+`previewUrl` to `POST /api/v1/iblue/rich-link`.
 
 Handles gain an optional `iBlue.contact` summary. Messages gain optional
 `iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`,

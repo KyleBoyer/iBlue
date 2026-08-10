@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type { IncomingAppBalloon } from "../types.js";
 import type {
   IBluePoll,
@@ -50,6 +52,57 @@ export interface EncodedPollVote {
   json: string;
   balloon: IncomingAppBalloon;
   update: IBluePollVoteUpdate;
+}
+
+export interface EncodedPollDefinition {
+  transportText: string;
+  json: string;
+  balloon: IncomingAppBalloon;
+  poll: IBluePoll;
+}
+
+export function encodePollDefinition(
+  creatorHandle: string,
+  optionTexts: readonly string[],
+  title = "",
+  sessionId = randomUUID().toUpperCase(),
+): EncodedPollDefinition {
+  const options = optionTexts.map((text) => ({
+    canBeEdited: false,
+    optionIdentifier: randomUUID().toUpperCase(),
+    creatorHandle,
+    attributedText: text,
+    text,
+  }));
+  const item = { creatorHandle, title, orderedPollOptions: options };
+  const json = JSON.stringify({ version: 1, item });
+  const encoded = Buffer.from(json, "utf8").toString("base64");
+  const balloon: IncomingAppBalloon = {
+    appName: "Polls",
+    bundleId: POLLS_BUNDLE_ID,
+    url: `data:,${encoded}?src=p&c=${options.length}`,
+    sessionId,
+    isLive: true,
+  };
+  return {
+    transportText: `\x00PL\x01${sessionId}\x01${encoded}\x00\ufffc`,
+    json,
+    balloon,
+    poll: {
+      version: 1,
+      title,
+      creatorHandle,
+      options: options.map(({ optionIdentifier, text, canBeEdited }) => ({
+        identifier: optionIdentifier,
+        text,
+        creatorHandle,
+        canBeEdited,
+      })),
+      votes: [],
+      sessionId,
+      bundleId: POLLS_BUNDLE_ID,
+    },
+  };
 }
 
 export function pollFromBalloon(balloon: IncomingAppBalloon | undefined): IBluePoll | undefined {

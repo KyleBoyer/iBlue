@@ -22,7 +22,7 @@ use rustpush::{
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
     ExtensionApp, OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
     ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
-    IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL,
+    IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL, RichLinkImageAttachmentSubstitute,
     TextFlags, TextFormat, TextEffect,
     ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
     UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
@@ -11348,8 +11348,156 @@ impl Client {
             MessageType::IMessage
         };
 
+        // Parse iBlue's internal rich-link and poll prefixes. Their JSON is
+        // base64 so user-authored text cannot collide with the framing bytes.
+        let (actual_text, link_meta, app) = if text.starts_with("\x00RL2\x01") {
+            let rest = &text[5..];
+            let end = rest.find('\x00').ok_or_else(|| WrappedError::GenericError {
+                msg: "Invalid rich-link transport framing".to_string(),
+            })?;
+            let metadata = BASE64_STANDARD.decode(&rest[..end]).map_err(|error| {
+                WrappedError::GenericError {
+                    msg: format!("Invalid rich-link metadata encoding: {error}"),
+                }
+            })?;
+            let metadata: serde_json::Value = serde_json::from_slice(&metadata).map_err(|error| {
+                WrappedError::GenericError {
+                    msg: format!("Invalid rich-link metadata JSON: {error}"),
+                }
+            })?;
+            let required_string = |key: &str| {
+                metadata.get(key).and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            };
+            let original_url_str = required_string("originalUrl").ok_or_else(|| {
+                WrappedError::GenericError { msg: "Rich link requires originalUrl".to_string() }
+            })?;
+            let url_str = required_string("url").unwrap_or_else(|| original_url_str.clone());
+            let image_mime = required_string("artworkMimeType");
+            let image_data = required_string("artworkDataBase64")
+                .map(|encoded| BASE64_STANDARD.decode(encoded))
+                .transpose()
+                .map_err(|error| WrappedError::GenericError {
+                    msg: format!("Invalid rich-link artwork encoding: {error}"),
+                })?;
+            let has_image = image_data.is_some() && image_mime.is_some();
+            let image = has_image.then(|| RichLinkImageAttachmentSubstitute {
+                mime_type: image_mime.clone().unwrap(),
+                rich_link_image_attachment_substitute_index: 0,
+                image_type: Some(0),
+                has_single_dominant_color: Some(false),
+            });
+            let title = required_string("title");
+            let specialization = if let (
+                Some(store_front_identifier),
+                Some(store_identifier),
+                Some(name),
+                Some(artist),
+                Some(album),
+                Some(preview_url),
+            ) = (
+                required_string("appleMusicStorefrontIdentifier"),
+                required_string("appleMusicStoreIdentifier"),
+                required_string("appleMusicName"),
+                required_string("appleMusicArtist"),
+                required_string("appleMusicAlbum"),
+                required_string("appleMusicPreviewUrl"),
+            ) {
+                Some(rustpush::LPSpecializationMetadata::LPiTunesMediaSongMetadata {
+                    store_front_identifier,
+                    store_identifier,
+                    name,
+                    artist,
+                    album,
+                    offers: Some(rustpush::NSArray {
+                        objects: vec!["buy".to_string(), "subscription".to_string()],
+                        class: rustpush::NSArrayClass::NSMutableArray,
+                    }),
+                    preview_url: NSURL {
+                        base: "$null".to_string(),
+                        relative: preview_url,
+                    },
+                    artwork: image.clone(),
+                })
+            } else {
+                None
+            };
+            let is_apple_music = specialization.is_some();
+            let lm = LinkMeta {
+                data: LPLinkMetadata {
+                    image_metadata: None,
+                    version: 1,
+                    icon_metadata: None,
+                    original_url: Some(NSURL { base: "$null".to_string(), relative: original_url_str }),
+                    url: (!is_apple_music).then(|| NSURL { base: "$null".to_string(), relative: url_str }),
+                    title: title.clone(),
+                    original_title: is_apple_music.then_some(title).flatten(),
+                    summary: required_string("summary"),
+                    image: (!is_apple_music).then(|| image.clone()).flatten(),
+                    icon: is_apple_music.then(|| image.clone()).flatten(),
+                    images: None,
+                    icons: None,
+                    is_incomplete: is_apple_music.then_some(false),
+                    uses_activity_pub: is_apple_music.then_some(false),
+                    is_encoded_for_local_use: is_apple_music.then_some(false),
+                    collaboration_type: is_apple_music.then_some(0),
+                    specialization,
+                },
+                attachments: image_data.into_iter().collect(),
+            };
+            (rest[end + 1..].to_string(), Some(lm), None)
+        } else if text.starts_with("\x00PL\x01") {
+            let rest = &text[4..];
+            let end = rest.find('\x00').ok_or_else(|| WrappedError::GenericError {
+                msg: "Invalid poll transport framing".to_string(),
+            })?;
+            let metadata = &rest[..end];
+            let (session_id, encoded) = metadata.split_once('\x01').ok_or_else(|| {
+                WrappedError::GenericError {
+                    msg: "Invalid poll transport metadata".to_string(),
+                }
+            })?;
+            uuid::Uuid::parse_str(session_id).map_err(|error| WrappedError::GenericError {
+                msg: format!("Invalid poll session ID: {error}"),
+            })?;
+            let poll_json = BASE64_STANDARD.decode(encoded).map_err(|error| {
+                WrappedError::GenericError {
+                    msg: format!("Invalid poll definition encoding: {error}"),
+                }
+            })?;
+            let envelope: serde_json::Value = serde_json::from_slice(&poll_json).map_err(|error| {
+                WrappedError::GenericError {
+                    msg: format!("Invalid poll definition JSON: {error}"),
+                }
+            })?;
+            let option_count = envelope
+                .get("item")
+                .and_then(|item| item.get("orderedPollOptions"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .filter(|count| *count >= 2)
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: "Poll definition must contain at least two orderedPollOptions".to_string(),
+                })?;
+            let actual = rest[end + 1..].to_string();
+            let spec = ExtensionApp {
+                name: "Polls".to_string(),
+                app_id: None,
+                bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls"
+                    .to_string(),
+                balloon: Some(Balloon {
+                    url: format!("data:,{encoded}?src=p&c={option_count}"),
+                    session: Some(session_id.to_string()),
+                    layout: None,
+                    ld_text: None,
+                    is_live: true,
+                    icon: None,
+                }),
+            };
+            (actual, None, Some(spec))
         // Parse rich link encoded as prefix: \x00RL\x01original_url\x01url\x01title\x01summary\x00actual_text
-        let (actual_text, link_meta) = if text.starts_with("\x00RL\x01") {
+        } else if text.starts_with("\x00RL\x01") {
             let rest = &text[4..]; // skip "\x00RL\x01"
             if let Some(end) = rest.find('\x00') {
                 let metadata = &rest[..end];
@@ -11385,6 +11533,7 @@ impl Client {
                         original_url: Some(original_url),
                         url,
                         title,
+                        original_title: None,
                         summary,
                         image: None,
                         icon: None,
@@ -11394,16 +11543,16 @@ impl Client {
                         uses_activity_pub: None,
                         is_encoded_for_local_use: None,
                         collaboration_type: None,
-                        specialization2: None,
+                        specialization: None,
                     },
                     attachments: vec![],
                 };
-                (actual, Some(lm))
+                (actual, Some(lm), None)
             } else {
-                (text, None)
+                (text, None, None)
             }
         } else {
-            (text, None)
+            (text, None, None)
         };
 
         let parts = if let Some(ref html_str) = html {
@@ -11422,7 +11571,7 @@ impl Client {
                 reply_part: reply_part.clone(),
                 service: service.clone(),
                 subject,
-                app: None,
+                app,
                 link_meta,
                 voice: false,
                 scheduled: schedule,
@@ -11431,6 +11580,7 @@ impl Client {
         } else {
             let mut n = NormalMessage::new(actual_text.clone(), service.clone());
             n.link_meta = link_meta;
+            n.app = app;
             n.effect = effect;
             n.subject = subject;
             n.reply_guid = reply_guid.clone();

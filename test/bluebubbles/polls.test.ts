@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  encodePollDefinition,
   encodePollVote,
   pollFromBalloon,
   pollVoteUpdateFromBalloon,
@@ -44,6 +45,20 @@ test("decodes Apple Polls definitions from app balloon URLs", () => {
     sessionId: "poll-session",
     bundleId: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls",
   });
+});
+
+test("encodes an authored poll as a live Polls app balloon", () => {
+  const encoded = encodePollDefinition(
+    "sender@example.com",
+    ["Pizza", "Tacos"],
+    "Dinner?",
+    "CBA9DE14-DD9A-45C5-BB63-989E6E32C538",
+  );
+  assert.equal(encoded.balloon.isLive, true);
+  assert.match(encoded.balloon.url ?? "", /^data:,.+\?src=p&c=2$/);
+  assert.ok(encoded.transportText.startsWith("\x00PL\x01CBA9DE14-DD9A-45C5-BB63-989E6E32C538\x01"));
+  assert.deepEqual(encoded.poll.options.map(({ text }) => text), ["Pizza", "Tacos"]);
+  assert.deepEqual(pollFromBalloon(encoded.balloon)?.options, encoded.poll.options);
 });
 
 test("decodes Apple Polls vote acknowledgements", () => {
