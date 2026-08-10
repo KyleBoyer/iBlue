@@ -524,6 +524,16 @@ struct SendReactionParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SendPollVoteParams {
+    conversation: ConversationParams,
+    target_uuid: String,
+    session_id: String,
+    poll_response_json: String,
+    from: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SendAttachmentParams {
     conversation: ConversationParams,
     path: String,
@@ -1568,6 +1578,23 @@ impl Engine {
                         reaction,
                         params.emoji,
                         params.remove,
+                        sender,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({ "guid": guid }))
+            }
+            "poll.vote" => {
+                let params: SendPollVoteParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let sender = self.sender(params.from)?;
+                let guid = self
+                    .client()?
+                    .send_poll_vote(
+                        params.conversation.into(),
+                        params.target_uuid,
+                        params.session_id,
+                        params.poll_response_json,
                         sender,
                     )
                     .await

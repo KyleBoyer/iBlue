@@ -188,6 +188,71 @@ test("Apple-provided audio transcriptions are exposed without synthesizing text"
   });
 });
 
+test("Apple Music shares expose structured rich-link metadata and downloadable artwork", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-rich-link-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const url = "https://music.apple.com/us/album/way-too-self-aware-remix/6771198461?i=6771198463";
+  const metadata = `${url}\x01${url}\x01Way Too Self Aware (Remix) — Ian Asher\x01\x01image/png`;
+  const result = await store.ingestIncoming({
+    uuid: "apple-music-rich-link-guid",
+    sender: "mailto:friend@example.com",
+    text: url,
+    participants: ["mailto:friend@example.com"],
+    timestampMs: Date.now(),
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [
+      {
+        mimeType: "x-richlink/meta",
+        filename: "",
+        utiType: "",
+        size: 0,
+        isInline: true,
+        dataBase64: Buffer.from(metadata).toString("base64"),
+        iris: false,
+      },
+      {
+        mimeType: "x-richlink/image",
+        filename: "",
+        utiType: "",
+        size: 4,
+        isInline: true,
+        dataBase64: Buffer.from("art!").toString("base64"),
+        iris: false,
+      },
+    ],
+  }, []);
+
+  assert.equal(result.balloonBundleId, "com.apple.messages.URLBalloonProvider");
+  assert.equal(result.attachments.length, 1);
+  assert.equal(result.attachments[0]?.mimeType, "image/png");
+  assert.equal(result.attachments[0]?.transferName, "rich-link-artwork.png");
+  assert.deepEqual(result.attachments[0]?.metadata, { iBlueRichLinkArtwork: true });
+  assert.deepEqual(result.iBlue?.richLink, {
+    provider: "apple-music",
+    originalUrl: url,
+    url,
+    title: "Way Too Self Aware (Remix) — Ian Asher",
+    artwork: {
+      attachmentGuid: result.attachments[0]?.guid,
+      mimeType: "image/png",
+    },
+    appleMusic: {
+      storefront: "us",
+      resourceType: "song",
+      catalogId: "6771198463",
+      albumId: "6771198461",
+      songId: "6771198463",
+    },
+  });
+
+  const storedArtwork = store.getAttachment(result.attachments[0]!.guid);
+  assert.equal(storedArtwork?.response.mimeType, "image/png");
+  assert.ok(storedArtwork?.path);
+  assert.deepEqual(await readFile(storedArtwork.path), Buffer.from("art!"));
+});
+
 test("tapbacks use BlueBubbles associated message types", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-reaction-test-"));
   const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));

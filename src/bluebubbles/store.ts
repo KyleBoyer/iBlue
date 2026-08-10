@@ -4,13 +4,17 @@ import { basename, join, resolve, sep } from "node:path";
 import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
-import type { Conversation, IncomingMessage, IncomingSharedProfile } from "../types.js";
+import type {
+  Conversation,
+  IncomingAppBalloon,
+  IncomingMessage,
+  IncomingSharedProfile,
+} from "../types.js";
 import type {
   BlueBubblesAttachment,
   BlueBubblesChat,
   BlueBubblesHandle,
   BlueBubblesMessage,
-  BlueBubblesReaction,
   BlueBubblesScheduledMessage,
   BlueBubblesScheduledMessagePayload,
   BlueBubblesScheduledMessageSchedule,
@@ -18,6 +22,9 @@ import type {
   IBlueContact,
   IBlueContactSource,
   IBlueContactSummary,
+  IBluePoll,
+  IBluePollVote,
+  IBlueRichLink,
   IBlueSharedLocation,
   IBlueSharedLocationRecord,
 } from "./contracts.js";
@@ -32,6 +39,14 @@ import {
 } from "./guid.js";
 import { sharedLocationFromBalloon, sharedLocationFromMessageText } from "./location.js";
 import { messageFlairFromEffectId } from "./message-flair.js";
+import { pollFromBalloon, pollVoteUpdateFromBalloon } from "./polls.js";
+import {
+  decodeRichLink,
+  RICH_LINK_IMAGE_MIME,
+  RICH_LINK_METADATA_MIME,
+  richLinkArtworkFilename,
+  richLinkArtworkUti,
+} from "./rich-link.js";
 
 interface MessageRow {
   rowid: number;
@@ -527,7 +542,9 @@ export class BlueBubblesStore {
     isFromMe: boolean,
   ): BlueBubblesMessage {
     const associatedType = message.tapback
-      ? reactionName(message.tapback.type, message.tapback.remove)
+      ? pollVoteUpdateFromBalloon(message.appBalloon)
+        ? "poll-vote"
+        : reactionName(message.tapback.type, message.tapback.remove)
       : null;
     this.database
       .prepare(`
@@ -604,12 +621,14 @@ export class BlueBubblesStore {
     subject?: string;
     timestamp?: number;
     associatedGuid?: string;
-    associatedType?: BlueBubblesReaction;
+    associatedType?: string;
     replyGuid?: string;
     replyPart?: string;
     effect?: string;
     isVoice?: boolean;
     partCount?: number;
+    appBalloon?: IncomingAppBalloon;
+    pollParticipantHandle?: string;
   }): BlueBubblesMessage {
     const conversation = this.conversationForChat(params.chatGuid);
     if (!conversation) throw new Error(`chat does not exist: ${params.chatGuid}`);
@@ -638,6 +657,10 @@ export class BlueBubblesStore {
             ? { reply: { guid: params.replyGuid, part: params.replyPart ?? "0" } }
             : {}),
           ...(params.partCount === undefined ? {} : { partCount: params.partCount }),
+          ...(params.appBalloon ? { appBalloon: params.appBalloon } : {}),
+          ...(params.pollParticipantHandle
+            ? { pollParticipantHandle: params.pollParticipantHandle }
+            : {}),
         }),
       );
     const message = this.getMessage(params.guid);
@@ -815,6 +838,11 @@ export class BlueBubblesStore {
   getMessage(guid: string, includeChat = true): BlueBubblesMessage | undefined {
     const row = this.#messageByGuid.get(guid) as unknown as MessageRow | undefined;
     return row ? this.serializeMessage(row, includeChat) : undefined;
+  }
+
+  getPoll(messageGuid: string): IBluePoll | undefined {
+    const row = this.#messageByGuid.get(messageGuid) as unknown as MessageRow | undefined;
+    return row ? this.pollForRow(row) : undefined;
   }
 
   queryMessages(options: QueryOptions = {}): { messages: BlueBubblesMessage[]; total: number } {
@@ -1355,7 +1383,12 @@ export class BlueBubblesStore {
     const row = this.database.prepare("SELECT * FROM attachment WHERE guid = ?").get(guid) as
       | (AttachmentRow & { file_path: string | null })
       | undefined;
-    return row ? { response: this.serializeAttachment(row), path: row.file_path } : undefined;
+    return row
+      ? {
+        response: this.serializeAttachment(row, this.richLinkArtworkMimeType(row)),
+        path: row.file_path,
+      }
+      : undefined;
   }
 
   async deleteMessage(chatGuid: string, messageGuid: string): Promise<boolean> {
@@ -1637,6 +1670,7 @@ export class BlueBubblesStore {
       tempGuid?: string;
       partCount?: number;
       didNotifyRecipient?: boolean;
+      pollParticipantHandle?: string;
     };
     const attachments = this.#attachmentsByMessage
       .all(row.guid) as unknown as AttachmentRow[];
@@ -1647,6 +1681,43 @@ export class BlueBubblesStore {
     const audioTranscription = raw.attachments
       ?.map((attachment) => attachment.audioTranscription?.trim())
       .find((value): value is string => Boolean(value));
+    const poll = pollFromBalloon(raw.appBalloon) ? this.pollForRow(row) : undefined;
+    const parsedPollVote = pollVoteUpdateFromBalloon(raw.appBalloon);
+    const decodedRichLink = decodeRichLink(raw.attachments);
+    const richLinkArtworkRow = decodedRichLink?.artworkAttachmentIndex === undefined
+      ? undefined
+      : attachments[decodedRichLink.artworkAttachmentIndex];
+    const richLink = decodedRichLink
+      ? {
+        ...decodedRichLink.value,
+        ...(richLinkArtworkRow
+          ? {
+            artwork: {
+              attachmentGuid: richLinkArtworkRow.guid,
+              mimeType: decodedRichLink.artworkMimeType ?? richLinkArtworkRow.mime_type,
+            },
+          }
+          : {}),
+      } satisfies IBlueRichLink
+      : undefined;
+    const visibleAttachments = attachments.flatMap((attachment, index) => {
+      if (attachment.mime_type === RICH_LINK_METADATA_MIME) return [];
+      const artworkMimeType = index === decodedRichLink?.artworkAttachmentIndex
+        ? decodedRichLink.artworkMimeType
+        : undefined;
+      return [this.serializeAttachment(attachment, artworkMimeType)];
+    });
+    const pollParticipantHandle = typeof raw.pollParticipantHandle === "string"
+      ? stripTransport(raw.pollParticipantHandle)
+      : row.sender
+        ? stripTransport(row.sender)
+        : undefined;
+    const pollVote = parsedPollVote
+      ? {
+        ...parsedPollVote,
+        ...(pollParticipantHandle ? { participantHandle: pollParticipantHandle } : {}),
+      }
+      : undefined;
     const output: BlueBubblesMessage = {
       originalROWID: row.rowid,
       guid: row.guid,
@@ -1658,7 +1729,7 @@ export class BlueBubblesStore {
       otherHandle: raw.participantChange?.changedAddress
         ? stableInt(stripTransport(raw.participantChange.changedAddress).toLowerCase())
         : 0,
-      attachments: attachments.map((attachment) => this.serializeAttachment(attachment)),
+      attachments: visibleAttachments,
       subject: row.subject,
       country: null,
       error: row.error,
@@ -1687,7 +1758,8 @@ export class BlueBubblesStore {
       groupTitle: raw.groupName ?? null,
       groupActionType: raw.participantChange?.action === "remove" ? 1 : 0,
       isExpired: false,
-      balloonBundleId: raw.appBalloon?.bundleId ?? null,
+      balloonBundleId: raw.appBalloon?.bundleId
+        ?? (richLink ? "com.apple.messages.URLBalloonProvider" : null),
       associatedMessageGuid: row.associated_guid,
       associatedMessageType: row.associated_type
         ?? (raw.tapback ? reactionName(raw.tapback.type, raw.tapback.remove) : null),
@@ -1700,7 +1772,7 @@ export class BlueBubblesStore {
       threadOriginatorPart: raw.reply?.part ?? null,
       dateRetracted: row.date_retracted,
       dateEdited: row.date_edited,
-      partCount: raw.partCount ?? (1 + attachments.length),
+      partCount: raw.partCount ?? (1 + visibleAttachments.length),
       payloadData: null,
       hasPayloadData: false,
       wasDeliveredQuietly: false,
@@ -1719,6 +1791,9 @@ export class BlueBubblesStore {
         ...(audioTranscription
           ? { audioTranscription: { text: audioTranscription, source: "apple" } }
           : {}),
+        ...(richLink ? { richLink } : {}),
+        ...(poll ? { poll } : {}),
+        ...(pollVote ? { pollVote } : {}),
       },
     };
     if (raw.tempGuid) output.tempGuid = raw.tempGuid;
@@ -1727,6 +1802,50 @@ export class BlueBubblesStore {
       output.chats = chat ? [chat] : [];
     }
     return output;
+  }
+
+
+  private pollForRow(row: MessageRow): IBluePoll | undefined {
+    const raw = JSON.parse(row.raw_json) as Partial<IncomingMessage>;
+    const poll = pollFromBalloon(raw.appBalloon);
+    if (!poll) return undefined;
+
+    const allowedOptions = new Set(poll.options.map((option) => option.identifier));
+    const currentVotes = new Map<string, IBluePollVote[]>();
+    const voteRows = this.database.prepare(`
+      SELECT * FROM message
+      WHERE associated_guid = ?
+      ORDER BY date_created ASC, rowid ASC
+    `).all(row.guid) as unknown as MessageRow[];
+
+    for (const voteRow of voteRows) {
+      const voteRaw = JSON.parse(voteRow.raw_json) as Partial<IncomingMessage> & {
+        pollParticipantHandle?: string;
+      };
+      const update = pollVoteUpdateFromBalloon(voteRaw.appBalloon);
+      if (!update) continue;
+
+      const replacements = new Map<string, IBluePollVote[]>();
+      for (const vote of update.votes) {
+        if (!allowedOptions.has(vote.optionIdentifier)) continue;
+        const key = stripTransport(vote.participantHandle).toLowerCase();
+        const existing = replacements.get(key) ?? [];
+        existing.push({ ...vote, participantHandle: stripTransport(vote.participantHandle) });
+        replacements.set(key, existing);
+      }
+      if (replacements.size === 0) {
+        const participant = voteRaw.pollParticipantHandle ?? voteRow.sender;
+        if (participant) replacements.set(stripTransport(participant).toLowerCase(), []);
+      }
+      for (const [participant, votes] of replacements) currentVotes.set(participant, votes);
+    }
+
+    const optionOrder = new Map(poll.options.map((option, index) => [option.identifier, index]));
+    const votes = [...currentVotes.values()].flat().sort((left, right) =>
+      (optionOrder.get(left.optionIdentifier) ?? Number.MAX_SAFE_INTEGER)
+        - (optionOrder.get(right.optionIdentifier) ?? Number.MAX_SAFE_INTEGER)
+      || left.participantHandle.localeCompare(right.participantHandle));
+    return { ...poll, votes };
   }
 
   private serializeScheduledMessage(row: ScheduledMessageRow): BlueBubblesScheduledMessage {
@@ -1875,21 +1994,35 @@ export class BlueBubblesStore {
     };
   }
 
-  private serializeAttachment(row: AttachmentRow): BlueBubblesAttachment {
+  private serializeAttachment(row: AttachmentRow, richLinkMimeType?: string): BlueBubblesAttachment {
+    const isRichLinkArtwork = Boolean(richLinkMimeType);
     return {
       originalROWID: row.rowid,
       guid: row.guid,
-      uti: row.uti,
-      mimeType: row.mime_type,
+      uti: isRichLinkArtwork ? richLinkArtworkUti(richLinkMimeType!) : row.uti,
+      mimeType: richLinkMimeType ?? row.mime_type,
       transferState: row.file_path ? 5 : 1,
       totalBytes: row.total_bytes,
       isOutgoing: Boolean(row.is_outgoing),
-      transferName: row.transfer_name,
+      transferName: isRichLinkArtwork ? richLinkArtworkFilename(richLinkMimeType!) : row.transfer_name,
       isSticker: Boolean(row.is_sticker),
       hideAttachment: false,
       originalGuid: row.guid,
       hasLivePhoto: Boolean(row.has_live_photo),
+      ...(isRichLinkArtwork ? { metadata: { iBlueRichLinkArtwork: true } } : {}),
     };
+  }
+
+  private richLinkArtworkMimeType(row: AttachmentRow): string | undefined {
+    if (row.mime_type !== RICH_LINK_IMAGE_MIME) return undefined;
+    const messageRow = this.#messageByGuid.get(row.message_guid) as unknown as MessageRow | undefined;
+    if (!messageRow) return undefined;
+    const raw = JSON.parse(messageRow.raw_json) as Partial<IncomingMessage>;
+    const decoded = decodeRichLink(raw.attachments);
+    if (decoded?.artworkAttachmentIndex === undefined) return undefined;
+    const rows = this.#attachmentsByMessage.all(row.message_guid) as unknown as AttachmentRow[];
+    if (rows[decoded.artworkAttachmentIndex]?.guid !== row.guid) return undefined;
+    return decoded.artworkMimeType;
   }
 }
 

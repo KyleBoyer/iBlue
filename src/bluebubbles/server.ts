@@ -398,6 +398,34 @@ export class BlueBubblesServer {
         count: MESSAGE_FLAIRS.length,
       }));
 
+    this.app.get<{ Params: { messageGuid: string } }>(
+      "/api/v1/iblue/poll/:messageGuid",
+      async (request, reply) => {
+        const poll = this.service.store.getPoll(request.params.messageGuid);
+        if (!poll) return reply.code(404).send(notFound("Poll not found!"));
+        return success(poll, "Successfully fetched poll!");
+      },
+    );
+    this.app.post<{ Params: { messageGuid: string } }>(
+      "/api/v1/iblue/poll/:messageGuid/vote",
+      async (request) => {
+        const body = asRecord(request.body);
+        if (!Array.isArray(body.optionIdentifiers)
+          || body.optionIdentifiers.some((value) => typeof value !== "string")) {
+          throw new RequestError(
+            400,
+            "optionIdentifiers must be an array of poll option identifier strings",
+            "VALIDATION_ERROR",
+          );
+        }
+        const result = await this.service.sendPollVote({
+          messageGuid: request.params.messageGuid,
+          optionIdentifiers: body.optionIdentifiers,
+        });
+        return success(result, "Poll vote sent!");
+      },
+    );
+
     this.app.post("/api/v1/iblue/location/query", async (request) => {
       const body = asRecord(request.body);
       const offset = numberValue(body.offset, 0);
@@ -1478,6 +1506,8 @@ export class BlueBubblesServer {
           sharedLocations: "/api/v1/iblue/location/query",
           liveSharedLocations: "/api/v1/iblue/location/live",
           messageFlair: "/api/v1/iblue/message/flair",
+          polls: "/api/v1/iblue/poll/:messageGuid",
+          richLinks: "message.iBlue.richLink",
         },
       },
     };

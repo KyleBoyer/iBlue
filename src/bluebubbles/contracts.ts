@@ -65,6 +65,61 @@ export interface IBlueAudioTranscription {
   source: "apple";
 }
 
+export interface IBlueAppleMusicLink {
+  storefront: string;
+  resourceType: "song" | "album" | "playlist" | "artist" | "music-video" | "unknown";
+  catalogId: string;
+  albumId?: string;
+  songId?: string;
+}
+
+export interface IBlueRichLink {
+  provider: "apple-music" | "generic";
+  originalUrl: string;
+  url?: string;
+  title?: string;
+  summary?: string;
+  artwork?: {
+    attachmentGuid: string;
+    mimeType: string;
+  };
+  appleMusic?: IBlueAppleMusicLink;
+}
+
+export interface IBluePollOption {
+  identifier: string;
+  text: string;
+  attributedText?: string;
+  creatorHandle?: string;
+  canBeEdited?: boolean;
+}
+
+export interface IBluePollVote {
+  optionIdentifier: string;
+  participantHandle: string;
+  /** Apple's server vote timestamp, preserved in its original numeric scale. */
+  serverVoteTime?: number;
+}
+
+export interface IBluePoll {
+  version: number;
+  title: string;
+  creatorHandle?: string;
+  options: IBluePollOption[];
+  votes: IBluePollVote[];
+  sessionId?: string;
+  bundleId?: string;
+}
+
+export interface IBluePollVoteUpdate {
+  version: number;
+  votes: IBluePollVote[];
+  /** Participant whose complete selection set this event replaces. */
+  participantHandle?: string;
+  sessionId?: string;
+  bundleId?: string;
+}
+
 export interface IBlueLiveLocation {
   source: "find-my";
   followId: string;
@@ -199,6 +254,9 @@ export interface BlueBubblesMessage {
     sharedLocation?: IBlueSharedLocation;
     messageFlair?: IBlueMessageFlair;
     audioTranscription?: IBlueAudioTranscription;
+    richLink?: IBlueRichLink;
+    poll?: IBluePoll;
+    pollVote?: IBluePollVoteUpdate;
   };
 }
 

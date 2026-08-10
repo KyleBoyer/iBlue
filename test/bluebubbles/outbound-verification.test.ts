@@ -19,6 +19,7 @@ import type {
   SendAttachmentParams,
   SendMessageParams,
   SendReactionParams,
+  SendPollVoteParams,
   SendReadReceiptParams,
   SendTypingParams,
 } from "../../src/types.js";
@@ -40,6 +41,7 @@ const snapshot: EngineSnapshot = {
 class VerificationEngine extends EventEmitter {
   readonly messages: SendMessageParams[] = [];
   readonly reactions: SendReactionParams[] = [];
+  readonly pollVotes: SendPollVoteParams[] = [];
   readonly typing: SendTypingParams[] = [];
   readonly reads: SendReadReceiptParams[] = [];
   readonly attachments: Array<{ params: SendAttachmentParams; data: Buffer }> = [];
@@ -69,6 +71,11 @@ class VerificationEngine extends EventEmitter {
   sendReaction(params: SendReactionParams): Promise<{ guid: string }> {
     this.reactions.push(params);
     return Promise.resolve(this.accept(`reaction-${this.#nextGuid++}`));
+  }
+
+  sendPollVote(params: SendPollVoteParams): Promise<{ guid: string }> {
+    this.pollVotes.push(params);
+    return Promise.resolve(this.accept(`poll-vote-${this.#nextGuid++}`));
   }
 
   async sendAttachment(params: SendAttachmentParams): Promise<{ guid: string }> {

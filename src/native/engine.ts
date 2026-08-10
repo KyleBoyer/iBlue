@@ -20,6 +20,7 @@ import type {
   SendNotifyParams,
   SendReadReceiptParams,
   SendReactionParams,
+  SendPollVoteParams,
   SendTypingParams,
   SendUnsendParams,
   ValidateHandlesParams,
@@ -50,6 +51,7 @@ export interface IMessageEngine {
   refreshFindMyFollowing?(address?: string, findMyIds?: string[]): Promise<NativeFindMyFollow[]>;
   sendMessage(params: SendMessageParams): Promise<{ guid: string }>;
   sendReaction(params: SendReactionParams): Promise<{ guid: string }>;
+  sendPollVote(params: SendPollVoteParams): Promise<{ guid: string }>;
   sendAttachment(params: SendAttachmentParams): Promise<{ guid: string }>;
   sendMultipartMessage(params: SendMultipartMessageParams): Promise<{ guid: string }>;
   renameGroup(params: SendGroupRenameParams): Promise<{ guid: string }>;
@@ -150,6 +152,10 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
 
   sendReaction(params: SendReactionParams): Promise<{ guid: string }> {
     return this.rpc.request("reaction.send", params);
+  }
+
+  sendPollVote(params: SendPollVoteParams): Promise<{ guid: string }> {
+    return this.rpc.request("poll.vote", params);
   }
 
   sendAttachment(params: SendAttachmentParams): Promise<{ guid: string }> {

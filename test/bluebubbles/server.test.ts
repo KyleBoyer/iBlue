@@ -31,6 +31,7 @@ import type {
   SendNotifyParams,
   SendReadReceiptParams,
   SendReactionParams,
+  SendPollVoteParams,
   SendTypingParams,
   SendUnsendParams,
   ValidateHandlesParams,
@@ -66,6 +67,7 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   currentSnapshot: EngineSnapshot = { ...snapshot, handles: [...snapshot.handles] };
   readonly messages: SendMessageParams[] = [];
   readonly reactions: SendReactionParams[] = [];
+  readonly pollVotes: SendPollVoteParams[] = [];
   readonly attachments: Array<{ params: SendAttachmentParams; data: Buffer }> = [];
   readonly multiparts: Array<{ params: SendMultipartMessageParams; data: Buffer[] }> = [];
   readonly groupRenames: SendGroupRenameParams[] = [];
@@ -142,6 +144,10 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   sendReaction(params: SendReactionParams): Promise<{ guid: string }> {
     this.reactions.push(params);
     return Promise.resolve({ guid: "reaction-guid" });
+  }
+  sendPollVote(params: SendPollVoteParams): Promise<{ guid: string }> {
+    this.pollVotes.push(params);
+    return Promise.resolve({ guid: "poll-vote-guid" });
   }
   async sendAttachment(params: SendAttachmentParams): Promise<{ guid: string }> {
     this.attachments.push({ params, data: await readFile(params.path) });
@@ -749,7 +755,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
         idsMode: string;
         version: string;
         blueBubblesCompatibility: string;
-        extensions: { messageFlair: string };
+        extensions: { messageFlair: string; polls: string; richLinks: string };
       };
     };
   };
@@ -771,6 +777,8 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(infoBody.data.iBlue.version, "0.1.0");
   assert.equal(infoBody.data.iBlue.blueBubblesCompatibility, infoBody.data.server_version);
   assert.equal(infoBody.data.iBlue.extensions.messageFlair, "/api/v1/iblue/message/flair");
+  assert.equal(infoBody.data.iBlue.extensions.polls, "/api/v1/iblue/poll/:messageGuid");
+  assert.equal(infoBody.data.iBlue.extensions.richLinks, "message.iBlue.richLink");
 
   const flairCatalog = await fetch(`${listening.address}/api/v1/iblue/message/flair?password=secret`);
   const flairCatalogBody = await flairCatalog.json() as {
@@ -1196,6 +1204,109 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
 
   const count = await fetch(`${listening.address}/api/v1/message/count?password=secret`);
   assert.deepEqual(await count.json(), { status: 200, message: "Success", data: { total: 3 } });
+
+  const pollSessionId = "cba9de14-dd9a-45c5-bb63-989e6e32c538";
+  const pollBundleId =
+    "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls";
+  const pollUrl = (item: unknown): string =>
+    `data:,${Buffer.from(JSON.stringify({ version: 1, item })).toString("base64")}`;
+  const pollEvent = serviceEvent(service, "new-message");
+  engine.emit("message.received", {
+    uuid: "api-poll-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 4_500,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    appBalloon: {
+      bundleId: pollBundleId,
+      appName: "Polls",
+      sessionId: pollSessionId,
+      url: pollUrl({
+        creatorHandle: "friend@example.com",
+        title: "Lunch?",
+        orderedPollOptions: [
+          { optionIdentifier: "OPTION-1", text: "Tacos" },
+          { optionIdentifier: "OPTION-2", text: "Pizza" },
+        ],
+      }),
+      isLive: true,
+    },
+  });
+  await pollEvent;
+  const firstVoteEvent = serviceEvent(service, "new-message");
+  engine.emit("message.received", {
+    uuid: "api-poll-friend-vote-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffd",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 4_501,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    tapback: { type: 7, targetUuid: "api-poll-guid", remove: false },
+    appBalloon: {
+      bundleId: pollBundleId,
+      appName: "Polls",
+      sessionId: pollSessionId,
+      url: pollUrl({
+        votes: [
+          { voteOptionIdentifier: "OPTION-1", participantHandle: "friend@example.com" },
+          { voteOptionIdentifier: "OPTION-2", participantHandle: "friend@example.com" },
+        ],
+      }),
+      isLive: false,
+    },
+  });
+  const receivedVote = await firstVoteEvent as {
+    associatedMessageType: string;
+    iBlue: { pollVote: { participantHandle: string; votes: unknown[] } };
+  };
+  assert.equal(receivedVote.associatedMessageType, "poll-vote");
+  assert.equal(receivedVote.iBlue.pollVote.participantHandle, "friend@example.com");
+  assert.equal(receivedVote.iBlue.pollVote.votes.length, 2);
+
+  const fetchedPoll = await fetch(
+    `${listening.address}/api/v1/iblue/poll/api-poll-guid?password=secret`,
+  );
+  const fetchedPollBody = await fetchedPoll.json() as {
+    data: { votes: Array<{ optionIdentifier: string; participantHandle: string }> };
+  };
+  assert.deepEqual(fetchedPollBody.data.votes, [
+    { optionIdentifier: "OPTION-1", participantHandle: "friend@example.com" },
+    { optionIdentifier: "OPTION-2", participantHandle: "friend@example.com" },
+  ]);
+
+  const jadeVote = await fetch(
+    `${listening.address}/api/v1/iblue/poll/api-poll-guid/vote?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ optionIdentifiers: ["OPTION-2"] }),
+    },
+  );
+  assert.equal(jadeVote.status, 200);
+  assert.equal(engine.pollVotes.at(-1)?.from, "mailto:secondary@example.com");
+  assert.equal(engine.pollVotes.at(-1)?.targetUuid, "api-poll-guid");
+  assert.deepEqual(JSON.parse(engine.pollVotes.at(-1)?.pollResponseJson ?? "{}"), {
+    item: {
+      votes: [{
+        voteOptionIdentifier: "OPTION-2",
+        participantHandle: "secondary@example.com",
+      }],
+    },
+    version: 1,
+  });
+  const jadeVoteBody = await jadeVote.json() as {
+    data: { poll: { votes: Array<{ optionIdentifier: string; participantHandle: string }> } };
+  };
+  assert.deepEqual(jadeVoteBody.data.poll.votes, [
+    { optionIdentifier: "OPTION-1", participantHandle: "friend@example.com" },
+    { optionIdentifier: "OPTION-2", participantHandle: "friend@example.com" },
+    { optionIdentifier: "OPTION-2", participantHandle: "secondary@example.com" },
+  ]);
 
   const directAttachment = new FormData();
   // Match the BlueBubbles app's field order: the file is added before the

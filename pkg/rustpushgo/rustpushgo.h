@@ -495,6 +495,16 @@ void* uniffi_rustpushgo_fn_method_client_send_permanent_delete_messages(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_poll_vote(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer target_uuid,
+	RustBuffer session_id,
+	RustBuffer poll_response_json,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_read_receipt(
 	void* ptr,
 	RustBuffer conversation,
@@ -1903,6 +1913,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_permanent_delete_chat(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_send_permanent_delete_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_poll_vote(
 	RustCallStatus* out_status
 );
 

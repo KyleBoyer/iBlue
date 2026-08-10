@@ -80,7 +80,7 @@ The full official 1.9.9 webhook-picker vocabulary is accepted, including
 optional server-update, Find My, FaceTime, and backup events. Accepting a
 subscription does not claim that an unsupported subsystem will emit it.
 
-## Additive iBlue contact, location, message-flair, and audio metadata API
+## Additive iBlue contact, location, poll, rich-link, message-flair, and audio metadata API
 
 iBlue exposes normalized data that is useful to non-stock clients without
 changing the pinned BlueBubbles contract. Every route uses the same
@@ -97,13 +97,24 @@ the rest of `/api/v1`:
 | `GET` | `/api/v1/iblue/location/live?address=...` | Refresh Find My and return the current position for active location shares, optionally filtered to one phone number or email address. |
 | `GET` | `/api/v1/iblue/location/:messageGuid` | Fetch the normalized snapshot or pin associated with one message. |
 | `GET` | `/api/v1/iblue/message/flair` | List friendly message-flair names, display labels, categories, and their exact Apple effect identifiers. |
+| `GET` | `/api/v1/iblue/poll/:messageGuid` | Fetch an Apple Messages poll definition plus its aggregated current votes. |
+| `POST` | `/api/v1/iblue/poll/:messageGuid/vote` | Replace the sending profile's complete selection set using `{optionIdentifiers: string[]}`; an empty array clears its votes. |
 
 Handles gain an optional `iBlue.contact` summary. Messages gain optional
-`iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`, and
-`iBlue.audioTranscription` properties; Maps extension
+`iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`,
+`iBlue.audioTranscription`, `iBlue.richLink`, `iBlue.poll`, and `iBlue.pollVote` properties; Maps extension
 messages also expose their real bundle identifier through BlueBubbles'
 existing `balloonBundleId` field. An incoming iMessage Name & Photo Sharing
 update emits the additive `iblue-contact-updated` Socket.IO/webhook event.
+
+Apple URL previews expose their URL, title, summary, and artwork reference as
+`iBlue.richLink`. Apple Music links additionally expose the storefront,
+resource type, catalog identifier, and album/song identifiers when present.
+The internal `x-richlink/meta` transport record is not returned as a user
+attachment. Preview artwork remains a normal authenticated attachment with its
+real image MIME type and an `iBlueRichLinkArtwork` metadata marker, so callers
+can download the exact bytes Apple sent. REST, Socket.IO, and webhook message
+objects share this representation.
 
 `iBlue.messageFlair` normalizes Apple's opaque `expressiveSendStyleId` into
 `name`, `displayName`, and `category` (`bubble` or `screen`) while retaining the
@@ -122,6 +133,14 @@ or synthesize a transcript. The original audio remains a normal BlueBubbles
 attachment and is available from the authenticated attachment download route.
 The same message object is used by REST queries, Socket.IO, and webhooks, so
 those surfaces expose the Apple-provided transcript consistently.
+
+Apple Messages Polls (“Choice” messages) are multi-select. The base message's
+`iBlue.poll.options` retains Apple's stable option identifiers, and
+`iBlue.poll.votes` aggregates the latest complete selection set sent by each
+participant. Each acknowledgement message also exposes its raw normalized set
+as `iBlue.pollVote`. Voting sends Apple Polls' extension acknowledgement rather
+than a tapback; callers submit the entire desired option-identifier set so add,
+remove, multi-select, and clear operations are deterministic.
 
 The profile VCF has priority over a peer's shared name. An avatar may fall
 back to Name & Photo Sharing when the matching VCF entry has no photo. Shared

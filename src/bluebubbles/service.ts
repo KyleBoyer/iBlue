@@ -19,6 +19,7 @@ import type {
   BlueBubblesMessage,
   BlueBubblesReaction,
   IBlueLiveLocation,
+  IBluePoll,
 } from "./contracts.js";
 import { contactAddressKey } from "./contact.js";
 import {
@@ -32,6 +33,7 @@ import {
 } from "./guid.js";
 import { BlueBubblesScheduler } from "./scheduler.js";
 import { BlueBubblesStore, type QueryOptions } from "./store.js";
+import { encodePollVote } from "./polls.js";
 
 export interface BlueBubblesEvent {
   type: string;
@@ -275,6 +277,54 @@ export class BlueBubblesService extends EventEmitter {
     }
     this.scheduleSnapshot();
     return message;
+  }
+
+  async sendPollVote(body: {
+    messageGuid: string;
+    optionIdentifiers: readonly string[];
+  }): Promise<{ message: BlueBubblesMessage; poll: IBluePoll }> {
+    this.requireOutboundIds("vote in a poll");
+    const target = this.store.getMessage(body.messageGuid);
+    if (!target) throw new Error("Poll message does not exist!");
+    const poll = this.store.getPoll(body.messageGuid);
+    if (!poll) throw new Error("Selected message is not an Apple Messages poll!");
+    if (!poll.sessionId) throw new Error("Poll message does not include a session ID!");
+    const chatGuid = target.cacheRoomnames;
+    if (!chatGuid) throw new Error("Poll message is not associated with a chat!");
+    const from = this.handles[0];
+    if (!from) throw new Error("The account has no registered sending handle!");
+
+    const optionIdentifiers = [...new Set(body.optionIdentifiers)];
+    const validOptions = new Set(poll.options.map((option) => option.identifier));
+    const invalid = optionIdentifiers.find((identifier) => !validOptions.has(identifier));
+    if (invalid) throw new Error(`Unknown poll option identifier: ${invalid}`);
+
+    const participantHandle = stripTransport(from);
+    const encoded = encodePollVote(poll.sessionId, participantHandle, optionIdentifiers);
+    const result = await this.engine.sendPollVote({
+      conversation: this.resolveConversation(chatGuid),
+      targetUuid: body.messageGuid,
+      sessionId: poll.sessionId,
+      pollResponseJson: encoded.json,
+      from,
+    });
+    this.#beginOutgoingAnnouncement(result.guid);
+    let message: BlueBubblesMessage;
+    try {
+      message = this.store.insertOutgoing({
+        guid: result.guid,
+        chatGuid,
+        associatedGuid: body.messageGuid,
+        associatedType: "poll-vote",
+        appBalloon: encoded.balloon,
+        pollParticipantHandle: participantHandle,
+      });
+      this.#publishOutgoing(result.guid, "new-message", message);
+    } finally {
+      this.#finishOutgoingAnnouncement(result.guid);
+    }
+    this.scheduleSnapshot();
+    return { message, poll: this.store.getPoll(body.messageGuid) ?? poll };
   }
 
   async sendAttachment(

@@ -17,10 +17,10 @@ use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore
 use log::{debug, error, info, warn};
 use rustpush::{
     authenticate_apple, deregister as deregister_ids, login_apple_delegates, register, APSConnectionResource,
-    APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
+    APSState, Attachment, AttachmentType, Balloon, ConversationData, DeleteTarget, EditMessage,
     IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
-    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+    ExtensionApp, OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
     ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL,
     TextFlags, TextFormat, TextEffect,
@@ -3213,6 +3213,44 @@ fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<S
     (tapback_type, emoji, !enable)
 }
 
+/// Lift an iMessage app extension and its balloon metadata onto the flat
+/// UniFFI message record. App reactions use the same extension payload as
+/// regular balloon messages (for example, Apple Polls votes), so both receive
+/// paths must preserve it for API consumers.
+fn populate_app_balloon(w: &mut WrappedMessage, app: &rustpush::ExtensionApp) {
+    w.app_balloon_bundle_id = Some(app.bundle_id.clone());
+    w.app_balloon_app_name = Some(app.name.clone());
+    let Some(balloon) = &app.balloon else { return };
+
+    w.app_balloon_url = Some(balloon.url.clone());
+    w.app_balloon_session_id = balloon.session.clone();
+    w.app_balloon_is_live = balloon.is_live;
+    w.app_balloon_ld_text = balloon.ld_text.clone();
+    if let Some(rustpush::BalloonLayout::TemplateLayout {
+        image_subtitle,
+        image_title,
+        caption,
+        secondary_subcaption,
+        tertiary_subcaption,
+        subcaption,
+        ..
+    }) = &balloon.layout
+    {
+        w.app_balloon_image_subtitle = Some(image_subtitle.clone());
+        w.app_balloon_image_title = Some(image_title.clone());
+        w.app_balloon_caption = Some(caption.clone());
+        w.app_balloon_secondary_subcaption = Some(secondary_subcaption.clone());
+        w.app_balloon_tertiary_subcaption = Some(tertiary_subcaption.clone());
+        w.app_balloon_subcaption = Some(subcaption.clone());
+    }
+    if let Some(icon_data) = &balloon.icon {
+        if !icon_data.is_empty() {
+            w.sticker_data = Some(icon_data.clone());
+            w.sticker_mime = Some("image/png".to_string());
+        }
+    }
+}
+
 fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
     match target {
         DeleteTarget::Chat(chat) => {
@@ -4765,37 +4803,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             // Sticker data from extension balloons (icon field)
             if let Some(ref app) = normal.app {
-                w.app_balloon_bundle_id = Some(app.bundle_id.clone());
-                w.app_balloon_app_name = Some(app.name.clone());
-                if let Some(ref balloon) = app.balloon {
-                    w.app_balloon_url = Some(balloon.url.clone());
-                    w.app_balloon_session_id = balloon.session.clone();
-                    w.app_balloon_is_live = balloon.is_live;
-                    w.app_balloon_ld_text = balloon.ld_text.clone();
-                    if let Some(rustpush::BalloonLayout::TemplateLayout {
-                        image_subtitle,
-                        image_title,
-                        caption,
-                        secondary_subcaption,
-                        tertiary_subcaption,
-                        subcaption,
-                        ..
-                    }) = &balloon.layout
-                    {
-                        w.app_balloon_image_subtitle = Some(image_subtitle.clone());
-                        w.app_balloon_image_title = Some(image_title.clone());
-                        w.app_balloon_caption = Some(caption.clone());
-                        w.app_balloon_secondary_subcaption = Some(secondary_subcaption.clone());
-                        w.app_balloon_tertiary_subcaption = Some(tertiary_subcaption.clone());
-                        w.app_balloon_subcaption = Some(subcaption.clone());
-                    }
-                    if let Some(ref icon_data) = balloon.icon {
-                        if !icon_data.is_empty() {
-                            w.sticker_data = Some(icon_data.clone());
-                            w.sticker_mime = Some("image/png".to_string());
-                        }
-                    }
-                }
+                populate_app_balloon(&mut w, app);
             }
         }
         Message::React(react) => {
@@ -4813,8 +4821,11 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     }
                 }
                 ReactMessageType::Extension { spec, body, .. } => {
-                    // Extension reactions (stickers etc.) — mark as tapback
+                    // Extension reactions include custom acknowledgements such
+                    // as Apple Polls votes. Preserve their live balloon URL so
+                    // callers can decode the acknowledgement payload.
                     w.tapback_type = Some(7);
+                    populate_app_balloon(&mut w, spec);
                     let sticker = spec.bundle_id.to_ascii_lowercase().contains("sticker");
                     append_wrapped_attachments(&mut w, body, sticker);
                 }
@@ -9641,9 +9652,9 @@ mod reply_target_tests {
     use super::{
         inline_relay_attachment, leave_group_participants, message_inst_to_wrapped,
         mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target, Attachment,
-        AttachmentType, ConversationData, IndexedMessagePart, Message, MessageInst, MessagePart,
-        MessageParts, MessageType, NormalMessage, PartExtension, ReactMessage, ReactMessageType,
-        Reaction, WrappedConversation,
+        AttachmentType, Balloon, ConversationData, ExtensionApp, IndexedMessagePart, Message,
+        MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, PartExtension,
+        ReactMessage, ReactMessageType, Reaction, WrappedConversation,
     };
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
@@ -9696,6 +9707,55 @@ mod reply_target_tests {
         let wrapped = message_inst_to_wrapped(&message);
         assert!(wrapped.is_typing);
         assert_eq!(wrapped.typing_active, Some(false));
+    }
+
+    #[test]
+    fn extension_reactions_preserve_poll_balloon_metadata() {
+        let message = MessageInst::new(
+            ConversationData {
+                participants: vec!["tel:+15555550101".to_string()],
+                cv_name: None,
+                sender_guid: None,
+                after_guid: None,
+            },
+            "mailto:self@example.com",
+            Message::React(ReactMessage {
+                to_uuid: "poll-guid".to_string(),
+                to_part: None,
+                reaction: ReactMessageType::Extension {
+                    spec: ExtensionApp {
+                        name: "Polls".to_string(),
+                        app_id: None,
+                        bundle_id: "com.apple.messages.Polls".to_string(),
+                        balloon: Some(Balloon {
+                            url: "data:,eyJpdGVtIjp7InZvdGVzIjpbXX19".to_string(),
+                            session: Some("cba9de14-dd9a-45c5-bb63-989e6e32c538".to_string()),
+                            layout: None,
+                            ld_text: None,
+                            is_live: false,
+                            icon: None,
+                        }),
+                    },
+                    body: MessageParts(vec![]),
+                    is_meta: true,
+                },
+                to_text: String::new(),
+                embedded_profile: None,
+            }),
+        );
+        let wrapped = message_inst_to_wrapped(&message);
+        assert!(wrapped.is_tapback);
+        assert_eq!(wrapped.tapback_target_uuid.as_deref(), Some("poll-guid"));
+        assert_eq!(wrapped.tapback_type, Some(7));
+        assert_eq!(wrapped.app_balloon_bundle_id.as_deref(), Some("com.apple.messages.Polls"));
+        assert_eq!(
+            wrapped.app_balloon_session_id.as_deref(),
+            Some("cba9de14-dd9a-45c5-bb63-989e6e32c538"),
+        );
+        assert_eq!(
+            wrapped.app_balloon_url.as_deref(),
+            Some("data:,eyJpdGVtIjp7InZvdGVzIjpbXX19"),
+        );
     }
 
     #[test]
@@ -11568,6 +11628,73 @@ impl Client {
         );
         self.send_with_flap_retry(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send tapback: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Send the current Apple Messages Polls selection set for one
+    /// participant. Poll votes are extension acknowledgements (amt=4000), not
+    /// ordinary tapbacks: the balloon contains the complete current set of
+    /// selected option identifiers for the sending handle.
+    pub async fn send_poll_vote(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        session_id: String,
+        poll_response_json: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        uuid::Uuid::parse_str(&session_id).map_err(|error| WrappedError::GenericError {
+            msg: format!("Invalid poll session ID: {error}"),
+        })?;
+        let envelope: serde_json::Value = serde_json::from_str(&poll_response_json)
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Invalid poll response JSON: {error}"),
+            })?;
+        if !envelope.get("item")
+            .and_then(|item| item.get("votes"))
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(WrappedError::GenericError {
+                msg: "Poll response JSON must contain item.votes".to_string(),
+            });
+        }
+
+        let conv: ConversationData = (&conversation).into();
+        let encoded = BASE64_STANDARD.encode(poll_response_json.as_bytes());
+        let spec = ExtensionApp {
+            name: "Polls".to_string(),
+            app_id: None,
+            bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls"
+                .to_string(),
+            balloon: Some(Balloon {
+                url: format!("data:,{encoded}"),
+                session: Some(session_id),
+                layout: None,
+                ld_text: None,
+                is_live: false,
+                icon: None,
+            }),
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::React(ReactMessage {
+                to_uuid: target_uuid,
+                to_part: None,
+                reaction: ReactMessageType::Extension {
+                    spec,
+                    body: MessageParts(vec![]),
+                    is_meta: true,
+                },
+                to_text: String::new(),
+                embedded_profile: None,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to send poll vote: {error}"),
+            })?;
         Ok(msg.id.clone())
     }
 

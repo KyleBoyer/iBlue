@@ -1039,6 +1039,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_poll_vote(uniffiStatus)
+		})
+		if checksum != 1384 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_poll_vote: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_send_read_receipt(uniffiStatus)
 		})
 		if checksum != 40114 {
@@ -3794,6 +3803,31 @@ func (_self *Client) SendPermanentDeleteMessages(conversation WrappedConversatio
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_permanent_delete_messages(
 				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(messageUuids)), FfiConverterBoolINSTANCE.Lower(isScheduled), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendPollVote(conversation WrappedConversation, targetUuid string, sessionId string, pollResponseJson string, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_poll_vote(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(targetUuid)), rustBufferToC(FfiConverterStringINSTANCE.Lower(sessionId)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pollResponseJson)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
 				status,
 			))
 		},

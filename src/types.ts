@@ -155,6 +155,14 @@ export interface SendReactionParams {
   from?: string;
 }
 
+export interface SendPollVoteParams {
+  conversation: Conversation;
+  targetUuid: string;
+  sessionId: string;
+  pollResponseJson: string;
+  from?: string;
+}
+
 export interface SendAttachmentParams {
   conversation: Conversation;
   path: string;
