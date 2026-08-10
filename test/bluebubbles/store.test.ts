@@ -117,6 +117,7 @@ test("incoming IDS messages serialize to stable BlueBubbles payloads", async (t)
     timestampMs: 1_725_000_000_000,
     isSms: false,
     isStoredMessage: false,
+    effect: "com.apple.messages.effect.CKConfettiEffect",
     attachments: [
       {
         mimeType: "image/png",
@@ -136,6 +137,14 @@ test("incoming IDS messages serialize to stable BlueBubbles payloads", async (t)
   assert.equal(result.isFromMe, false);
   assert.equal(result.chats?.[0]?.guid, "iMessage;-;friend@example.com");
   assert.equal(result.attachments[0]?.mimeType, "image/png");
+  assert.equal(result.expressiveSendStyleId, "com.apple.messages.effect.CKConfettiEffect");
+  assert.deepEqual(result.iBlue?.messageFlair, {
+    name: "confetti",
+    displayName: "Confetti",
+    category: "screen",
+    effectId: "com.apple.messages.effect.CKConfettiEffect",
+    known: true,
+  });
 
   const attachment = store.getAttachment(result.attachments[0]!.guid);
   assert.ok(attachment?.path);
@@ -144,6 +153,39 @@ test("incoming IDS messages serialize to stable BlueBubbles payloads", async (t)
   const queried = store.queryMessages({ chatGuid: "iMessage;-;friend@example.com" });
   assert.equal(queried.total, 1);
   assert.equal(queried.messages[0]?.originalROWID, result.originalROWID);
+});
+
+test("Apple-provided audio transcriptions are exposed without synthesizing text", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-audio-transcription-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const result = await store.ingestIncoming({
+    uuid: "audio-transcription-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: Date.now(),
+    isSms: false,
+    isStoredMessage: false,
+    isVoice: true,
+    attachments: [{
+      mimeType: "application/octet-stream",
+      filename: "Audio Message.caf",
+      utiType: "com.apple.coreaudio-format",
+      size: 3,
+      isInline: true,
+      dataBase64: Buffer.from([1, 2, 3]).toString("base64"),
+      iris: false,
+      audioTranscription: "  Meet at five  ",
+    }],
+  }, []);
+
+  assert.equal(result.isAudioMessage, true);
+  assert.equal(result.text, "\ufffc");
+  assert.deepEqual(result.iBlue?.audioTranscription, {
+    text: "Meet at five",
+    source: "apple",
+  });
 });
 
 test("tapbacks use BlueBubbles associated message types", async (t) => {

@@ -500,11 +500,22 @@ Messages.app on a separate, previously trusted Apple device also cannot stay
 signed in or send, use Apple's iMessage activation/support workflow before
 making another iBlue registration attempt.
 
-Apple's official activation workflow subsequently emailed on 2026-08-03 that
+Apple’s official activation workflow subsequently emailed on 2026-08-03 that
 the secondary Apple Account was ready for iMessage. iBlue therefore preserves
 the working device registration and cooldown rather than re-authenticating; the
-post-cooldown strict canary remains the test of whether Apple's device-specific
+post-cooldown strict canary remains the test of whether Apple’s device-specific
 directory response has changed.
+
+On 2026-08-10 that preserved registration successfully sent a live confetti
+message through the BlueBubbles REST adapter. Apple returned a delivery control
+for the same GUID, superseding the earlier empty-directory observation for text
+sends while leaving the guarded one-shot verification policy in place for the
+other outbound operations.
+
+The same live session received a CAF audio message and preserved Apple's
+sender-side transcription beside the downloadable raw attachment. It also sent
+an M4A through the BlueBubbles attachment route with the audio-message flag;
+the peer rendered it as audio and Apple returned a correlated delivery control.
 
 If that canary is still empty, it extends the quiet period as usual. Once the
 new cooldown fully expires, `registration-refresh --confirm` can republish the

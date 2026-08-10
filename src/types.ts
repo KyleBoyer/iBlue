@@ -288,6 +288,8 @@ export interface IncomingAttachment {
   dataBase64?: string;
   iris: boolean;
   isSticker?: boolean;
+  /** Transcript supplied by Apple's iMessage attachment metadata. */
+  audioTranscription?: string;
   mmcsDescriptorJson?: string;
 }
 

@@ -80,7 +80,7 @@ The full official 1.9.9 webhook-picker vocabulary is accepted, including
 optional server-update, Find My, FaceTime, and backup events. Accepting a
 subscription does not claim that an unsupported subsystem will emit it.
 
-## Additive iBlue contact and location API
+## Additive iBlue contact, location, message-flair, and audio metadata API
 
 iBlue exposes normalized data that is useful to non-stock clients without
 changing the pinned BlueBubbles contract. Every route uses the same
@@ -96,12 +96,32 @@ the rest of `/api/v1`:
 | `POST` | `/api/v1/iblue/location/query` | Query immutable location snapshots and static Apple Maps pins by chat and timestamp. |
 | `GET` | `/api/v1/iblue/location/live?address=...` | Refresh Find My and return the current position for active location shares, optionally filtered to one phone number or email address. |
 | `GET` | `/api/v1/iblue/location/:messageGuid` | Fetch the normalized snapshot or pin associated with one message. |
+| `GET` | `/api/v1/iblue/message/flair` | List friendly message-flair names, display labels, categories, and their exact Apple effect identifiers. |
 
 Handles gain an optional `iBlue.contact` summary. Messages gain optional
-`iBlue.senderContact` and `iBlue.sharedLocation` properties; Maps extension
+`iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`, and
+`iBlue.audioTranscription` properties; Maps extension
 messages also expose their real bundle identifier through BlueBubbles'
 existing `balloonBundleId` field. An incoming iMessage Name & Photo Sharing
 update emits the additive `iblue-contact-updated` Socket.IO/webhook event.
+
+`iBlue.messageFlair` normalizes Apple's opaque `expressiveSendStyleId` into
+`name`, `displayName`, and `category` (`bubble` or `screen`) while retaining the
+exact identifier in `effectId`. Unknown future identifiers are preserved with
+`known: false`. Outbound text, attachment, multipart, scheduled, and Socket.IO
+message requests may use the additive friendly `flair` string (for example,
+`"confetti"` or `"invisible-ink"`) instead of BlueBubbles' raw `effectId`.
+The raw field remains accepted unchanged, and supplying an unknown raw
+`com.apple.*` identifier through `flair` is also allowed as a forward-compatible
+escape hatch.
+
+For a received audio message, `iBlue.audioTranscription` is present only when
+Apple included the sender-side transcript in the iMessage attachment metadata.
+Its shape is `{text, source: "apple"}`. iBlue does not run speech recognition
+or synthesize a transcript. The original audio remains a normal BlueBubbles
+attachment and is available from the authenticated attachment download route.
+The same message object is used by REST queries, Socket.IO, and webhooks, so
+those surfaces expose the Apple-provided transcript consistently.
 
 The profile VCF has priority over a peer's shared name. An avatar may fall
 back to Name & Photo Sharing when the matching VCF entry has no photo. Shared

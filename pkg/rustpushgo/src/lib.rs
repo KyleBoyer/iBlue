@@ -2693,6 +2693,9 @@ pub struct WrappedAttachment {
     pub iris: bool,
     /// True when the attachment is the visual payload of an iMessage sticker.
     pub is_sticker: bool,
+    /// Sender-provided audio transcription from Apple's FILE XML metadata.
+    /// None means Apple did not include a transcript; iBlue never synthesizes one.
+    pub audio_transcription: Option<String>,
     /// Serialized MMCS descriptor JSON for non-inline attachments; None for
     /// inline attachments and rich-link sidebands. The Go-side
     /// AttachmentRetrier persists this alongside a pending row so it can
@@ -4715,6 +4718,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     inline_data: Some(meta.into_bytes()),
                     iris: false,
                     is_sticker: false,
+                    audio_transcription: None,
                     mmcs_descriptor_json: None,
                 });
 
@@ -4739,6 +4743,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                         inline_data: Some(img_data),
                         iris: false,
                         is_sticker: false,
+                        audio_transcription: None,
                         mmcs_descriptor_json: None,
                     });
                 }
@@ -4969,7 +4974,12 @@ fn append_wrapped_attachments(
             is_inline,
             inline_data,
             iris: att.iris,
-            is_sticker: force_sticker || indexed_part.ext.is_some(),
+            is_sticker: force_sticker
+                || matches!(indexed_part.ext.as_ref(), Some(PartExtension::Sticker { .. })),
+            audio_transcription: match &indexed_part.ext {
+                Some(PartExtension::AudioTranscription { text }) => Some(text.clone()),
+                _ => None,
+            },
             mmcs_descriptor_json,
         });
     }
@@ -9630,9 +9640,10 @@ fn inline_relay_attachment(
 mod reply_target_tests {
     use super::{
         inline_relay_attachment, leave_group_participants, message_inst_to_wrapped,
-        mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target, AttachmentType,
-        ConversationData, Message, MessageInst, ReactMessage, ReactMessageType, Reaction,
-        WrappedConversation,
+        mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target, Attachment,
+        AttachmentType, ConversationData, IndexedMessagePart, Message, MessageInst, MessagePart,
+        MessageParts, MessageType, NormalMessage, PartExtension, ReactMessage, ReactMessageType,
+        Reaction, WrappedConversation,
     };
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
@@ -9757,6 +9768,45 @@ mod reply_target_tests {
         assert_eq!(attachment.mime, "image/png");
         assert_eq!(attachment.uti_type, "public.png");
         assert_eq!(attachment.name, "image.png");
+    }
+
+    #[test]
+    fn apple_audio_transcription_survives_message_wrapping() {
+        let mut normal = NormalMessage::new("\u{fffc}".to_string(), MessageType::IMessage);
+        normal.voice = true;
+        normal.parts = MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Attachment(Attachment {
+                a_type: AttachmentType::Inline(vec![1, 2, 3]),
+                part: 0,
+                uti_type: "com.apple.coreaudio-format".to_string(),
+                mime: "application/octet-stream".to_string(),
+                name: "Audio Message.caf".to_string(),
+                iris: false,
+            }),
+            idx: Some(0),
+            ext: Some(PartExtension::AudioTranscription {
+                text: "Meet at five".to_string(),
+            }),
+        }]);
+        let message = MessageInst::new(
+            ConversationData {
+                participants: vec!["mailto:friend@example.com".to_string()],
+                cv_name: None,
+                sender_guid: None,
+                after_guid: None,
+            },
+            "mailto:self@example.com",
+            Message::Message(normal),
+        );
+
+        let wrapped = message_inst_to_wrapped(&message);
+        assert!(wrapped.is_voice);
+        assert_eq!(wrapped.attachments.len(), 1);
+        assert!(!wrapped.attachments[0].is_sticker);
+        assert_eq!(
+            wrapped.attachments[0].audio_transcription.as_deref(),
+            Some("Meet at five")
+        );
     }
 }
 

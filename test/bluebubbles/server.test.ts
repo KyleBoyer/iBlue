@@ -745,7 +745,12 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
       macos_time_sync: number | null;
       local_ipv4s: string[];
       local_ipv6s: string[];
-      iBlue: { idsMode: string; version: string; blueBubblesCompatibility: string };
+      iBlue: {
+        idsMode: string;
+        version: string;
+        blueBubblesCompatibility: string;
+        extensions: { messageFlair: string };
+      };
     };
   };
   assert.equal(infoBody.data.computer_id, derivePublicComputerId("test", "device-test"));
@@ -765,6 +770,26 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.ok(Number.isInteger(Number(osMinor)));
   assert.equal(infoBody.data.iBlue.version, "0.1.0");
   assert.equal(infoBody.data.iBlue.blueBubblesCompatibility, infoBody.data.server_version);
+  assert.equal(infoBody.data.iBlue.extensions.messageFlair, "/api/v1/iblue/message/flair");
+
+  const flairCatalog = await fetch(`${listening.address}/api/v1/iblue/message/flair?password=secret`);
+  const flairCatalogBody = await flairCatalog.json() as {
+    status: number;
+    data: Array<{ name: string; category: string; effectId: string }>;
+    metadata: { count: number };
+  };
+  assert.equal(flairCatalogBody.status, 200);
+  assert.equal(flairCatalogBody.metadata.count, 13);
+  assert.deepEqual(
+    flairCatalogBody.data.find(({ name }) => name === "confetti"),
+    {
+      name: "confetti",
+      displayName: "Confetti",
+      category: "screen",
+      effectId: "com.apple.messages.effect.CKConfettiEffect",
+      known: true,
+    },
+  );
 
   // The official BlueBubbles client requests Firebase configuration during
   // both QR/manual setup paths, but treats this exact upstream 404 as a
@@ -914,6 +939,33 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(engine.messages.at(-1)?.subject, "subject line");
   assert.equal(engine.messages.at(-1)?.effectId, "com.apple.messages.effect.CKConfettiEffect");
   assert.equal(sentBody.data.threadOriginatorGuid, "reply-target-guid");
+
+  const flairSent = await fetch(`${listening.address}/api/v1/message/text?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      message: "friendly flair",
+      flair: "confetti",
+    }),
+  });
+  assert.equal(flairSent.status, 200);
+  assert.equal(engine.messages.at(-1)?.effectId, "com.apple.messages.effect.CKConfettiEffect");
+
+  const unknownFlair = await fetch(`${listening.address}/api/v1/message/text?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      message: "invalid flair",
+      flair: "party-parrot",
+    }),
+  });
+  assert.equal(unknownFlair.status, 400);
+  assert.match(
+    (await unknownFlair.json() as { message: string }).message,
+    /Unknown message flair/,
+  );
 
   const deliveredAt = Date.now() + 1_000;
   const deliveryEvent = new Promise<{ type: string; data: {

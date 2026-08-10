@@ -701,6 +701,7 @@ fn attachment_to_json(attachment: WrappedAttachment) -> Value {
         "dataBase64": attachment.inline_data.map(|data| BASE64.encode(data)),
         "iris": attachment.iris,
         "isSticker": attachment.is_sticker,
+        "audioTranscription": attachment.audio_transcription,
         "mmcsDescriptorJson": attachment.mmcs_descriptor_json,
     })
 }
@@ -2125,11 +2126,33 @@ mod tests {
             inline_data: Some(vec![1, 2, 3]),
             iris: false,
             is_sticker: true,
+            audio_transcription: None,
             mmcs_descriptor_json: None,
         });
         let encoded = message_to_json(message);
         assert_eq!(encoded["verificationFailed"], Value::Bool(true));
         assert_eq!(encoded["attachments"][0]["isSticker"], Value::Bool(true));
+    }
+
+    #[test]
+    fn native_attachment_json_exposes_apple_audio_transcription() {
+        let attachment = WrappedAttachment {
+            mime_type: "application/octet-stream".to_string(),
+            filename: "Audio Message.caf".to_string(),
+            uti_type: "com.apple.coreaudio-format".to_string(),
+            size: 3,
+            is_inline: true,
+            inline_data: Some(vec![1, 2, 3]),
+            iris: false,
+            is_sticker: false,
+            audio_transcription: Some("Sender-provided words".to_string()),
+            mmcs_descriptor_json: None,
+        };
+        let encoded = attachment_to_json(attachment);
+        assert_eq!(
+            encoded["audioTranscription"],
+            Value::String("Sender-provided words".to_string())
+        );
     }
 
     #[test]

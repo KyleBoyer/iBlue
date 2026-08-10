@@ -1,14 +1,12 @@
 # Outbound iMessage wire audit
 
-This audit records what iBlue can prove without making an Apple request. Live
-delivery remains a separate gate while the secondary account's IDS directory
-responses are empty.
+This audit separates offline wire guarantees from live Apple delivery evidence.
 
 | Operation | rustpush wire shape | iBlue preflight guarantee | Live status |
 | --- | --- | --- | --- |
-| Text | IDS command `100`, encrypted `RawIMessage` body | BlueBubbles chat resolves to canonical IDS participants; subject and expressive effect are preserved | Pending |
+| Text | IDS command `100`, encrypted `RawIMessage` body | BlueBubbles chat resolves to canonical IDS participants; subject and expressive effect are preserved | Delivered with `CKConfettiEffect`; Apple delivery receipt correlated |
 | Reply | Command `100`; body field `r:<part>:<guid>` | A supplied GUID always has a part; omitted BlueBubbles `partIndex` becomes `0` in TypeScript and native Rust | Pending |
-| Attachment/image | Target lookup, MMCS upload, then command `100`; message text uses the attachment replacement character | The exact recipient plus sender-fanout set is resolved before any MMCS bytes are uploaded; file, MIME type, UTI, filename, subject, effect, audio-message flag, and normalized reply metadata are retained | Pending |
+| Attachment/image | Target lookup, MMCS upload, then command `100`; message text uses the attachment replacement character | The exact recipient plus sender-fanout set is resolved before any MMCS bytes are uploaded; file, MIME type, UTI, filename, subject, effect, audio-message flag, and normalized reply metadata are retained | M4A audio attachment delivered as an audio message with a correlated Apple receipt; other media pending |
 | Tapback/emoji reaction | Command `100`; `amk` is `p:<part>/<guid>`; notification `ams` contains the associated text | Part defaults to `0`; text reactions use the stored current text and attachment reactions use `U+FFFC` | Pending |
 | Typing start/stop | Command `100`, `eX=0`; one-to-one start can be bodyless, stop/group typing has an encrypted body | Conversation and sender are passed through unchanged | Pending |
 | Read receipt | Bodyless command `102`; envelope UUID is the message being acknowledged | The newest incoming message GUID is used when BlueBubbles omits `messageGuid`; no random receipt UUID is generated | Pending |

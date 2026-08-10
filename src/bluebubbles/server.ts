@@ -25,6 +25,7 @@ import type { ScheduledMessageDraft } from "./scheduler.js";
 import { BlueBubblesService, type BlueBubblesEvent } from "./service.js";
 import { stripTransport } from "./guid.js";
 import { parseVCardContacts } from "./contact.js";
+import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
 
 const WEBHOOK_EVENTS = new Set([
   "*",
@@ -392,6 +393,11 @@ export class BlueBubblesServer {
       },
     );
 
+    this.app.get("/api/v1/iblue/message/flair", async () =>
+      success(MESSAGE_FLAIRS.map((flair) => ({ ...flair })), "Successfully fetched message flair catalog!", {
+        count: MESSAGE_FLAIRS.length,
+      }));
+
     this.app.post("/api/v1/iblue/location/query", async (request) => {
       const body = asRecord(request.body);
       const offset = numberValue(body.offset, 0);
@@ -599,11 +605,13 @@ export class BlueBubblesServer {
       if (addresses.length === 0) throw new RequestError(400, "No addresses provided!", "VALIDATION_ERROR");
       const guid = this.service.createChat(addresses);
       if (typeof body.message === "string" || typeof body.subject === "string") {
+        const effectId = outboundEffectId(body.effectId, body.flair);
         await this.service.sendText({
           chatGuid: guid,
           message: typeof body.message === "string" ? body.message : "",
           ...(typeof body.subject === "string" ? { subject: body.subject } : {}),
           ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
+          ...(effectId ? { effectId } : {}),
         });
       }
       const chat = this.service.store.getChat(guid, true, true);
@@ -741,12 +749,13 @@ export class BlueBubblesServer {
       if (typeof body.message !== "string") {
         throw new RequestError(400, "A 'message' is required", "VALIDATION_ERROR");
       }
+      const effectId = outboundEffectId(body.effectId, body.flair);
       const message = await this.service.sendText({
         chatGuid,
         message: body.message,
         ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
         ...(typeof body.subject === "string" ? { subject: body.subject } : {}),
-        ...(typeof body.effectId === "string" ? { effectId: body.effectId } : {}),
+        ...(effectId ? { effectId } : {}),
         ...(typeof body.selectedMessageGuid === "string"
           ? { selectedMessageGuid: body.selectedMessageGuid }
           : {}),
@@ -790,6 +799,8 @@ export class BlueBubblesServer {
         const tempGuid = multipartField(file, "tempGuid");
         const caption = multipartField(file, "subject");
         const effectId = multipartField(file, "effectId");
+        const flair = multipartField(file, "flair");
+        const resolvedEffectId = outboundEffectId(effectId, flair);
         const isAudioMessage = multipartField(file, "isAudioMessage") === "true";
         const replyGuid = multipartField(file, "selectedMessageGuid");
         const replyPart = multipartField(file, "partIndex");
@@ -801,7 +812,7 @@ export class BlueBubblesServer {
           utiType: utiForMime(file.mimetype),
           ...(tempGuid ? { tempGuid } : {}),
           ...(caption ? { caption } : {}),
-          ...(effectId ? { effectId } : {}),
+          ...(resolvedEffectId ? { effectId: resolvedEffectId } : {}),
           ...(isAudioMessage ? { isAudioMessage: true } : {}),
           ...(replyGuid ? { replyGuid } : {}),
           ...(replyPart ? { replyPart } : {}),
@@ -866,12 +877,13 @@ export class BlueBubblesServer {
         };
       }));
 
+      const effectId = outboundEffectId(body.effectId, body.flair);
       const message = await this.service.sendMultipart({
         chatGuid,
         parts,
         ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
         ...(typeof body.subject === "string" ? { subject: body.subject } : {}),
-        ...(typeof body.effectId === "string" ? { effectId: body.effectId } : {}),
+        ...(effectId ? { effectId } : {}),
         ...(typeof body.selectedMessageGuid === "string"
           ? { replyGuid: body.selectedMessageGuid }
           : {}),
@@ -1182,10 +1194,12 @@ export class BlueBubblesServer {
       void (async () => {
         const chatGuid = this.service.createChat(raw);
         if (typeof body.message === "string" && body.message.length > 0) {
+          const effectId = outboundEffectId(body.effectId, body.flair);
           await this.service.sendText({
             chatGuid,
             message: body.message,
             ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
+            ...(effectId ? { effectId } : {}),
           });
         }
         const chat = this.service.store.getChat(chatGuid, true, true);
@@ -1345,6 +1359,7 @@ export class BlueBubblesServer {
     if (!attachmentGuid && typeof body.message !== "string") throw new Error("No message or attachment provided");
 
     try {
+      const effectId = outboundEffectId(body.effectId, body.flair);
       if (attachmentGuid) {
         if (!upload) throw new Error("attachment upload state is missing");
         const filename = typeof body.attachmentName === "string" ? basename(body.attachmentName) : undefined;
@@ -1357,10 +1372,16 @@ export class BlueBubblesServer {
           mimeType,
           utiType: utiForMime(mimeType),
           tempGuid: attachmentGuid,
+          ...(effectId ? { effectId } : {}),
         });
       }
       if (typeof body.message === "string" && body.message.length > 0) {
-        await this.service.sendText({ chatGuid, message: body.message, tempGuid });
+        await this.service.sendText({
+          chatGuid,
+          message: body.message,
+          tempGuid,
+          ...(effectId ? { effectId } : {}),
+        });
       }
       return { channel: "message-sent", payload: success(null) };
     } finally {
@@ -1375,6 +1396,7 @@ export class BlueBubblesServer {
     const chatGuid = typeof body.guid === "string"
       ? body.guid
       : requiredString(body, "chatGuid");
+    const effectId = outboundEffectId(body.effectId, body.flair);
     let sent;
     if (typeof body.attachment === "string") {
       const directory = await mkdtemp(join(tmpdir(), "iblue-socket-upload-"));
@@ -1390,6 +1412,7 @@ export class BlueBubblesServer {
           mimeType,
           utiType: utiForMime(mimeType),
           ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
+          ...(effectId ? { effectId } : {}),
         });
       } finally {
         await rm(directory, { recursive: true, force: true });
@@ -1400,6 +1423,7 @@ export class BlueBubblesServer {
         chatGuid,
         message: body.message,
         ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
+        ...(effectId ? { effectId } : {}),
       });
     }
     if (!sent) throw new Error("No message or attachment provided");
@@ -1453,6 +1477,7 @@ export class BlueBubblesServer {
           contacts: "/api/v1/iblue/contact",
           sharedLocations: "/api/v1/iblue/location/query",
           liveSharedLocations: "/api/v1/iblue/location/live",
+          messageFlair: "/api/v1/iblue/message/flair",
         },
       },
     };
@@ -1562,6 +1587,27 @@ function positiveInteger(value: unknown): number | undefined {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function outboundEffectId(effectIdValue: unknown, flairValue: unknown): string | undefined {
+  const effectId = typeof effectIdValue === "string" ? effectIdValue.trim() : undefined;
+  if (flairValue !== undefined && typeof flairValue !== "string") {
+    throw new RequestError(400, "flair must be a string", "VALIDATION_ERROR");
+  }
+  const flair = typeof flairValue === "string" ? flairValue.trim() : undefined;
+  if (!flair) return effectId || undefined;
+  const resolved = effectIdForMessageFlair(flair);
+  if (!resolved) {
+    throw new RequestError(
+      400,
+      `Unknown message flair '${flair}'. Use one of: ${MESSAGE_FLAIRS.map((item) => item.name).join(", ")}`,
+      "VALIDATION_ERROR",
+    );
+  }
+  if (effectId && effectId !== resolved) {
+    throw new RequestError(400, "effectId and flair select different message effects", "VALIDATION_ERROR");
+  }
+  return effectId || resolved;
+}
+
 function scheduledMessageDraft(value: unknown): ScheduledMessageDraft {
   const body = asRecord(value);
   if (body.type !== "send-message") {
@@ -1607,6 +1653,7 @@ function scheduledMessageDraft(value: unknown): ScheduledMessageDraft {
   if (partIndex !== undefined && (!Number.isInteger(partIndex) || partIndex < 0)) {
     throw new RequestError(400, "partIndex must be a non-negative integer", "VALIDATION_ERROR");
   }
+  const effectId = outboundEffectId(payload.effectId, payload.flair);
   return {
     payload: {
       chatGuid,
@@ -1615,7 +1662,7 @@ function scheduledMessageDraft(value: unknown): ScheduledMessageDraft {
       ...(typeof payload.selectedMessageGuid === "string"
         ? { selectedMessageGuid: payload.selectedMessageGuid }
         : {}),
-      ...(typeof payload.effectId === "string" ? { effectId: payload.effectId } : {}),
+      ...(effectId ? { effectId } : {}),
       ...(typeof payload.subject === "string" ? { subject: payload.subject } : {}),
       ...(typeof payload.attributedBody === "string" ? { attributedBody: payload.attributedBody } : {}),
       ...(partIndex === undefined ? {} : { partIndex }),

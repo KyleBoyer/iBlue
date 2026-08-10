@@ -1676,10 +1676,31 @@ index df97ecc..e3070a8 100644
 +    Ok(())
 +}
 diff --git a/src/imessage/messages.rs b/src/imessage/messages.rs
-index f87deb5..5b5e763 100644
+index f87deb5..2021f42 100644
 --- a/src/imessage/messages.rs
 +++ b/src/imessage/messages.rs
-@@ -1026,6 +1026,17 @@ pub struct ErrorMessage {
+@@ -843,6 +843,10 @@ impl Reaction {
+ #[derive(Serialize, Deserialize, Clone)]
+ #[serde(untagged)]
+ pub enum PartExtension {
++    AudioTranscription {
++        #[serde(rename = "audio-transcription")]
++        text: String,
++    },
+     Sticker {
+         #[serde(rename = "spw")]
+         msg_width: f64,
+@@ -885,6 +889,9 @@ impl PartExtension {
+     }
+ 
+     fn from_dict(mut data: HashMap<String, String>) -> Option<Self> {
++        if let Some(text) = data.remove("audio-transcription") {
++            return Some(PartExtension::AudioTranscription { text });
++        }
+         Some(PartExtension::Sticker {
+             msg_width: data.get("spw")?.parse().ok()?,
+             rotation: data.get("sro")?.parse().ok()?,
+@@ -1026,6 +1033,17 @@ pub struct ErrorMessage {
  }
  
  impl ReactMessage {
@@ -1697,7 +1718,7 @@ index f87deb5..5b5e763 100644
      fn get_text(&self) -> String {
          self.reaction.get_text(&self.to_text)
      }
-@@ -2184,7 +2195,7 @@ impl MessageInst {
+@@ -2184,7 +2202,7 @@ impl MessageInst {
  
                  let raw = RawReactMessage {
                      text: text,
@@ -1706,6 +1727,30 @@ index f87deb5..5b5e763 100644
                      amrlc: 0,
                      amt: react.reaction.get_cmd(),
                      participants: conversation.participants.clone(),
+@@ -2897,6 +2915,23 @@ impl MessageInst {
+     }
+ }
+ 
++#[cfg(test)]
++mod audio_transcription_tests {
++    use super::*;
++
++    #[test]
++    fn file_audio_transcription_survives_xml_parsing_and_serialization() {
++        let xml = r#"<html><body><FILE name="Audio Message.caf" mime-type="application/octet-stream" uti-type="com.apple.coreaudio-format" file-size="3" message-part="0" inline-attachment="ia-0" audio-transcription="Meet at five" /></body></html>"#;
++        let parts = MessageParts::parse_parts(xml, None);
++        assert_eq!(parts.0.len(), 1);
++        assert!(matches!(
++            &parts.0[0].ext,
++            Some(PartExtension::AudioTranscription { text }) if text == "Meet at five"
++        ));
++        assert!(parts.to_xml(None).contains("audio-transcription=\"Meet at five\""));
++    }
++}
++
+ impl fmt::Display for MessageInst {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
 diff --git a/src/lib.rs b/src/lib.rs
 index c71234a..cd85a7a 100644
 --- a/src/lib.rs

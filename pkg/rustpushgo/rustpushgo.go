@@ -7133,6 +7133,7 @@ type WrappedAttachment struct {
 	InlineData         *[]byte
 	Iris               bool
 	IsSticker          bool
+	AudioTranscription *string
 	MmcsDescriptorJson *string
 }
 
@@ -7145,6 +7146,7 @@ func (r *WrappedAttachment) Destroy() {
 	FfiDestroyerOptionalBytes{}.Destroy(r.InlineData)
 	FfiDestroyerBool{}.Destroy(r.Iris)
 	FfiDestroyerBool{}.Destroy(r.IsSticker)
+	FfiDestroyerOptionalString{}.Destroy(r.AudioTranscription)
 	FfiDestroyerOptionalString{}.Destroy(r.MmcsDescriptorJson)
 }
 
@@ -7167,6 +7169,7 @@ func (c FfiConverterTypeWrappedAttachment) Read(reader io.Reader) WrappedAttachm
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -7183,6 +7186,7 @@ func (c FfiConverterTypeWrappedAttachment) Write(writer io.Writer, value Wrapped
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.InlineData)
 	FfiConverterBoolINSTANCE.Write(writer, value.Iris)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsSticker)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AudioTranscription)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.MmcsDescriptorJson)
 }
 

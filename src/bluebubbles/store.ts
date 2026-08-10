@@ -31,6 +31,7 @@ import {
   toTransportAddress,
 } from "./guid.js";
 import { sharedLocationFromBalloon, sharedLocationFromMessageText } from "./location.js";
+import { messageFlairFromEffectId } from "./message-flair.js";
 
 interface MessageRow {
   rowid: number;
@@ -1642,6 +1643,10 @@ export class BlueBubblesStore {
     const handle = row.sender ? this.serializeHandle(row.sender) : null;
     const senderContact = handle?.iBlue?.contact;
     const sharedLocation = this.getSharedLocation(row.guid);
+    const messageFlair = messageFlairFromEffectId(raw.effect);
+    const audioTranscription = raw.attachments
+      ?.map((attachment) => attachment.audioTranscription?.trim())
+      .find((value): value is string => Boolean(value));
     const output: BlueBubblesMessage = {
       originalROWID: row.rowid,
       guid: row.guid,
@@ -1710,6 +1715,10 @@ export class BlueBubblesStore {
           : { senderVerificationFailed: raw.verificationFailed }),
         ...(senderContact ? { senderContact } : {}),
         ...(sharedLocation ? { sharedLocation: locationSummary(sharedLocation) } : {}),
+        ...(messageFlair ? { messageFlair } : {}),
+        ...(audioTranscription
+          ? { audioTranscription: { text: audioTranscription, source: "apple" } }
+          : {}),
       },
     };
     if (raw.tempGuid) output.tempGuid = raw.tempGuid;

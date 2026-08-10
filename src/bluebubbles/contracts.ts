@@ -49,6 +49,22 @@ export interface IBlueSharedLocationRecord extends IBlueSharedLocation {
   dateCreated: number;
 }
 
+export interface IBlueMessageFlair {
+  /** Stable friendly API name, or "unknown" for an unrecognized Apple ID. */
+  name: string;
+  displayName: string;
+  category: "bubble" | "screen" | "unknown";
+  /** Apple's exact expressiveSendStyleId value. */
+  effectId: string;
+  known: boolean;
+}
+
+export interface IBlueAudioTranscription {
+  text: string;
+  /** iBlue preserves Apple's value and does not run speech recognition. */
+  source: "apple";
+}
+
 export interface IBlueLiveLocation {
   source: "find-my";
   followId: string;
@@ -181,6 +197,8 @@ export interface BlueBubblesMessage {
     compatibilityNotes?: string[];
     senderContact?: IBlueContactSummary;
     sharedLocation?: IBlueSharedLocation;
+    messageFlair?: IBlueMessageFlair;
+    audioTranscription?: IBlueAudioTranscription;
   };
 }
 
