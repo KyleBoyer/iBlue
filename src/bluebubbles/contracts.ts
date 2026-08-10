@@ -13,12 +13,76 @@ export interface BlueBubblesResponse<T = unknown> {
   error?: BlueBubblesErrorBody;
 }
 
+export type IBlueContactSource = "profile-vcf" | "name-and-photo-sharing";
+
+export interface IBlueContactSummary {
+  displayName: string;
+  firstName?: string;
+  lastName?: string;
+  nickname?: string;
+  source: IBlueContactSource;
+}
+
+export interface IBlueContact extends IBlueContactSummary {
+  address: string;
+  service: "iMessage";
+  hasAvatar: boolean;
+  updatedAt: number;
+}
+
+export interface IBlueSharedLocation {
+  latitude?: number;
+  longitude?: number;
+  label?: string;
+  address?: string;
+  url: string;
+  isLive: boolean;
+  sessionId?: string;
+  bundleId?: string;
+  findMyId?: string;
+}
+
+export interface IBlueSharedLocationRecord extends IBlueSharedLocation {
+  messageGuid: string;
+  chatGuid: string;
+  sender: string | null;
+  dateCreated: number;
+}
+
+export interface IBlueLiveLocation {
+  source: "find-my";
+  followId: string;
+  address: string;
+  acceptedHandles: string[];
+  fromHandles: string[];
+  isActive: boolean;
+  isFromMessages: boolean;
+  locatingInProgress: boolean;
+  expiresAt: number | null;
+  sharingUpdatedAt: number;
+  latitude?: number;
+  longitude?: number;
+  altitude?: number;
+  horizontalAccuracy?: number;
+  verticalAccuracy?: number;
+  locationUpdatedAt?: number;
+  isInaccurate?: boolean;
+  isOld?: boolean;
+  formattedAddress?: string;
+  locality?: string;
+  stateCode?: string;
+  countryCode?: string;
+}
+
 export interface BlueBubblesHandle {
   originalROWID: number;
   address: string;
   service: string;
   country?: string;
   uncanonicalizedId?: string;
+  iBlue?: {
+    contact?: IBlueContactSummary;
+  };
 }
 
 export interface BlueBubblesAttachment {
@@ -115,6 +179,8 @@ export interface BlueBubblesMessage {
     storedMessage?: boolean;
     senderVerificationFailed?: boolean;
     compatibilityNotes?: string[];
+    senderContact?: IBlueContactSummary;
+    sharedLocation?: IBlueSharedLocation;
   };
 }
 

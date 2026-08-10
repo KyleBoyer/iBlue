@@ -291,6 +291,55 @@ export interface IncomingAttachment {
   mmcsDescriptorJson?: string;
 }
 
+export interface IncomingSharedProfile {
+  displayName?: string;
+  firstName?: string;
+  lastName?: string;
+  hasPoster: boolean;
+  avatarBase64?: string;
+}
+
+export interface IncomingAppBalloon {
+  bundleId?: string;
+  appName?: string;
+  url?: string;
+  sessionId?: string;
+  isLive: boolean;
+  ldText?: string;
+  imageTitle?: string;
+  imageSubtitle?: string;
+  caption?: string;
+  subcaption?: string;
+  secondarySubcaption?: string;
+  tertiarySubcaption?: string;
+}
+
+export interface NativeFindMyLocation {
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  horizontalAccuracy: number;
+  verticalAccuracy: number;
+  timestamp: number;
+  isInaccurate: boolean;
+  isOld?: boolean;
+  formattedAddressLines: string[];
+  locality?: string;
+  stateCode?: string;
+  countryCode?: string;
+}
+
+export interface NativeFindMyFollow {
+  id: string;
+  invitationAcceptedHandles: string[];
+  invitationFromHandles: string[];
+  expires: number;
+  updateTimestamp: number;
+  isFromMessages: boolean;
+  locateInProgress: boolean;
+  lastLocation?: NativeFindMyLocation;
+}
+
 export interface IncomingMessage {
   uuid: string;
   sender?: string;
@@ -336,6 +385,8 @@ export interface IncomingMessage {
   effect?: string;
   html?: string;
   isVoice?: boolean;
+  sharedProfile?: IncomingSharedProfile;
+  appBalloon?: IncomingAppBalloon;
 }
 
 export interface EngineNotificationMap {

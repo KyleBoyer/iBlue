@@ -24,6 +24,7 @@ import { failure, success, unsupported } from "./response.js";
 import type { ScheduledMessageDraft } from "./scheduler.js";
 import { BlueBubblesService, type BlueBubblesEvent } from "./service.js";
 import { stripTransport } from "./guid.js";
+import { parseVCardContacts } from "./contact.js";
 
 const WEBHOOK_EVENTS = new Set([
   "*",
@@ -43,6 +44,7 @@ const WEBHOOK_EVENTS = new Set([
   // bridge the singular subscription in BlueBubblesService.
   "imessage-alias-removed",
   "imessage-aliases-removed",
+  "iblue-contact-updated",
   "scheduled-message-created",
   "scheduled-message-updated",
   "scheduled-message-deleted",
@@ -133,6 +135,8 @@ export class BlueBubblesServer {
 
   async start(): Promise<{ address: string; port: number }> {
     await this.cleanupStaleMultipartUploads();
+    const savedVcf = await this.loadContactsVcf();
+    if (savedVcf) this.service.store.replaceProfileVcfContacts(parseVCardContacts(savedVcf));
     await this.app.register(cors, { origin: true });
     await this.app.register(multipart, {
       limits: { fileSize: 1024 * 1024 * 1024, files: 8, fields: 100 },
@@ -324,11 +328,104 @@ export class BlueBubblesServer {
     });
 
     // Contacts.app belongs to the signed-in macOS user and is intentionally
-    // outside the isolated iBlue profile. These read routes therefore expose
-    // an empty, valid BlueBubbles contact book. Handles remain available from
-    // /handle/query, and clients may keep their own address book.
+    // outside the isolated iBlue profile. Keep the stock BlueBubbles contact
+    // surface neutral; normalized profile-local contacts are exposed under
+    // /api/v1/iblue/contact without changing BlueBubbles' response schema.
     this.app.get("/api/v1/contact", async () => success([]));
     this.app.post("/api/v1/contact/query", async () => success([]));
+
+    this.app.get<{ Querystring: Query }>("/api/v1/iblue/contact", async (request) => {
+      const result = this.service.store.queryContacts({
+        ...(request.query.address ? { addresses: [request.query.address] } : {}),
+        ...(request.query.search ? { search: request.query.search } : {}),
+        offset: numberValue(request.query.offset, 0),
+        limit: numberValue(request.query.limit, 100),
+      });
+      return success(result.contacts, "Successfully fetched iBlue contacts!", {
+        total: result.total,
+        offset: numberValue(request.query.offset, 0),
+        limit: numberValue(request.query.limit, 100),
+        count: result.contacts.length,
+      });
+    });
+    this.app.post("/api/v1/iblue/contact/query", async (request) => {
+      const body = asRecord(request.body);
+      const addresses = Array.isArray(body.addresses)
+        ? body.addresses.filter((value): value is string => typeof value === "string")
+        : undefined;
+      const sources = Array.isArray(body.sources)
+        ? body.sources.filter((value): value is "profile-vcf" | "name-and-photo-sharing" =>
+          value === "profile-vcf" || value === "name-and-photo-sharing")
+        : undefined;
+      const offset = numberValue(body.offset, 0);
+      const limit = numberValue(body.limit, 100);
+      const result = this.service.store.queryContacts({
+        ...(addresses ? { addresses } : {}),
+        ...(typeof body.search === "string" ? { search: body.search } : {}),
+        ...(sources ? { sources } : {}),
+        offset,
+        limit,
+      });
+      return success(result.contacts, "Successfully queried iBlue contacts!", {
+        total: result.total,
+        offset,
+        limit,
+        count: result.contacts.length,
+      });
+    });
+    this.app.get("/api/v1/iblue/contact/vcf", async () =>
+      success(await this.loadContactsVcf(), "Successfully retrieved profile VCF"));
+    this.app.put("/api/v1/iblue/contact/vcf", async (request) => {
+      const body = asRecord(request.body);
+      const vcf = requiredString(body, "vcf");
+      const imported = await this.saveContactsVcf(vcf);
+      return success({ imported }, "Successfully imported profile VCF");
+    });
+    this.app.get<{ Params: { address: string } }>(
+      "/api/v1/iblue/contact/:address/avatar",
+      async (request, reply) => {
+        const avatar = this.service.store.getContactAvatar(request.params.address);
+        if (!avatar) return reply.code(404).send(notFound("Contact avatar not found!"));
+        reply.header("content-type", detectImageMime(avatar.data));
+        reply.header("cache-control", "private, max-age=3600");
+        return reply.send(avatar.data);
+      },
+    );
+
+    this.app.post("/api/v1/iblue/location/query", async (request) => {
+      const body = asRecord(request.body);
+      const offset = numberValue(body.offset, 0);
+      const limit = numberValue(body.limit, 100);
+      const result = this.service.store.querySharedLocations({
+        ...(typeof body.chatGuid === "string" ? { chatGuid: body.chatGuid } : {}),
+        ...(body.after === undefined ? {} : { after: numberValue(body.after, 0) }),
+        ...(body.before === undefined ? {} : { before: numberValue(body.before, Date.now()) }),
+        offset,
+        limit,
+      });
+      return success(result.locations, "Successfully queried shared locations!", {
+        total: result.total,
+        offset,
+        limit,
+        count: result.locations.length,
+      });
+    });
+    this.app.get<{ Querystring: Query }>("/api/v1/iblue/location/live", async (request) => {
+      const locations = await this.service.refreshLiveLocations(request.query.address);
+      return success(locations, "Successfully refreshed live shared locations!", {
+        count: locations.length,
+        refreshedAt: Date.now(),
+        ...(request.query.address ? { address: stripTransport(request.query.address) } : {}),
+      });
+    });
+    this.app.get<{ Params: { messageGuid: string } }>(
+      "/api/v1/iblue/location/:messageGuid",
+      async (request, reply) => {
+        const location = this.service.store.getSharedLocation(request.params.messageGuid);
+        if (!location) return reply.code(404).send(notFound("Shared location not found!"));
+        return success(location);
+      },
+    );
 
     // BlueBubbles' manual setup treats this exact missing-config error as a
     // successful connection without Firebase. Socket.IO and webhooks are
@@ -1352,6 +1449,11 @@ export class BlueBubblesServer {
         runtimeRelease,
         blueBubblesCompatibility: BLUEBUBBLES_COMPAT_VERSION,
         blueBubblesCommit: BLUEBUBBLES_COMPAT_COMMIT,
+        extensions: {
+          contacts: "/api/v1/iblue/contact",
+          sharedLocations: "/api/v1/iblue/location/query",
+          liveSharedLocations: "/api/v1/iblue/location/live",
+        },
       },
     };
   }
@@ -1380,10 +1482,11 @@ export class BlueBubblesServer {
     return join(this.service.store.attachmentRoot, ".contacts", "AddressBook.vcf");
   }
 
-  private async saveContactsVcf(vcf: string): Promise<void> {
+  private async saveContactsVcf(vcf: string): Promise<number> {
     const path = this.contactsVcfPath();
     await mkdir(join(this.service.store.attachmentRoot, ".contacts"), { recursive: true, mode: 0o700 });
     await writeFile(path, vcf, { mode: 0o600 });
+    return this.service.store.replaceProfileVcfContacts(parseVCardContacts(vcf));
   }
 
   private async loadContactsVcf(): Promise<string | null> {
@@ -1618,4 +1721,14 @@ function mimeForFilename(filename: string): string {
     pdf: "application/pdf",
   };
   return (extension && map[extension]) || "application/octet-stream";
+}
+
+function detectImageMime(data: Buffer): string {
+  if (data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return "image/png";
+  }
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "image/jpeg";
+  if (data.subarray(0, 6).toString("ascii") === "GIF87a"
+    || data.subarray(0, 6).toString("ascii") === "GIF89a") return "image/gif";
+  return "application/octet-stream";
 }

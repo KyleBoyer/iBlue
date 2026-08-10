@@ -11,8 +11,8 @@ use rustpush::ids::user::IDSUserType;
 use rustpushgo::{
     connect, create_config_from_hardware_key, create_config_from_hardware_key_with_device_id,
     create_local_macos_config, create_local_macos_config_with_device_id, deregister_account,
-    init_logger, login_start, new_client, refresh_registration_once, restore_token_provider,
-    AccountPersistData, Client,
+    init_logger, login_start, new_client, refresh_registration_once,
+    restore_token_provider_with_pet_expiration, AccountPersistData, Client,
     LoginSession, MessageCallback, UpdateUsersCallback, WrappedAPSConnection, WrappedAPSState, WrappedAttachment,
     WrappedConversation, WrappedIDSNGMIdentity, WrappedIDSUsers, WrappedMessage, WrappedOSConfig,
     WrappedMultipartPart, WrappedTokenProvider,
@@ -158,6 +158,19 @@ impl CredentialBackend {
             }
             Self::EncryptedFile { .. } => "encrypted-file",
         }
+    }
+
+    fn modified_at_ms(&self) -> Option<u64> {
+        let Self::EncryptedFile { path, .. } = self else {
+            return None;
+        };
+        std::fs::metadata(path)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis() as u64)
     }
 
     fn load(&self, service: &str) -> Result<Option<Vec<u8>>, String> {
@@ -390,6 +403,10 @@ struct AccountState {
     username: String,
     hashed_password_hex: String,
     pet: String,
+    #[serde(default)]
+    pet_expires_at_ms: u64,
+    #[serde(default)]
+    mme_delegate_json: Option<String>,
     adsid: String,
     dsid: String,
     spd_base64: String,
@@ -401,6 +418,8 @@ impl From<AccountPersistData> for AccountState {
             username: value.username,
             hashed_password_hex: value.hashed_password_hex,
             pet: value.pet,
+            pet_expires_at_ms: value.pet_expires_at_ms,
+            mme_delegate_json: value.mme_delegate_json,
             adsid: value.adsid,
             dsid: value.dsid,
             spd_base64: value.spd_base64,
@@ -589,6 +608,16 @@ struct ValidateHandlesParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FindMyFollowingParams {
+    address: Option<String>,
+    #[serde(default)]
+    find_my_ids: Vec<String>,
+    // Backward compatibility for callers built against the first extension.
+    find_my_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SendEditParams {
     conversation: ConversationParams,
     target_uuid: String,
@@ -720,6 +749,33 @@ fn message_to_json(message: WrappedMessage) -> Value {
             "message": message.error_status_str,
         })
     });
+    let shared_profile = message.is_share_profile.then(|| {
+        json!({
+            "displayName": message.share_profile_display_name,
+            "firstName": message.share_profile_first_name,
+            "lastName": message.share_profile_last_name,
+            "hasPoster": message.share_profile_has_poster,
+            "avatarBase64": message.share_profile_avatar.map(|data| BASE64.encode(data)),
+        })
+    });
+    let app_balloon = (message.app_balloon_bundle_id.is_some()
+        || message.app_balloon_url.is_some())
+        .then(|| {
+            json!({
+                "bundleId": message.app_balloon_bundle_id,
+                "appName": message.app_balloon_app_name,
+                "url": message.app_balloon_url,
+                "sessionId": message.app_balloon_session_id,
+                "isLive": message.app_balloon_is_live,
+                "ldText": message.app_balloon_ld_text,
+                "imageTitle": message.app_balloon_image_title,
+                "imageSubtitle": message.app_balloon_image_subtitle,
+                "caption": message.app_balloon_caption,
+                "subcaption": message.app_balloon_subcaption,
+                "secondarySubcaption": message.app_balloon_secondary_subcaption,
+                "tertiarySubcaption": message.app_balloon_tertiary_subcaption,
+            })
+        });
 
     json!({
         "uuid": message.uuid,
@@ -758,6 +814,8 @@ fn message_to_json(message: WrappedMessage) -> Value {
         "effect": message.effect,
         "html": message.html,
         "isVoice": message.is_voice,
+        "sharedProfile": shared_profile,
+        "appBalloon": app_balloon,
     })
 }
 
@@ -940,14 +998,34 @@ impl Engine {
     }
 
     fn load_account_secret(&self) -> Result<Option<AccountState>, RpcError> {
-        self.credential_backend
+        let Some(value) = self.credential_backend
             .load(&self.credential_service)
-            .map_err(RpcError::native)?
-            .map(|value| {
-                serde_json::from_slice(&value)
-                    .map_err(|error| RpcError::native(format!("invalid iBlue credential entry: {error}")))
-            })
-            .transpose()
+            .map_err(RpcError::native)? else {
+                return Ok(None);
+            };
+        let mut account: AccountState = serde_json::from_slice(&value)
+            .map_err(|error| RpcError::native(format!("invalid iBlue credential entry: {error}")))?;
+
+        // Version-0 encrypted records did not persist the PET expiry. If such
+        // a record was just written by a successful interactive login, migrate
+        // it once using the credential file's trusted local mtime. Older files
+        // remain expired and follow the existing password-refresh path.
+        if account.pet_expires_at_ms == 0 {
+            const RECENT_LOGIN_WINDOW_MS: u64 = 30 * 60 * 1000;
+            const MIGRATED_PET_LIFETIME_MS: u64 = 20 * 60 * 60 * 1000;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if let Some(modified_at_ms) = self.credential_backend.modified_at_ms()
+                .filter(|modified_at_ms| now_ms.saturating_sub(*modified_at_ms) <= RECENT_LOGIN_WINDOW_MS)
+            {
+                account.pet_expires_at_ms = modified_at_ms + MIGRATED_PET_LIFETIME_MS;
+                self.store_account_secret(&account)?;
+            }
+        }
+
+        Ok(Some(account))
     }
 
     fn store_account_secret(&self, account: &AccountState) -> Result<(), RpcError> {
@@ -1087,13 +1165,15 @@ impl Engine {
                 };
                 let token_provider = if let Some(account) = account.as_ref() {
                     Some(
-                        restore_token_provider(
+                        restore_token_provider_with_pet_expiration(
                             &config,
                             &connection,
                             account.username.clone(),
                             account.hashed_password_hex.clone(),
                             account.pet.clone(),
                             account.spd_base64.clone(),
+                            account.pet_expires_at_ms,
+                            account.mme_delegate_json.clone(),
                         )
                         .await
                         .map_err(RpcError::native)?,
@@ -1592,6 +1672,30 @@ impl Engine {
                     .map_err(RpcError::native)?;
                 Ok(json!({ "available": available }))
             }
+            "findmy.following" => {
+                let params: FindMyFollowingParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let client = self.client()?;
+                let mut find_my_ids = params.find_my_ids;
+                if find_my_ids.is_empty() {
+                    find_my_ids.extend(params.find_my_id);
+                }
+                let mut following = Vec::new();
+                if find_my_ids.is_empty() {
+                    following = client
+                        .refresh_findmy_following(params.address, None)
+                        .await
+                        .map_err(RpcError::native)?;
+                } else {
+                    for find_my_id in find_my_ids {
+                        following = client
+                            .refresh_findmy_following(params.address.clone(), Some(find_my_id))
+                            .await
+                            .map_err(RpcError::native)?;
+                    }
+                }
+                serde_json::to_value(following).map_err(RpcError::native)
+            }
             "message.edit" => {
                 let params: SendEditParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
@@ -2026,6 +2130,25 @@ mod tests {
         let encoded = message_to_json(message);
         assert_eq!(encoded["verificationFailed"], Value::Bool(true));
         assert_eq!(encoded["attachments"][0]["isSticker"], Value::Bool(true));
+    }
+
+    #[test]
+    fn native_message_json_exposes_safe_profile_and_balloon_metadata() {
+        let mut message = WrappedMessage::default();
+        message.uuid = "metadata-test".to_string();
+        message.is_share_profile = true;
+        message.share_profile_display_name = Some("Jane Example".to_string());
+        message.share_profile_avatar = Some(vec![1, 2, 3]);
+        message.app_balloon_bundle_id = Some("com.apple.Maps.MessagesExtension".to_string());
+        message.app_balloon_url = Some("https://maps.apple.com/?ll=37.3349,-122.009".to_string());
+        message.app_balloon_is_live = true;
+
+        let encoded = message_to_json(message);
+        assert_eq!(encoded["sharedProfile"]["displayName"], "Jane Example");
+        assert_eq!(encoded["sharedProfile"]["avatarBase64"], "AQID");
+        assert_eq!(encoded["appBalloon"]["isLive"], true);
+        assert_eq!(encoded["appBalloon"]["bundleId"], "com.apple.Maps.MessagesExtension");
+        assert!(encoded["sharedProfile"].get("recordKey").is_none());
     }
 
     #[test]

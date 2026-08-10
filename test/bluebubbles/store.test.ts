@@ -252,3 +252,103 @@ test("IDS group messages retain their conversation UUID and other participants",
     "+15555550101",
   ]);
 });
+
+test("contact names enrich handles while VCF data takes precedence over shared profiles", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-contact-store-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+
+  store.upsertNameAndPhotoContact("mailto:friend@example.com", {
+    displayName: "Shared Jane",
+    firstName: "Jane",
+    lastName: "Example",
+    hasPoster: false,
+    avatarBase64: "AQID",
+  });
+  store.replaceProfileVcfContacts([{
+    addresses: ["friend@example.com"],
+    displayName: "My Jane",
+    firstName: "Jane",
+    lastName: "Example",
+    source: "profile-vcf",
+  }]);
+  store.ensureDirectChat("iMessage;-;friend@example.com", {
+    participants: ["mailto:friend@example.com"],
+  });
+
+  const handle = store.getHandle("friend@example.com");
+  assert.equal(handle?.iBlue?.contact?.displayName, "My Jane");
+  assert.equal(handle?.iBlue?.contact?.source, "profile-vcf");
+  assert.deepEqual(store.queryContacts({ search: "jane" }).contacts.map((contact) => contact.address), [
+    "friend@example.com",
+  ]);
+  assert.equal(store.queryContacts({ search: "shared" }).total, 0);
+  assert.equal(store.queryContacts({ sources: ["name-and-photo-sharing"] }).contacts[0]?.displayName, "Shared Jane");
+  assert.deepEqual(store.getContactAvatar("friend@example.com")?.data, Buffer.from([1, 2, 3]));
+});
+
+test("Maps app balloons persist as iBlue shared-location message properties", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-location-store-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const message = await store.ingestIncoming({
+    uuid: "location-message-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 1234,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    appBalloon: {
+      bundleId: "com.apple.Maps.MessagesExtension",
+      appName: "Maps",
+      url: "https://maps.apple.com/?ll=37.3349,-122.009",
+      sessionId: "maps-session",
+      isLive: false,
+      imageTitle: "Apple Park",
+      subcaption: "Cupertino, CA",
+    },
+  }, []);
+
+  assert.equal(message.balloonBundleId, "com.apple.Maps.MessagesExtension");
+  assert.deepEqual(message.iBlue?.sharedLocation, {
+    latitude: 37.3349,
+    longitude: -122.009,
+    label: "Apple Park",
+    address: "Cupertino, CA",
+    url: "https://maps.apple.com/?ll=37.3349,-122.009",
+    isLive: false,
+    sessionId: "maps-session",
+    bundleId: "com.apple.Maps.MessagesExtension",
+  });
+  assert.equal(store.getSharedLocation("location-message-guid")?.chatGuid, "iMessage;-;friend@example.com");
+  assert.equal(store.querySharedLocations({ chatGuid: "iMessage;-;friend@example.com" }).total, 1);
+  assert.equal(store.mediaTotals().locations, 1);
+  assert.equal(store.mediaTotalsByChat()[0]?.totals.locations, 1);
+});
+
+test("plain Apple Maps URLs persist as static shared-location messages", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-static-location-store-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const url = "https://maps.apple.com/place?coordinate=37.334900,-122.009000&name=Dropped%20Pin";
+  const message = await store.ingestIncoming({
+    uuid: "static-location-message-guid",
+    sender: "tel:+15555550101",
+    text: url,
+    participants: ["tel:+15555550101"],
+    timestampMs: 5678,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+  }, []);
+
+  assert.deepEqual(message.iBlue?.sharedLocation, {
+    latitude: 37.3349,
+    longitude: -122.009,
+    label: "Dropped Pin",
+    url,
+    isLive: false,
+  });
+});

@@ -7,6 +7,7 @@ import type {
   IdsLookupResult,
   IdsRegistrationInspection,
   InitializeParams,
+  NativeFindMyFollow,
   SendAttachmentParams,
   SendEditParams,
   SendGroupIconParams,
@@ -46,6 +47,7 @@ export interface IMessageEngine {
   startClient(): Promise<EngineSnapshot>;
   snapshot(): Promise<EngineSnapshot>;
   health(): Promise<{ clientStarted: boolean; secondsSinceLastInbound: number }>;
+  refreshFindMyFollowing?(address?: string, findMyIds?: string[]): Promise<NativeFindMyFollow[]>;
   sendMessage(params: SendMessageParams): Promise<{ guid: string }>;
   sendReaction(params: SendReactionParams): Promise<{ guid: string }>;
   sendAttachment(params: SendAttachmentParams): Promise<{ guid: string }>;
@@ -136,6 +138,10 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
 
   health(): Promise<{ clientStarted: boolean; secondsSinceLastInbound: number }> {
     return this.rpc.request("system.health");
+  }
+
+  refreshFindMyFollowing(address?: string, findMyIds?: string[]): Promise<NativeFindMyFollow[]> {
+    return this.rpc.request("findmy.following", { address, findMyIds });
   }
 
   sendMessage(params: SendMessageParams): Promise<{ guid: string }> {

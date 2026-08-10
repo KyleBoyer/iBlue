@@ -1,12 +1,27 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4a1966f..c5c81f2 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -57,6 +57,10 @@ chrono = "0.4.41"
+ bitflags = "2.9.1"
+ x509-cert = "0.2.5"
+
++[target.'cfg(target_os = "macos")'.dependencies]
++core-foundation = "0.9.4"
++security-framework-sys = { version = "2.14.0", features = ["OSX_10_13"] }
++
+ [build-dependencies]
+ prost-build = { version = "0.12.0" }
+
 diff --git a/src/aps.rs b/src/aps.rs
 index 6301922..8204f8d 100644
 --- a/src/aps.rs
 +++ b/src/aps.rs
 @@ -1,5 +1,5 @@
- 
+
 -use std::{borrow::BorrowMut, cmp::min, collections::{HashMap, VecDeque}, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::{Cursor, Read, Write}, marker::PhantomData, net::ToSocketAddrs, ops::Index, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
 +use std::{borrow::BorrowMut, cmp::min, collections::{HashMap, VecDeque}, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::{Cursor, Read, Write}, marker::PhantomData, ops::Index, sync::{Arc, Weak, atomic::{AtomicU32, AtomicU64, Ordering}}, time::{Duration, SystemTime}};
- 
+
  use backon::ExponentialBuilder;
  use deku::prelude::*;
 @@ -11,7 +11,7 @@ use prost::Message;
@@ -17,11 +32,11 @@ index 6301922..8204f8d 100644
 +use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split}, net::{TcpListener, TcpStream, lookup_host}, select, sync::{broadcast::{self, Receiver, Sender, error::RecvError}, mpsc}, task::{self, JoinHandle}};
  use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream, rustls::pki_types::ServerName};
  use async_recursion::async_recursion;
- 
+
 @@ -1205,7 +1205,75 @@ pub struct APSConnectionResource {
      sub_counter: AtomicU32,
  }
- 
+
 -const APNS_PORT: u16 = 5223;
 +const APNS_PORTS: [u16; 2] = [5223, 443];
 +const APNS_PORT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -92,19 +107,19 @@ index 6301922..8204f8d 100644
 +        ).into()
 +    }))
 +}
- 
+
  async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>, Option<APSPackedDecoder>), PushError> {
      let certs = rustls_pemfile::certs(&mut Cursor::new(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")))?;
 @@ -1225,10 +1293,7 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
- 
+
      let domain = format!("{}-{}", rand::thread_rng().gen_range(1..hostcount), hostname);
-     
+
 -    let dnsname = ServerName::try_from(hostname).unwrap();
--    
+-
 -    let stream = TcpStream::connect((domain.as_str(), APNS_PORT).to_socket_addrs()?.next().unwrap()).await?;
 -    let stream = connector.connect(dnsname, stream).await?;
 +    let stream = connect_apns_socket(&connector, domain.as_str(), hostname.as_str()).await?;
- 
+
      let mut encoder = None;
      let mut decoder = None;
 @@ -1255,12 +1320,27 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
@@ -137,7 +152,1074 @@ index 6301922..8204f8d 100644
 +            }
          };
          info!("Generating Opened socket");
- 
+
+diff --git a/src/auth.rs b/src/auth.rs
+index 454eff9..f52ba36 100644
+--- a/src/auth.rs
++++ b/src/auth.rs
+@@ -193,6 +193,23 @@ impl<T: AnisetteProvider> TokenProvider<T> {
+         }
+         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
+     }
++
++    /// Return the Apple Account identifier associated with the current
++    /// MobileMe token. Some Find My endpoints authenticate the SearchParty
++    /// token against this identifier rather than the numeric DSID.
++    pub async fn get_account_username(&self) -> Result<String, PushError> {
++        self.account
++            .lock()
++            .await
++            .username
++            .clone()
++            .ok_or(PushError::TokenMissing)
++    }
++
++    pub async fn seed_mme_delegate(&self, delegate: MobileMeDelegateResponse) {
++        *self.mme_delegate.lock().await = Some(delegate);
++        *self.mme_refreshed.lock().await = SystemTime::now();
++    }
+ }
+
+ #[derive(Deserialize)]
+@@ -1447,4 +1464,3 @@ impl IdmsAuthListener {
+         })
+     }
+ }
+-
+diff --git a/src/findmy.rs b/src/findmy.rs
+index 1be0a65..fa8b7aa 100644
+--- a/src/findmy.rs
++++ b/src/findmy.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
++use std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, u8};
+
+ use aes::{cipher::consts::U16, Aes128, Aes256};
+ use aes_gcm::{Aes256Gcm, AesGcm, Nonce, Tag, aead::{Aead, AeadMutInPlace}};
+@@ -7,7 +7,7 @@ use cloudkit_derive::CloudKitRecord;
+ use deku::{DekuContainerRead, DekuRead};
+ use hkdf::Hkdf;
+ use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
+-use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
++use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::{sha1, sha256}, sign::{Signer, Verifier}};
+ use sha2::Sha256;
+ use icloud_auth::AppleAccount;
+ use log::{debug, warn};
+@@ -34,8 +34,12 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
+         "com.apple.private.alloy.kcsharing.invite",
+     ],
+     client_data: &[
++        ("supports-key-sharing", Value::Boolean(true)),
+         ("supports-fmd-v2", Value::Boolean(true)),
++        ("supports-fm-fence-v1", Value::Boolean(true)),
++        ("supports-location-sharing", Value::Boolean(true)),
+         ("supports-incoming-fmd-v1", Value::Boolean(true)),
++        ("supports-secure-loc-v1", Value::Boolean(true)),
+         ("supports-findmy-plugin-messages", Value::Boolean(true)),
+         ("supports-beacon-sharing-v3", Value::Boolean(true)),
+         ("supports-beacon-sharing-v2", Value::Boolean(true)),
+@@ -44,6 +48,61 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
+     capabilities_name: "com.apple.private.alloy"
+ };
+
++const FMF_PUSH_TOPIC: &str = "com.apple.mobileme.fmf3";
++const FMF_IDS_TOPIC: &str = "com.apple.private.alloy.fmf";
++const FMD_IDS_TOPIC: &str = "com.apple.private.alloy.fmd";
++const SECURE_LOCATION_KEYSHARING_TOPIC: &str = "com.apple.private.alloy.status.keysharing";
++const ITEM_SHARING_TOPIC: &str = "com.apple.private.alloy.findmy.itemsharing-crossaccount";
++
++fn plist_shape(value: &Value) -> String {
++    match value {
++        Value::Dictionary(values) => format!(
++            "dict{{{}}}",
++            values.iter().map(|(key, value)| format!("{key}:{}", plist_shape(value))).collect::<Vec<_>>().join(",")
++        ),
++        Value::Array(values) => format!(
++            "array({})[{}]",
++            values.len(),
++            values.iter().take(3).map(plist_shape).collect::<Vec<_>>().join(",")
++        ),
++        Value::Data(value) => format!("data({})", value.len()),
++        Value::String(value) => format!("string({})", value.len()),
++        Value::Boolean(_) => "bool".to_string(),
++        Value::Integer(_) => "integer".to_string(),
++        Value::Real(_) => "real".to_string(),
++        Value::Date(_) => "date".to_string(),
++        Value::Uid(_) => "uid".to_string(),
++        _ => "other".to_string(),
++    }
++}
++
++fn json_shape(value: &serde_json::Value) -> String {
++    match value {
++        serde_json::Value::Object(values) => format!(
++            "object{{{}}}",
++            values
++                .iter()
++                .map(|(key, value)| format!("{key}:{}", json_shape(value)))
++                .collect::<Vec<_>>()
++                .join(",")
++        ),
++        serde_json::Value::Array(values) => format!(
++            "array({})[{}]",
++            values.len(),
++            values
++                .iter()
++                .take(2)
++                .map(json_shape)
++                .collect::<Vec<_>>()
++                .join(",")
++        ),
++        serde_json::Value::String(value) => format!("string({})", value.len()),
++        serde_json::Value::Number(_) => "number".to_string(),
++        serde_json::Value::Bool(_) => "bool".to_string(),
++        serde_json::Value::Null => "null".to_string(),
++    }
++}
++
+ #[derive(Deserialize, Serialize, Default, Clone)]
+ #[serde(rename_all = "camelCase")]
+ pub struct BeaconAttributes {
+@@ -72,6 +131,90 @@ pub struct FindMyShareState {
+     pub shared_beacons: HashMap<String, SharedBeaconRecord>,
+     pub tags: HashMap<String, String>,
+     pub shared_beacons_client: HashMap<String, SharedBeaconClient>,
++    /// Secure Find My Friends location keys received from the sharing peer.
++    /// The outer map is keyed by Find My identifier; the inner map is keyed
++    /// by the base64-encoded advertised location identifier used by the
++    /// gateway fetch API. The containing FindMyState is encrypted at rest.
++    #[serde(default)]
++    pub secure_friend_keys: HashMap<String, HashMap<String, SecureFriendKey>>,
++}
++
++#[derive(Serialize, Deserialize, Clone, Debug)]
++pub struct SecureFriendKey {
++    pub index: i64,
++    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
++    pub decryption_key: Vec<u8>,
++}
++
++struct DecodedSecureFriendKeyUpdate {
++    find_my_identifier: String,
++    index: i64,
++    private_key: Vec<u8>,
++    advertised_location_id: Vec<u8>,
++}
++
++fn plist_wrapped_string(value: &Value) -> Option<String> {
++    match value {
++        Value::String(value) => Some(value.clone()),
++        Value::Data(value) => std::str::from_utf8(value).ok().map(str::to_owned),
++        Value::Dictionary(values) => ["rawValue", "value", "identifier", "data", "_0"]
++            .into_iter()
++            .find_map(|key| values.get(key).and_then(plist_wrapped_string)),
++        Value::Array(values) if values.len() == 1 => plist_wrapped_string(&values[0]),
++        _ => None,
++    }
++}
++
++fn plist_wrapped_data(value: &Value) -> Option<Vec<u8>> {
++    match value {
++        Value::Data(value) => Some(value.clone()),
++        Value::Dictionary(values) => ["data", "rawValue", "value", "key", "keyMaterial", "_0"]
++            .into_iter()
++            .find_map(|key| values.get(key).and_then(plist_wrapped_data)),
++        Value::Array(values) if values.len() == 1 => plist_wrapped_data(&values[0]),
++        _ => None,
++    }
++}
++
++fn plist_wrapped_integer(value: &Value) -> Option<i64> {
++    value
++        .as_signed_integer()
++        .or_else(|| value.as_unsigned_integer().and_then(|value| i64::try_from(value).ok()))
++        .or_else(|| match value {
++            Value::Dictionary(values) => ["rawValue", "value", "index", "_0"]
++                .into_iter()
++                .find_map(|key| values.get(key).and_then(plist_wrapped_integer)),
++            Value::Array(values) if values.len() == 1 => plist_wrapped_integer(&values[0]),
++            _ => None,
++        })
++}
++
++fn decode_secure_friend_key_update(value: &Value) -> Option<DecodedSecureFriendKeyUpdate> {
++    let values = value.as_dictionary()?;
++    let find_my_identifier = values
++        .get("entityIdentifier")
++        .or_else(|| values.get("findMyIdentifier"))
++        .and_then(plist_wrapped_string)?;
++    let index = values.get("index").and_then(plist_wrapped_integer)?;
++    let private_key = values.get("privateKey").and_then(plist_wrapped_data)?;
++    let advertised_location_id = values
++        .get("hashedAdvertisement")
++        .or_else(|| values.get("advertisedLocationId"))
++        .and_then(plist_wrapped_data)?;
++
++    Some(DecodedSecureFriendKeyUpdate {
++        find_my_identifier,
++        index,
++        private_key,
++        advertised_location_id,
++    })
++}
++
++fn decode_secure_friend_key_updates(value: &Value) -> Vec<DecodedSecureFriendKeyUpdate> {
++    match value {
++        Value::Array(values) => values.iter().filter_map(decode_secure_friend_key_update).collect(),
++        _ => decode_secure_friend_key_update(value).into_iter().collect(),
++    }
+ }
+
+ impl FindMyShareState {
+@@ -216,6 +359,373 @@ pub struct FindMyClient<P: AnisetteProvider> {
+     pub keychain: Arc<KeychainClient<P>>,
+     token_provider: Arc<TokenProvider<P>>,
+     anisette: ArcAnisetteClient<P>,
++    secure_friend_bootstrap_attempted: Mutex<HashMap<String, SystemTime>>,
++}
++
++#[derive(Deserialize, Serialize, Clone)]
++#[serde(rename_all = "camelCase")]
++pub struct SecureFriendLocationInfo {
++    pub location_ts: i64,
++    pub location: String,
++    pub fmt: i64,
++}
++
++#[derive(Deserialize, Serialize, Clone)]
++#[serde(rename_all = "camelCase")]
++pub struct SecureFriendLocationPayload {
++    #[serde(default)]
++    pub location_info: Vec<SecureFriendLocationInfo>,
++    pub id: String,
++    #[serde(default)]
++    pub loc_decrypt_key: Option<String>,
++    #[serde(default)]
++    pub lvl_packets: Option<serde_json::Value>,
++}
++
++#[derive(Deserialize, Serialize, Clone, Default)]
++#[serde(rename_all = "camelCase")]
++pub struct SecureFriendLocationResponse {
++    #[serde(default)]
++    pub location_payload: Vec<SecureFriendLocationPayload>,
++    #[serde(default)]
++    pub failed_fm_ids: Vec<String>,
++    #[serde(default)]
++    pub config_version: Option<i64>,
++    #[serde(default)]
++    pub status_code: Option<String>,
++}
++
++#[derive(Clone, Debug)]
++struct DecodedSecureFriendLocation {
++    latitude: f64,
++    longitude: f64,
++    horizontal_accuracy: f64,
++    timestamp: i64,
++}
++
++#[cfg(target_os = "macos")]
++fn decrypt_secure_friend_ecies(
++    private_key: &[u8],
++    encrypted: &[u8],
++) -> Result<Vec<u8>, PushError> {
++    use core_foundation::{
++        base::{CFType, TCFType},
++        data::CFData,
++        dictionary::CFDictionary,
++        error::CFError,
++        string::CFString,
++    };
++    use security_framework_sys::{
++        item::{
++            kSecAttrKeyClass, kSecAttrKeyClassPrivate, kSecAttrKeyType,
++            kSecAttrKeyTypeEC,
++        },
++        key::{
++            Algorithm, SecKeyCreateDecryptedData, SecKeyCreateWithData,
++            SecKeyIsAlgorithmSupported, kSecKeyOperationTypeDecrypt,
++        },
++    };
++
++    unsafe {
++        let key_type_name = CFString::wrap_under_get_rule(kSecAttrKeyType);
++        let key_type_ec = CFString::wrap_under_get_rule(kSecAttrKeyTypeEC);
++        let key_class_name = CFString::wrap_under_get_rule(kSecAttrKeyClass);
++        let key_class_private = CFString::wrap_under_get_rule(kSecAttrKeyClassPrivate);
++        let attributes = CFDictionary::from_CFType_pairs(&[
++            (key_type_name, key_type_ec),
++            (key_class_name, key_class_private),
++        ]);
++        let key_data = CFData::from_buffer(private_key);
++        let mut error = std::ptr::null_mut();
++        let key = SecKeyCreateWithData(
++            key_data.as_concrete_TypeRef(),
++            attributes.as_concrete_TypeRef(),
++            &mut error,
++        );
++        if !error.is_null() {
++            let error = CFError::wrap_under_create_rule(error);
++            debug!("Secure Find My Friends private key import failed code={}", error.code());
++            return Err(PushError::BadMsg);
++        }
++        if key.is_null() {
++            return Err(PushError::BadMsg);
++        }
++        let key_owner = CFType::wrap_under_create_rule(key.cast());
++
++        let encrypted_data = CFData::from_buffer(encrypted);
++        let algorithm = Algorithm::ECIESEncryptionStandardVariableIVX963SHA256AESGCM.into();
++        let algorithm_supported = SecKeyIsAlgorithmSupported(
++            key,
++            kSecKeyOperationTypeDecrypt,
++            algorithm,
++        ) != 0;
++        let mut error = std::ptr::null_mut();
++        let decrypted = SecKeyCreateDecryptedData(
++            key,
++            algorithm,
++            encrypted_data.as_concrete_TypeRef(),
++            &mut error,
++        );
++        drop(key_owner);
++        if !error.is_null() {
++            let error = CFError::wrap_under_create_rule(error);
++            debug!(
++                "Secure Find My Friends ECIES decrypt failed code={}, algorithm_supported={algorithm_supported}, encrypted_len={}",
++                error.code(),
++                encrypted.len(),
++            );
++            return Err(PushError::BadMsg);
++        }
++        if decrypted.is_null() {
++            return Err(PushError::BadMsg);
++        }
++        Ok(CFData::wrap_under_create_rule(decrypted).to_vec())
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn negated_p224_private_key(private_key: &[u8]) -> Result<Vec<u8>, PushError> {
++    if private_key.len() != 85 {
++        return Err(PushError::BadMsg);
++    }
++    let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
++    let mut context = BigNumContext::new()?;
++    let mut public = EcPoint::from_bytes(&group, &private_key[..57], &mut context)?;
++    public.invert(&group, &context)?;
++
++    let mut order = BigNum::new()?;
++    group.order(&mut order, &mut context)?;
++    let scalar = BigNum::from_slice(&private_key[57..])?;
++    let mut negated_scalar = BigNum::new()?;
++    negated_scalar.checked_sub(&order, &scalar)?;
++
++    let mut result = public.to_bytes(
++        &group,
++        PointConversionForm::UNCOMPRESSED,
++        &mut context,
++    )?;
++    result.extend_from_slice(&negated_scalar.to_vec_padded(28)?);
++    Ok(result)
++}
++
++fn decrypt_secure_friend_custom_ecies(
++    private_key: &[u8],
++    encrypted_data: &[u8],
++) -> Result<Vec<u8>, PushError> {
++    if private_key.len() != 85 || encrypted_data.len() < 57 + 16 {
++        return Err(PushError::BadMsg);
++    }
++    let (public_key, private_scalar) = private_key.split_at(57);
++    let group = EcGroup::from_curve_name(Nid::SECP224R1)?;
++    let mut context = BigNumContext::new()?;
++    let own_public = EcPoint::from_bytes(&group, public_key, &mut context)?;
++    let own_private = BigNum::from_slice(private_scalar)?;
++    let own_key = EcKey::from_private_components(&group, &own_private, &own_public)?;
++
++    let peer_public = EcPoint::from_bytes(&group, &encrypted_data[..57], &mut context)?;
++    let peer_key = EcKey::from_public_key(&group, &peer_public)?;
++    let own_pkey = PKey::from_ec_key(own_key)?;
++    let peer_pkey = PKey::from_ec_key(peer_key)?;
++    let mut deriver = Deriver::new(&own_pkey)?;
++    deriver.set_peer(&peer_pkey)?;
++    let secret = deriver.derive_to_vec()?;
++    let symmetric = sha256(&[
++        secret.as_slice(),
++        &[0x00, 0x00, 0x00, 0x01],
++        &encrypted_data[..57],
++    ].concat());
++
++    let cipher = AesGcm::<Aes128, U16>::new_from_slice(&symmetric[..16])
++        .map_err(|_| PushError::BadMsg)?;
++    cipher
++        .decrypt(Nonce::from_slice(&symmetric[16..]), &encrypted_data[57..])
++        .map_err(|_| PushError::BadMsg)
++}
++
++fn decrypt_secure_friend_location(
++    private_key: &[u8],
++    encoded_location: &str,
++    payload_format: i64,
++    outer_timestamp: i64,
++) -> Result<DecodedSecureFriendLocation, PushError> {
++    // FindMyCrypto.PrivateKey is the 57-byte uncompressed P-224 public point
++    // followed by the 28-byte private scalar. Secure People reports use
++    // Security.framework's variable-IV ECIES envelope.
++    if private_key.len() != 85 {
++        return Err(PushError::BadMsg);
++    }
++    let payload = base64_decode(encoded_location);
++    if payload.len() < 5 + 57 + 16 {
++        return Err(PushError::BadMsg);
++    }
++
++    #[cfg(not(target_os = "macos"))]
++    let timestamp_seconds = u32::from_be_bytes(
++        payload[..4].try_into().map_err(|_| PushError::BadMsg)?,
++    ) as u64 + 978_307_200;
++    #[cfg(target_os = "macos")]
++    {
++        // SecureLocationsPayloadFormat.jsonFull is a Security.framework ECIES
++        // envelope containing the JSON-encoded SecureLocation. Unlike Find My
++        // network beacon reports, it has no advertised-key/timestamp prefix:
++        // searchpartyd passes the complete `location` Data to
++        // SecKeyCreateDecryptedData.
++        if payload_format == 0 {
++            if let Ok(decrypted) = decrypt_secure_friend_ecies(private_key, &payload) {
++                let value: serde_json::Value = serde_json::from_slice(&decrypted)
++                    .map_err(|_| PushError::BadMsg)?;
++                debug!(
++                    "Authenticated secure Find My Friends jsonFull report encrypted_len={}, plaintext_len={}, plaintext_shape={}",
++                    payload.len(),
++                    decrypted.len(),
++                    json_shape(&value),
++                );
++                let latitude = value
++                    .get("latitude")
++                    .and_then(serde_json::Value::as_f64)
++                    .ok_or(PushError::BadMsg)?;
++                let longitude = value
++                    .get("longitude")
++                    .and_then(serde_json::Value::as_f64)
++                    .ok_or(PushError::BadMsg)?;
++                let horizontal_accuracy = value
++                    .get("horizontalAccuracy")
++                    .and_then(serde_json::Value::as_f64)
++                    .unwrap_or_default();
++                if !(-90.0..=90.0).contains(&latitude)
++                    || !(-180.0..=180.0).contains(&longitude)
++                {
++                    return Err(PushError::BadMsg);
++                }
++                // Foundation's default Codable representation for Date is
++                // seconds since 2001-01-01. Keep the response's locationTs as
++                // a compatibility fallback for future payload revisions.
++                let timestamp = value
++                    .get("timestamp")
++                    .and_then(serde_json::Value::as_f64)
++                    .filter(|timestamp| timestamp.is_finite())
++                    .map(|timestamp| ((timestamp + 978_307_200.0) * 1000.0) as i64)
++                    .unwrap_or_else(|| {
++                        if outer_timestamp.abs() >= 10_000_000_000 {
++                            outer_timestamp
++                        } else {
++                            outer_timestamp.saturating_mul(1000)
++                        }
++                    });
++                return Ok(DecodedSecureFriendLocation {
++                    latitude,
++                    longitude,
++                    horizontal_accuracy,
++                    timestamp,
++                });
++            }
++        }
++
++        // Current BeaconPayloadv1 packets place the Apple timestamp at
++        // 32..36, metadata at 36, and the ECIES ciphertext at 37..end. The
++        // legacy packet uses the compact 0..4 / 4 / 5..end layout.
++        let (timestamp_offset, encrypted_offset) = if payload.len() >= 120 {
++            (32usize, 37usize)
++        } else {
++            (0usize, 5usize)
++        };
++        let timestamp_seconds = u32::from_be_bytes(
++            payload[timestamp_offset..timestamp_offset + 4]
++                .try_into()
++                .map_err(|_| PushError::BadMsg)?,
++        ) as u64 + 978_307_200;
++        let (decrypted, decrypt_format) =
++            match decrypt_secure_friend_ecies(private_key, &payload[encrypted_offset..]) {
++                Ok(decrypted) => (decrypted, "security-framework"),
++                Err(_) => {
++                    let negated_key = negated_p224_private_key(private_key)?;
++                    match decrypt_secure_friend_ecies(&negated_key, &payload[encrypted_offset..]) {
++                        Ok(decrypted) => (decrypted, "security-framework-negated"),
++                        Err(_) => (
++                            decrypt_secure_friend_custom_ecies(
++                                private_key,
++                                &payload[encrypted_offset..],
++                            )?,
++                            "custom-ecies",
++                        ),
++                    }
++                }
++            };
++        debug!(
++            "Authenticated secure Find My Friends report segment encrypted_len={}, plaintext_len={}, decrypt_format={decrypt_format}",
++            payload.len() - encrypted_offset,
++            decrypted.len(),
++        );
++        let (_, decoded) = EncryptedReport::from_bytes((&decrypted, 0))?;
++        if !(-900_000_000..=900_000_000).contains(&decoded.lat)
++            || !(-1_800_000_000..=1_800_000_000).contains(&decoded.long)
++        {
++            return Err(PushError::BadMsg);
++        }
++        return Ok(DecodedSecureFriendLocation {
++            latitude: decoded.lat as f64 / 10_000_000f64,
++            longitude: decoded.long as f64 / 10_000_000f64,
++            horizontal_accuracy: decoded.horizontal_accuracy as f64,
++            timestamp: i64::try_from(timestamp_seconds.saturating_mul(1000))
++                .map_err(|_| PushError::BadMsg)?,
++        });
++    }
++
++    #[cfg(not(target_os = "macos"))]
++    let encrypted_data = &payload[5..];
++
++    #[cfg(not(target_os = "macos"))]
++    {
++        let decrypted = decrypt_secure_friend_custom_ecies(private_key, encrypted_data)?;
++        let (_, decoded) = EncryptedReport::from_bytes((&decrypted, 0))?;
++
++        Ok(DecodedSecureFriendLocation {
++            latitude: decoded.lat as f64 / 10_000_000f64,
++            longitude: decoded.long as f64 / 10_000_000f64,
++            horizontal_accuracy: decoded.horizontal_accuracy as f64,
++            timestamp: i64::try_from(timestamp_seconds.saturating_mul(1000))
++                .map_err(|_| PushError::BadMsg)?,
++        })
++    }
++}
++
++fn secure_friend_fetch_request(
++    find_my_id: &str,
++    secure_location_ids: &[String],
++    aps_token: &[u8],
++    context_app: &str,
++) -> serde_json::Value {
++    let fetch = if secure_location_ids.is_empty() {
++        json!({
++            "fmId": find_my_id,
++            "intent": "distributeKeys",
++            "mode": "shallow",
++        })
++    } else {
++        json!({
++            "fmId": find_my_id,
++            "intent": "startLocationUpdates",
++            "mode": "shallow",
++            "ids": secure_location_ids,
++        })
++    };
++
++    json!({
++        "fetch": [fetch],
++        "clientContext": {
++            "apsToken": encode_hex(aps_token).to_uppercase(),
++            "clientId": encode_hex(&sha1(aps_token)),
++            // FindMyLocate.RequestOrigin obtains this from
++            // ProcessInfo.processIdentifier. SecureLocationsClientContext
++            // serializes the value as a decimal string.
++            "contextApp": context_app,
++            "shallowStats": {},
++            "liveStats": {
++                "errors": [],
++            },
++            "autoMeConnectedDevice": [],
++        },
++    })
+ }
+
+ const SEARCH_PARTY_CONTAINER: CloudKitContainer = CloudKitContainer {
+@@ -808,7 +1318,13 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+     pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
+         let daemon = FindMyFriendsClient::new(config.as_ref(), state.state.lock().await.dsid.clone(), token_provider.clone(), conn.clone(), anisette.clone(), true).await?;
+         Ok(FindMyClient {
+-            _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
++            _interest_token: conn.request_topics(&[
++                FMF_IDS_TOPIC,
++                FMD_IDS_TOPIC,
++                SECURE_LOCATION_KEYSHARING_TOPIC,
++                ITEM_SHARING_TOPIC,
++                FMF_PUSH_TOPIC,
++            ]).await,
+             conn,
+             identity,
+             daemon: DebugMutex::new(daemon),
+@@ -819,6 +1335,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+             keychain,
+             token_provider,
+             anisette,
++            secure_friend_bootstrap_attempted: Mutex::new(HashMap::new()),
+         })
+     }
+
+@@ -831,6 +1348,19 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+         return Ok(locked.clone().unwrap())
+     }
+
++    /// Return the opaque location identifiers needed by the secure Find My
++    /// Friends gateway. These identifiers are safe to pass back to Apple but
++    /// must not be logged alongside the associated decryption keys.
++    pub async fn secure_friend_location_ids(&self, find_my_id: &str) -> Vec<String> {
++        let state = self.state.state.lock().await;
++        state
++            .share_state
++            .secure_friend_keys
++            .get(find_my_id)
++            .map(|keys| keys.keys().cloned().collect())
++            .unwrap_or_default()
++    }
++
+     pub async fn sync_items(&self, fetch_shares: bool) -> Result<(), PushError> {
+         let container = self.get_container().await?;
+
+@@ -1134,6 +1664,180 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+         Ok(serde_json::from_slice(&description)?)
+     }
+
++    /// Ask the modern Find My Friends service to begin shallow location
++    /// updates for a Messages share. Secure location identifiers are supplied
++    /// by the peer's key-sharing handoff and may be empty while that handoff is
++    /// still pending.
++    pub async fn fetch_secure_friend_locations(&self, find_my_id: &str, secure_location_ids: &[String]) -> Result<SecureFriendLocationResponse, PushError> {
++        // A new secure share has no advertised location IDs yet. Current Apple
++        // clients bootstrap it with the `distributeKeys` intent and omit `ids`
++        // entirely; the sharing peer then delivers its rotating ID and key over
++        // IDS. Once those keys exist, `startLocationUpdates` includes their IDs
++        // and the gateway returns encrypted reports.
++        let bootstrapping = secure_location_ids.is_empty();
++        if bootstrapping {
++            let now = SystemTime::now();
++            let mut attempted = self.secure_friend_bootstrap_attempted.lock().await;
++            if attempted
++                .get(find_my_id)
++                .and_then(|last_attempt| now.duration_since(*last_attempt).ok())
++                .is_some_and(|elapsed| elapsed < Duration::from_secs(30))
++            {
++                debug!("Secure Find My Friends fetch deferred after bootstrap while the key handoff is pending");
++                return Ok(Default::default());
++            }
++            attempted.insert(find_my_id.to_string(), now);
++            debug!("Bootstrapping Secure Find My Friends location-key subscription");
++        }
++        let mut request = self.anisette.lock().await.get_headers().await?.clone();
++        request.remove("X-Mme-Client-Info");
++        let anisette_headers: HeaderMap = request.into_iter()
++            .map(|(name, value)| (HeaderName::from_str(&name).unwrap(), value.parse().unwrap()))
++            .collect();
++        let token = self.token_provider.get_mme_token("searchPartyToken").await?;
++        let aps_token = self.conn.get_token().await;
++        let body = serde_json::to_string(&secure_friend_fetch_request(
++            find_my_id,
++            secure_location_ids,
++            &aps_token,
++            &std::process::id().to_string(),
++        ))?;
++        let account_username = self.token_provider.get_account_username().await?;
++        let dsid = self.state.state.lock().await.dsid.clone();
++        let request_for = |username: &str| {
++            REQWEST.post("https://gateway.icloud.com/findmyservice/fetch")
++                .basic_auth(username, Some(token.clone()))
++                .headers(anisette_headers.clone())
++                .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyd/1.0"))
++                .header("Accept", "application/json")
++                .header("accept-version", "1")
++                .header("user-agent", "searchpartyd/1.0 CFNetwork/1410.0.3 Darwin/22.6.0")
++                .header("Content-Type", "application/json")
++                .body(body.clone())
++        };
++        let mut response = request_for(&account_username).send().await?;
++        if response.status() == reqwest::StatusCode::UNAUTHORIZED && dsid != account_username {
++            debug!("Secure Find My Friends fetch retrying with person-ID credential");
++            response = request_for(&dsid).send().await?;
++        }
++        let status = response.status();
++        let description = response.bytes().await?;
++        if description.is_empty() {
++            debug!("Secure Find My Friends fetch returned HTTP {status} with an empty body");
++            return Ok(Default::default())
++        }
++        let response_value: serde_json::Value = serde_json::from_slice(&description)?;
++        debug!(
++            "Secure Find My Friends response shape={}",
++            json_shape(&response_value),
++        );
++        let decoded: SecureFriendLocationResponse = serde_json::from_value(response_value)?;
++        debug!(
++            "Secure Find My Friends fetch returned HTTP {status}, status={:?}, failed_ids={}, payloads={}, reports={}",
++            decoded.status_code,
++            decoded.failed_fm_ids.len(),
++            decoded.location_payload.len(),
++            decoded.location_payload.iter().map(|payload| payload.location_info.len()).sum::<usize>(),
++        );
++        debug!(
++            "Secure Find My Friends report formats={:?}",
++            decoded.location_payload.iter().flat_map(|payload| payload.location_info.iter()).map(|report| {
++                (report.fmt, base64_decode(&report.location).len())
++            }).collect::<Vec<_>>(),
++        );
++        self.apply_secure_friend_locations(find_my_id, &decoded).await?;
++        Ok(decoded)
++    }
++
++    async fn apply_secure_friend_locations(
++        &self,
++        find_my_id: &str,
++        response: &SecureFriendLocationResponse,
++    ) -> Result<(), PushError> {
++        let state = self.state.state.lock().await;
++        let Some(keys) = state.share_state.secure_friend_keys.get(find_my_id) else {
++            return Ok(());
++        };
++
++        let derived_advertisement_matches = keys
++            .iter()
++            .filter(|(_, key)| key.decryption_key.len() == 85)
++            .filter(|(location_id, key)| {
++                base64_decode(location_id) == sha256(&key.decryption_key[1..29])
++            })
++            .count();
++        let payload_id_matches = response
++            .location_payload
++            .iter()
++            .filter(|payload| keys.contains_key(&payload.id))
++            .count();
++        debug!(
++            "Secure Find My Friends key alignment keys={}, derived_advertisement_matches={}, payload_id_matches={}",
++            keys.len(),
++            derived_advertisement_matches,
++            payload_id_matches,
++        );
++
++        let mut newest: Option<DecodedSecureFriendLocation> = None;
++        let mut decoded_count = 0usize;
++        for payload in &response.location_payload {
++            for location in &payload.location_info {
++                let mut decoded = keys
++                    .get(&payload.id)
++                    .and_then(|key| decrypt_secure_friend_location(
++                        &key.decryption_key,
++                        &location.location,
++                        location.fmt,
++                        location.location_ts,
++                    ).ok());
++                if decoded.is_none() {
++                    decoded = keys.values().find_map(|key| {
++                        decrypt_secure_friend_location(
++                            &key.decryption_key,
++                            &location.location,
++                            location.fmt,
++                            location.location_ts,
++                        ).ok()
++                    });
++                }
++                let Some(decoded) = decoded else { continue };
++                decoded_count += 1;
++                if newest.as_ref().is_none_or(|current| decoded.timestamp > current.timestamp) {
++                    newest = Some(decoded);
++                }
++            }
++        }
++        drop(state);
++
++        debug!(
++            "Secure Find My Friends decoded reports={decoded_count}, has_latest={}",
++            newest.is_some(),
++        );
++        let Some(newest) = newest else { return Ok(()) };
++        let mut daemon = self.daemon.lock().await;
++        let Some(follow) = daemon.following.iter_mut().find(|follow| follow.id == find_my_id) else {
++            return Ok(());
++        };
++        follow.last_location = Some(Location {
++            address: None,
++            altitude: 0.0,
++            floor_level: 0,
++            horizontal_accuracy: newest.horizontal_accuracy,
++            is_inaccurate: false,
++            latitude: newest.latitude,
++            location_id: None,
++            location_timestamp: Some(newest.timestamp),
++            longitude: newest.longitude,
++            secure_location_ts: newest.timestamp,
++            timestamp: newest.timestamp,
++            vertical_accuracy: 0.0,
++            position_type: Some("secure".to_string()),
++            is_old: None,
++            location_finished: Some(true),
++        });
++        Ok(())
++    }
++
+     pub async fn sync_item_positions(&self) -> Result<(), PushError> {
+         self.sync_items(true).await?;
+
+@@ -1604,8 +2308,49 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+         } else { Ok(Some((payload_data.share_identifier, attrs)))}
+     }
+
++    async fn store_secure_friend_key_updates(&self, payload: &Value) -> Result<usize, PushError> {
++        let updates = decode_secure_friend_key_updates(payload);
++        let mut state = self.state.state.lock().await;
++        let mut stored = 0usize;
++        for update in updates {
++            let location_id = base64_encode(&update.advertised_location_id);
++            let find_my_keys = state
++                .share_state
++                .secure_friend_keys
++                .entry(update.find_my_identifier)
++                .or_default();
++            find_my_keys.insert(location_id, SecureFriendKey {
++                index: update.index,
++                decryption_key: update.private_key,
++            });
++            // Keep a bounded rotation history. Apple normally sends only a
++            // handful of active keys, but a long-running bridge should not
++            // retain obsolete entries forever.
++            while find_my_keys.len() > 64 {
++                let Some(oldest) = find_my_keys
++                    .iter()
++                    .min_by_key(|(_, key)| key.index)
++                    .map(|(id, _)| id.clone())
++                else { break };
++                find_my_keys.remove(&oldest);
++            }
++            stored += 1;
++        }
++        if stored > 0 {
++            self.state.save(&state)?;
++        }
++        Ok(stored)
++    }
++
+     pub async fn handle(&self, msg: APSMessage) -> Result<Vec<(String, String, BeaconAttributes)>, PushError> {
+-        if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), ns_since_epoch: Some(ns_since_epoch), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await? {
++        if let APSMessage::Notification { topic, payload, .. } = &msg {
++            if topic == &sha1(FMF_PUSH_TOPIC.as_bytes()) {
++                debug!("Find My Friends push payload shape: {}", plist_shape(payload));
++                return Ok(vec![])
++            }
++        }
++
++        if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), ns_since_epoch: Some(ns_since_epoch), .. }) = self.identity.receive_message(msg, &[FMF_IDS_TOPIC, FMD_IDS_TOPIC, SECURE_LOCATION_KEYSHARING_TOPIC, ITEM_SHARING_TOPIC]).await? {
+             let do_app_ack = || async {
+                 let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender.clone()], &[MessageTarget::Token(token)])?;
+                 self.identity.send_message(topic, IDSSendMessage {
+@@ -1626,7 +2371,63 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+                 Ok::<(), PushError>(())
+             };
+
+-            if topic == "com.apple.private.alloy.findmy.itemsharing-crossaccount" {
++            // Current macOS sends People secure-location key updates as a
++            // FindMyMessaging Message on the FMD (and, on some versions, FMF)
++            // IDS service. Type 0/version 1 contains one
++            // SecureLocationsKeyUpdateEnvelope. Older clients used the
++            // StatusKit key-sharing service and a vector payload.
++            if topic == FMD_IDS_TOPIC || topic == FMF_IDS_TOPIC {
++                if let Ok(parsed) = message.clone().plist::<ItemSharingMessage>() {
++                    let payload: Value = plist::from_bytes(parsed.payload.as_ref())?;
++                    debug!(
++                        "Secure Find My IDS envelope topic={} type={} version={} payload_shape={}",
++                        topic,
++                        parsed.r#type,
++                        parsed.version,
++                        plist_shape(&payload),
++                    );
++                    // Current macOS releases have emitted this envelope as
++                    // both the modern enum value 0 and the legacy-compatible
++                    // key-update value 10 on the FMD service.
++                    if matches!(parsed.r#type, 0 | 10) && parsed.version == 1 {
++                        let stored = self.store_secure_friend_key_updates(&payload).await?;
++                        debug!("Stored {stored} secure Find My Friends key update(s)");
++                    } else {
++                        debug!(
++                            "Ignoring unsupported secure Find My IDS message type={} version={}",
++                            parsed.r#type,
++                            parsed.version,
++                        );
++                    }
++                    do_app_ack().await?;
++                    return Ok(vec![])
++                }
++            }
++
++            if topic == SECURE_LOCATION_KEYSHARING_TOPIC {
++                let parsed: ItemSharingMessage = message.plist()?;
++                let payload: Value = plist::from_bytes(parsed.payload.as_ref())?;
++                debug!(
++                    "Secure Find My key-sharing IDS envelope type={} version={} payload_shape={}",
++                    parsed.r#type,
++                    parsed.version,
++                    plist_shape(&payload),
++                );
++                if parsed.r#type == 10 && parsed.version == 1 {
++                    let stored = self.store_secure_friend_key_updates(&payload).await?;
++                    debug!("Stored {stored} secure Find My Friends key update(s)");
++                } else {
++                    debug!(
++                        "Ignoring unsupported secure Find My key-sharing message type={} version={}",
++                        parsed.r#type,
++                        parsed.version,
++                    );
++                }
++                do_app_ack().await?;
++                return Ok(vec![])
++            }
++
++            if topic == ITEM_SHARING_TOPIC {
+                 let parsed: ItemSharingMessage = message.plist()?;
+
+                 let payload_data: Value = plist::from_bytes(parsed.payload.as_ref())?;
+@@ -1668,15 +2469,22 @@ impl<P: AnisetteProvider> FindMyClient<P> {
+                 }
+                 return Ok(vec![])
+             }
++
++            if topic != FMF_IDS_TOPIC {
++                let payload: Value = message.plist()?;
++                debug!("Find My IDS payload on {topic} has shape: {}", plist_shape(&payload));
++                do_app_ack().await?;
++                return Ok(vec![])
++            }
+             let parsed: FMFPayload = message.plist()?;
+             debug!("Find my IDS message came in as {}", encode_hex(&uuid));
+             match parsed {
+                 FMFPayload::MappingPacket { p } => {
+                     do_app_ack().await?;
+-                    debug!("Importing find my token {p}!");
++                    debug!("Importing Find My Friends Messages handoff token");
+
+                     self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
+-                    debug!("Imported find my token {p}!");
++                    debug!("Imported Find My Friends Messages handoff token");
+                 }
+             }
+         }
+@@ -1919,6 +2727,11 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
+         let ms_since_epoch = duration_since_epoch().as_millis() as f64 / 1000f64;
+         let meta = config.get_debug_meta();
+         let reg = config.get_register_meta();
++        let account_username = if self.daemon {
++            Some(self.token_provider.get_account_username().await?)
++        } else {
++            None
++        };
+
+         let token = self.aps.get_token().await;
+
+@@ -1941,7 +2754,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
+                 "productType": meta.hardware_version,
+                 "selectedFriend": self.selected_friend,
+                 "regionCode": "US",
+-                "signedInAs": "tag3@copper.jjtech.dev",
++                "signedInAs": account_username,
+                 "timezone": "EST, -18000",
+                 "unlockState": 0,
+             })
+@@ -1989,6 +2802,12 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
+         }
+
+         let raw_request: serde_json::Value = response.json().await?;
++        debug!(
++            "Find My Friends response for {path}: fields={:?}, following={}, locations={}",
++            raw_request.as_object().map(|value| value.keys().collect::<Vec<_>>()),
++            raw_request.get("following").and_then(|value| value.as_array()).map_or(0, Vec::len),
++            raw_request.get("locations").and_then(|value| value.as_array()).map_or(0, Vec::len),
++        );
+
+         let request: FindMyFriendsStateUpdate = serde_json::from_value(raw_request.clone())?;
+
+@@ -2066,4 +2885,73 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
+         let _ = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
+         Ok(())
+     }
+-}
+\ No newline at end of file
++}
++
++#[cfg(test)]
++mod secure_friend_fetch_tests {
++    use super::{decode_secure_friend_key_updates, secure_friend_fetch_request};
++    use plist::{Dictionary, Value};
++
++    #[test]
++    fn bootstrap_uses_process_context_and_omits_ids() {
++        let request = secure_friend_fetch_request("relationship-id", &[], &[0xAB, 0xCD], "4242");
++
++        assert_eq!(request["clientContext"]["contextApp"], "4242");
++        assert!(request["clientContext"]["contextApp"].is_string());
++        assert_eq!(request["clientContext"]["apsToken"], "ABCD");
++        assert_eq!(request["clientContext"]["liveStats"]["errors"], json!([]));
++        assert_eq!(request["clientContext"]["autoMeConnectedDevice"], json!([]));
++        assert_eq!(request["fetch"][0]["intent"], "distributeKeys");
++        assert!(request["fetch"][0].get("ids").is_none());
++    }
++
++    #[test]
++    fn established_share_requests_locations_for_advertised_ids() {
++        let ids = vec!["location-id".to_string()];
++        let request = secure_friend_fetch_request("relationship-id", &ids, &[0xAB], "7");
++
++        assert_eq!(request["fetch"][0]["intent"], "startLocationUpdates");
++        assert_eq!(request["fetch"][0]["ids"][0], "location-id");
++    }
++
++    #[test]
++    fn decodes_modern_fmd_key_update_wrappers() {
++        let payload = Value::Dictionary(Dictionary::from_iter([
++            (
++                "entityIdentifier".to_string(),
++                Value::Dictionary(Dictionary::from_iter([(
++                    "rawValue".to_string(),
++                    Value::String("relationship-id".to_string()),
++                )])),
++            ),
++            (
++                "index".to_string(),
++                Value::Dictionary(Dictionary::from_iter([(
++                    "rawValue".to_string(),
++                    Value::Integer(17.into()),
++                )])),
++            ),
++            (
++                "privateKey".to_string(),
++                Value::Dictionary(Dictionary::from_iter([(
++                    "data".to_string(),
++                    Value::Data(vec![1, 2, 3]),
++                )])),
++            ),
++            (
++                "hashedAdvertisement".to_string(),
++                Value::Dictionary(Dictionary::from_iter([(
++                    "data".to_string(),
++                    Value::Data(vec![4, 5, 6]),
++                )])),
++            ),
++        ]));
++
++        let updates = decode_secure_friend_key_updates(&payload);
++        assert_eq!(updates.len(), 1);
++        assert_eq!(updates[0].find_my_identifier, "relationship-id");
++        assert_eq!(updates[0].index, 17);
++        assert_eq!(updates[0].private_key, vec![1, 2, 3]);
++        assert_eq!(updates[0].advertised_location_id, vec![4, 5, 6]);
++    }
++}
 diff --git a/src/icloud/keychain.rs b/src/icloud/keychain.rs
 index c8afb85..6594220 100644
 --- a/src/icloud/keychain.rs
@@ -154,7 +1236,7 @@ index c8afb85..6594220 100644
 @@ -1626,7 +1626,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                  modified = true;
              }
- 
+
 +            let my_id = &state.user_identity.as_ref().unwrap().identifier;
              for excluded in &trust.excludeds {
 +                if excluded == my_id {
@@ -169,19 +1251,19 @@ index c8afb85..6594220 100644
                  if current_state.includeds.contains(excluded) {
                      current_state.includeds.retain(|a| a != excluded);
 diff --git a/src/ids/identity_manager.rs b/src/ids/identity_manager.rs
-index 56c840e..7a1bcef 100644
+index 56c840e..8884a63 100644
 --- a/src/ids/identity_manager.rs
 +++ b/src/ids/identity_manager.rs
 @@ -1,4 +1,4 @@
 -use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
 +use std::{collections::{HashMap, HashSet}, fs, io::{Cursor, Write}, path::{Path, PathBuf}, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
- 
+
  use backon::{ConstantBuilder, ExponentialBuilder};
  use deku::{DekuContainerRead, DekuRead, DekuWrite};
 @@ -27,6 +27,28 @@ const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
  const REFRESH_MIN: Duration = Duration::from_secs(60);
  use deku::{DekuContainerWrite, DekuUpdate};
- 
+
 +fn protect_private_file(path: &Path) -> std::io::Result<()> {
 +    #[cfg(unix)]
 +    {
@@ -210,7 +1292,7 @@ index 56c840e..7a1bcef 100644
 @@ -41,11 +63,18 @@ struct CachedKeys {
      at_ms: u64
  }
- 
+
 +fn elapsed_since_cache_timestamp(now: SystemTime, at_ms: u64) -> Duration {
 +    // Wall clocks can move backwards after sleep/NTP correction, especially
 +    // on Windows. The entry was valid immediately before that correction, so
@@ -227,12 +1309,12 @@ index 56c840e..7a1bcef 100644
 -            .expect("Time went backwards")
 +        elapsed_since_cache_timestamp(SystemTime::now(), self.at_ms)
      }
- 
+
      fn is_valid(&self) -> bool {
 @@ -70,6 +99,25 @@ impl CachedKeys {
      }
  }
- 
+
 +#[cfg(test)]
 +mod cached_keys_tests {
 +    use super::*;
@@ -266,18 +1348,18 @@ index 56c840e..7a1bcef 100644
              if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                  loaded.cache_location = path;
 @@ -240,7 +291,7 @@ impl KeyCache {
- 
+
      pub fn save(&self) {
          let saved = plist_to_string(self).unwrap();
 -        fs::write(&self.cache_location, saved).unwrap();
 +        write_private_file(&self.cache_location, saved.as_bytes()).unwrap();
      }
- 
+
      pub fn invalidate(&mut self, handle: &str, keys_for: &str) {
-@@ -313,6 +364,14 @@ impl KeyCache {
+@@ -320,6 +371,14 @@ impl KeyCache {
          cached.keys.sender_correlation_identifier.clone()
      }
- 
+
 +    /// Millisecond timestamp of the raw per-target cache entry, whether or not
 +    /// that entry is still valid. Diagnostics compare this value before and
 +    /// after one query to distinguish an entry returned by that response from
@@ -321,10 +1403,10 @@ index 56c840e..7a1bcef 100644
 +                    }
                  }
              };
- 
-@@ -826,6 +897,16 @@ impl IdentityResource {
+
+@@ -824,6 +895,16 @@ impl IdentityResource {
      }
- 
+
      pub async fn cache_keys(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
 +        // iBlue owns its sparse-probe and outbound retry policy above this
 +        // library. In particular, its post-cooldown canary must represent one
@@ -342,7 +1424,7 @@ index 56c840e..7a1bcef 100644
 @@ -869,6 +950,31 @@ impl IdentityResource {
          Ok(targets.iter().filter(|target| !key_cache.get_keys(&topic, handle, *target).is_empty()).map(|i| i.clone()).collect())
      }
- 
+
 +    /// Validate targets with a directly signed HTTPS `id-query`, without
 +    /// changing the normal APNs-tunnel lookup cache. This is intentionally a
 +    /// diagnostic seam so callers can distinguish a transport-specific lookup
@@ -371,23 +1453,62 @@ index 56c840e..7a1bcef 100644
      pub async fn refresh_handles(&self, topic: &'static str, handle: &str, handles: &[DeliveryHandle]) -> Result<Vec<DeliveryHandle>, PushError> {
          if handles.is_empty() {
              return Ok(vec![])
+diff --git a/src/ids/mod.rs b/src/ids/mod.rs
+index 17e6aa0..f6c32a2 100644
+--- a/src/ids/mod.rs
++++ b/src/ids/mod.rs
+@@ -10,7 +10,7 @@ use num_bigint::{BigInt, Sign};
+ pub mod user;
+ pub mod identity_manager;
+
+-#[derive(Deserialize, Debug)]
++#[derive(Deserialize, Debug, Clone)]
+ #[serde(untagged)]
+ pub enum MessageBody {
+     Plist(Value),
+@@ -102,4 +102,4 @@ pub struct CertifiedContext {
+
+ pub mod idsp {
+     include!(concat!(env!("OUT_DIR"), "/idsp.rs"));
+-}
+\ No newline at end of file
++}
 diff --git a/src/ids/user.rs b/src/ids/user.rs
-index df97ecc..c2c73c3 100644
+index df97ecc..e3070a8 100644
 --- a/src/ids/user.rs
 +++ b/src/ids/user.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
++use std::{collections::{BTreeSet, HashMap}, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
+
+ use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
+ use hkdf::Hkdf;
 @@ -19,7 +19,7 @@ use crate::util::DebugMutex;
- 
+
  use rand::{Rng, RngCore};
- 
+
 -use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
 +use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, ungzip}};
- 
- 
+
+
  #[repr(C)]
-@@ -804,21 +804,20 @@ impl IDSUser {
+@@ -661,6 +661,12 @@ pub struct ParsedClientData {
+     pub ngm_public_identity: Option<CompactECKey<Public>>,
+     #[serde(default)]
+     pub supports_certified_delivery_v1: bool,
++    #[serde(default)]
++    pub supports_key_sharing: bool,
++    #[serde(default)]
++    pub supports_secure_loc_v1: bool,
++    #[serde(default)]
++    pub supports_findmy_plugin_messages: bool,
+ }
+
+ pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>
+@@ -804,21 +810,20 @@ impl IDSUser {
              .send(&REQWEST).await?
              .bytes().await?;
- 
+
 -        info!("Got alias response {}", str::from_utf8(&bytes).expect("Bytes to urtf8"));
 -
          #[derive(Deserialize)]
@@ -397,23 +1518,65 @@ index df97ecc..c2c73c3 100644
 +            alias: Option<String>,
              status: u32,
          }
- 
+
          let parsed: AliasResult = plist::from_bytes(&bytes)?;
 -        *alias = Some(parsed.alias);
          if parsed.status != 0 {
              return Err(PushError::AliasError(parsed.status))
          }
 +        *alias = Some(parsed.alias.ok_or(PushError::BadMsg)?);
- 
+
 -        info!("Just took action {operation} on alias {} for handle {handle}", alias.as_ref().expect("No alias!"));
 +        info!("Completed IDS alias action {operation}");
- 
+
          Ok(())
      }
-@@ -997,6 +996,48 @@ impl IDSUser {
- 
-         Ok(loaded.results.unwrap())
-     }
+@@ -988,9 +993,83 @@ impl IDSUser {
+         }
+         let request = request?;
+
+-        debug!("receieved apns query {:?}", plist::from_bytes::<Value>(&request)?);
++        fn collect_client_data_keys(value: &Value, keys: &mut BTreeSet<String>) {
++            match value {
++                Value::Dictionary(dictionary) => {
++                    for (key, child) in dictionary {
++                        if key == "client-data" {
++                            if let Value::Dictionary(client_data) = child {
++                                keys.extend(client_data.keys().cloned());
++                            }
++                        } else {
++                            collect_client_data_keys(child, keys);
++                        }
++                    }
++                }
++                Value::Array(array) => {
++                    for child in array {
++                        collect_client_data_keys(child, keys);
++                    }
++                }
++                _ => {}
++            }
++        }
+
++        let raw_response: Value = plist::from_bytes(&request)?;
++        let mut client_data_keys = BTreeSet::new();
++        collect_client_data_keys(&raw_response, &mut client_data_keys);
+         let loaded: IDSLookupResp = plist::from_bytes(&request)?;
++        let identity_count = loaded.results.as_ref().map(|results| results.values()
++            .map(|result| result.identities.len()).sum::<usize>()).unwrap_or_default();
++        debug!(
++            "received APNs IDS query: status={}, results={}, identities={}, client-data-keys={:?}",
++            loaded.status,
++            loaded.results.as_ref().map(HashMap::len).unwrap_or_default(),
++            identity_count,
++            client_data_keys,
++        );
++        if loaded.status != 0 || loaded.results.is_none() {
++            return Err(PushError::LookupFailed(IDSError(loaded.status)))
++        }
++
++        Ok(loaded.results.unwrap())
++    }
 +
 +    /// Run the same signed IDS `id-query` against its HTTPS bag URL instead of
 +    /// tunnelling it through the live APNs connection. Apple clients and
@@ -450,26 +1613,20 @@ index df97ecc..c2c73c3 100644
 +            Ok(value) => value,
 +            Err(_) => plist::from_bytes(&ungzip(&response)?)?,
 +        };
-+        if loaded.status != 0 || loaded.results.is_none() {
-+            return Err(PushError::LookupFailed(IDSError(loaded.status)))
-+        }
-+
-+        Ok(loaded.results.unwrap())
-+    }
- }
- 
- #[derive(Debug)]
-@@ -1103,7 +1144,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
+         if loaded.status != 0 || loaded.results.is_none() {
+             return Err(PushError::LookupFailed(IDSError(loaded.status)))
+         }
+@@ -1103,7 +1182,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
          ("validation-data", Value::Data(config.generate_validation_data().await?))
      ].into_iter()));
- 
+
 -    let mut request = SignedRequest::new("id-register", Method::POST)
 +    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)
              .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
              .header("x-protocol-version", &config.get_protocol_version().to_string())
              .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
-@@ -1183,3 +1224,49 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
- 
+@@ -1183,3 +1262,49 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
+
      Ok(())
  }
 +
@@ -524,7 +1681,7 @@ index f87deb5..5b5e763 100644
 +++ b/src/imessage/messages.rs
 @@ -1026,6 +1026,17 @@ pub struct ErrorMessage {
  }
- 
+
  impl ReactMessage {
 +    /// Apple's `amrln` is an NSRange length. Count UTF-16 code units, matching
 +    /// NSString, rather than Rust's UTF-8 byte length. This matters for emoji
@@ -541,7 +1698,7 @@ index f87deb5..5b5e763 100644
          self.reaction.get_text(&self.to_text)
      }
 @@ -2184,7 +2195,7 @@ impl MessageInst {
- 
+
                  let raw = RawReactMessage {
                      text: text,
 -                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
@@ -554,7 +1711,7 @@ index c71234a..cd85a7a 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -1,11 +1,11 @@
- 
+
 -mod activation;
 +pub mod activation;
  mod aps;
@@ -587,7 +1744,7 @@ index a8fe25d..c9d3e90 100644
 -            panic!("No saved channel for identifier!")
 +            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };
          };
- 
+
          APSChannel {
 @@ -733,7 +733,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                  let Some(channel) = &channel else { return Ok(None) };
@@ -595,6 +1752,6 @@ index a8fe25d..c9d3e90 100644
                  let mut state = self.state.write().await;
 -                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };
 +                let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };
- 
+
                  let key = referenced_channel.get_key(inner.ratchet)?;
- 
+

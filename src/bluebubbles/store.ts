@@ -4,7 +4,7 @@ import { basename, join, resolve, sep } from "node:path";
 import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
-import type { Conversation, IncomingMessage } from "../types.js";
+import type { Conversation, IncomingMessage, IncomingSharedProfile } from "../types.js";
 import type {
   BlueBubblesAttachment,
   BlueBubblesChat,
@@ -15,7 +15,13 @@ import type {
   BlueBubblesScheduledMessagePayload,
   BlueBubblesScheduledMessageSchedule,
   BlueBubblesWebhook,
+  IBlueContact,
+  IBlueContactSource,
+  IBlueContactSummary,
+  IBlueSharedLocation,
+  IBlueSharedLocationRecord,
 } from "./contracts.js";
+import { contactAddressKey, type ContactInput } from "./contact.js";
 import {
   chatIdentifier,
   deriveIncomingChatGuid,
@@ -24,6 +30,7 @@ import {
   stripTransport,
   toTransportAddress,
 } from "./guid.js";
+import { sharedLocationFromBalloon, sharedLocationFromMessageText } from "./location.js";
 
 interface MessageRow {
   rowid: number;
@@ -72,6 +79,33 @@ interface AttachmentRow {
   is_outgoing: number;
   has_live_photo: number;
   is_sticker: number;
+}
+
+interface ContactRow {
+  address_key: string;
+  address: string;
+  source: IBlueContactSource;
+  display_name: string;
+  first_name: string | null;
+  last_name: string | null;
+  nickname: string | null;
+  avatar: Uint8Array | null;
+  updated_at: number;
+}
+
+interface SharedLocationRow {
+  message_guid: string;
+  chat_guid: string;
+  sender: string | null;
+  date_created: number;
+  latitude: number | null;
+  longitude: number | null;
+  label: string | null;
+  address: string | null;
+  url: string;
+  is_live: number;
+  session_id: string | null;
+  bundle_id: string | null;
 }
 
 interface WebhookRow {
@@ -218,6 +252,8 @@ export class BlueBubblesStore {
   #messageByGuid: StatementSync;
   #chatByGuid: StatementSync;
   #attachmentsByMessage: StatementSync;
+  #contactByAddress: StatementSync;
+  #locationByMessage: StatementSync;
   readonly #incomingClaimOwner = randomUUID();
 
   constructor(databasePath: string, attachmentRoot: string) {
@@ -278,6 +314,30 @@ export class BlueBubblesStore {
         is_outgoing INTEGER NOT NULL DEFAULT 0,
         has_live_photo INTEGER NOT NULL DEFAULT 0,
         is_sticker INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS contact (
+        address_key TEXT NOT NULL,
+        address TEXT NOT NULL,
+        source TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        first_name TEXT,
+        last_name TEXT,
+        nickname TEXT,
+        avatar BLOB,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(address_key, source)
+      );
+      CREATE INDEX IF NOT EXISTS contact_display_name ON contact(display_name COLLATE NOCASE);
+      CREATE TABLE IF NOT EXISTS shared_location (
+        message_guid TEXT PRIMARY KEY REFERENCES message(guid) ON DELETE CASCADE,
+        latitude REAL,
+        longitude REAL,
+        label TEXT,
+        address TEXT,
+        url TEXT NOT NULL,
+        is_live INTEGER NOT NULL DEFAULT 0,
+        session_id TEXT,
+        bundle_id TEXT
       );
       CREATE TABLE IF NOT EXISTS webhook (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -343,6 +403,18 @@ export class BlueBubblesStore {
     this.#attachmentsByMessage = this.database.prepare(
       "SELECT * FROM attachment WHERE message_guid = ? ORDER BY rowid ASC",
     );
+    this.#contactByAddress = this.database.prepare(`
+      SELECT * FROM contact WHERE address_key = ?
+      ORDER BY CASE source WHEN 'profile-vcf' THEN 0 ELSE 1 END, updated_at DESC
+      LIMIT 1
+    `);
+    this.#locationByMessage = this.database.prepare(`
+      SELECT shared_location.*, message.chat_guid, message.sender, message.date_created
+      FROM shared_location
+      JOIN message ON message.guid = shared_location.message_guid
+      WHERE shared_location.message_guid = ?
+    `);
+    this.backfillStaticLocationMessages();
   }
 
   close(): void {
@@ -443,6 +515,7 @@ export class BlueBubblesStore {
     }
 
     const output = this.insertIncomingRecord(message, chatGuid, isFromMe);
+    this.persistSharedLocation(message);
     await this.persistAttachments(message);
     return this.getMessage(output.guid) ?? output;
   }
@@ -856,6 +929,10 @@ export class BlueBubblesStore {
       const category = mediaCategory(row.mime_type, row.uti);
       if (category !== "other") totals[category] += 1;
     }
+    const locations = this.database.prepare("SELECT COUNT(*) AS total FROM shared_location").get() as {
+      total: number;
+    };
+    totals.locations += Number(locations.total);
     return totals;
   }
 
@@ -894,6 +971,29 @@ export class BlueBubblesStore {
       const category = mediaCategory(row.mime_type, row.uti);
       if (category !== "other") entry.totals[category] += 1;
     }
+    const locationRows = this.database.prepare(`
+      SELECT message.chat_guid, chat.display_name, COUNT(*) AS total
+      FROM shared_location
+      JOIN message ON message.guid = shared_location.message_guid
+      JOIN chat ON chat.guid = message.chat_guid
+      GROUP BY message.chat_guid, chat.display_name
+    `).all() as unknown as Array<{
+      chat_guid: string;
+      display_name: string | null;
+      total: number;
+    }>;
+    for (const row of locationRows) {
+      let entry = result.get(row.chat_guid);
+      if (!entry) {
+        entry = {
+          chatGuid: row.chat_guid,
+          groupName: row.display_name,
+          totals: { images: 0, videos: 0, locations: 0 },
+        };
+        result.set(row.chat_guid, entry);
+      }
+      entry.totals.locations += Number(row.total);
+    }
     return [...result.values()].filter((entry) => Object.values(entry.totals).some((count) => count > 0));
   }
 
@@ -930,6 +1030,200 @@ export class BlueBubblesStore {
 
   getHandle(address: string, additionalAddresses: readonly string[] = []): BlueBubblesHandle | undefined {
     return this.queryHandles({ address, additionalAddresses, limit: 1 }).handles[0];
+  }
+
+  replaceProfileVcfContacts(contacts: readonly ContactInput[]): number {
+    const now = Date.now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare("DELETE FROM contact WHERE source = 'profile-vcf'").run();
+      const insert = this.database.prepare(`
+        INSERT INTO contact (
+          address_key, address, source, display_name, first_name, last_name,
+          nickname, avatar, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(address_key, source) DO UPDATE SET
+          address=excluded.address,
+          display_name=excluded.display_name,
+          first_name=excluded.first_name,
+          last_name=excluded.last_name,
+          nickname=excluded.nickname,
+          avatar=excluded.avatar,
+          updated_at=excluded.updated_at
+      `);
+      let count = 0;
+      for (const contact of contacts) {
+        for (const address of contact.addresses) {
+          const key = contactAddressKey(address);
+          if (!key) continue;
+          insert.run(
+            key,
+            stripTransport(address),
+            "profile-vcf",
+            contact.displayName,
+            contact.firstName ?? null,
+            contact.lastName ?? null,
+            contact.nickname ?? null,
+            contact.avatar ?? null,
+            now,
+          );
+          count += 1;
+        }
+      }
+      this.database.exec("COMMIT");
+      return count;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  upsertNameAndPhotoContact(
+    address: string,
+    profile: IncomingSharedProfile,
+  ): IBlueContact | undefined {
+    const key = contactAddressKey(address);
+    if (!key) return undefined;
+    const existing = this.database.prepare(`
+      SELECT * FROM contact WHERE address_key = ? AND source = 'name-and-photo-sharing'
+    `).get(key) as unknown as ContactRow | undefined;
+    const displayName = profile.displayName?.trim()
+      || [profile.firstName?.trim(), profile.lastName?.trim()].filter(Boolean).join(" ")
+      || existing?.display_name;
+    if (!displayName) return this.getContact(address);
+    const avatar = profile.avatarBase64 ? safeBase64(profile.avatarBase64) : undefined;
+    this.database.prepare(`
+      INSERT INTO contact (
+        address_key, address, source, display_name, first_name, last_name,
+        nickname, avatar, updated_at
+      ) VALUES (?, ?, 'name-and-photo-sharing', ?, ?, ?, NULL, ?, ?)
+      ON CONFLICT(address_key, source) DO UPDATE SET
+        address=excluded.address,
+        display_name=excluded.display_name,
+        first_name=COALESCE(excluded.first_name, contact.first_name),
+        last_name=COALESCE(excluded.last_name, contact.last_name),
+        avatar=COALESCE(excluded.avatar, contact.avatar),
+        updated_at=excluded.updated_at
+    `).run(
+      key,
+      stripTransport(address),
+      displayName,
+      profile.firstName?.trim() || null,
+      profile.lastName?.trim() || null,
+      avatar ?? null,
+      Date.now(),
+    );
+    return this.getContact(address);
+  }
+
+  getContact(address: string): IBlueContact | undefined {
+    const key = contactAddressKey(address);
+    if (!key) return undefined;
+    const row = this.#contactByAddress.get(key) as unknown as ContactRow | undefined;
+    return row ? this.serializeContact(row) : undefined;
+  }
+
+  getContactAvatar(address: string): { data: Buffer; contact: IBlueContact } | undefined {
+    const key = contactAddressKey(address);
+    if (!key) return undefined;
+    const row = this.database.prepare(`
+      SELECT * FROM contact WHERE address_key = ? AND avatar IS NOT NULL
+      ORDER BY CASE source WHEN 'profile-vcf' THEN 0 ELSE 1 END, updated_at DESC
+      LIMIT 1
+    `).get(key) as unknown as ContactRow | undefined;
+    if (!row?.avatar?.byteLength) return undefined;
+    const contact = this.getContact(address);
+    if (!contact) return undefined;
+    return { data: Buffer.from(row.avatar), contact };
+  }
+
+  queryContacts(options: {
+    addresses?: readonly string[];
+    search?: string;
+    sources?: readonly IBlueContactSource[];
+    offset?: number;
+    limit?: number;
+  } = {}): { contacts: IBlueContact[]; total: number } {
+    const allowedAddresses = options.addresses?.length
+      ? new Set(options.addresses.map(contactAddressKey).filter(Boolean))
+      : undefined;
+    const allowedSources = options.sources?.length ? new Set(options.sources) : undefined;
+    const search = options.search?.trim().toLowerCase();
+    const rows = this.database.prepare(`
+      SELECT * FROM contact
+      ORDER BY address_key,
+        CASE source WHEN 'profile-vcf' THEN 0 ELSE 1 END,
+        updated_at DESC
+    `).all() as unknown as ContactRow[];
+    const selected = new Map<string, IBlueContact>();
+    for (const row of rows) {
+      if (allowedAddresses && !allowedAddresses.has(row.address_key)) continue;
+      if (allowedSources && !allowedSources.has(row.source)) continue;
+      if (!selected.has(row.address_key)) {
+        selected.set(row.address_key, this.serializeContact(row));
+      }
+    }
+    const all = [...selected.values()]
+      .filter((contact) => !search || [
+        contact.address,
+        contact.displayName,
+        contact.firstName,
+        contact.lastName,
+        contact.nickname,
+      ].some((value) => value?.toLowerCase().includes(search)))
+      .sort((left, right) =>
+        left.displayName.localeCompare(right.displayName) || left.address.localeCompare(right.address));
+    const offset = Math.max(options.offset ?? 0, 0);
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1000);
+    return { contacts: all.slice(offset, offset + limit), total: all.length };
+  }
+
+  getSharedLocation(messageGuid: string): IBlueSharedLocationRecord | undefined {
+    const row = this.#locationByMessage.get(messageGuid) as unknown as SharedLocationRow | undefined;
+    return row ? this.serializeSharedLocation(row) : undefined;
+  }
+
+  querySharedLocations(options: {
+    chatGuid?: string;
+    after?: number;
+    before?: number;
+    offset?: number;
+    limit?: number;
+  } = {}): { locations: IBlueSharedLocationRecord[]; total: number } {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.chatGuid) {
+      clauses.push("message.chat_guid = ?");
+      params.push(options.chatGuid);
+    }
+    if (options.after !== undefined) {
+      clauses.push("message.date_created > ?");
+      params.push(options.after);
+    }
+    if (options.before !== undefined) {
+      clauses.push("message.date_created < ?");
+      params.push(options.before);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const count = this.database.prepare(`
+      SELECT COUNT(*) AS total FROM shared_location
+      JOIN message ON message.guid = shared_location.message_guid
+      ${where}
+    `).get(...params) as { total: number };
+    const offset = Math.max(options.offset ?? 0, 0);
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1000);
+    const rows = this.database.prepare(`
+      SELECT shared_location.*, message.chat_guid, message.sender, message.date_created
+      FROM shared_location
+      JOIN message ON message.guid = shared_location.message_guid
+      ${where}
+      ORDER BY message.date_created DESC, message.rowid DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, limit, offset) as unknown as SharedLocationRow[];
+    return {
+      locations: rows.map((row) => this.serializeSharedLocation(row)),
+      total: Number(count.total),
+    };
   }
 
   updateOutgoingEdit(guid: string, text: string, timestamp = Date.now()): BlueBubblesMessage | undefined {
@@ -1346,6 +1640,8 @@ export class BlueBubblesStore {
     const attachments = this.#attachmentsByMessage
       .all(row.guid) as unknown as AttachmentRow[];
     const handle = row.sender ? this.serializeHandle(row.sender) : null;
+    const senderContact = handle?.iBlue?.contact;
+    const sharedLocation = this.getSharedLocation(row.guid);
     const output: BlueBubblesMessage = {
       originalROWID: row.rowid,
       guid: row.guid,
@@ -1386,7 +1682,7 @@ export class BlueBubblesStore {
       groupTitle: raw.groupName ?? null,
       groupActionType: raw.participantChange?.action === "remove" ? 1 : 0,
       isExpired: false,
-      balloonBundleId: null,
+      balloonBundleId: raw.appBalloon?.bundleId ?? null,
       associatedMessageGuid: row.associated_guid,
       associatedMessageType: row.associated_type
         ?? (raw.tapback ? reactionName(raw.tapback.type, raw.tapback.remove) : null),
@@ -1412,6 +1708,8 @@ export class BlueBubblesStore {
         ...(raw.verificationFailed === undefined
           ? {}
           : { senderVerificationFailed: raw.verificationFailed }),
+        ...(senderContact ? { senderContact } : {}),
+        ...(sharedLocation ? { sharedLocation: locationSummary(sharedLocation) } : {}),
       },
     };
     if (raw.tempGuid) output.tempGuid = raw.tempGuid;
@@ -1460,12 +1758,111 @@ export class BlueBubblesStore {
 
   private serializeHandle(address: string): BlueBubblesHandle {
     const stripped = stripTransport(address);
+    const contact = this.getContact(stripped);
     return {
       originalROWID: stableInt(stripped.toLowerCase()),
       address: stripped,
       service: "iMessage",
       country: "US",
       uncanonicalizedId: stripped,
+      ...(contact ? { iBlue: { contact: contactSummary(contact) } } : {}),
+    };
+  }
+
+  private serializeContact(row: ContactRow): IBlueContact {
+    return {
+      address: row.address,
+      service: "iMessage",
+      displayName: row.display_name,
+      ...(row.first_name ? { firstName: row.first_name } : {}),
+      ...(row.last_name ? { lastName: row.last_name } : {}),
+      ...(row.nickname ? { nickname: row.nickname } : {}),
+      source: row.source,
+      hasAvatar: Boolean(row.avatar?.byteLength) || this.contactHasAvatar(row.address_key),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private contactHasAvatar(addressKey: string): boolean {
+    const row = this.database.prepare(`
+      SELECT 1 AS found FROM contact
+      WHERE address_key = ? AND avatar IS NOT NULL AND length(avatar) > 0
+      LIMIT 1
+    `).get(addressKey) as { found: number } | undefined;
+    return Boolean(row?.found);
+  }
+
+  private persistSharedLocation(message: IncomingMessage): void {
+    const location = sharedLocationFromBalloon(message.appBalloon)
+      ?? sharedLocationFromMessageText(message.text);
+    if (!location) return;
+    this.upsertSharedLocation(message.uuid, location);
+  }
+
+  private backfillStaticLocationMessages(): void {
+    const rows = this.database.prepare(`
+      SELECT message.guid, message.text
+      FROM message
+      LEFT JOIN shared_location ON shared_location.message_guid = message.guid
+      WHERE shared_location.message_guid IS NULL
+        AND message.text LIKE '%maps.apple.com/%'
+    `).all() as unknown as Array<{ guid: string; text: string | null }>;
+    for (const row of rows) {
+      const location = sharedLocationFromMessageText(row.text ?? undefined);
+      if (location) this.upsertSharedLocation(row.guid, location);
+    }
+  }
+
+  private upsertSharedLocation(messageGuid: string, location: IBlueSharedLocation): void {
+    this.database.prepare(`
+      INSERT INTO shared_location (
+        message_guid, latitude, longitude, label, address, url, is_live,
+        session_id, bundle_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(message_guid) DO UPDATE SET
+        latitude=excluded.latitude,
+        longitude=excluded.longitude,
+        label=excluded.label,
+        address=excluded.address,
+        url=excluded.url,
+        is_live=excluded.is_live,
+        session_id=excluded.session_id,
+        bundle_id=excluded.bundle_id
+    `).run(
+      messageGuid,
+      location.latitude ?? null,
+      location.longitude ?? null,
+      location.label ?? null,
+      location.address ?? null,
+      location.url,
+      location.isLive ? 1 : 0,
+      location.sessionId ?? null,
+      location.bundleId ?? null,
+    );
+  }
+
+  private serializeSharedLocation(row: SharedLocationRow): IBlueSharedLocationRecord {
+    const decoded = sharedLocationFromBalloon({
+      url: row.url,
+      isLive: Boolean(row.is_live),
+      ...(row.bundle_id ? { bundleId: row.bundle_id } : {}),
+    });
+    const latitude = row.latitude ?? decoded?.latitude;
+    const longitude = row.longitude ?? decoded?.longitude;
+    return {
+      messageGuid: row.message_guid,
+      chatGuid: row.chat_guid,
+      sender: row.sender ? stripTransport(row.sender) : null,
+      dateCreated: row.date_created,
+      ...(latitude === undefined ? {} : { latitude }),
+      ...(longitude === undefined ? {} : { longitude }),
+      ...(row.label ? { label: row.label } : {}),
+      ...(row.address ? { address: row.address } : {}),
+      url: row.url,
+      isLive: Boolean(row.is_live),
+      ...(row.session_id ? { sessionId: row.session_id } : {}),
+      ...(row.bundle_id ? { bundleId: row.bundle_id } : {}),
+      ...(decoded?.findMyId ? { findMyId: decoded.findMyId } : {}),
     };
   }
 
@@ -1484,6 +1881,31 @@ export class BlueBubblesStore {
       originalGuid: row.guid,
       hasLivePhoto: Boolean(row.has_live_photo),
     };
+  }
+}
+
+function contactSummary(contact: IBlueContact): IBlueContactSummary {
+  return {
+    displayName: contact.displayName,
+    ...(contact.firstName ? { firstName: contact.firstName } : {}),
+    ...(contact.lastName ? { lastName: contact.lastName } : {}),
+    ...(contact.nickname ? { nickname: contact.nickname } : {}),
+    source: contact.source,
+  };
+}
+
+function locationSummary(location: IBlueSharedLocationRecord): IBlueSharedLocation {
+  const { messageGuid: _messageGuid, chatGuid: _chatGuid, sender: _sender, dateCreated: _dateCreated, ...summary } = location;
+  return summary;
+}
+
+function safeBase64(value: string): Buffer | undefined {
+  const compact = value.replace(/\s/g, "");
+  if (!compact || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) return undefined;
+  try {
+    return Buffer.from(compact, "base64");
+  } catch {
+    return undefined;
   }
 }
 

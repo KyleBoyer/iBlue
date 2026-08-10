@@ -12,12 +12,15 @@ import type {
   PersistedSession,
   SendAttachmentParams,
   SendMultipartMessageParams,
+  NativeFindMyFollow,
 } from "../types.js";
 import type {
   BlueBubblesChat,
   BlueBubblesMessage,
   BlueBubblesReaction,
+  IBlueLiveLocation,
 } from "./contracts.js";
+import { contactAddressKey } from "./contact.js";
 import {
   conversationFromDirectChatGuid,
   chatIdentifier,
@@ -378,6 +381,19 @@ export class BlueBubblesService extends EventEmitter {
     const result = await this.engine.validateHandles({ addresses: [target] });
     const canonical = target.toLowerCase();
     return result.available.some((value) => toTransportAddress(value).toLowerCase() === canonical);
+  }
+
+  async refreshLiveLocations(address?: string): Promise<IBlueLiveLocation[]> {
+    const refresh = this.engine.refreshFindMyFollowing;
+    if (!refresh) throw new Error("native engine does not support Find My live-location refresh");
+    const requested = address ? contactAddressKey(address) : undefined;
+    const follows = await refresh.call(this.engine, address);
+    const now = Date.now();
+    return follows
+      .filter((follow) => !requested || [...follow.invitationAcceptedHandles, ...follow.invitationFromHandles]
+        .some((handle) => contactAddressKey(handle) === requested))
+      .map((follow) => liveLocationFromFollow(follow, now))
+      .filter((location) => location.isActive);
   }
 
   async editMessage(body: {
@@ -825,6 +841,11 @@ export class BlueBubblesService extends EventEmitter {
     const verification = message.verificationFailed === undefined
       ? {}
       : { iBlue: { senderVerificationFailed: message.verificationFailed } };
+    if (message.sharedProfile && message.sender) {
+      const contact = this.store.upsertNameAndPhotoContact(message.sender, message.sharedProfile);
+      if (contact) this.dispatch("iblue-contact-updated", contact);
+    }
+    if (isSharedProfileOnly(message)) return;
     if (message.typing) {
       this.dispatch("typing-indicator", { display: message.typing.active, guid: chatGuid, ...verification });
       return;
@@ -842,7 +863,7 @@ export class BlueBubblesService extends EventEmitter {
       this.scheduleSnapshot();
       return;
     }
-    let normalizedMessage = message;
+    let normalizedMessage = withoutSharedProfileAvatar(message);
     if (message.participantChange && !message.participantChange.action) {
       const before = new Map(previousParticipants.map((value) => [stripTransport(value).toLowerCase(), value]));
       const after = new Map(message.participantChange.participants.map((value) => [stripTransport(value).toLowerCase(), value]));
@@ -990,6 +1011,67 @@ export class BlueBubblesService extends EventEmitter {
     await this.#webhookDrain;
     this.#webhookWakeRequested = false;
   }
+}
+
+function isSharedProfileOnly(message: IncomingMessage): boolean {
+  return Boolean(
+    message.sharedProfile
+    && !message.text
+    && !message.subject
+    && message.attachments.length === 0
+    && !message.tapback
+    && !message.edit
+    && !message.unsend
+    && !message.typing
+    && !message.groupRename
+    && !message.participantChange
+    && !message.groupIconChange
+    && !message.markUnread
+    && !message.notifyAnyway
+    && !message.appBalloon,
+  );
+}
+
+function liveLocationFromFollow(follow: NativeFindMyFollow, now: number): IBlueLiveLocation {
+  const location = follow.lastLocation;
+  const expiresAt = follow.expires > 0 ? follow.expires : null;
+  const address = follow.invitationAcceptedHandles[0]
+    ?? follow.invitationFromHandles[0]
+    ?? follow.id;
+  return {
+    source: "find-my",
+    followId: follow.id,
+    address: stripTransport(address),
+    acceptedHandles: follow.invitationAcceptedHandles.map(stripTransport),
+    fromHandles: follow.invitationFromHandles.map(stripTransport),
+    isActive: expiresAt === null || expiresAt > now,
+    isFromMessages: follow.isFromMessages,
+    locatingInProgress: follow.locateInProgress,
+    expiresAt,
+    sharingUpdatedAt: follow.updateTimestamp,
+    ...(location ? {
+      latitude: location.latitude,
+      longitude: location.longitude,
+      altitude: location.altitude,
+      horizontalAccuracy: location.horizontalAccuracy,
+      verticalAccuracy: location.verticalAccuracy,
+      locationUpdatedAt: location.timestamp,
+      isInaccurate: location.isInaccurate,
+      ...(location.isOld === undefined || location.isOld === null ? {} : { isOld: location.isOld }),
+      ...(location.formattedAddressLines?.length
+        ? { formattedAddress: location.formattedAddressLines.join("\n") }
+        : {}),
+      ...(location.locality ? { locality: location.locality } : {}),
+      ...(location.stateCode ? { stateCode: location.stateCode } : {}),
+      ...(location.countryCode ? { countryCode: location.countryCode } : {}),
+    } : {}),
+  };
+}
+
+function withoutSharedProfileAvatar(message: IncomingMessage): IncomingMessage {
+  if (!message.sharedProfile?.avatarBase64) return message;
+  const { avatarBase64: _avatarBase64, ...sharedProfile } = message.sharedProfile;
+  return { ...message, sharedProfile };
 }
 
 function nullReactionText(reaction: BlueBubblesReaction): string {

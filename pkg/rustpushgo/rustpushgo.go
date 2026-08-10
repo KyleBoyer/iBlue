@@ -481,6 +481,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_restore_token_provider_with_pet_expiration(uniffiStatus)
+		})
+		if checksum != 24132 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_restore_token_provider_with_pet_expiration: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_batch_resolve_handles(uniffiStatus)
 		})
 		if checksum != 63113 {
@@ -801,6 +810,15 @@ func uniffiCheckChecksums() {
 		if checksum != 38295 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_purge_recoverable_zones: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_refresh_findmy_following(uniffiStatus)
+		})
+		if checksum != 35658 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_refresh_findmy_following: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1899,6 +1917,15 @@ func uniffiCheckChecksums() {
 		if checksum != 58563 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_refresh_pet_token: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_seed_inner_mme_delegate(uniffiStatus)
+		})
+		if checksum != 22432 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_seed_inner_mme_delegate: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -3174,6 +3201,31 @@ func (_self *Client) PurgeRecoverableZones() error {
 		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) RefreshFindmyFollowing(address *string, findMyId *string) ([]WrappedFindMyFollow, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_refresh_findmy_following(
+				_pointer, rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(address)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(findMyId)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceTypeWrappedFindMyFollowINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -6550,6 +6602,31 @@ func (_self *WrappedTokenProvider) RefreshPetToken() error {
 		})
 }
 
+func (_self *WrappedTokenProvider) SeedInnerMmeDelegate() error {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_seed_inner_mme_delegate(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *WrappedTokenProvider) SeedMmeDelegateJson(json string) error {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
 	defer _self.ffiObject.decrementPointer()
@@ -6623,6 +6700,8 @@ type AccountPersistData struct {
 	Username          string
 	HashedPasswordHex string
 	Pet               string
+	PetExpiresAtMs    uint64
+	MmeDelegateJson   *string
 	Adsid             string
 	Dsid              string
 	SpdBase64         string
@@ -6632,6 +6711,8 @@ func (r *AccountPersistData) Destroy() {
 	FfiDestroyerString{}.Destroy(r.Username)
 	FfiDestroyerString{}.Destroy(r.HashedPasswordHex)
 	FfiDestroyerString{}.Destroy(r.Pet)
+	FfiDestroyerUint64{}.Destroy(r.PetExpiresAtMs)
+	FfiDestroyerOptionalString{}.Destroy(r.MmeDelegateJson)
 	FfiDestroyerString{}.Destroy(r.Adsid)
 	FfiDestroyerString{}.Destroy(r.Dsid)
 	FfiDestroyerString{}.Destroy(r.SpdBase64)
@@ -6650,6 +6731,8 @@ func (c FfiConverterTypeAccountPersistData) Read(reader io.Reader) AccountPersis
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterUint64INSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
@@ -6664,6 +6747,8 @@ func (c FfiConverterTypeAccountPersistData) Write(writer io.Writer, value Accoun
 	FfiConverterStringINSTANCE.Write(writer, value.Username)
 	FfiConverterStringINSTANCE.Write(writer, value.HashedPasswordHex)
 	FfiConverterStringINSTANCE.Write(writer, value.Pet)
+	FfiConverterUint64INSTANCE.Write(writer, value.PetExpiresAtMs)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.MmeDelegateJson)
 	FfiConverterStringINSTANCE.Write(writer, value.Adsid)
 	FfiConverterStringINSTANCE.Write(writer, value.Dsid)
 	FfiConverterStringINSTANCE.Write(writer, value.SpdBase64)
@@ -7555,6 +7640,150 @@ func (_ FfiDestroyerTypeWrappedConversation) Destroy(value WrappedConversation) 
 	value.Destroy()
 }
 
+type WrappedFindMyFollow struct {
+	Id                        string
+	InvitationAcceptedHandles []string
+	InvitationFromHandles     []string
+	Expires                   int64
+	UpdateTimestamp           int64
+	IsFromMessages            bool
+	LocateInProgress          bool
+	LastLocation              *WrappedFindMyLocation
+}
+
+func (r *WrappedFindMyFollow) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Id)
+	FfiDestroyerSequenceString{}.Destroy(r.InvitationAcceptedHandles)
+	FfiDestroyerSequenceString{}.Destroy(r.InvitationFromHandles)
+	FfiDestroyerInt64{}.Destroy(r.Expires)
+	FfiDestroyerInt64{}.Destroy(r.UpdateTimestamp)
+	FfiDestroyerBool{}.Destroy(r.IsFromMessages)
+	FfiDestroyerBool{}.Destroy(r.LocateInProgress)
+	FfiDestroyerOptionalTypeWrappedFindMyLocation{}.Destroy(r.LastLocation)
+}
+
+type FfiConverterTypeWrappedFindMyFollow struct{}
+
+var FfiConverterTypeWrappedFindMyFollowINSTANCE = FfiConverterTypeWrappedFindMyFollow{}
+
+func (c FfiConverterTypeWrappedFindMyFollow) Lift(rb RustBufferI) WrappedFindMyFollow {
+	return LiftFromRustBuffer[WrappedFindMyFollow](c, rb)
+}
+
+func (c FfiConverterTypeWrappedFindMyFollow) Read(reader io.Reader) WrappedFindMyFollow {
+	return WrappedFindMyFollow{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalTypeWrappedFindMyLocationINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedFindMyFollow) Lower(value WrappedFindMyFollow) RustBuffer {
+	return LowerIntoRustBuffer[WrappedFindMyFollow](c, value)
+}
+
+func (c FfiConverterTypeWrappedFindMyFollow) Write(writer io.Writer, value WrappedFindMyFollow) {
+	FfiConverterStringINSTANCE.Write(writer, value.Id)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.InvitationAcceptedHandles)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.InvitationFromHandles)
+	FfiConverterInt64INSTANCE.Write(writer, value.Expires)
+	FfiConverterInt64INSTANCE.Write(writer, value.UpdateTimestamp)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsFromMessages)
+	FfiConverterBoolINSTANCE.Write(writer, value.LocateInProgress)
+	FfiConverterOptionalTypeWrappedFindMyLocationINSTANCE.Write(writer, value.LastLocation)
+}
+
+type FfiDestroyerTypeWrappedFindMyFollow struct{}
+
+func (_ FfiDestroyerTypeWrappedFindMyFollow) Destroy(value WrappedFindMyFollow) {
+	value.Destroy()
+}
+
+type WrappedFindMyLocation struct {
+	Latitude              float64
+	Longitude             float64
+	Altitude              float64
+	HorizontalAccuracy    float64
+	VerticalAccuracy      float64
+	Timestamp             int64
+	IsInaccurate          bool
+	IsOld                 *bool
+	FormattedAddressLines []string
+	Locality              *string
+	StateCode             *string
+	CountryCode           *string
+}
+
+func (r *WrappedFindMyLocation) Destroy() {
+	FfiDestroyerFloat64{}.Destroy(r.Latitude)
+	FfiDestroyerFloat64{}.Destroy(r.Longitude)
+	FfiDestroyerFloat64{}.Destroy(r.Altitude)
+	FfiDestroyerFloat64{}.Destroy(r.HorizontalAccuracy)
+	FfiDestroyerFloat64{}.Destroy(r.VerticalAccuracy)
+	FfiDestroyerInt64{}.Destroy(r.Timestamp)
+	FfiDestroyerBool{}.Destroy(r.IsInaccurate)
+	FfiDestroyerOptionalBool{}.Destroy(r.IsOld)
+	FfiDestroyerSequenceString{}.Destroy(r.FormattedAddressLines)
+	FfiDestroyerOptionalString{}.Destroy(r.Locality)
+	FfiDestroyerOptionalString{}.Destroy(r.StateCode)
+	FfiDestroyerOptionalString{}.Destroy(r.CountryCode)
+}
+
+type FfiConverterTypeWrappedFindMyLocation struct{}
+
+var FfiConverterTypeWrappedFindMyLocationINSTANCE = FfiConverterTypeWrappedFindMyLocation{}
+
+func (c FfiConverterTypeWrappedFindMyLocation) Lift(rb RustBufferI) WrappedFindMyLocation {
+	return LiftFromRustBuffer[WrappedFindMyLocation](c, rb)
+}
+
+func (c FfiConverterTypeWrappedFindMyLocation) Read(reader io.Reader) WrappedFindMyLocation {
+	return WrappedFindMyLocation{
+		FfiConverterFloat64INSTANCE.Read(reader),
+		FfiConverterFloat64INSTANCE.Read(reader),
+		FfiConverterFloat64INSTANCE.Read(reader),
+		FfiConverterFloat64INSTANCE.Read(reader),
+		FfiConverterFloat64INSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalBoolINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedFindMyLocation) Lower(value WrappedFindMyLocation) RustBuffer {
+	return LowerIntoRustBuffer[WrappedFindMyLocation](c, value)
+}
+
+func (c FfiConverterTypeWrappedFindMyLocation) Write(writer io.Writer, value WrappedFindMyLocation) {
+	FfiConverterFloat64INSTANCE.Write(writer, value.Latitude)
+	FfiConverterFloat64INSTANCE.Write(writer, value.Longitude)
+	FfiConverterFloat64INSTANCE.Write(writer, value.Altitude)
+	FfiConverterFloat64INSTANCE.Write(writer, value.HorizontalAccuracy)
+	FfiConverterFloat64INSTANCE.Write(writer, value.VerticalAccuracy)
+	FfiConverterInt64INSTANCE.Write(writer, value.Timestamp)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsInaccurate)
+	FfiConverterOptionalBoolINSTANCE.Write(writer, value.IsOld)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.FormattedAddressLines)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Locality)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.StateCode)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.CountryCode)
+}
+
+type FfiDestroyerTypeWrappedFindMyLocation struct{}
+
+func (_ FfiDestroyerTypeWrappedFindMyLocation) Destroy(value WrappedFindMyLocation) {
+	value.Destroy()
+}
+
 type WrappedIdsLookupReport struct {
 	Targets  []WrappedIdsLookupTarget
 	Error    *string
@@ -7801,6 +8030,18 @@ type WrappedMessage struct {
 	ShareProfileFirstName         *string
 	ShareProfileLastName          *string
 	ShareProfileAvatar            *[]byte
+	AppBalloonBundleId            *string
+	AppBalloonAppName             *string
+	AppBalloonUrl                 *string
+	AppBalloonSessionId           *string
+	AppBalloonIsLive              bool
+	AppBalloonLdText              *string
+	AppBalloonImageTitle          *string
+	AppBalloonImageSubtitle       *string
+	AppBalloonCaption             *string
+	AppBalloonSubcaption          *string
+	AppBalloonSecondarySubcaption *string
+	AppBalloonTertiarySubcaption  *string
 }
 
 func (r *WrappedMessage) Destroy() {
@@ -7893,6 +8134,18 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.ShareProfileFirstName)
 	FfiDestroyerOptionalString{}.Destroy(r.ShareProfileLastName)
 	FfiDestroyerOptionalBytes{}.Destroy(r.ShareProfileAvatar)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonBundleId)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonAppName)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonUrl)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonSessionId)
+	FfiDestroyerBool{}.Destroy(r.AppBalloonIsLive)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonLdText)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonImageTitle)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonImageSubtitle)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonCaption)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonSubcaption)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonSecondarySubcaption)
+	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonTertiarySubcaption)
 }
 
 type FfiConverterTypeWrappedMessage struct{}
@@ -7994,6 +8247,18 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalBytesINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -8091,6 +8356,18 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.ShareProfileFirstName)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.ShareProfileLastName)
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.ShareProfileAvatar)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonBundleId)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonAppName)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonUrl)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonSessionId)
+	FfiConverterBoolINSTANCE.Write(writer, value.AppBalloonIsLive)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonLdText)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonImageTitle)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonImageSubtitle)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonCaption)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonSubcaption)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonSecondarySubcaption)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonTertiarySubcaption)
 }
 
 type FfiDestroyerTypeWrappedMessage struct{}
@@ -9222,6 +9499,43 @@ func (_ FfiDestroyerOptionalTypeAccountPersistData) Destroy(value *AccountPersis
 	}
 }
 
+type FfiConverterOptionalTypeWrappedFindMyLocation struct{}
+
+var FfiConverterOptionalTypeWrappedFindMyLocationINSTANCE = FfiConverterOptionalTypeWrappedFindMyLocation{}
+
+func (c FfiConverterOptionalTypeWrappedFindMyLocation) Lift(rb RustBufferI) *WrappedFindMyLocation {
+	return LiftFromRustBuffer[*WrappedFindMyLocation](c, rb)
+}
+
+func (_ FfiConverterOptionalTypeWrappedFindMyLocation) Read(reader io.Reader) *WrappedFindMyLocation {
+	if readInt8(reader) == 0 {
+		return nil
+	}
+	temp := FfiConverterTypeWrappedFindMyLocationINSTANCE.Read(reader)
+	return &temp
+}
+
+func (c FfiConverterOptionalTypeWrappedFindMyLocation) Lower(value *WrappedFindMyLocation) RustBuffer {
+	return LowerIntoRustBuffer[*WrappedFindMyLocation](c, value)
+}
+
+func (_ FfiConverterOptionalTypeWrappedFindMyLocation) Write(writer io.Writer, value *WrappedFindMyLocation) {
+	if value == nil {
+		writeInt8(writer, 0)
+	} else {
+		writeInt8(writer, 1)
+		FfiConverterTypeWrappedFindMyLocationINSTANCE.Write(writer, *value)
+	}
+}
+
+type FfiDestroyerOptionalTypeWrappedFindMyLocation struct{}
+
+func (_ FfiDestroyerOptionalTypeWrappedFindMyLocation) Destroy(value *WrappedFindMyLocation) {
+	if value != nil {
+		FfiDestroyerTypeWrappedFindMyLocation{}.Destroy(*value)
+	}
+}
+
 type FfiConverterOptionalTypeWrappedShareProfileData struct{}
 
 var FfiConverterOptionalTypeWrappedShareProfileDataINSTANCE = FfiConverterOptionalTypeWrappedShareProfileData{}
@@ -9760,6 +10074,49 @@ type FfiDestroyerSequenceTypeWrappedCloudSyncMessage struct{}
 func (FfiDestroyerSequenceTypeWrappedCloudSyncMessage) Destroy(sequence []WrappedCloudSyncMessage) {
 	for _, value := range sequence {
 		FfiDestroyerTypeWrappedCloudSyncMessage{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeWrappedFindMyFollow struct{}
+
+var FfiConverterSequenceTypeWrappedFindMyFollowINSTANCE = FfiConverterSequenceTypeWrappedFindMyFollow{}
+
+func (c FfiConverterSequenceTypeWrappedFindMyFollow) Lift(rb RustBufferI) []WrappedFindMyFollow {
+	return LiftFromRustBuffer[[]WrappedFindMyFollow](c, rb)
+}
+
+func (c FfiConverterSequenceTypeWrappedFindMyFollow) Read(reader io.Reader) []WrappedFindMyFollow {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]WrappedFindMyFollow, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeWrappedFindMyFollowINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeWrappedFindMyFollow) Lower(value []WrappedFindMyFollow) RustBuffer {
+	return LowerIntoRustBuffer[[]WrappedFindMyFollow](c, value)
+}
+
+func (c FfiConverterSequenceTypeWrappedFindMyFollow) Write(writer io.Writer, value []WrappedFindMyFollow) {
+	if len(value) > math.MaxInt32 {
+		panic("[]WrappedFindMyFollow is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeWrappedFindMyFollowINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeWrappedFindMyFollow struct{}
+
+func (FfiDestroyerSequenceTypeWrappedFindMyFollow) Destroy(sequence []WrappedFindMyFollow) {
+	for _, value := range sequence {
+		FfiDestroyerTypeWrappedFindMyFollow{}.Destroy(value)
 	}
 }
 
@@ -10384,6 +10741,28 @@ func RestoreTokenProvider(config *WrappedOsConfig, connection *WrappedApsConnect
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_func_restore_token_provider(FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterStringINSTANCE.Lower(username)), rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pet)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_pointer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) unsafe.Pointer {
+			// completeFunc
+			return C.ffi_rustpushgo_rust_future_complete_pointer(unsafe.Pointer(handle), status)
+		},
+		FfiConverterWrappedTokenProviderINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_pointer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func RestoreTokenProviderWithPetExpiration(config *WrappedOsConfig, connection *WrappedApsConnection, username string, hashedPasswordHex string, pet string, spdBase64 string, petExpiresAtMs uint64, mmeDelegateJson *string) (*WrappedTokenProvider, error) {
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_func_restore_token_provider_with_pet_expiration(FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterStringINSTANCE.Lower(username)), rustBufferToC(FfiConverterStringINSTANCE.Lower(hashedPasswordHex)), rustBufferToC(FfiConverterStringINSTANCE.Lower(pet)), rustBufferToC(FfiConverterStringINSTANCE.Lower(spdBase64)), FfiConverterUint64INSTANCE.Lower(petExpiresAtMs), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(mmeDelegateJson)),
 				status,
 			))
 		},

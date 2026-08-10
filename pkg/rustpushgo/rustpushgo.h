@@ -281,6 +281,13 @@ void* uniffi_rustpushgo_fn_method_client_purge_recoverable_zones(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_refresh_findmy_following(
+	void* ptr,
+	RustBuffer address,
+	RustBuffer find_my_id,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_reset_cloud_client(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1191,6 +1198,11 @@ void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_refresh_pet_token(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_seed_inner_mme_delegate(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_seed_mme_delegate_json(
 	void* ptr,
 	RustBuffer json,
@@ -1284,6 +1296,18 @@ void* uniffi_rustpushgo_fn_func_restore_token_provider(
 	RustBuffer hashed_password_hex,
 	RustBuffer pet,
 	RustBuffer spd_base64,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_func_restore_token_provider_with_pet_expiration(
+	void* config,
+	void* connection,
+	RustBuffer username,
+	RustBuffer hashed_password_hex,
+	RustBuffer pet,
+	RustBuffer spd_base64,
+	uint64_t pet_expires_at_ms,
+	RustBuffer mme_delegate_json,
 	RustCallStatus* out_status
 );
 
@@ -1634,6 +1658,10 @@ uint16_t uniffi_rustpushgo_checksum_func_restore_token_provider(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_func_restore_token_provider_with_pet_expiration(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_batch_resolve_handles(
 	RustCallStatus* out_status
 );
@@ -1775,6 +1803,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_lookup_targets_once(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_purge_recoverable_zones(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_refresh_findmy_following(
 	RustCallStatus* out_status
 );
 
@@ -2263,6 +2295,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_cl
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_refresh_pet_token(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_seed_inner_mme_delegate(
 	RustCallStatus* out_status
 );
 

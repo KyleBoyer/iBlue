@@ -18,6 +18,7 @@ import type {
   EngineSnapshot,
   IdsLookupResult,
   InitializeParams,
+  NativeFindMyFollow,
   SendAttachmentParams,
   SendEditParams,
   SendGroupIconParams,
@@ -76,6 +77,7 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   readonly unreads: SendMarkUnreadParams[] = [];
   readonly notifications: SendNotifyParams[] = [];
   readonly validations: ValidateHandlesParams[] = [];
+  readonly findMyRequests: Array<string | undefined> = [];
 
   initialize(_params: InitializeParams): Promise<EngineSnapshot> {
     return Promise.resolve(this.currentSnapshot);
@@ -106,6 +108,32 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   }
   health(): Promise<{ clientStarted: boolean; secondsSinceLastInbound: number }> {
     return Promise.resolve({ clientStarted: true, secondsSinceLastInbound: 1 });
+  }
+  refreshFindMyFollowing(address?: string): Promise<NativeFindMyFollow[]> {
+    this.findMyRequests.push(address);
+    return Promise.resolve([{
+      id: "findmy-follow-1",
+      invitationAcceptedHandles: ["friend@example.com"],
+      invitationFromHandles: ["secondary@example.com"],
+      expires: 0,
+      updateTimestamp: 4_300,
+      isFromMessages: true,
+      locateInProgress: false,
+      lastLocation: {
+        latitude: 37.335,
+        longitude: -122.01,
+        altitude: 12,
+        horizontalAccuracy: 4,
+        verticalAccuracy: 8,
+        timestamp: 4_400,
+        isInaccurate: false,
+        isOld: false,
+        formattedAddressLines: ["One Apple Park Way", "Cupertino, CA"],
+        locality: "Cupertino",
+        stateCode: "CA",
+        countryCode: "US",
+      },
+    }]);
   }
   sendMessage(params: SendMessageParams): Promise<{ guid: string }> {
     this.messages.push(params);
@@ -486,6 +514,58 @@ test("APNs replay emits each incoming message and typing envelope only once", as
 
   assert.deepEqual(events, ["typing-indicator", "new-message"]);
   assert.equal(store.queryMessages({ chatGuid: "iMessage;-;friend@example.com" }).total, 1);
+});
+
+test("standalone Name & Photo Sharing updates contacts without creating an empty message", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-shared-profile-test-"));
+  const engine = new FakeEngine();
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  const sessions = new SessionStore("test", join(root, "session.json"));
+  const service = new BlueBubblesService({
+    profile: "test",
+    password: "secret",
+    engine,
+    store,
+    sessionStore: sessions,
+  });
+  t.after(async () => {
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+  await service.start({
+    version: 1,
+    profile: "test",
+    deviceId: "device-test",
+    apsState: "aps",
+    users: "users",
+    identity: "identity",
+    accountUsername: "secondary@example.com",
+    handles: snapshot.handles,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const updatedContact = serviceEvent(service, "iblue-contact-updated");
+  engine.emit("message.received", {
+    uuid: "shared-profile-control-guid",
+    sender: "mailto:friend@example.com",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 123,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    sharedProfile: {
+      displayName: "Jane Example",
+      firstName: "Jane",
+      lastName: "Example",
+      hasPoster: false,
+      avatarBase64: "AQID",
+    },
+  });
+  assert.equal((await updatedContact as { displayName: string }).displayName, "Jane Example");
+  assert.equal(store.countMessages(), 0);
+  assert.equal(store.getContact("friend@example.com")?.source, "name-and-photo-sharing");
+  assert.deepEqual(store.getContactAvatar("friend@example.com")?.data, Buffer.from([1, 2, 3]));
 });
 
 test("scheduled messages survive restart, execute, and reschedule recurring jobs", async (t) => {
@@ -1328,6 +1408,50 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     body: JSON.stringify({ addresses: ["friend@example.com"] }),
   });
   assert.deepEqual((await queriedContacts.json() as { data: unknown }).data, []);
+  const profileVcf = [
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    "N:Example;API Jane;;;",
+    "FN:API Jane Example",
+    "EMAIL:friend@example.com",
+    "PHOTO;ENCODING=b;TYPE=PNG:iVBORw0KGgo=",
+    "END:VCARD",
+  ].join("\r\n");
+  const importedContacts = await fetch(`${listening.address}/api/v1/iblue/contact/vcf?password=secret`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ vcf: profileVcf }),
+  });
+  assert.deepEqual((await importedContacts.json() as { data: unknown }).data, { imported: 1 });
+  const loadedProfileVcf = await fetch(`${listening.address}/api/v1/iblue/contact/vcf?password=secret`);
+  assert.match((await loadedProfileVcf.json() as { data: string }).data, /API Jane Example/);
+  const iBlueContacts = await fetch(
+    `${listening.address}/api/v1/iblue/contact?password=secret&search=Jane`,
+  );
+  const iBlueContactsBody = await iBlueContacts.json() as {
+    data: Array<{
+      address: string;
+      displayName: string;
+      source: string;
+      hasAvatar: boolean;
+      updatedAt: number;
+    }>;
+  };
+  assert.deepEqual(iBlueContactsBody.data, [{
+    address: "friend@example.com",
+    service: "iMessage",
+    displayName: "API Jane Example",
+    firstName: "API Jane",
+    lastName: "Example",
+    source: "profile-vcf",
+    hasAvatar: true,
+    updatedAt: iBlueContactsBody.data[0]?.updatedAt,
+  }]);
+  const contactAvatar = await fetch(
+    `${listening.address}/api/v1/iblue/contact/friend%40example.com/avatar?password=secret`,
+  );
+  assert.equal(contactAvatar.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await contactAvatar.arrayBuffer()), Buffer.from("iVBORw0KGgo=", "base64"));
   const shareContactStatus = await fetch(
     `${listening.address}/api/v1/chat/${directChatGuid}/share/contact/status?password=secret`,
   );
@@ -1338,12 +1462,88 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ limit: 100 }),
   });
-  const handlesBody = await handles.json() as { data: Array<{ address: string }> };
+  const handlesBody = await handles.json() as {
+    data: Array<{ address: string; iBlue?: { contact?: { displayName: string } } }>;
+  };
   assert.deepEqual(handlesBody.data.map((handle) => handle.address).sort(), [
     "friend@example.com",
     "one@example.com",
     "secondary@example.com",
   ]);
+  assert.equal(
+    handlesBody.data.find((handle) => handle.address === "friend@example.com")?.iBlue?.contact?.displayName,
+    "API Jane Example",
+  );
+
+  const locationEvent = serviceEvent(service, "new-message");
+  engine.emit("message.received", {
+    uuid: "api-location-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 4321,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    appBalloon: {
+      bundleId: "com.apple.Maps.MessagesExtension",
+      appName: "Maps",
+      url: "https://maps.apple.com/?ll=37.3349,-122.009",
+      isLive: false,
+      imageTitle: "Apple Park",
+      subcaption: "Cupertino, CA",
+    },
+  });
+  const locationMessage = await locationEvent as {
+    iBlue: { sharedLocation: { latitude: number; longitude: number } };
+  };
+  assert.equal(locationMessage.iBlue.sharedLocation.latitude, 37.3349);
+  assert.equal(locationMessage.iBlue.sharedLocation.longitude, -122.009);
+  const locations = await fetch(`${listening.address}/api/v1/iblue/location/query?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chatGuid: "iMessage;-;friend@example.com" }),
+  });
+  const locationsBody = await locations.json() as { data: Array<{ messageGuid: string; label: string }> };
+  assert.deepEqual(locationsBody.data.map(({ messageGuid, label }) => ({ messageGuid, label })), [{
+    messageGuid: "api-location-guid",
+    label: "Apple Park",
+  }]);
+  const location = await fetch(
+    `${listening.address}/api/v1/iblue/location/api-location-guid?password=secret`,
+  );
+  assert.equal((await location.json() as { data: { address: string } }).data.address, "Cupertino, CA");
+  const liveLocations = await fetch(
+    `${listening.address}/api/v1/iblue/location/live?password=secret&address=friend%40example.com`,
+  );
+  const liveLocationsBody = await liveLocations.json() as {
+    data: Array<{ address: string; latitude: number; locationUpdatedAt: number; expiresAt: number | null }>;
+  };
+  assert.deepEqual(liveLocationsBody.data, [{
+    source: "find-my",
+    followId: "findmy-follow-1",
+    address: "friend@example.com",
+    acceptedHandles: ["friend@example.com"],
+    fromHandles: ["secondary@example.com"],
+    isActive: true,
+    isFromMessages: true,
+    locatingInProgress: false,
+    expiresAt: null,
+    sharingUpdatedAt: 4_300,
+    latitude: 37.335,
+    longitude: -122.01,
+    altitude: 12,
+    horizontalAccuracy: 4,
+    verticalAccuracy: 8,
+    locationUpdatedAt: 4_400,
+    isInaccurate: false,
+    isOld: false,
+    formattedAddress: "One Apple Park Way\nCupertino, CA",
+    locality: "Cupertino",
+    stateCode: "CA",
+    countryCode: "US",
+  }]);
+  assert.deepEqual(engine.findMyRequests, ["friend@example.com"]);
 
   const edited = await fetch(`${listening.address}/api/v1/message/sent-guid/edit?password=secret`, {
     method: "POST",

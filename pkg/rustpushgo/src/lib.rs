@@ -931,6 +931,8 @@ pub struct AccountPersistData {
     pub username: String,
     pub hashed_password_hex: String,
     pub pet: String,
+    pub pet_expires_at_ms: u64,
+    pub mme_delegate_json: Option<String>,
     pub adsid: String,
     pub dsid: String,
     pub spd_base64: String,
@@ -1822,6 +1824,15 @@ impl WrappedTokenProvider {
         Ok(())
     }
 
+    /// Copy the wrapper's persisted MobileMe delegate into rustpush's raw
+    /// TokenProvider. Find My reads its service token from the raw provider,
+    /// while contacts/keychain use the wrapper's serialized copy.
+    async fn seed_inner_mme_delegate(&self) -> Result<(), WrappedError> {
+        let delegate = self.parse_mme_delegate().await?;
+        self.inner.seed_mme_delegate(delegate).await;
+        Ok(())
+    }
+
     /// Proactively refresh the GSA/PET session by re-running login_email_pass
     /// against the stored credentials. Apple's PET lifetime is ~24h; on a
     /// long-running bridge without restarts, a mid-run refresh prevents the
@@ -2249,6 +2260,33 @@ pub async fn restore_token_provider(
     pet: String,
     spd_base64: String,
 ) -> Result<Arc<WrappedTokenProvider>, WrappedError> {
+    restore_token_provider_with_pet_expiration(
+        config,
+        connection,
+        username,
+        hashed_password_hex,
+        pet,
+        spd_base64,
+        0,
+        None,
+    )
+    .await
+}
+
+/// Restore a TokenProvider while preserving the PET's real expiry. A freshly
+/// completed MFA login must not immediately mark its PET stale and trigger a
+/// second login challenge when the long-running native process starts.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn restore_token_provider_with_pet_expiration(
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+    username: String,
+    hashed_password_hex: String,
+    pet: String,
+    spd_base64: String,
+    pet_expires_at_ms: u64,
+    mme_delegate_json: Option<String>,
+) -> Result<Arc<WrappedTokenProvider>, WrappedError> {
     let os_config = config.config.clone();
     let conn = connection.inner.clone();
 
@@ -2284,9 +2322,9 @@ pub async fn restore_token_provider(
 
     account.spd = Some(spd);
 
-    // Inject the persisted PET into account.tokens with an already-expired
-    // timestamp. Byte-for-byte port of the master-branch restore path
-    // (master's pkg/rustpushgo/src/lib.rs line 805).
+    // Inject the persisted PET with its actual expiry when the login flow
+    // captured one. Legacy callers pass zero and retain the old expired-token
+    // behavior, which forces a password-derived refresh.
     //
     // Why: the `get_token` call short-circuits and returns None when
     // `tokens.is_empty() == false` AND the requested key is absent. So if
@@ -2295,7 +2333,7 @@ pub async fn restore_token_provider(
     // corner-case path or returns None immediately. Neither gives `get_token`
     // the opportunity to auto-refresh via `login_email_pass`.
     //
-    // With an expired PET entry present, `get_token`'s expiration check
+    // With an expired legacy PET entry present, `get_token`'s expiration check
     // fires (`data.expiration.elapsed().is_err()` → false → has_valid_token
     // false), it enters the auto-refresh branch, calls `login_email_pass`
     // with the persisted credentials, and — assuming Apple still trusts
@@ -2318,7 +2356,8 @@ pub async fn restore_token_provider(
         "com.apple.gs.idms.pet".to_string(),
         icloud_auth::FetchedToken {
             token: pet,
-            expiration: std::time::UNIX_EPOCH,
+            expiration: std::time::UNIX_EPOCH
+                + Duration::from_millis(pet_expires_at_ms),
         },
     );
 
@@ -2327,17 +2366,19 @@ pub async fn restore_token_provider(
 
     info!("Restored TokenProvider from persisted credentials");
 
-    // Restore path does not have a MobileMe delegate — callers must
-    // seed_mme_delegate_json() from persisted state before using keychain/
-    // contacts features.
-    Ok(Arc::new(WrappedTokenProvider {
+    let wrapped = Arc::new(WrappedTokenProvider {
         inner: token_provider,
         account,
         os_config,
-        mme_delegate_bytes: tokio::sync::Mutex::new(None),
+        mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_json.map(String::into_bytes)),
         keychain_clients_cache: tokio::sync::Mutex::new(None),
         mme_self_heal_lock: tokio::sync::Mutex::new(()),
-    }))
+    });
+    if wrapped.mme_delegate_bytes.lock().await.is_some() {
+        wrapped.seed_inner_mme_delegate().await?;
+        info!("Seeded persisted MobileMe delegate into restored TokenProvider");
+    }
+    Ok(wrapped)
 }
 
 // ============================================================================
@@ -2531,6 +2572,113 @@ pub struct WrappedMessage {
     pub share_profile_first_name: Option<String>,
     pub share_profile_last_name: Option<String>,
     pub share_profile_avatar: Option<Vec<u8>>,
+
+    // iMessage app-balloon metadata. The TypeScript BlueBubbles adapter uses
+    // this to normalize Maps pins and live-location balloons without exposing
+    // Apple's keyed-archive payload on its public API.
+    pub app_balloon_bundle_id: Option<String>,
+    pub app_balloon_app_name: Option<String>,
+    pub app_balloon_url: Option<String>,
+    pub app_balloon_session_id: Option<String>,
+    pub app_balloon_is_live: bool,
+    pub app_balloon_ld_text: Option<String>,
+    pub app_balloon_image_title: Option<String>,
+    pub app_balloon_image_subtitle: Option<String>,
+    pub app_balloon_caption: Option<String>,
+    pub app_balloon_subcaption: Option<String>,
+    pub app_balloon_secondary_subcaption: Option<String>,
+    pub app_balloon_tertiary_subcaption: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrappedFindMyLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude: f64,
+    pub horizontal_accuracy: f64,
+    pub vertical_accuracy: f64,
+    pub timestamp: i64,
+    pub is_inaccurate: bool,
+    pub is_old: Option<bool>,
+    pub formatted_address_lines: Vec<String>,
+    pub locality: Option<String>,
+    pub state_code: Option<String>,
+    pub country_code: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrappedFindMyFollow {
+    pub id: String,
+    pub invitation_accepted_handles: Vec<String>,
+    pub invitation_from_handles: Vec<String>,
+    pub expires: i64,
+    pub update_timestamp: i64,
+    pub is_from_messages: bool,
+    pub locate_in_progress: bool,
+    pub last_location: Option<WrappedFindMyLocation>,
+}
+
+fn normalize_findmy_handle(value: &str) -> String {
+    let value = value
+        .strip_prefix("tel:")
+        .or_else(|| value.strip_prefix("mailto:"))
+        .unwrap_or(value)
+        .trim()
+        .to_lowercase();
+    if value.contains('@') {
+        value
+    } else {
+        let international = value
+            .strip_prefix("00")
+            .map(|rest| format!("+{rest}"))
+            .unwrap_or(value);
+        let has_plus = international.starts_with('+');
+        let digits: String = international
+            .chars()
+            .filter(|value| value.is_ascii_digit())
+            .collect();
+        if has_plus {
+            format!("+{digits}")
+        } else if digits.len() == 10 {
+            format!("+1{digits}")
+        } else {
+            digits
+        }
+    }
+}
+
+fn wrap_findmy_follow(follow: &rustpush::findmy::Follow) -> WrappedFindMyFollow {
+    let last_location = follow.last_location.as_ref().map(|location| {
+        let address = location.address.as_ref();
+        WrappedFindMyLocation {
+            latitude: location.latitude,
+            longitude: location.longitude,
+            altitude: location.altitude,
+            horizontal_accuracy: location.horizontal_accuracy,
+            vertical_accuracy: location.vertical_accuracy,
+            timestamp: location.timestamp,
+            is_inaccurate: location.is_inaccurate,
+            is_old: location.is_old,
+            formatted_address_lines: address
+                .and_then(|value| value.formatted_address_lines.clone())
+                .unwrap_or_default(),
+            locality: address.and_then(|value| value.locality.clone()),
+            state_code: address.and_then(|value| value.state_code.clone()),
+            country_code: address.map(|value| value.country_code.clone()),
+        }
+    });
+    WrappedFindMyFollow {
+        id: follow.id.clone(),
+        invitation_accepted_handles: follow.invitation_accepted_handles.clone(),
+        invitation_from_handles: follow.invitation_from_handles.clone(),
+        expires: follow.expires,
+        update_timestamp: follow.update_timestamp,
+        is_from_messages: follow.is_from_messages,
+        locate_in_progress: follow.locate_in_progress,
+        last_location,
+    }
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -4495,6 +4643,18 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         share_profile_first_name: None,
         share_profile_last_name: None,
         share_profile_avatar: None,
+        app_balloon_bundle_id: None,
+        app_balloon_app_name: None,
+        app_balloon_url: None,
+        app_balloon_session_id: None,
+        app_balloon_is_live: false,
+        app_balloon_ld_text: None,
+        app_balloon_image_title: None,
+        app_balloon_image_subtitle: None,
+        app_balloon_caption: None,
+        app_balloon_subcaption: None,
+        app_balloon_secondary_subcaption: None,
+        app_balloon_tertiary_subcaption: None,
     };
 
     match &msg.message {
@@ -4600,7 +4760,30 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             // Sticker data from extension balloons (icon field)
             if let Some(ref app) = normal.app {
+                w.app_balloon_bundle_id = Some(app.bundle_id.clone());
+                w.app_balloon_app_name = Some(app.name.clone());
                 if let Some(ref balloon) = app.balloon {
+                    w.app_balloon_url = Some(balloon.url.clone());
+                    w.app_balloon_session_id = balloon.session.clone();
+                    w.app_balloon_is_live = balloon.is_live;
+                    w.app_balloon_ld_text = balloon.ld_text.clone();
+                    if let Some(rustpush::BalloonLayout::TemplateLayout {
+                        image_subtitle,
+                        image_title,
+                        caption,
+                        secondary_subcaption,
+                        tertiary_subcaption,
+                        subcaption,
+                        ..
+                    }) = &balloon.layout
+                    {
+                        w.app_balloon_image_subtitle = Some(image_subtitle.clone());
+                        w.app_balloon_image_title = Some(image_title.clone());
+                        w.app_balloon_caption = Some(caption.clone());
+                        w.app_balloon_secondary_subcaption = Some(secondary_subcaption.clone());
+                        w.app_balloon_tertiary_subcaption = Some(tertiary_subcaption.clone());
+                        w.app_balloon_subcaption = Some(subcaption.clone());
+                    }
                     if let Some(ref icon_data) = balloon.icon {
                         if !icon_data.is_empty() {
                             w.sticker_data = Some(icon_data.clone());
@@ -5180,6 +5363,27 @@ pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
     if let Err(err) = write_result {
         let _ = std::fs::remove_file(&tmp_path);
         warn!("Failed to persist state to {}: {}", path, err);
+    }
+}
+
+fn persist_binary_state(path: &str, data: &[u8]) {
+    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(data)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        warn!("Failed to persist binary state to {}: {}", path, err);
     }
 }
 
@@ -5991,6 +6195,16 @@ impl LoginSession {
 
         let pet = account.get_pet()
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
+        let pet_expires_at_ms = account.tokens
+            .get("com.apple.gs.idms.pet")
+            .and_then(|token| token.expiration.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_else(|| {
+                (std::time::SystemTime::now() + Duration::from_secs(20 * 60 * 60))
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+            });
 
         let spd = account.spd.as_ref().expect("No SPD after login");
         let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap().to_string();
@@ -6017,10 +6231,12 @@ impl LoginSession {
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
         let spd_base64 = base64_encode(&spd_bytes);
 
-        let account_persist = AccountPersistData {
+        let mut account_persist = AccountPersistData {
             username: self.username.clone(),
             hashed_password_hex,
             pet: pet.clone(),
+            pet_expires_at_ms,
+            mme_delegate_json: None,
             adsid: adsid.clone(),
             dsid: dsid.clone(),
             spd_base64,
@@ -6161,17 +6377,26 @@ impl LoginSession {
             None
         };
 
+        account_persist.mme_delegate_json = mme_delegate_bytes
+            .as_ref()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+
+        let wrapped_token_provider = Arc::new(WrappedTokenProvider {
+            inner: token_provider,
+            account: account_arc,
+            os_config: os_config.clone(),
+            mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
+            keychain_clients_cache: tokio::sync::Mutex::new(None),
+            mme_self_heal_lock: tokio::sync::Mutex::new(()),
+        });
+        if wrapped_token_provider.mme_delegate_bytes.lock().await.is_some() {
+            wrapped_token_provider.seed_inner_mme_delegate().await?;
+        }
+
         Ok(IDSUsersWithIdentityRecord {
             users: Arc::new(WrappedIDSUsers { inner: users }),
             identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
-            token_provider: Some(Arc::new(WrappedTokenProvider {
-                inner: token_provider,
-                account: account_arc,
-                os_config: os_config.clone(),
-                mme_delegate_bytes: tokio::sync::Mutex::new(mme_delegate_bytes),
-                keychain_clients_cache: tokio::sync::Mutex::new(None),
-                mme_self_heal_lock: tokio::sync::Mutex::new(()),
-            })),
+            token_provider: Some(wrapped_token_provider),
             account_persist: Some(account_persist),
         })
     }
@@ -7260,6 +7485,8 @@ pub struct Client {
     passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
     statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
     sharedstreams_client: tokio::sync::Mutex<Option<Arc<WrappedSharedStreamsClient>>>,
+    findmy_friends_client: tokio::sync::Mutex<Option<rustpush::findmy::FindMyFriendsClient<BridgeDefaultAnisetteProvider>>>,
+    findmy_client: tokio::sync::Mutex<Option<Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>>>,
     /// Cached Profiles client (Name & Photo Sharing). Initialized lazily the
     /// first time a shared profile needs to be fetched from CloudKit.
     profiles_client: tokio::sync::Mutex<Option<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>>>,
@@ -7774,6 +8001,12 @@ pub async fn new_client(
             const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
             while let Some((msg, drain_ts)) = rx.recv().await {
+                if let Some(client_arc) = client_weak_for_loop
+                    .get()
+                    .and_then(|weak| weak.upgrade())
+                {
+                    client_arc.handle_findmy_message(msg.clone()).await;
+                }
                 // Diagnostic — log at the earliest APS dispatch point every
                 // keysharing-topic message we receive, BEFORE any workaround
                 // or handle() logic. Lets us distinguish "peers aren't sending
@@ -8659,6 +8892,8 @@ pub async fn new_client(
         passwords_client: tokio::sync::Mutex::new(None),
         statuskit_client: tokio::sync::Mutex::new(None),
         sharedstreams_client: tokio::sync::Mutex::new(None),
+        findmy_friends_client: tokio::sync::Mutex::new(None),
+        findmy_client: tokio::sync::Mutex::new(None),
         profiles_client: tokio::sync::Mutex::new(None),
         shared_statuskit: shared_statuskit_for_recv,
         status_callback: status_callback_for_recv,
@@ -8671,6 +8906,74 @@ pub async fn new_client(
 }
 
 impl Client {
+    async fn get_or_init_findmy_client(
+        &self,
+    ) -> Result<Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+        {
+            let locked = self.findmy_client.lock().await;
+            if let Some(client) = &*locked {
+                return Ok(client.clone());
+            }
+        }
+
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.get_dsid().await?;
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        let cloudkit = keychain.client.clone();
+        let anisette = tp.get_account().lock().await.anisette.clone();
+        let state_path = subsystem_state_path("findmy-state.bin");
+        let state = match std::fs::read(&state_path) {
+            Ok(data) => rustpush::findmy::FindMyState::restore(&data).unwrap_or_else(|error| {
+                warn!("Failed to restore Find My state at {}: {}; starting fresh", state_path, error);
+                rustpush::findmy::FindMyState::new(dsid.clone())
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                rustpush::findmy::FindMyState::new(dsid.clone())
+            }
+            Err(error) => {
+                warn!("Failed to read Find My state at {}: {}; starting fresh", state_path, error);
+                rustpush::findmy::FindMyState::new(dsid.clone())
+            }
+        };
+        let state_path_for_update = state_path.clone();
+        let state = Arc::new(rustpush::findmy::FindMyStateManager {
+            state: rustpush::DebugMutex::new(state),
+            update: Box::new(move |data| persist_binary_state(&state_path_for_update, &data)),
+        });
+        let client = Arc::new(
+            rustpush::findmy::FindMyClient::new(
+                self.conn.clone(),
+                cloudkit,
+                keychain,
+                self.os_config.clone(),
+                state,
+                tp.inner.clone(),
+                anisette,
+                self.client.identity.clone(),
+            )
+            .await?,
+        );
+
+        let mut locked = self.findmy_client.lock().await;
+        if let Some(existing) = &*locked {
+            return Ok(existing.clone());
+        }
+        *locked = Some(client.clone());
+        info!("Find My client initialized and subscribed to Messages share handoffs");
+        Ok(client)
+    }
+
+    async fn handle_findmy_message(&self, message: rustpush::APSMessage) {
+        let client = self.findmy_client.lock().await.clone();
+        if let Some(client) = client {
+            if let Err(error) = client.handle(message).await {
+                warn!("Find My handoff processing failed: {}", error);
+            }
+        }
+    }
+
     pub(crate) async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
         // Fast path: return cached client without doing any slow work.
         // IMPORTANT: the lock is released before any network calls so that
@@ -8686,9 +8989,12 @@ impl Client {
         info!("Cloud client init: no cached client, initializing now");
 
         // All slow work happens here WITHOUT holding cloud_messages_client.
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
+        let tp = self
+            .token_provider
+            .as_ref()
+            .ok_or(WrappedError::GenericError {
+                msg: "No TokenProvider available".into(),
+            })?;
 
         let dsid = tp.get_dsid().await?;
         let adsid = tp.get_adsid().await?;
@@ -9324,8 +9630,9 @@ fn inline_relay_attachment(
 mod reply_target_tests {
     use super::{
         inline_relay_attachment, leave_group_participants, message_inst_to_wrapped,
-        mmcs_preflight_targets, normalize_reply_target, AttachmentType, ConversationData, Message,
-        MessageInst, ReactMessage, ReactMessageType, Reaction, WrappedConversation,
+        mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target, AttachmentType,
+        ConversationData, Message, MessageInst, ReactMessage, ReactMessageType, Reaction,
+        WrappedConversation,
     };
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
@@ -9339,6 +9646,19 @@ mod reply_target_tests {
             to_text: text.to_string(),
             embedded_profile: None,
         }
+    }
+
+    #[test]
+    fn findmy_handles_normalize_nanp_national_numbers() {
+        assert_eq!(normalize_findmy_handle("5555550101"), "+15555550101");
+        assert_eq!(
+            normalize_findmy_handle("tel:+1 (651) 319-6252"),
+            "+15555550101"
+        );
+        assert_eq!(
+            normalize_findmy_handle("MAILTO:Friend@Example.com"),
+            "friend@example.com"
+        );
     }
 
     #[test]
@@ -9474,6 +9794,8 @@ impl Client {
         *self.cloud_messages_client.lock().await = None;
         *self.cloud_keychain_client.lock().await = None;
         *self.profiles_client.lock().await = None;
+        *self.findmy_client.lock().await = None;
+        *self.findmy_friends_client.lock().await = None;
     }
 
     /// Retry an MMCS attachment download from a previously-captured descriptor
@@ -9509,6 +9831,247 @@ impl Client {
         if let Some(tp) = &self.token_provider {
             let _ = tp.inner.refresh_mme().await;
         }
+    }
+
+    /// Refresh Find My Friends state and return the latest location attached
+    /// to each active follow. When an address is supplied, select that follow
+    /// before the second refresh so Apple returns its freshest live position.
+    pub async fn refresh_findmy_following(
+        &self,
+        address: Option<String>,
+        find_my_id: Option<String>,
+    ) -> Result<Vec<WrappedFindMyFollow>, WrappedError> {
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+        let dsid = tp.get_dsid().await?;
+        let mut findmy = self.get_or_init_findmy_client().await?;
+        for attempt in 0..2 {
+            let mut locked = self.findmy_friends_client.lock().await;
+            let result: Result<Vec<WrappedFindMyFollow>, rustpush::PushError> = async {
+                if let Some(find_my_id) = find_my_id.as_deref() {
+                    let secure_location_ids = findmy.secure_friend_location_ids(find_my_id).await;
+                    let _ = findmy
+                        .fetch_secure_friend_locations(find_my_id, &secure_location_ids)
+                        .await?;
+                }
+                {
+                    let mut daemon = findmy.daemon.lock().await;
+                    daemon.refresh(self.os_config.as_ref()).await?;
+                    if !daemon.following.is_empty() {
+                        let mut keysharing_target = None;
+                        let mut secure_find_my_id = None;
+                        if let Some(address) = address.as_deref() {
+                            let wanted = normalize_findmy_handle(address);
+                            let selected = daemon
+                                .following
+                                .iter()
+                                .find(|follow| {
+                                    follow
+                                        .invitation_accepted_handles
+                                        .iter()
+                                        .chain(follow.invitation_from_handles.iter())
+                                        .any(|handle| normalize_findmy_handle(handle) == wanted)
+                                })
+                                .map(|follow| {
+                                    debug!(
+                                        "Selected Find My relationship: from_messages={}, secure_capable={}, shallow_or_live_secure_capable={}, fallback_to_legacy_allowed={:?}",
+                                        follow.is_from_messages,
+                                        follow.secure_locations_capable,
+                                        follow.shallow_or_live_secure_locations_capable,
+                                        follow.fallback_to_legacy_allowed,
+                                    );
+                                    let target = follow
+                                        .invitation_accepted_handles
+                                        .iter()
+                                        .chain(follow.invitation_from_handles.iter())
+                                        .find(|handle| normalize_findmy_handle(handle) == wanted)
+                                        .cloned();
+                                    (follow.id.clone(), target)
+                                });
+                            if let Some((id, target)) = selected {
+                                daemon.selected_friend = Some(id.clone());
+                                keysharing_target = target;
+                                secure_find_my_id = Some(id);
+                            } else {
+                                daemon.selected_friend = None;
+                            }
+                            if daemon.selected_friend.is_some() {
+                                daemon.refresh(self.os_config.as_ref()).await?;
+                            }
+                        }
+                        drop(daemon);
+
+                        // Prime the peer's keysharing directory entry.  The
+                        // secure-location handoff is an IDS exchange, and a
+                        // routable peer identity is a prerequisite for sending
+                        // the request.  This is cache-aware, so steady-state live
+                        // refreshes do not repeatedly hit Apple's directory.
+                        if let Some(target) = keysharing_target {
+                            let target = if target.starts_with("tel:") || target.starts_with("mailto:") {
+                                target
+                            } else if target.contains('@') {
+                                format!("mailto:{target}")
+                            } else {
+                                format!("tel:{target}")
+                            };
+                            if let Some(my_handle) = findmy.identity.get_handles().await.first().cloned() {
+                                let keysharing_topic = "com.apple.private.alloy.status.keysharing";
+                                let report = ids_guard::guarded_cache_keys(
+                                    &findmy.identity,
+                                    keysharing_topic,
+                                    std::slice::from_ref(&target),
+                                    &my_handle,
+                                    true,
+                                    &rustpush::ids::user::QueryOptions {
+                                        required_for_message: false,
+                                        result_expected: true,
+                                    },
+                                    30,
+                                    ids_guard::QuarantinePolicy::Bypass,
+                                )
+                                .await;
+                                if let Some(err) = report.error {
+                                    warn!("Find My keysharing directory lookup failed for peer: {err}");
+                                } else {
+                                    debug!(
+                                        "Find My keysharing directory lookup completed: attempts={}, panicked={}",
+                                        report.attempts,
+                                        !report.poisoned.is_empty() || report.systemic,
+                                    );
+                                }
+
+                                // A sharing iPhone can send the secure location
+                                // key only if Apple's IDS directory advertises
+                                // this exact APS connection for our recipient
+                                // handle on the keysharing service. Verify that
+                                // registration without logging handles, tokens,
+                                // or key material.
+                                let self_report = ids_guard::guarded_cache_keys(
+                                    &findmy.identity,
+                                    keysharing_topic,
+                                    std::slice::from_ref(&my_handle),
+                                    &my_handle,
+                                    true,
+                                    &rustpush::ids::user::QueryOptions {
+                                        required_for_message: false,
+                                        result_expected: true,
+                                    },
+                                    30,
+                                    ids_guard::QuarantinePolicy::Bypass,
+                                )
+                                .await;
+                                if let Some(err) = self_report.error {
+                                    warn!("Find My keysharing self-visibility lookup failed: {err}");
+                                } else {
+                                    let my_push_token = self.conn.get_token().await;
+                                    let cache = findmy.identity.cache.lock().await;
+                                    let identities = cache.get_keys(
+                                        keysharing_topic,
+                                        &my_handle,
+                                        &my_handle,
+                                    );
+                                    let own_identity = identities
+                                        .iter()
+                                        .find(|identity| identity.push_token == my_push_token);
+                                    let own_token_present = own_identity.is_some();
+                                    debug!(
+                                        "Find My keysharing self-visibility: identities={}, own_token_present={}, supports_key_sharing={}, supports_secure_loc_v1={}, supports_findmy_plugin_messages={}",
+                                        identities.len(),
+                                        own_token_present,
+                                        own_identity.map(|identity| identity.client_data.supports_key_sharing).unwrap_or(false),
+                                        own_identity.map(|identity| identity.client_data.supports_secure_loc_v1).unwrap_or(false),
+                                        own_identity.map(|identity| identity.client_data.supports_findmy_plugin_messages).unwrap_or(false),
+                                    );
+                                }
+                            }
+                        }
+
+                        // The secure gateway's `fmId` is the relationship's
+                        // short base64 `id`. `personIdHash` is a separate
+                        // hexadecimal hash, while a Messages balloon's UUID is
+                        // only the invitation envelope identifier.
+                        if let Some(secure_find_my_id) = secure_find_my_id
+                            .filter(|secure_find_my_id| Some(secure_find_my_id.as_str()) != find_my_id.as_deref())
+                        {
+                            let secure_location_ids = findmy.secure_friend_location_ids(&secure_find_my_id).await;
+                            let _ = findmy
+                                .fetch_secure_friend_locations(&secure_find_my_id, &secure_location_ids)
+                                .await?;
+                        }
+
+                        // Secure location decoding updates the shared Find My
+                        // daemon. Snapshot follows only after that fetch so the
+                        // RPC returns the newly attached last_location instead
+                        // of the pre-fetch relationship state.
+                        let daemon = findmy.daemon.lock().await;
+                        let follows = daemon.following.iter().map(wrap_findmy_follow).collect();
+                        return Ok(follows);
+                    }
+                }
+
+                if locked.is_none() {
+                    let anisette = tp.get_account().lock().await.anisette.clone();
+                    *locked = Some(
+                        rustpush::findmy::FindMyFriendsClient::new(
+                            self.os_config.as_ref(),
+                            dsid.clone(),
+                            tp.inner.clone(),
+                            self.conn.clone(),
+                            anisette,
+                            false,
+                        )
+                        .await?,
+                    );
+                }
+
+                let client = locked.as_mut().expect("Find My client initialized");
+                client.refresh(self.os_config.as_ref()).await?;
+                if let Some(address) = address.as_deref() {
+                    let wanted = normalize_findmy_handle(address);
+                    let selected = client
+                        .following
+                        .iter()
+                        .find(|follow| {
+                            follow
+                                .invitation_accepted_handles
+                                .iter()
+                                .chain(follow.invitation_from_handles.iter())
+                                .any(|handle| normalize_findmy_handle(handle) == wanted)
+                        })
+                        .map(|follow| follow.id.clone());
+                    if let Some(selected) = selected {
+                        client.selected_friend = Some(selected);
+                        client.refresh(self.os_config.as_ref()).await?;
+                    }
+                }
+
+                Ok(client.following.iter().map(wrap_findmy_follow).collect())
+            }
+            .await;
+
+            match result {
+                Ok(follows) => return Ok(follows),
+                Err(err) if attempt == 0 && is_token_missing_error(&err) => {
+                    drop(locked);
+                    warn!("Find My token missing; refreshing MobileMe delegate before one retry");
+                    self.refresh_mme_and_reset_cloud_client().await;
+                    findmy = self.get_or_init_findmy_client().await?;
+                }
+                Err(err) if is_token_missing_error(&err) => {
+                    if let Err(seed_err) = tp.ensure_mme_delegate_bytes_seeded().await {
+                        return Err(WrappedError::GenericError {
+                            msg: format!("Find My authentication unavailable: {seed_err}"),
+                        });
+                    }
+                    return Err(WrappedError::GenericError {
+                        msg: "Find My Friends access is unavailable for this Apple account; re-authenticate iBlue and make sure Find My is enabled".into(),
+                    });
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        unreachable!("Find My refresh loop always returns or retries once")
     }
 
     /// Initialize the StatusKit presence system. Must be called after login

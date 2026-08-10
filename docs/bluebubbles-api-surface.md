@@ -53,7 +53,8 @@ The exact REST implementations cover:
   create/read/update/delete and scheduled-message realtime events;
 - attachment metadata, download, force-download alias, and stored embedded
   media;
-- empty isolated contact reads plus profile-local Socket.IO VCF storage;
+- empty isolated BlueBubbles contact reads plus profile-local Socket.IO VCF
+  storage and the additive iBlue contact/location API described below;
 - webhook create/list/delete; and
 - FaceTime availability as an explicit `false` capability result.
 
@@ -78,6 +79,44 @@ delivers the canonical plural event.
 The full official 1.9.9 webhook-picker vocabulary is accepted, including
 optional server-update, Find My, FaceTime, and backup events. Accepting a
 subscription does not claim that an unsupported subsystem will emit it.
+
+## Additive iBlue contact and location API
+
+iBlue exposes normalized data that is useful to non-stock clients without
+changing the pinned BlueBubbles contract. Every route uses the same
+`?password=` authentication and `{status,message,data,metadata}` envelope as
+the rest of `/api/v1`:
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1/iblue/contact` | List or search contacts with `address`, `displayName`, component names, source, avatar availability, and update time. |
+| `POST` | `/api/v1/iblue/contact/query` | Query contacts by `addresses`, `search`, `sources`, `offset`, and `limit`. |
+| `GET` / `PUT` | `/api/v1/iblue/contact/vcf` | Read or replace the profile-local VCF and its normalized contact index. |
+| `GET` | `/api/v1/iblue/contact/:address/avatar` | Download the best available profile-local avatar. |
+| `POST` | `/api/v1/iblue/location/query` | Query immutable location snapshots and static Apple Maps pins by chat and timestamp. |
+| `GET` | `/api/v1/iblue/location/live?address=...` | Refresh Find My and return the current position for active location shares, optionally filtered to one phone number or email address. |
+| `GET` | `/api/v1/iblue/location/:messageGuid` | Fetch the normalized snapshot or pin associated with one message. |
+
+Handles gain an optional `iBlue.contact` summary. Messages gain optional
+`iBlue.senderContact` and `iBlue.sharedLocation` properties; Maps extension
+messages also expose their real bundle identifier through BlueBubbles'
+existing `balloonBundleId` field. An incoming iMessage Name & Photo Sharing
+update emits the additive `iblue-contact-updated` Socket.IO/webhook event.
+
+The profile VCF has priority over a peer's shared name. An avatar may fall
+back to Name & Photo Sharing when the matching VCF entry has no photo. Shared
+location history records are derived from received iMessage app balloons and
+plain Apple Maps URLs. Find My balloons preserve the initial location as an
+immutable message snapshot, while Apple Maps links (including Dropped Pin
+messages) are normalized to coordinates when present.
+
+`GET /api/v1/iblue/location/live` is deliberately separate from message
+history. Each request refreshes the profile's Find My Friends state using its
+existing Apple session; supplying `address` also selects that share for a
+second refresh so Apple can return its latest position. Responses include the
+location timestamp, accuracy, expiry, active/old state, and any address fields
+Apple returns. Clients may poll this additive endpoint to follow movement.
+iBlue does not read Contacts.app or geocode coordinates itself.
 
 Two additional exact routes deliberately report an absent optional capability:
 
