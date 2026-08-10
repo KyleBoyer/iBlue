@@ -55,8 +55,11 @@ test("encodes an authored poll as a live Polls app balloon", () => {
     "CBA9DE14-DD9A-45C5-BB63-989E6E32C538",
   );
   assert.equal(encoded.balloon.isLive, true);
+  assert.equal(encoded.balloon.ldText, "Sent a poll");
+  assert.equal(encoded.balloon.caption, "Sent a poll");
   assert.match(encoded.balloon.url ?? "", /^data:,.+\?src=p&c=2$/);
   assert.ok(encoded.transportText.startsWith("\x00PL\x01CBA9DE14-DD9A-45C5-BB63-989E6E32C538\x01"));
+  assert.ok(encoded.transportText.endsWith("\x00\ufffd\ufffc"));
   assert.deepEqual(encoded.poll.options.map(({ text }) => text), ["Pizza", "Tacos"]);
   assert.deepEqual(pollFromBalloon(encoded.balloon)?.options, encoded.poll.options);
 });

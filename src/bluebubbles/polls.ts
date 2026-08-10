@@ -83,9 +83,16 @@ export function encodePollDefinition(
     url: `data:,${encoded}?src=p&c=${options.length}`,
     sessionId,
     isLive: true,
+    ldText: "Sent a poll",
+    imageTitle: "",
+    imageSubtitle: "",
+    caption: "Sent a poll",
+    subcaption: "",
+    secondarySubcaption: "",
+    tertiarySubcaption: "",
   };
   return {
-    transportText: `\x00PL\x01${sessionId}\x01${encoded}\x00\ufffc`,
+    transportText: `\x00PL\x01${sessionId}\x01${encoded}\x00\ufffd\ufffc`,
     json,
     balloon,
     poll: {
