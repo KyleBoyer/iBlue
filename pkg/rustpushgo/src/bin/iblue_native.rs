@@ -463,22 +463,6 @@ struct KeychainJoinParams {
     device_index: Option<u32>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ICloudPhotosShareProbeParams {
-    media_path: Option<String>,
-    filename: Option<String>,
-    width: Option<i64>,
-    height: Option<i64>,
-    keep_share: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ICloudPhotosShareDeleteParams {
-    zone_name: String,
-}
-
 #[derive(Deserialize)]
 struct LogoutParams {
     deregister: bool,
@@ -1267,81 +1251,6 @@ impl Engine {
                 }
                 .map_err(RpcError::native)?;
                 Ok(json!({ "joined": true, "detail": result }))
-            }
-            "icloud.photos.probe" => {
-                let token_provider = self.token_provider.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("there is no loaded Apple account")
-                })?;
-                let authenticated = token_provider
-                    .probe_icloud_photos_container()
-                    .await
-                    .map_err(RpcError::native)?;
-                Ok(json!({ "authenticated": authenticated }))
-            }
-            "icloud.photos.shareProbe" => {
-                let params: ICloudPhotosShareProbeParams =
-                    serde_json::from_value(params).unwrap_or_default();
-                let media = params.media_path.map(|path| {
-                    let filename = params.filename.unwrap_or_else(|| {
-                        Path::new(&path)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("photo.jpg")
-                            .to_string()
-                    });
-                    rustpushgo::ICloudPhotosProbeMedia {
-                        path,
-                        filename,
-                        width: params.width.unwrap_or(1),
-                        height: params.height.unwrap_or(1),
-                    }
-                });
-                let token_provider = self.token_provider.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("there is no loaded Apple account")
-                })?;
-                let result = token_provider
-                    .probe_icloud_photos_share(media, !params.keep_share)
-                    .await
-                    .map_err(RpcError::native)?;
-                Ok(json!({
-                    "shareUrl": result.share_url,
-                    "shareRoutingUrl": result.share_routing_url,
-                    "zoneName": result.zone_name,
-                    "shortGuidLength": result.short_guid_length,
-                    "hasStableUrl": result.has_stable_url,
-                    "participantCount": result.participant_count,
-                    "chainPrivateKeyBytes": result.chain_private_key_bytes,
-                    "hasChainProtectionInfo": result.has_chain_protection_info,
-                    "savedMediaRecords": result.saved_media_records,
-                    "rootProtectionBytes": result.root_protection_bytes,
-                    "chainProtectionBytes": result.chain_protection_bytes,
-                    "invitedPcsBytes": result.invited_pcs_bytes,
-                    "selfAddedPcsBytes": result.self_added_pcs_bytes,
-                    "protectedFullTokenBytes": result.protected_full_token_bytes,
-                    "encryptedPublicSharingKeyBytes": result.encrypted_public_sharing_key_bytes,
-                    "stableShortTokenHashMatches": result.stable_short_token_hash_matches,
-                    "shareShortTokenHashMatches": result.share_short_token_hash_matches,
-                    "rootProtectionBase64": result.root_protection_base64,
-                    "selfAddedPcsBase64": result.self_added_pcs_base64,
-                    "publicSharingIdentityBase64": result.public_sharing_identity_base64,
-                    "encryptedPublicSharingKeyBase64": result.encrypted_public_sharing_key_base64,
-                    "protectedFullTokenBase64": result.protected_full_token_base64,
-                    "chainPrivateKeyBase64": result.chain_private_key_base64,
-                    "chainProtectionBase64": result.chain_protection_base64,
-                    "invitedPcsBase64": result.invited_pcs_base64,
-                }))
-            }
-            "icloud.photos.shareDelete" => {
-                let params: ICloudPhotosShareDeleteParams = serde_json::from_value(params)
-                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-                let token_provider = self.token_provider.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("there is no loaded Apple account")
-                })?;
-                let deleted = token_provider
-                    .delete_icloud_photos_share_zone(params.zone_name)
-                    .await
-                    .map_err(RpcError::native)?;
-                Ok(json!({ "deleted": deleted }))
             }
             "account.login.start" => {
                 let params: LoginStartParams = serde_json::from_value(params)
