@@ -12,6 +12,7 @@ import { io as socketClient, type Socket } from "socket.io-client";
 import { BlueBubblesServer, derivePublicComputerId } from "../../src/bluebubbles/server.js";
 import { BlueBubblesService } from "../../src/bluebubbles/service.js";
 import { BlueBubblesStore } from "../../src/bluebubbles/store.js";
+import { ICloudShareResolver } from "../../src/bluebubbles/icloud-share.js";
 import type { IMessageEngine } from "../../src/native/engine.js";
 import { SessionStore } from "../../src/profile.js";
 import type {
@@ -289,6 +290,160 @@ function serviceEvent(
     service.on("event", listener);
   });
 }
+
+function icloudShareFetchFixture(): typeof fetch {
+  return async (input) => {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    if (url.pathname.endsWith("/records/resolve")) {
+      return new Response(JSON.stringify({
+        results: [{
+          zoneID: { zoneName: "CMM-ZONE", ownerRecordName: "_owner", zoneType: "REGULAR_CUSTOM_ZONE" },
+          rootRecord: {
+            fields: {
+              assetCount: { value: 1, type: "INT64" },
+              photosCount: { value: 1, type: "INT64" },
+              videosCount: { value: 0, type: "INT64" },
+              startDate: { value: 1_786_041_600_000, type: "TIMESTAMP" },
+              endDate: { value: 1_786_041_600_000, type: "TIMESTAMP" },
+            },
+          },
+          anonymousPublicAccess: {
+            token: "fixture-token",
+            databasePartition: "https://p126-ckdatabasews.icloud.com:443",
+          },
+        }],
+      }), { headers: { "content-type": "application/json" } });
+    }
+    if (url.pathname.endsWith("/records/query")) {
+      return new Response(JSON.stringify({
+        records: [
+          {
+            recordName: "master-fixture",
+            recordType: "CPLMaster",
+            fields: {
+              itemType: { value: "public.jpeg", type: "STRING" },
+              resOriginalFileType: { value: "public.jpeg", type: "STRING" },
+              resOriginalFileSize: { value: 10, type: "INT64" },
+              resOriginalWidth: { value: 100, type: "INT64" },
+              resOriginalHeight: { value: 50, type: "INT64" },
+              resOriginalRes: {
+                value: {
+                  downloadURL: "https://cvws-h2.icloud-content.com/B/fixture/${f}",
+                  size: 10,
+                },
+                type: "ASSETID",
+              },
+            },
+          },
+          {
+            recordName: "asset-fixture",
+            recordType: "CPLAsset",
+            fields: {
+              masterRef: { value: { recordName: "master-fixture" }, type: "REFERENCE" },
+              assetDate: { value: 1_786_041_600_000, type: "TIMESTAMP" },
+              duration: { value: 0, type: "INT64" },
+            },
+          },
+        ],
+      }), { headers: { "content-type": "application/json" } });
+    }
+    if (url.hostname === "cvws-h2.icloud-content.com") {
+      return new Response(Buffer.from("jpeg-bytes"), {
+        headers: { "content-type": "image/jpeg", "content-length": "10" },
+      });
+    }
+    throw new Error(`unexpected iCloud fixture URL ${url}`);
+  };
+}
+
+test("iCloud Photos API resolves, downloads, and sends native share balloons", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-icloud-share-api-test-"));
+  const engine = new FakeEngine();
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  const sessions = new SessionStore("test", join(root, "session.json"));
+  const service = new BlueBubblesService({
+    profile: "test",
+    password: "secret",
+    engine,
+    store,
+    sessionStore: sessions,
+  });
+  await service.start({
+    version: 1,
+    profile: "test",
+    deviceId: "device-test",
+    apsState: "aps",
+    users: "users",
+    identity: "identity",
+    accountUsername: "secondary@example.com",
+    handles: snapshot.handles,
+    updatedAt: new Date().toISOString(),
+  });
+  const api = new BlueBubblesServer({
+    service,
+    port: 0,
+    icloudShareResolver: new ICloudShareResolver(icloudShareFetchFixture()),
+  });
+  const listening = await api.start();
+  t.after(async () => {
+    await api.stop();
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const shareUrl = "https://share.icloud.com/photos/05dFixtureShareToken_1234567890";
+  const incomingEvent = serviceEvent(service, "new-message");
+  engine.emit("message.received", {
+    uuid: "incoming-icloud-share-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffd\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 5_000,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    appBalloon: {
+      appName: "None",
+      bundleId: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.mobileslideshow.PhotosMessagesApp",
+      url: shareUrl,
+      isLive: true,
+      caption: "Thursday",
+      subcaption: "1 Photo",
+      ldText: "Thursday - 1 Photo",
+    },
+  });
+  await incomingEvent;
+
+  const resolved = await fetch(
+    `${listening.address}/api/v1/iblue/icloud-share/incoming-icloud-share-guid?password=secret`,
+  );
+  assert.equal(resolved.status, 200);
+  const resolvedBody = await resolved.json() as {
+    data: { itemCount: number; items: Array<{ guid: string; variants: { original: { downloadUrl: string } } }> };
+  };
+  assert.equal(resolvedBody.data.itemCount, 1);
+  assert.equal(resolvedBody.data.items[0]?.guid, "asset-fixture");
+  assert.equal(resolvedBody.data.items[0]?.variants.original.downloadUrl,
+    "/api/v1/iblue/icloud-share/incoming-icloud-share-guid/item/asset-fixture/original");
+
+  const downloaded = await fetch(
+    `${listening.address}${resolvedBody.data.items[0]!.variants.original.downloadUrl}?password=secret`,
+  );
+  assert.equal(downloaded.status, 200);
+  assert.equal(downloaded.headers.get("content-type"), "image/jpeg");
+  assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), Buffer.from("jpeg-bytes"));
+
+  const sent = await fetch(`${listening.address}/api/v1/iblue/icloud-share?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chatGuid: "iMessage;-;friend@example.com", url: shareUrl }),
+  });
+  assert.equal(sent.status, 200);
+  const sentBody = await sent.json() as { data: { iBlue: { icloudShare: { itemCount: number } } } };
+  assert.equal(sentBody.data.iBlue.icloudShare.itemCount, 1);
+  assert.ok(engine.messages.at(-1)?.text.startsWith("\x00ICL\x01"));
+});
 
 test("passive IDS mode rejects BlueBubbles outbound traffic locally", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-passive-api-test-"));
@@ -755,7 +910,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
         idsMode: string;
         version: string;
         blueBubblesCompatibility: string;
-        extensions: { messageFlair: string; polls: string; richLinks: string };
+        extensions: { messageFlair: string; polls: string; richLinks: string; icloudShares: string };
       };
     };
   };
@@ -779,6 +934,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(infoBody.data.iBlue.extensions.messageFlair, "/api/v1/iblue/message/flair");
   assert.equal(infoBody.data.iBlue.extensions.polls, "/api/v1/iblue/poll/:messageGuid");
   assert.equal(infoBody.data.iBlue.extensions.richLinks, "message.iBlue.richLink");
+  assert.equal(infoBody.data.iBlue.extensions.icloudShares, "/api/v1/iblue/icloud-share/:messageGuid");
 
   const flairCatalog = await fetch(`${listening.address}/api/v1/iblue/message/flair?password=secret`);
   const flairCatalogBody = await flairCatalog.json() as {

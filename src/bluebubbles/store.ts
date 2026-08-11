@@ -38,6 +38,7 @@ import {
   toTransportAddress,
 } from "./guid.js";
 import { sharedLocationFromBalloon, sharedLocationFromMessageText } from "./location.js";
+import { iCloudShareFromBalloon } from "./icloud-share.js";
 import { messageFlairFromEffectId } from "./message-flair.js";
 import { pollFromBalloon, pollVoteUpdateFromBalloon } from "./polls.js";
 import {
@@ -1680,6 +1681,7 @@ export class BlueBubblesStore {
     const handle = row.sender ? this.serializeHandle(row.sender) : null;
     const senderContact = handle?.iBlue?.contact;
     const sharedLocation = this.getSharedLocation(row.guid);
+    const icloudShare = iCloudShareFromBalloon(raw.appBalloon);
     const messageFlair = messageFlairFromEffectId(raw.effect);
     const audioTranscription = raw.attachments
       ?.map((attachment) => attachment.audioTranscription?.trim())
@@ -1796,6 +1798,7 @@ export class BlueBubblesStore {
           ? { audioTranscription: { text: audioTranscription, source: "apple" } }
           : {}),
         ...(richLink ? { richLink } : {}),
+        ...(icloudShare ? { icloudShare } : {}),
         ...(poll ? { poll } : {}),
         ...(pollVote ? { pollVote } : {}),
       },

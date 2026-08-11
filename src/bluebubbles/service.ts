@@ -35,6 +35,7 @@ import { BlueBubblesScheduler } from "./scheduler.js";
 import { BlueBubblesStore, type QueryOptions } from "./store.js";
 import { encodePollDefinition, encodePollVote } from "./polls.js";
 import { encodeRichLinkTransport } from "./rich-link.js";
+import { encodeICloudShareTransport } from "./icloud-share.js";
 
 export interface BlueBubblesEvent {
   type: string;
@@ -409,6 +410,36 @@ export class BlueBubblesService extends EventEmitter {
           isLive: false,
         },
         richLink: encoded.richLink,
+      });
+      this.#publishOutgoing(result.guid, "new-message", message);
+    } finally {
+      this.#finishOutgoingAnnouncement(result.guid);
+    }
+    this.scheduleSnapshot();
+    return message;
+  }
+
+  async sendICloudShare(body: {
+    chatGuid: string;
+    url: string;
+    caption?: string;
+    subcaption?: string;
+    ldText?: string;
+  }): Promise<BlueBubblesMessage> {
+    this.requireOutboundIds("send an iCloud Photos share");
+    const encoded = encodeICloudShareTransport(body);
+    const result = await this.engine.sendMessage({
+      conversation: this.resolveConversation(body.chatGuid),
+      text: encoded.transportText,
+    });
+    this.#beginOutgoingAnnouncement(result.guid);
+    let message: BlueBubblesMessage;
+    try {
+      message = this.store.insertOutgoing({
+        guid: result.guid,
+        chatGuid: body.chatGuid,
+        text: "\ufffd\ufffc",
+        appBalloon: encoded.balloon,
       });
       this.#publishOutgoing(result.guid, "new-message", message);
     } finally {

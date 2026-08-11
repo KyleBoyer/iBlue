@@ -95,6 +95,28 @@ the registered URL's query string, since iBlue sends only its own
 at-least-once through a durable retrying outbox; deduplicate on the delivery-id
 header.
 
+## Additive message components
+
+iBlue exposes Apple components that are not part of BlueBubbles' upstream
+schema under `/api/v1/iblue`. Received iCloud Photos links include a normalized
+`message.iBlue.icloudShare` summary. Resolve item-level photo/video metadata and
+authenticated media proxy paths with:
+
+```bash
+curl -s "http://127.0.0.1:1234/api/v1/iblue/icloud-share/<message-guid>?password=$IBLUE_SERVER_PASSWORD"
+curl -L "http://127.0.0.1:1234/api/v1/iblue/icloud-share/<message-guid>/item/<item-guid>/original?password=$IBLUE_SERVER_PASSWORD"
+```
+
+Send the native Photos Messages app balloon, rather than a plain URL preview,
+with `POST /api/v1/iblue/icloud-share` and JSON
+`{"chatGuid":"...","url":"https://share.icloud.com/photos/..."}`. iCloud
+links are bearer URLs and expire on Apple's schedule; iBlue never returns the
+short-lived CloudKit access token or Apple CDN URL to API consumers. This
+endpoint requires an existing Photos share URL. Creating a fresh iCloud Photos
+link remains unavailable: Apple's native path requires an entitled `cloudd`
+account context, while iCloud.com's equivalent API requires a separate
+cookie-backed web login that iBlue neither requests nor stores.
+
 ## Outbound testing
 
 Outbound sends are gated behind a deliberate IDS flow. For the first test

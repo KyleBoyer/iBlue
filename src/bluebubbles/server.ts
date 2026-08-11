@@ -4,6 +4,7 @@ import { createWriteStream } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { networkInterfaces, platform, release, tmpdir } from "node:os";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { deflateSync } from "node:zlib";
 
@@ -19,6 +20,7 @@ import type {
   BlueBubblesReaction,
   BlueBubblesResponse,
   BlueBubblesScheduleInterval,
+  IBlueICloudShareVariantName,
 } from "./contracts.js";
 import { failure, success, unsupported } from "./response.js";
 import type { ScheduledMessageDraft } from "./scheduler.js";
@@ -26,6 +28,12 @@ import { BlueBubblesService, type BlueBubblesEvent } from "./service.js";
 import { stripTransport } from "./guid.js";
 import { parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
+import {
+  ICloudShareError,
+  ICloudShareResolver,
+  iCloudSharePresentation,
+  publicICloudShare,
+} from "./icloud-share.js";
 
 const WEBHOOK_EVENTS = new Set([
   "*",
@@ -107,6 +115,8 @@ export interface BlueBubblesServerOptions {
   service: BlueBubblesService;
   host?: string;
   port?: number;
+  /** Test/embedding override for Apple's public iCloud Photos resolver. */
+  icloudShareResolver?: ICloudShareResolver;
 }
 
 type Query = Record<string, string | undefined>;
@@ -124,6 +134,7 @@ export class BlueBubblesServer {
   readonly host: string;
   readonly port: number;
   readonly app: FastifyInstance;
+  readonly icloudShareResolver: ICloudShareResolver;
 
   #socket?: SocketIoServer;
 
@@ -131,6 +142,7 @@ export class BlueBubblesServer {
     this.service = options.service;
     this.host = options.host ?? "127.0.0.1";
     this.port = options.port ?? 1234;
+    this.icloudShareResolver = options.icloudShareResolver ?? new ICloudShareResolver();
     this.app = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024 });
   }
 
@@ -432,6 +444,72 @@ export class BlueBubblesServer {
         ...(appleMusicPlayback ? { appleMusicPlayback } : {}),
       });
       return success(message, "Rich link sent!");
+    });
+
+    this.app.get<{ Params: { messageGuid: string } }>(
+      "/api/v1/iblue/icloud-share/:messageGuid",
+      async (request) => {
+        const message = this.service.store.getMessage(request.params.messageGuid);
+        const share = message?.iBlue?.icloudShare;
+        if (!share) throw new RequestError(404, "iCloud Photos share not found!", "NOT_FOUND");
+        try {
+          const resolved = await this.icloudShareResolver.resolve(share.url);
+          return success(
+            publicICloudShare(resolved, request.params.messageGuid),
+            "Successfully resolved iCloud Photos share!",
+          );
+        } catch (error) {
+          throw iCloudShareRequestError(error);
+        }
+      },
+    );
+
+    this.app.get<{
+      Params: { messageGuid: string; itemGuid: string; variant: string };
+    }>(
+      "/api/v1/iblue/icloud-share/:messageGuid/item/:itemGuid/:variant",
+      async (request, reply) => {
+        const message = this.service.store.getMessage(request.params.messageGuid);
+        const share = message?.iBlue?.icloudShare;
+        if (!share) throw new RequestError(404, "iCloud Photos share not found!", "NOT_FOUND");
+        const variant = iCloudShareVariant(request.params.variant);
+        if (!variant) {
+          throw new RequestError(400, "variant must be original, medium, or thumbnail", "VALIDATION_ERROR");
+        }
+        try {
+          const asset = await this.icloudShareResolver.fetchAsset(share.url, request.params.itemGuid, variant);
+          if (!asset.response.body) throw new ICloudShareError("Apple returned empty shared media");
+          reply.header("content-type", asset.mimeType);
+          reply.header("content-length", String(asset.totalBytes));
+          reply.header("content-disposition", `inline; filename="${asset.filename}"`);
+          reply.header("cache-control", "private, max-age=300");
+          return reply.send(Readable.fromWeb(
+            asset.response.body as unknown as import("node:stream/web").ReadableStream,
+          ));
+        } catch (error) {
+          throw iCloudShareRequestError(error);
+        }
+      },
+    );
+
+    this.app.post("/api/v1/iblue/icloud-share", async (request) => {
+      const body = asRecord(request.body);
+      const url = requiredString(body, "url");
+      let resolved;
+      try {
+        resolved = await this.icloudShareResolver.resolve(url);
+      } catch (error) {
+        throw iCloudShareRequestError(error);
+      }
+      const presentation = iCloudSharePresentation(resolved);
+      const message = await this.service.sendICloudShare({
+        chatGuid: requiredString(body, "chatGuid"),
+        url: resolved.url,
+        caption: typeof body.caption === "string" ? body.caption : presentation.caption,
+        subcaption: typeof body.subcaption === "string" ? body.subcaption : presentation.subcaption,
+        ldText: typeof body.ldText === "string" ? body.ldText : presentation.ldText,
+      });
+      return success(message, "iCloud Photos share sent!");
     });
 
     this.app.get<{ Params: { messageGuid: string } }>(
@@ -1563,6 +1641,7 @@ export class BlueBubblesServer {
           messageFlair: "/api/v1/iblue/message/flair",
           polls: "/api/v1/iblue/poll/:messageGuid",
           richLinks: "message.iBlue.richLink",
+          icloudShares: "/api/v1/iblue/icloud-share/:messageGuid",
         },
       },
     };
@@ -1642,12 +1721,25 @@ export class BlueBubblesServer {
 
 class RequestError extends Error {
   constructor(
-    readonly status: 400 | 404 | 500,
+    readonly status: 400 | 404 | 500 | 502 | 504,
     message: string,
     readonly code: string,
   ) {
     super(message);
   }
+}
+
+function iCloudShareRequestError(error: unknown): RequestError {
+  if (error instanceof RequestError) return error;
+  if (error instanceof ICloudShareError) {
+    return new RequestError(error.status, error.message, "ICLOUD_SHARE_ERROR");
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return new RequestError(502, `Could not resolve iCloud Photos share: ${message}`, "ICLOUD_SHARE_ERROR");
+}
+
+function iCloudShareVariant(value: string): IBlueICloudShareVariantName | undefined {
+  return value === "original" || value === "medium" || value === "thumbnail" ? value : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

@@ -253,6 +253,44 @@ test("Apple Music shares expose structured rich-link metadata and downloadable a
   assert.deepEqual(await readFile(storedArtwork.path), Buffer.from("art!"));
 });
 
+test("iCloud Photos app balloons expose normalized share metadata", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-icloud-share-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const shareUrl = "https://share.icloud.com/photos/05dFixtureShareToken_1234567890";
+  const result = await store.ingestIncoming({
+    uuid: "icloud-share-guid",
+    sender: "tel:+15555550100",
+    text: "\ufffd\ufffc",
+    participants: ["tel:+15555550100"],
+    timestampMs: Date.now(),
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    appBalloon: {
+      appName: "None",
+      bundleId: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.mobileslideshow.PhotosMessagesApp",
+      url: shareUrl,
+      isLive: true,
+      caption: "Wednesday\u2009–\u2009Friday",
+      subcaption: "4 Photos",
+      ldText: "Wednesday\u2009–\u2009Friday - 4 Photos",
+    },
+  }, []);
+
+  assert.equal(result.balloonBundleId?.endsWith("com.apple.mobileslideshow.PhotosMessagesApp"), true);
+  assert.deepEqual(result.iBlue?.icloudShare, {
+    provider: "icloud-photos",
+    shareId: "05dFixtureShareToken_1234567890",
+    url: shareUrl,
+    isLive: true,
+    caption: "Wednesday\u2009–\u2009Friday",
+    itemCount: 4,
+    photoCount: 4,
+    bundleId: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.mobileslideshow.PhotosMessagesApp",
+  });
+});
+
 test("tapbacks use BlueBubbles associated message types", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-reaction-test-"));
   const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));

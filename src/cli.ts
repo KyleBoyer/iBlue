@@ -33,7 +33,12 @@ import {
   executeIdsCanary,
   executeIdsProbe,
 } from "./ids-probe.js";
-import { NativeEngine, type LoginStartResult, type TwoFactorPhoneOption } from "./native/engine.js";
+import {
+  NativeEngine,
+  type ICloudKeychainDevice,
+  type LoginStartResult,
+  type TwoFactorPhoneOption,
+} from "./native/engine.js";
 import { NativeRpcError } from "./native/rpc-client.js";
 import {
   assertOutboundVerificationAllowed,
@@ -92,6 +97,9 @@ async function main(): Promise<void> {
       break;
     case "logout":
       await logout();
+      break;
+    case "icloud-keychain-setup":
+      await iCloudKeychainSetup();
       break;
     case "doctor":
       await doctor();
@@ -356,6 +364,63 @@ async function logout(): Promise<void> {
     }
   } finally {
     await engine.close();
+  }
+}
+
+async function iCloudKeychainSetup(): Promise<void> {
+  const profile = args.values.profile!;
+  const paths = profilePaths(profile, args.values["data-root"]);
+  await prepareProfile(paths);
+  const session = await new SessionStore(profile, paths.session).load();
+  if (!(session?.accountUsername || session?.account) || !session.users || !session.identity) {
+    throw new Error(`profile '${profile}' is not logged in; run: iblue login --profile ${profile}`);
+  }
+
+  const credentialKeyFile = credentialKeyPath(paths);
+  const engine = new NativeEngine({
+    stateDir: paths.native,
+    ...(args.values.native ? { binaryPath: args.values.native } : {}),
+    ...(credentialKeyFile ? { credentialKeyFile } : {}),
+    ...(nacBinaryPath() ? { nacBinaryFile: nacBinaryPath() } : {}),
+    requestTimeoutMs: 15 * 60_000,
+  });
+  try {
+    await engine.initialize(initializeParams(session, await hardwareKey()));
+    const { devices } = await engine.iCloudKeychainDevices();
+    const selected = await chooseEscrowDevice(devices);
+    const passcode = await readSecret(`Passcode for ${formatEscrowDevice(selected)}: `);
+    if (!passcode) throw new Error("device passcode must not be empty");
+    const result = await engine.joinICloudKeychain(passcode, selected.index);
+    if (!result.joined) throw new Error("the native engine did not confirm the keychain join");
+    process.stdout.write(
+      `Profile '${profile}' joined iCloud Keychain using ${formatEscrowDevice(selected)}. ` +
+      "The passcode was used only for escrow recovery and was not stored.\n",
+    );
+  } finally {
+    await engine.close();
+  }
+}
+
+function formatEscrowDevice(device: ICloudKeychainDevice): string {
+  const name = device.name || "Apple device";
+  return device.model ? `${name} (${device.model})` : name;
+}
+
+async function chooseEscrowDevice(devices: ICloudKeychainDevice[]): Promise<ICloudKeychainDevice> {
+  if (devices.length === 0) throw new Error("Apple returned no eligible iCloud Keychain devices");
+  if (devices.length === 1) {
+    process.stdout.write(`Using ${formatEscrowDevice(devices[0]!)}.\n`);
+    return devices[0]!;
+  }
+  process.stdout.write("Trusted devices with recoverable iCloud Keychain data:\n");
+  devices.forEach((device, index) => {
+    process.stdout.write(`  ${index + 1}. ${formatEscrowDevice(device)}\n`);
+  });
+  while (true) {
+    const choice = Number.parseInt((await readLine("Device: ")).trim(), 10);
+    const selected = devices[choice - 1];
+    if (selected) return selected;
+    process.stderr.write(`Choose a device from 1 to ${devices.length}.\n`);
   }
 }
 
@@ -1287,6 +1352,7 @@ function printHelp(): void {
   process.stdout.write(`  iblue login  [--profile secondary] [--apple-id name@example.com]\n`);
   process.stdout.write(`  iblue serve  [--profile secondary] [--host 127.0.0.1] [--port 1234] [--ids-passive]\n`);
   process.stdout.write(`  iblue logout [--profile secondary] [--local-only]\n`);
+  process.stdout.write(`  iblue icloud-keychain-setup [--profile secondary]\n`);
   process.stdout.write(`  iblue doctor [--profile secondary]\n\n`);
   process.stdout.write(`  iblue registration-inspect [--profile secondary] [--json]\n\n`);
   process.stdout.write(

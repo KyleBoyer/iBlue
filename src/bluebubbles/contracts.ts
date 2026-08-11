@@ -1,4 +1,4 @@
-export type BlueBubblesStatus = 200 | 201 | 400 | 401 | 403 | 404 | 500 | 501 | 504;
+export type BlueBubblesStatus = 200 | 201 | 400 | 401 | 403 | 404 | 500 | 501 | 502 | 504;
 
 export interface BlueBubblesErrorBody {
   type: string;
@@ -84,6 +84,48 @@ export interface IBlueRichLink {
     mimeType: string;
   };
   appleMusic?: IBlueAppleMusicLink;
+}
+
+export type IBlueICloudShareVariantName = "original" | "medium" | "thumbnail";
+
+export interface IBlueICloudShareSummary {
+  provider: "icloud-photos";
+  shareId: string;
+  url: string;
+  isLive: boolean;
+  caption?: string;
+  itemCount?: number;
+  photoCount?: number;
+  videoCount?: number;
+  bundleId?: string;
+}
+
+export interface IBlueICloudShareVariant {
+  mimeType: string;
+  uti: string;
+  totalBytes: number;
+  width: number;
+  height: number;
+  /** Authenticated iBlue proxy path; Apple CDN credentials are never exposed. */
+  downloadUrl?: string;
+}
+
+export interface IBlueICloudShareItem {
+  guid: string;
+  mediaType: "image" | "video" | "unknown";
+  createdAt?: number;
+  durationMs?: number;
+  variants: Partial<Record<IBlueICloudShareVariantName, IBlueICloudShareVariant>>;
+}
+
+export interface IBlueICloudShare extends IBlueICloudShareSummary {
+  startDate?: number;
+  endDate?: number;
+  createdAt?: number;
+  expiresAt?: number;
+  ownerDisplayName?: string;
+  truncated: boolean;
+  items: IBlueICloudShareItem[];
 }
 
 export interface IBluePollOption {
@@ -255,6 +297,7 @@ export interface BlueBubblesMessage {
     messageFlair?: IBlueMessageFlair;
     audioTranscription?: IBlueAudioTranscription;
     richLink?: IBlueRichLink;
+    icloudShare?: IBlueICloudShareSummary;
     poll?: IBluePoll;
     pollVote?: IBluePollVoteUpdate;
   };

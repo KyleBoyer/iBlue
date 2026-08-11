@@ -37,6 +37,12 @@ export interface TwoFactorPhoneOption {
   lastTwoDigits: string;
 }
 
+export interface ICloudKeychainDevice {
+  index: number;
+  name: string;
+  model: string;
+}
+
 export interface IMessageEngine {
   initialize(params: InitializeParams): Promise<EngineSnapshot>;
   loginStart(appleId: string, password: string): Promise<LoginStartResult>;
@@ -44,6 +50,8 @@ export interface IMessageEngine {
   loginRequestSms(phoneId: number): Promise<{ sent: boolean }>;
   loginSubmit2fa(code: string): Promise<{ accepted: boolean }>;
   loginFinish(): Promise<EngineSnapshot>;
+  iCloudKeychainDevices?(): Promise<{ devices: ICloudKeychainDevice[] }>;
+  joinICloudKeychain?(passcode: string, deviceIndex?: number): Promise<{ joined: boolean; detail: string }>;
   migrateCredentialToFile(keyPath: string): Promise<{ migrated: boolean; credentialBackend: string }>;
   startClient(): Promise<EngineSnapshot>;
   snapshot(): Promise<EngineSnapshot>;
@@ -112,6 +120,17 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
 
   loginFinish(): Promise<EngineSnapshot> {
     return this.rpc.request("account.login.finish");
+  }
+
+  iCloudKeychainDevices(): Promise<{ devices: ICloudKeychainDevice[] }> {
+    return this.rpc.request("account.keychain.devices");
+  }
+
+  joinICloudKeychain(passcode: string, deviceIndex?: number): Promise<{ joined: boolean; detail: string }> {
+    return this.rpc.request("account.keychain.join", {
+      passcode,
+      ...(deviceIndex === undefined ? {} : { deviceIndex }),
+    });
   }
 
   migrateCredentialToFile(keyPath: string): Promise<{ migrated: boolean; credentialBackend: string }> {

@@ -98,6 +98,9 @@ the rest of `/api/v1`:
 | `GET` | `/api/v1/iblue/location/:messageGuid` | Fetch the normalized snapshot or pin associated with one message. |
 | `GET` | `/api/v1/iblue/message/flair` | List friendly message-flair names, display labels, categories, and their exact Apple effect identifiers. |
 | `POST` | `/api/v1/iblue/rich-link` | Send a rich URL preview, optionally reusing a stored artwork attachment. |
+| `GET` | `/api/v1/iblue/icloud-share/:messageGuid` | Resolve one received iCloud Photos link into item-level image/video metadata and authenticated media proxy paths. |
+| `GET` | `/api/v1/iblue/icloud-share/:messageGuid/item/:itemGuid/:variant` | Stream an `original`, `medium`, or `thumbnail` shared-media variant without exposing Apple's temporary CDN credentials. |
+| `POST` | `/api/v1/iblue/icloud-share` | Send an existing iCloud Photos link as the native Photos Messages app balloon using `{chatGuid, url, caption?, subcaption?, ldText?}`. Fresh link creation is not available because Apple gates native web-sharing activation behind a system `cloudd` entitlement, while iCloud.com's equivalent API requires a separate cookie-backed web login that iBlue does not store. |
 | `GET` | `/api/v1/iblue/poll/:messageGuid` | Fetch an Apple Messages poll definition plus its aggregated current votes. |
 | `POST` | `/api/v1/iblue/poll` | Author and send an Apple Messages poll using `{chatGuid, options, title?}`. |
 | `POST` | `/api/v1/iblue/poll/:messageGuid/vote` | Replace the sending profile's complete selection set using `{optionIdentifiers: string[]}`; an empty array clears its votes. |
@@ -110,7 +113,7 @@ previously stored `artworkAttachmentGuid`, and an `appleMusic` object containing
 
 Handles gain an optional `iBlue.contact` summary. Messages gain optional
 `iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`,
-`iBlue.audioTranscription`, `iBlue.richLink`, `iBlue.poll`, and `iBlue.pollVote` properties; Maps extension
+`iBlue.audioTranscription`, `iBlue.richLink`, `iBlue.icloudShare`, `iBlue.poll`, and `iBlue.pollVote` properties; Maps extension
 messages also expose their real bundle identifier through BlueBubbles'
 existing `balloonBundleId` field. An incoming iMessage Name & Photo Sharing
 update emits the additive `iblue-contact-updated` Socket.IO/webhook event.
@@ -123,6 +126,17 @@ attachment. Preview artwork remains a normal authenticated attachment with its
 real image MIME type and an `iBlueRichLinkArtwork` metadata marker, so callers
 can download the exact bytes Apple sent. REST, Socket.IO, and webhook message
 objects share this representation.
+
+Photos Messages app balloons containing `share.icloud.com/photos/...` links
+expose an immediate `iBlue.icloudShare` summary with the share ID, canonical
+URL, presentation caption, and any photo/video counts Apple included in the
+balloon. The resolver endpoint then uses Apple's anonymous public-share grant
+to return start/end/creation/expiry timestamps, owner display name, ordered
+items, media kind, duration, dimensions, byte sizes, and proxy download paths.
+Only `icloud-content.com` asset hosts are accepted, redirects are revalidated,
+JSON responses are size-bounded, and neither the CloudKit access token nor the
+signed Apple CDN URL is serialized into the public response. The iBlue server
+password remains required for metadata and media routes.
 
 `iBlue.messageFlair` normalizes Apple's opaque `expressiveSendStyleId` into
 `name`, `displayName`, and `category` (`bubble` or `screen`) while retaining the
