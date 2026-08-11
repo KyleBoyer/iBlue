@@ -2621,12 +2621,13 @@ pub struct WrappedFindMyFollow {
 }
 
 fn normalize_findmy_handle(value: &str) -> String {
+    let value = value.trim().to_lowercase();
     let value = value
         .strip_prefix("tel:")
         .or_else(|| value.strip_prefix("mailto:"))
-        .unwrap_or(value)
+        .unwrap_or(&value)
         .trim()
-        .to_lowercase();
+        .to_string();
     if value.contains('@') {
         value
     } else {
@@ -9675,7 +9676,7 @@ mod reply_target_tests {
         assert_eq!(normalize_findmy_handle("5555550101"), "+15555550101");
         assert_eq!(
             normalize_findmy_handle("tel:+1 (651) 319-6252"),
-            "+15555550101"
+            "+16513196252"
         );
         assert_eq!(
             normalize_findmy_handle("MAILTO:Friend@Example.com"),

@@ -43,6 +43,27 @@ export interface ICloudKeychainDevice {
   model: string;
 }
 
+export interface ICloudWebLoginStatus {
+  ready: boolean;
+  needs2fa: boolean;
+  reusedSession: boolean;
+  photosAvailable: boolean;
+  pcsRequired: boolean;
+}
+
+export interface ICloudWebPhoneOption {
+  id: number;
+  lastTwoDigits: string;
+  mode: string;
+}
+
+export interface FreshICloudPhotoShare {
+  url: string;
+  shareId: string;
+  assetGuid: string;
+  itemCount: number;
+}
+
 export interface IMessageEngine {
   initialize(params: InitializeParams): Promise<EngineSnapshot>;
   loginStart(appleId: string, password: string): Promise<LoginStartResult>;
@@ -52,6 +73,22 @@ export interface IMessageEngine {
   loginFinish(): Promise<EngineSnapshot>;
   iCloudKeychainDevices?(): Promise<{ devices: ICloudKeychainDevice[] }>;
   joinICloudKeychain?(passcode: string, deviceIndex?: number): Promise<{ joined: boolean; detail: string }>;
+  iCloudWebStatus?(): Promise<ICloudWebLoginStatus>;
+  iCloudWebLoginStart?(): Promise<ICloudWebLoginStatus>;
+  iCloudWeb2faOptions?(): Promise<{ phones: ICloudWebPhoneOption[] }>;
+  iCloudWebRequestSms?(phoneId: number, mode?: string): Promise<{ sent: boolean }>;
+  iCloudWebSubmit2fa?(
+    code: string,
+    phoneId?: number,
+    mode?: string,
+  ): Promise<ICloudWebLoginStatus>;
+  iCloudWebPreparePhotos?(): Promise<ICloudWebLoginStatus>;
+  createICloudPhotoShare?(params: {
+    path: string;
+    filename: string;
+    mimeType: string;
+    title?: string;
+  }): Promise<FreshICloudPhotoShare>;
   migrateCredentialToFile(keyPath: string): Promise<{ migrated: boolean; credentialBackend: string }>;
   startClient(): Promise<EngineSnapshot>;
   snapshot(): Promise<EngineSnapshot>;
@@ -131,6 +168,46 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
       passcode,
       ...(deviceIndex === undefined ? {} : { deviceIndex }),
     });
+  }
+
+  iCloudWebStatus(): Promise<ICloudWebLoginStatus> {
+    return this.rpc.request("icloud.web.status");
+  }
+
+  iCloudWebLoginStart(): Promise<ICloudWebLoginStatus> {
+    return this.rpc.request("icloud.web.login.start");
+  }
+
+  iCloudWeb2faOptions(): Promise<{ phones: ICloudWebPhoneOption[] }> {
+    return this.rpc.request("icloud.web.login.2fa.options");
+  }
+
+  iCloudWebRequestSms(phoneId: number, mode = "sms"): Promise<{ sent: boolean }> {
+    return this.rpc.request("icloud.web.login.2fa.requestSms", { phoneId, mode });
+  }
+
+  iCloudWebSubmit2fa(
+    code: string,
+    phoneId?: number,
+    mode = "sms",
+  ): Promise<ICloudWebLoginStatus> {
+    return this.rpc.request("icloud.web.login.submit2fa", {
+      code,
+      ...(phoneId === undefined ? {} : { phoneId, mode }),
+    });
+  }
+
+  iCloudWebPreparePhotos(): Promise<ICloudWebLoginStatus> {
+    return this.rpc.request("icloud.web.photos.prepare");
+  }
+
+  createICloudPhotoShare(params: {
+    path: string;
+    filename: string;
+    mimeType: string;
+    title?: string;
+  }): Promise<FreshICloudPhotoShare> {
+    return this.rpc.request("icloud.photos.share.create", params);
   }
 
   migrateCredentialToFile(keyPath: string): Promise<{ migrated: boolean; credentialBackend: string }> {

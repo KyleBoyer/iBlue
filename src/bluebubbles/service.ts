@@ -449,6 +449,28 @@ export class BlueBubblesService extends EventEmitter {
     return message;
   }
 
+  async createICloudPhotoShare(body: {
+    chatGuid: string;
+    path: string;
+    filename: string;
+    mimeType: string;
+    title?: string;
+  }): Promise<import("../native/engine.js").FreshICloudPhotoShare> {
+    this.requireOutboundIds("create an iCloud Photos share");
+    // Resolve the conversation before uploading anything so an invalid chat
+    // cannot leave a fresh Photos asset and CMM zone behind.
+    this.resolveConversation(body.chatGuid);
+    if (!this.engine.createICloudPhotoShare) {
+      throw new Error("The native engine does not support fresh iCloud Photos shares");
+    }
+    return this.engine.createICloudPhotoShare({
+      path: body.path,
+      filename: body.filename,
+      mimeType: body.mimeType,
+      ...(body.title === undefined ? {} : { title: body.title }),
+    });
+  }
+
   async sendAttachment(
     body: Omit<SendAttachmentParams, "conversation"> & { chatGuid: string; tempGuid?: string },
   ): Promise<BlueBubblesMessage> {

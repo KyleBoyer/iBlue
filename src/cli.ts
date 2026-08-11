@@ -36,6 +36,7 @@ import {
 import {
   NativeEngine,
   type ICloudKeychainDevice,
+  type ICloudWebPhoneOption,
   type LoginStartResult,
   type TwoFactorPhoneOption,
 } from "./native/engine.js";
@@ -100,6 +101,9 @@ async function main(): Promise<void> {
       break;
     case "icloud-keychain-setup":
       await iCloudKeychainSetup();
+      break;
+    case "icloud-web-setup":
+      await iCloudWebSetup();
       break;
     case "doctor":
       await doctor();
@@ -398,6 +402,98 @@ async function iCloudKeychainSetup(): Promise<void> {
     );
   } finally {
     await engine.close();
+  }
+}
+
+async function iCloudWebSetup(): Promise<void> {
+  const profile = args.values.profile!;
+  const paths = profilePaths(profile, args.values["data-root"]);
+  await prepareProfile(paths);
+  const session = await new SessionStore(profile, paths.session).load();
+  if (!(session?.accountUsername || session?.account) || !session.users || !session.identity) {
+    throw new Error(`profile '${profile}' is not logged in; run: iblue login --profile ${profile}`);
+  }
+
+  const credentialKeyFile = credentialKeyPath(paths);
+  const engine = new NativeEngine({
+    stateDir: paths.native,
+    ...(args.values.native ? { binaryPath: args.values.native } : {}),
+    ...(credentialKeyFile ? { credentialKeyFile } : {}),
+    ...(nacBinaryPath() ? { nacBinaryFile: nacBinaryPath() } : {}),
+    requestTimeoutMs: 15 * 60_000,
+  });
+  try {
+    await engine.initialize(initializeParams(session, await hardwareKey()));
+    process.stdout.write(
+      "Enabling iCloud Photos web access for this profile. This is optional and reuses the " +
+      "password hash already stored by iBlue; the Apple Account password is not requested again.\n",
+    );
+    let status = await engine.iCloudWebLoginStart();
+    if (status.needs2fa) {
+      let selectedSms: ICloudWebPhoneOption | undefined;
+      while (status.needs2fa) {
+        process.stdout.write(
+          "Approve the iCloud.com sign-in on a trusted device and enter its code. " +
+          "Type 'sms' to send a code to a trusted phone number.\n",
+        );
+        const answer = (await readLine("Apple verification code (or 'sms'): ")).trim();
+        if (answer.toLowerCase() === "sms") {
+          const { phones } = await engine.iCloudWeb2faOptions();
+          if (phones.length === 0) {
+            throw new Error("Apple did not return any trusted phone numbers for web-session verification");
+          }
+          selectedSms = await chooseICloudWebPhone(phones);
+          const requested = await engine.iCloudWebRequestSms(selectedSms.id, selectedSms.mode);
+          if (!requested.sent) throw new Error("Apple did not confirm that the SMS code was sent");
+          process.stdout.write(`Apple sent a code to the trusted number ending in ${selectedSms.lastTwoDigits}.\n`);
+          continue;
+        }
+        const code = answer.replaceAll(/\s/g, "");
+        if (!/^\d{6}$/.test(code)) {
+          process.stderr.write("Enter Apple's six-digit code, or type 'sms'.\n");
+          continue;
+        }
+        try {
+          status = await engine.iCloudWebSubmit2fa(
+            code,
+            selectedSms?.id,
+            selectedSms?.mode,
+          );
+        } catch (error) {
+          process.stderr.write(`${(error as Error).message}; request or enter a fresh code.\n`);
+        }
+      }
+    }
+    if (!status.ready || !status.photosAvailable) {
+      throw new Error("Apple authenticated the web session but did not expose iCloud Photos");
+    }
+    if (status.pcsRequired) {
+      process.stdout.write(
+        "Apple may ask a trusted device to approve access to encrypted Photos data. " +
+        "Approve that prompt if it appears; iBlue will wait for it.\n",
+      );
+    }
+    await engine.iCloudWebPreparePhotos();
+    process.stdout.write(
+      `Profile '${profile}' can now create fresh iCloud Photos share links. ` +
+      `${status.reusedSession ? "The existing web session was reused." : "The new web session was stored securely."}\n`,
+    );
+  } finally {
+    await engine.close();
+  }
+}
+
+async function chooseICloudWebPhone(phones: ICloudWebPhoneOption[]): Promise<ICloudWebPhoneOption> {
+  if (phones.length === 1) return phones[0]!;
+  process.stdout.write("Trusted phone numbers:\n");
+  phones.forEach((phone, index) => {
+    process.stdout.write(`  ${index + 1}. ending in ${phone.lastTwoDigits}\n`);
+  });
+  while (true) {
+    const selection = Number.parseInt((await readLine("Send code to number: ")).trim(), 10);
+    const selected = phones[selection - 1];
+    if (selected) return selected;
+    process.stderr.write(`Choose a number from 1 to ${phones.length}.\n`);
   }
 }
 
@@ -1353,6 +1449,7 @@ function printHelp(): void {
   process.stdout.write(`  iblue serve  [--profile secondary] [--host 127.0.0.1] [--port 1234] [--ids-passive]\n`);
   process.stdout.write(`  iblue logout [--profile secondary] [--local-only]\n`);
   process.stdout.write(`  iblue icloud-keychain-setup [--profile secondary]\n`);
+  process.stdout.write(`  iblue icloud-web-setup [--profile secondary]\n`);
   process.stdout.write(`  iblue doctor [--profile secondary]\n\n`);
   process.stdout.write(`  iblue registration-inspect [--profile secondary] [--json]\n\n`);
   process.stdout.write(

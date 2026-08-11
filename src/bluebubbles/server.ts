@@ -512,6 +512,59 @@ export class BlueBubblesServer {
       return success(message, "iCloud Photos share sent!");
     });
 
+    this.app.post("/api/v1/iblue/icloud-share/create", async (request) => {
+      const file = await request.file();
+      if (!file || file.fieldname !== "photo") {
+        throw new RequestError(400, "JPEG photo not provided or was empty!", "VALIDATION_ERROR");
+      }
+      const chatGuid = multipartField(file, "chatGuid");
+      if (!chatGuid) throw new RequestError(400, "chatGuid is required", "VALIDATION_ERROR");
+      const filename = safeAttachmentName(file.filename || "photo.jpg");
+      const mimeType = file.mimetype || mimeForFilename(filename);
+      if (mimeType !== "image/jpeg") {
+        throw new RequestError(400, "Fresh iCloud Photos shares currently require a JPEG photo", "VALIDATION_ERROR");
+      }
+      const directory = await mkdtemp(join(tmpdir(), "iblue-icloud-photo-share-"));
+      const path = join(directory, filename);
+      try {
+        if (await saveMultipartFile(file, path) === 0) {
+          throw new RequestError(400, "JPEG photo not provided or was empty!", "VALIDATION_ERROR");
+        }
+        const created = await this.service.createICloudPhotoShare({
+          chatGuid,
+          path,
+          filename,
+          mimeType,
+          ...(multipartField(file, "title") === undefined
+            ? {}
+            : { title: multipartField(file, "title")! }),
+        });
+        // A newly written CloudKit share can resolve before its anonymous
+        // public-access grant has propagated. Wait for that grant so the API
+        // never sends a bearer URL that the recipient cannot open yet.
+        const resolved = await resolveFreshICloudShare(this.icloudShareResolver, created.url);
+        const presentation = iCloudSharePresentation(resolved);
+        const message = await this.service.sendICloudShare({
+          chatGuid,
+          url: created.url,
+          caption: multipartField(file, "caption") ?? presentation.caption,
+          subcaption: multipartField(file, "subcaption") ?? presentation.subcaption,
+          ldText: multipartField(file, "ldText") ?? presentation.ldText,
+        });
+        return success({
+          message,
+          share: {
+            provider: "icloud-photos",
+            ...created,
+          },
+        }, "Fresh iCloud Photos share created and sent!");
+      } catch (error) {
+        throw iCloudShareRequestError(error);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+
     this.app.get<{ Params: { messageGuid: string } }>(
       "/api/v1/iblue/poll/:messageGuid",
       async (request, reply) => {
@@ -1642,6 +1695,7 @@ export class BlueBubblesServer {
           polls: "/api/v1/iblue/poll/:messageGuid",
           richLinks: "message.iBlue.richLink",
           icloudShares: "/api/v1/iblue/icloud-share/:messageGuid",
+          icloudShareCreate: "/api/v1/iblue/icloud-share/create",
         },
       },
     };
@@ -1736,6 +1790,20 @@ function iCloudShareRequestError(error: unknown): RequestError {
   }
   const message = error instanceof Error ? error.message : String(error);
   return new RequestError(502, `Could not resolve iCloud Photos share: ${message}`, "ICLOUD_SHARE_ERROR");
+}
+
+async function resolveFreshICloudShare(resolver: ICloudShareResolver, url: string) {
+  let lastError: ICloudShareError | undefined;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      return await resolver.resolve(url, true);
+    } catch (error) {
+      if (!(error instanceof ICloudShareError) || error.status !== 404) throw error;
+      lastError = error;
+      if (attempt < 29) await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+  }
+  throw lastError ?? new ICloudShareError("iCloud Photos share did not become public", 504);
 }
 
 function iCloudShareVariant(value: string): IBlueICloudShareVariantName | undefined {

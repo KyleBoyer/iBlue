@@ -22,6 +22,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+mod icloud_web;
+
+use icloud_web::ICloudWebSession;
+
 const PROTOCOL_VERSION: &str = "1";
 const CREDENTIAL_ACCOUNT: &str = "ids-account";
 const CREDENTIAL_FILE_MAGIC: &[u8] = b"IBLUE-CREDENTIAL-V1\0";
@@ -410,6 +414,8 @@ struct AccountState {
     adsid: String,
     dsid: String,
     spd_base64: String,
+    #[serde(default)]
+    icloud_web_session: Option<ICloudWebSession>,
 }
 
 impl From<AccountPersistData> for AccountState {
@@ -423,6 +429,7 @@ impl From<AccountPersistData> for AccountState {
             adsid: value.adsid,
             dsid: value.dsid,
             spd_base64: value.spd_base64,
+            icloud_web_session: None,
         }
     }
 }
@@ -454,6 +461,33 @@ struct TwoFactorParams {
 #[serde(rename_all = "camelCase")]
 struct TwoFactorSmsParams {
     phone_id: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ICloudWebSmsParams {
+    phone_id: i64,
+    #[serde(default)]
+    mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ICloudWebTwoFactorParams {
+    code: String,
+    phone_id: Option<i64>,
+    #[serde(default)]
+    mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ICloudPhotoShareCreateParams {
+    path: String,
+    filename: String,
+    mime_type: String,
+    #[serde(default)]
+    title: String,
 }
 
 #[derive(Deserialize)]
@@ -1218,6 +1252,159 @@ impl Engine {
                     "secondsSinceLastInbound": connection.seconds_since_last_inbound(),
                 }))
             }
+            "icloud.web.status" => {
+                let account = self.account.as_ref().ok_or_else(|| {
+                    RpcError::invalid_state("profile is not logged in")
+                })?;
+                let status = account
+                    .icloud_web_session
+                    .as_ref()
+                    .map(|session| session.status(false))
+                    .unwrap_or_else(|| ICloudWebSession::default().status(false));
+                serde_json::to_value(status).map_err(RpcError::native)
+            }
+            "icloud.web.login.start" => {
+                let account = self.account.as_ref().ok_or_else(|| {
+                    RpcError::invalid_state("profile is not logged in")
+                })?;
+                let username = account.username.clone();
+                let hashed_password_hex = account.hashed_password_hex.clone();
+                let mut web = account.icloud_web_session.clone().unwrap_or_default();
+                let status = web
+                    .begin_login(&username, &hashed_password_hex)
+                    .await
+                    .map_err(RpcError::native)?;
+                let persisted = {
+                    let account = self.account.as_mut().ok_or_else(|| {
+                        RpcError::invalid_state("profile is not logged in")
+                    })?;
+                    account.icloud_web_session = Some(web);
+                    account.clone()
+                };
+                self.store_account_secret(&persisted)?;
+                serde_json::to_value(status).map_err(RpcError::native)
+            }
+            "icloud.web.login.2fa.options" => {
+                let mut web = self
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.icloud_web_session.clone())
+                    .ok_or_else(|| {
+                        RpcError::invalid_state("there is no pending iCloud web login")
+                    })?;
+                let phones = web.phone_options().await.map_err(RpcError::native)?;
+                let persisted = {
+                    let account = self.account.as_mut().ok_or_else(|| {
+                        RpcError::invalid_state("profile is not logged in")
+                    })?;
+                    account.icloud_web_session = Some(web);
+                    account.clone()
+                };
+                self.store_account_secret(&persisted)?;
+                Ok(json!({ "phones": phones }))
+            }
+            "icloud.web.login.2fa.requestSms" => {
+                let params: ICloudWebSmsParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let mut web = self
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.icloud_web_session.clone())
+                    .ok_or_else(|| {
+                        RpcError::invalid_state("there is no pending iCloud web login")
+                    })?;
+                web.request_sms(params.phone_id, &params.mode)
+                    .await
+                    .map_err(RpcError::native)?;
+                let persisted = {
+                    let account = self.account.as_mut().ok_or_else(|| {
+                        RpcError::invalid_state("profile is not logged in")
+                    })?;
+                    account.icloud_web_session = Some(web);
+                    account.clone()
+                };
+                self.store_account_secret(&persisted)?;
+                Ok(json!({ "sent": true }))
+            }
+            "icloud.web.login.submit2fa" => {
+                let params: ICloudWebTwoFactorParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let mut web = self
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.icloud_web_session.clone())
+                    .ok_or_else(|| {
+                        RpcError::invalid_state("there is no pending iCloud web login")
+                    })?;
+                let sms = params.phone_id.map(|phone_id| (phone_id, params.mode));
+                let status = web
+                    .submit_2fa(&params.code, sms)
+                    .await
+                    .map_err(RpcError::native)?;
+                let persisted = {
+                    let account = self.account.as_mut().ok_or_else(|| {
+                        RpcError::invalid_state("profile is not logged in")
+                    })?;
+                    account.icloud_web_session = Some(web);
+                    account.clone()
+                };
+                self.store_account_secret(&persisted)?;
+                serde_json::to_value(status).map_err(RpcError::native)
+            }
+            "icloud.web.photos.prepare" => {
+                let mut web = self
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.icloud_web_session.clone())
+                    .ok_or_else(|| {
+                        RpcError::invalid_state(
+                            "iCloud Photos web access is not enrolled; run icloud-web-setup first",
+                        )
+                    })?;
+                let result = web.prepare_photos().await;
+                let persisted = {
+                    let account = self.account.as_mut().ok_or_else(|| {
+                        RpcError::invalid_state("profile is not logged in")
+                    })?;
+                    account.icloud_web_session = Some(web);
+                    account.clone()
+                };
+                self.store_account_secret(&persisted)?;
+                let status = result.map_err(RpcError::native)?;
+                serde_json::to_value(status).map_err(RpcError::native)
+            }
+            "icloud.photos.share.create" => {
+                let params: ICloudPhotoShareCreateParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let account = self.account.as_ref().ok_or_else(|| {
+                    RpcError::invalid_state("profile is not logged in")
+                })?;
+                let dsid = account.dsid.clone();
+                let mut web = account.icloud_web_session.clone().ok_or_else(|| {
+                    RpcError::invalid_state(
+                        "iCloud Photos web access is not enrolled; run icloud-web-setup first",
+                    )
+                })?;
+                let share = web
+                    .create_photo_share(
+                        &dsid,
+                        Path::new(&params.path),
+                        &params.filename,
+                        &params.mime_type,
+                        &params.title,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                let persisted = {
+                    let account = self.account.as_mut().ok_or_else(|| {
+                        RpcError::invalid_state("profile is not logged in")
+                    })?;
+                    account.icloud_web_session = Some(web);
+                    account.clone()
+                };
+                self.store_account_secret(&persisted)?;
+                serde_json::to_value(share).map_err(RpcError::native)
+            }
             "account.keychain.devices" => {
                 let token_provider = self.token_provider.as_ref().ok_or_else(|| {
                     RpcError::invalid_state("there is no loaded Apple account")
@@ -1341,7 +1528,19 @@ impl Engine {
                 }
                 self.identity = Some(result.identity);
                 self.token_provider = result.token_provider;
+                let existing_web_session = self.account.as_ref().and_then(|account| {
+                    account.icloud_web_session.clone().map(|web| {
+                        (account.username.clone(), account.dsid.clone(), web)
+                    })
+                });
                 self.account = result.account_persist.map(AccountState::from);
+                if let (Some(account), Some((username, dsid, web))) =
+                    (self.account.as_mut(), existing_web_session)
+                {
+                    if account.username.eq_ignore_ascii_case(&username) && account.dsid == dsid {
+                        account.icloud_web_session = Some(web);
+                    }
+                }
                 if let Some(account) = self.account.as_ref() {
                     self.store_account_secret(account)?;
                 }

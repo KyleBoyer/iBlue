@@ -13,7 +13,7 @@ import { BlueBubblesServer, derivePublicComputerId } from "../../src/bluebubbles
 import { BlueBubblesService } from "../../src/bluebubbles/service.js";
 import { BlueBubblesStore } from "../../src/bluebubbles/store.js";
 import { ICloudShareResolver } from "../../src/bluebubbles/icloud-share.js";
-import type { IMessageEngine } from "../../src/native/engine.js";
+import type { FreshICloudPhotoShare, IMessageEngine } from "../../src/native/engine.js";
 import { SessionStore } from "../../src/profile.js";
 import type {
   EngineSnapshot,
@@ -81,6 +81,13 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   readonly notifications: SendNotifyParams[] = [];
   readonly validations: ValidateHandlesParams[] = [];
   readonly findMyRequests: Array<string | undefined> = [];
+  readonly freshICloudShares: Array<{
+    path: string;
+    filename: string;
+    mimeType: string;
+    title?: string;
+    data: Buffer;
+  }> = [];
 
   initialize(_params: InitializeParams): Promise<EngineSnapshot> {
     return Promise.resolve(this.currentSnapshot);
@@ -137,6 +144,20 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
         countryCode: "US",
       },
     }]);
+  }
+  async createICloudPhotoShare(params: {
+    path: string;
+    filename: string;
+    mimeType: string;
+    title?: string;
+  }): Promise<FreshICloudPhotoShare> {
+    this.freshICloudShares.push({ ...params, data: await readFile(params.path) });
+    return {
+      url: "https://share.icloud.com/photos/05dFixtureShareToken_1234567890",
+      shareId: "05dFixtureShareToken_1234567890",
+      assetGuid: "fresh-asset-guid",
+      itemCount: 1,
+    };
   }
   sendMessage(params: SendMessageParams): Promise<{ guid: string }> {
     this.messages.push(params);
@@ -442,6 +463,33 @@ test("iCloud Photos API resolves, downloads, and sends native share balloons", a
   assert.equal(sent.status, 200);
   const sentBody = await sent.json() as { data: { iBlue: { icloudShare: { itemCount: number } } } };
   assert.equal(sentBody.data.iBlue.icloudShare.itemCount, 1);
+  assert.ok(engine.messages.at(-1)?.text.startsWith("\x00ICL\x01"));
+
+  const form = new FormData();
+  form.append("chatGuid", "iMessage;-;friend@example.com");
+  form.append("title", "Fresh test share");
+  form.append("photo", new Blob([Buffer.from("fresh-jpeg-bytes")], { type: "image/jpeg" }), "fresh.jpg");
+  const created = await fetch(
+    `${listening.address}/api/v1/iblue/icloud-share/create?password=secret`,
+    { method: "POST", body: form },
+  );
+  assert.equal(created.status, 200);
+  const createdBody = await created.json() as {
+    data: {
+      message: { guid: string };
+      share: { url: string; shareId: string; assetGuid: string; itemCount: number };
+    };
+  };
+  assert.equal(createdBody.data.message.guid, "sent-guid");
+  assert.equal(createdBody.data.share.url, shareUrl);
+  assert.equal(createdBody.data.share.shareId, "05dFixtureShareToken_1234567890");
+  assert.equal(createdBody.data.share.assetGuid, "fresh-asset-guid");
+  assert.equal(createdBody.data.share.itemCount, 1);
+  assert.equal(engine.freshICloudShares.length, 1);
+  assert.equal(engine.freshICloudShares[0]?.filename, "fresh.jpg");
+  assert.equal(engine.freshICloudShares[0]?.mimeType, "image/jpeg");
+  assert.equal(engine.freshICloudShares[0]?.title, "Fresh test share");
+  assert.deepEqual(engine.freshICloudShares[0]?.data, Buffer.from("fresh-jpeg-bytes"));
   assert.ok(engine.messages.at(-1)?.text.startsWith("\x00ICL\x01"));
 });
 
@@ -910,7 +958,13 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
         idsMode: string;
         version: string;
         blueBubblesCompatibility: string;
-        extensions: { messageFlair: string; polls: string; richLinks: string; icloudShares: string };
+        extensions: {
+          messageFlair: string;
+          polls: string;
+          richLinks: string;
+          icloudShares: string;
+          icloudShareCreate: string;
+        };
       };
     };
   };
@@ -935,6 +989,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(infoBody.data.iBlue.extensions.polls, "/api/v1/iblue/poll/:messageGuid");
   assert.equal(infoBody.data.iBlue.extensions.richLinks, "message.iBlue.richLink");
   assert.equal(infoBody.data.iBlue.extensions.icloudShares, "/api/v1/iblue/icloud-share/:messageGuid");
+  assert.equal(infoBody.data.iBlue.extensions.icloudShareCreate, "/api/v1/iblue/icloud-share/create");
 
   const flairCatalog = await fetch(`${listening.address}/api/v1/iblue/message/flair?password=secret`);
   const flairCatalogBody = await flairCatalog.json() as {

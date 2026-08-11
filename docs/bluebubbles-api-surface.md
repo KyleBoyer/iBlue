@@ -100,7 +100,8 @@ the rest of `/api/v1`:
 | `POST` | `/api/v1/iblue/rich-link` | Send a rich URL preview, optionally reusing a stored artwork attachment. |
 | `GET` | `/api/v1/iblue/icloud-share/:messageGuid` | Resolve one received iCloud Photos link into item-level image/video metadata and authenticated media proxy paths. |
 | `GET` | `/api/v1/iblue/icloud-share/:messageGuid/item/:itemGuid/:variant` | Stream an `original`, `medium`, or `thumbnail` shared-media variant without exposing Apple's temporary CDN credentials. |
-| `POST` | `/api/v1/iblue/icloud-share` | Send an existing iCloud Photos link as the native Photos Messages app balloon using `{chatGuid, url, caption?, subcaption?, ldText?}`. Fresh link creation is not available because Apple gates native web-sharing activation behind a system `cloudd` entitlement, while iCloud.com's equivalent API requires a separate cookie-backed web login that iBlue does not store. |
+| `POST` | `/api/v1/iblue/icloud-share` | Send an existing iCloud Photos link as the native Photos Messages app balloon using `{chatGuid, url, caption?, subcaption?, ldText?}`. |
+| `POST` | `/api/v1/iblue/icloud-share/create` | Upload a JPEG, create a fresh iCloud Photos share, verify the public share, and send its native Photos balloon. Use multipart fields `photo`, `chatGuid`, and optional `title`, `caption`, `subcaption`, and `ldText`; first enable the profile with the opt-in `iblue icloud-web-setup`. |
 | `GET` | `/api/v1/iblue/poll/:messageGuid` | Fetch an Apple Messages poll definition plus its aggregated current votes. |
 | `POST` | `/api/v1/iblue/poll` | Author and send an Apple Messages poll using `{chatGuid, options, title?}`. |
 | `POST` | `/api/v1/iblue/poll/:messageGuid/vote` | Replace the sending profile's complete selection set using `{optionIdentifiers: string[]}`; an empty array clears its votes. |
@@ -137,6 +138,15 @@ Only `icloud-content.com` asset hosts are accepted, redirects are revalidated,
 JSON responses are size-bounded, and neither the CloudKit access token nor the
 signed Apple CDN URL is serialized into the public response. The iBlue server
 password remains required for metadata and media routes.
+
+Creating a fresh link uses Apple's iCloud.com Photos API rather than the
+entitlement-gated native `cloudd` path. Because Apple gives that API a separate
+web session, iBlue does not enable it during normal Messages login. The explicit
+`icloud-web-setup` command reuses the encrypted password hash already held by
+the profile, requests only the separate Apple web MFA confirmation, prepares
+Photos protected-data access when required, and saves the web session inside
+the same encrypted credential record. It never exposes web cookies, account
+tokens, temporary CloudKit grants, or signed CDN URLs through the REST API.
 
 `iBlue.messageFlair` normalizes Apple's opaque `expressiveSendStyleId` into
 `name`, `displayName`, and `category` (`bubble` or `screen`) while retaining the

@@ -111,11 +111,18 @@ Send the native Photos Messages app balloon, rather than a plain URL preview,
 with `POST /api/v1/iblue/icloud-share` and JSON
 `{"chatGuid":"...","url":"https://share.icloud.com/photos/..."}`. iCloud
 links are bearer URLs and expire on Apple's schedule; iBlue never returns the
-short-lived CloudKit access token or Apple CDN URL to API consumers. This
-endpoint requires an existing Photos share URL. Creating a fresh iCloud Photos
-link remains unavailable: Apple's native path requires an entitled `cloudd`
-account context, while iCloud.com's equivalent API requires a separate
-cookie-backed web login that iBlue neither requests nor stores.
+short-lived CloudKit access token or Apple CDN URL to API consumers.
+
+Fresh links use iCloud.com's Photos API and are deliberately opt-in because
+Apple treats that as a separate web sign-in. Enable it once with
+`iblue icloud-web-setup --profile secondary`; iBlue reuses the encrypted
+password hash already saved by the normal account login, asks only for Apple's
+separate web MFA confirmation, and stores the resulting web session inside the
+profile's encrypted credential record. Then send a JPEG as a newly created
+Photos share with multipart `POST /api/v1/iblue/icloud-share/create`, using the
+fields `photo`, `chatGuid`, and optional `title`, `caption`, `subcaption`, and
+`ldText`. iBlue verifies Apple's public share before it sends the native Photos
+Messages app balloon.
 
 ## Outbound testing
 
