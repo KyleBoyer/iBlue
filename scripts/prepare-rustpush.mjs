@@ -34,6 +34,7 @@ if (!existsSync(join(rustpushRoot, ".git"))) {
 
 git(["submodule", "update", "--init", "--recursive", "apple-private-apis"], rustpushRoot);
 applyPatch(rustpushRoot, join(projectRoot, "rustpush", "upstream-iblue.patch"));
+applyPatch(rustpushRoot, join(projectRoot, "rustpush", "modern-messages.patch"));
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 
 const openAbsintheTarget = join(rustpushRoot, "open-absinthe");
@@ -78,11 +79,13 @@ function gitOutput(args, cwd) {
 }
 
 function applyPatch(cwd, patchPath) {
-  if (gitCheck(["apply", "--check", patchPath], cwd)) {
-    git(["apply", patchPath], cwd);
+  // Some small overlay patches deliberately use zero context so their own
+  // blank context lines do not fail the repository's whitespace checks.
+  if (gitCheck(["apply", "--unidiff-zero", "--check", patchPath], cwd)) {
+    git(["apply", "--unidiff-zero", patchPath], cwd);
     return;
   }
-  if (!gitCheck(["apply", "--reverse", "--check", patchPath], cwd)) {
+  if (!gitCheck(["apply", "--unidiff-zero", "--reverse", "--check", patchPath], cwd)) {
     throw new Error(`cannot apply or recognize existing patch ${patchPath}`);
   }
 }

@@ -19,10 +19,10 @@ import Fastify, {
 import { Server as SocketIoServer, type Socket } from "socket.io";
 
 import type {
-  BlueBubblesReaction,
   BlueBubblesResponse,
   BlueBubblesScheduleInterval,
   IBlueICloudShareVariantName,
+  IBlueReactionRequest,
 } from "./contracts.js";
 import { failure, success, unsupported } from "./response.js";
 import type { ScheduledMessageDraft } from "./scheduler.js";
@@ -30,6 +30,13 @@ import { BlueBubblesService, type BlueBubblesEvent } from "./service.js";
 import { stripTransport } from "./guid.js";
 import { parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
+import {
+  assertSingleEmoji,
+  htmlFromTextRuns,
+  IBLUE_TEXT_EFFECTS,
+  IBLUE_TEXT_STYLES,
+  parseOutboundTextRuns,
+} from "./attributed-text.js";
 import { completeOpenApiDocument, documentApiRoute } from "./openapi.js";
 import {
   ICloudShareError,
@@ -474,6 +481,12 @@ export class BlueBubblesServer {
       success(MESSAGE_FLAIRS.map((flair) => ({ ...flair })), "Successfully fetched message flair catalog!", {
         count: MESSAGE_FLAIRS.length,
       }));
+    this.app.get("/api/v1/iblue/message/text-effects", async () =>
+      success({
+        styles: [...IBLUE_TEXT_STYLES],
+        effects: [...IBLUE_TEXT_EFFECTS],
+        rangeEncoding: "utf-16",
+      }, "Successfully fetched attributed text capabilities!"));
 
     this.app.post("/api/v1/iblue/rich-link", async (request) => {
       const body = asRecord(request.body);
@@ -1029,6 +1042,7 @@ export class BlueBubblesServer {
         throw new RequestError(400, "A 'message' is required", "VALIDATION_ERROR");
       }
       const effectId = outboundEffectId(body.effectId, body.flair);
+      const attributedBody = outboundAttributedBody(body, body.message);
       const message = await this.service.sendText({
         chatGuid,
         message: body.message,
@@ -1039,26 +1053,78 @@ export class BlueBubblesServer {
           ? { selectedMessageGuid: body.selectedMessageGuid }
           : {}),
         ...(body.partIndex === undefined ? {} : { partIndex: numberValue(body.partIndex, 0) }),
-        ...(typeof body.attributedBody === "string" ? { attributedBody: body.attributedBody } : {}),
+        ...(attributedBody ? { attributedBody } : {}),
       });
       return success(message, "Message sent!");
     });
 
     this.app.post("/api/v1/message/react", async (request) => {
       const body = asRecord(request.body);
-      const reaction = requiredString(body, "reaction") as BlueBubblesReaction;
-      const allowed: BlueBubblesReaction[] = [
+      const reaction = requiredString(body, "reaction") as IBlueReactionRequest;
+      const allowed: IBlueReactionRequest[] = [
         "love", "like", "dislike", "laugh", "emphasize", "question",
         "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question",
+        "emoji", "-emoji",
       ];
       if (!allowed.includes(reaction)) throw new RequestError(400, "Invalid reaction!", "VALIDATION_ERROR");
+      const emoji = emojiForReaction(reaction, body.emoji);
       const message = await this.service.sendReaction({
         chatGuid: requiredString(body, "chatGuid"),
         selectedMessageGuid: requiredString(body, "selectedMessageGuid"),
         reaction,
+        ...(emoji ? { emoji } : {}),
         ...(body.partIndex === undefined ? {} : { partIndex: numberValue(body.partIndex, 0) }),
       });
       return success(message, "Reaction sent!");
+    });
+
+    this.app.post("/api/v1/iblue/message/sticker", async (request) => {
+      const file = await request.file();
+      if (!file || file.fieldname !== "sticker") {
+        throw new RequestError(400, "Sticker image not provided or was empty!", "VALIDATION_ERROR");
+      }
+      const directory = await mkdtemp(join(tmpdir(), "iblue-sticker-"));
+      const filename = safeAttachmentName(multipartField(file, "filename") ?? file.filename);
+      const path = join(directory, filename);
+      try {
+        const size = await saveMultipartFile(file, path);
+        if (size === 0 || size > 500 * 1024) {
+          throw new RequestError(400, "Sticker image must be between 1 byte and 500 KB", "VALIDATION_ERROR");
+        }
+        const chatGuid = multipartField(file, "chatGuid");
+        const selectedMessageGuid = multipartField(file, "selectedMessageGuid");
+        if (!chatGuid) throw new RequestError(400, "chatGuid is required", "VALIDATION_ERROR");
+        if (!selectedMessageGuid) {
+          throw new RequestError(400, "selectedMessageGuid is required", "VALIDATION_ERROR");
+        }
+        const sourceValue = multipartField(file, "source") ?? "sticker";
+        if (sourceValue !== "sticker" && sourceValue !== "memoji" && sourceValue !== "genmoji") {
+          throw new RequestError(400, "source must be sticker, memoji, or genmoji", "VALIDATION_ERROR");
+        }
+        const rawPartIndex = multipartField(file, "partIndex");
+        const partIndex = rawPartIndex === undefined ? 0 : Number(rawPartIndex);
+        if (!Number.isSafeInteger(partIndex) || partIndex < 0) {
+          throw new RequestError(400, "partIndex must be a non-negative integer", "VALIDATION_ERROR");
+        }
+        const mimeType = file.mimetype || mimeForFilename(filename);
+        const allowedMimeTypes = new Set(["image/png", "image/gif", "image/jpeg", "image/heic", "image/heif"]);
+        if (!allowedMimeTypes.has(mimeType)) {
+          throw new RequestError(400, "Sticker image must be PNG, GIF, JPEG, HEIC, or HEIF", "VALIDATION_ERROR");
+        }
+        const message = await this.service.sendStickerReaction({
+          chatGuid,
+          selectedMessageGuid,
+          targetPart: partIndex,
+          path,
+          filename,
+          mimeType,
+          utiType: utiForMime(mimeType),
+          source: sourceValue,
+        });
+        return success(message, "Sticker reaction sent!");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
     });
 
     this.app.post("/api/v1/message/attachment", async (request) => {
@@ -1527,10 +1593,11 @@ export class BlueBubblesServer {
     socket.on("remove-participant", socketParticipant("remove"));
     socket.on("send-reaction", (params, callback) => {
       const body = asRecord(params);
-      const tapback = typeof body.tapback === "string" ? body.tapback as BlueBubblesReaction : undefined;
-      const allowed: BlueBubblesReaction[] = [
+      const tapback = typeof body.tapback === "string" ? body.tapback as IBlueReactionRequest : undefined;
+      const allowed: IBlueReactionRequest[] = [
         "love", "like", "dislike", "laugh", "emphasize", "question",
         "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question",
+        "emoji", "-emoji",
       ];
       if (!tapback || !allowed.includes(tapback)) {
         return response(
@@ -1539,12 +1606,16 @@ export class BlueBubblesServer {
           failure(400, "Invalid tapback descriptor provided!", "Validation Error", "Invalid tapback descriptor provided!"),
         );
       }
-      void (async () => this.service.sendReaction({
-        chatGuid: requiredString(body, "chatGuid"),
-        selectedMessageGuid: requiredString(body, "actionMessageGuid"),
-        reaction: tapback,
-        ...(body.partIndex === undefined ? {} : { partIndex: numberValue(body.partIndex, 0) }),
-      }))()
+      void (async () => {
+        const emoji = emojiForReaction(tapback, body.emoji);
+        return this.service.sendReaction({
+          chatGuid: requiredString(body, "chatGuid"),
+          selectedMessageGuid: requiredString(body, "actionMessageGuid"),
+          reaction: tapback,
+          ...(emoji ? { emoji } : {}),
+          ...(body.partIndex === undefined ? {} : { partIndex: numberValue(body.partIndex, 0) }),
+        });
+      })()
         .then((message) => response(callback, "tapback-sent", success(message, "Successfully sent reaction!")))
         .catch((error: Error) =>
           response(callback, "send-tapback-error", failure(500, "Reaction Send Error", "iMessage Error", error.message)),
@@ -1698,11 +1769,13 @@ export class BlueBubblesServer {
       }
     }
     if (typeof body.message === "string") {
+      const attributedBody = outboundAttributedBody(body, body.message);
       sent = await this.service.sendText({
         chatGuid,
         message: body.message,
         ...(typeof body.tempGuid === "string" ? { tempGuid: body.tempGuid } : {}),
         ...(effectId ? { effectId } : {}),
+        ...(attributedBody ? { attributedBody } : {}),
       });
     }
     if (!sent) throw new Error("No message or attachment provided");
@@ -1757,6 +1830,8 @@ export class BlueBubblesServer {
           sharedLocations: "/api/v1/iblue/location/query",
           liveSharedLocations: "/api/v1/iblue/location/live",
           messageFlair: "/api/v1/iblue/message/flair",
+          attributedText: "/api/v1/iblue/message/text-effects",
+          stickerReactions: "/api/v1/iblue/message/sticker",
           polls: "/api/v1/iblue/poll/:messageGuid",
           richLinks: "message.iBlue.richLink",
           icloudShares: "/api/v1/iblue/icloud-share/:messageGuid",
@@ -1887,6 +1962,42 @@ function requiredString(body: Record<string, unknown>, key: string): string {
   return value;
 }
 
+function outboundAttributedBody(body: Record<string, unknown>, text: string): string | undefined {
+  const attributedBody = typeof body.attributedBody === "string" ? body.attributedBody : undefined;
+  if (body.textRuns === undefined) return attributedBody;
+  if (attributedBody !== undefined) {
+    throw new RequestError(400, "Use either 'attributedBody' or 'textRuns', not both", "VALIDATION_ERROR");
+  }
+  try {
+    return htmlFromTextRuns(text, parseOutboundTextRuns(body.textRuns, text));
+  } catch (error) {
+    throw new RequestError(
+      400,
+      error instanceof Error ? error.message : String(error),
+      "VALIDATION_ERROR",
+    );
+  }
+}
+
+function emojiForReaction(reaction: IBlueReactionRequest, value: unknown): string | undefined {
+  if (reaction !== "emoji" && reaction !== "-emoji") {
+    if (value !== undefined) {
+      throw new RequestError(400, "'emoji' is only valid with an emoji reaction", "VALIDATION_ERROR");
+    }
+    return undefined;
+  }
+  try {
+    assertSingleEmoji(value);
+    return value;
+  } catch (error) {
+    throw new RequestError(
+      400,
+      error instanceof Error ? error.message : String(error),
+      "VALIDATION_ERROR",
+    );
+  }
+}
+
 function numberValue(value: unknown, fallback: number): number {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -1964,6 +2075,7 @@ function scheduledMessageDraft(value: unknown): ScheduledMessageDraft {
     throw new RequestError(400, "partIndex must be a non-negative integer", "VALIDATION_ERROR");
   }
   const effectId = outboundEffectId(payload.effectId, payload.flair);
+  const attributedBody = outboundAttributedBody(payload, message);
   return {
     payload: {
       chatGuid,
@@ -1974,7 +2086,7 @@ function scheduledMessageDraft(value: unknown): ScheduledMessageDraft {
         : {}),
       ...(effectId ? { effectId } : {}),
       ...(typeof payload.subject === "string" ? { subject: payload.subject } : {}),
-      ...(typeof payload.attributedBody === "string" ? { attributedBody: payload.attributedBody } : {}),
+      ...(attributedBody ? { attributedBody } : {}),
       ...(partIndex === undefined ? {} : { partIndex }),
     },
     scheduledFor: new Date(body.scheduledFor).toISOString(),
@@ -2054,6 +2166,7 @@ function utiForMime(mime: string): string {
     "image/png": "public.png",
     "image/gif": "com.compuserve.gif",
     "image/heic": "public.heic",
+    "image/heif": "public.heif",
     "video/mp4": "public.mpeg-4",
     "video/quicktime": "com.apple.quicktime-movie",
     "audio/mpeg": "public.mp3",
@@ -2071,6 +2184,7 @@ function mimeForFilename(filename: string): string {
     png: "image/png",
     gif: "image/gif",
     heic: "image/heic",
+    heif: "image/heif",
     mp4: "video/mp4",
     mov: "video/quicktime",
     mp3: "audio/mpeg",

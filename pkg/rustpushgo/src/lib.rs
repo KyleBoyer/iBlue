@@ -3353,6 +3353,30 @@ fn html_escape(s: &str) -> String {
 
 /// Parse Matrix HTML into iMessage MessageParts with formatting.
 /// Returns None if no formatting tags are found (plain text fallback).
+fn text_effect_from_html_span(tag: &str) -> Option<TextEffect> {
+    let marker = "data-mx-imessage-effect";
+    let start = tag.find(marker)? + marker.len();
+    let value = tag[start..].trim_start().strip_prefix('=')?.trim_start();
+    let value = if let Some(rest) = value.strip_prefix('"') {
+        rest.split('"').next()?
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        rest.split('\'').next()?
+    } else {
+        value.split_whitespace().next()?.trim_end_matches('/')
+    };
+    match value {
+        "big" => Some(TextEffect::Big),
+        "small" => Some(TextEffect::Small),
+        "shake" => Some(TextEffect::Shake),
+        "nod" => Some(TextEffect::Nod),
+        "explode" => Some(TextEffect::Explode),
+        "ripple" => Some(TextEffect::Ripple),
+        "bloom" => Some(TextEffect::Bloom),
+        "jitter" => Some(TextEffect::Jitter),
+        _ => None,
+    }
+}
+
 fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
     if !html.contains('<') {
         return None;
@@ -3366,6 +3390,7 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
     let mut italic = false;
     let mut underline = false;
     let mut strikethrough = false;
+    let mut active_effect: Option<TextEffect> = None;
 
     while pos < len {
         if bytes[pos] == b'<' {
@@ -3383,16 +3408,23 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
                 "/u" => underline = false,
                 "del" | "s" | "strike" => strikethrough = true,
                 "/del" | "/s" | "/strike" => strikethrough = false,
+                "/span" => active_effect = None,
                 "br" | "br/" | "br /" => {
                     let flags = TextFlags { bold, italic, underline, strikethrough };
                     parts.push(IndexedMessagePart {
-                        part: MessagePart::Text("\n".to_string(), TextFormat::Flags(flags)),
+                        part: MessagePart::Text(
+                            "\n".to_string(),
+                            active_effect.map(TextFormat::Effect).unwrap_or(TextFormat::Flags(flags)),
+                        ),
                         idx: None,
                         ext: None,
                     });
                 }
                 _ => {
-                    // Skip unknown tags (p, div, span without effect, etc.)
+                    if tag_content.starts_with("span ") {
+                        active_effect = text_effect_from_html_span(tag_content);
+                    }
+                    // Skip other unknown tags (p, div, etc.).
                 }
             }
             pos = tag_end;
@@ -3407,7 +3439,10 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
             if !decoded.is_empty() {
                 let flags = TextFlags { bold, italic, underline, strikethrough };
                 parts.push(IndexedMessagePart {
-                    part: MessagePart::Text(decoded, TextFormat::Flags(flags)),
+                    part: MessagePart::Text(
+                        decoded,
+                        active_effect.map(TextFormat::Effect).unwrap_or(TextFormat::Flags(flags)),
+                    ),
                     idx: None,
                     ext: None,
                 });
@@ -3424,7 +3459,14 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
         MessagePart::Text(t, _) => t.as_str(),
         _ => "",
     }).collect();
-    if reconstructed == plain_text && !parts.iter().any(|p| matches!(&p.part, MessagePart::Text(_, TextFormat::Flags(f)) if f.bold || f.italic || f.underline || f.strikethrough)) {
+    let has_formatting = parts.iter().any(|p| match &p.part {
+        MessagePart::Text(_, TextFormat::Effect(_)) => true,
+        MessagePart::Text(_, TextFormat::Flags(flags)) => {
+            flags.bold || flags.italic || flags.underline || flags.strikethrough
+        }
+        _ => false,
+    });
+    if reconstructed == plain_text && !has_formatting {
         return None;
     }
 
@@ -9652,10 +9694,12 @@ fn inline_relay_attachment(
 mod reply_target_tests {
     use super::{
         inline_relay_attachment, leave_group_participants, message_inst_to_wrapped,
-        mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target, Attachment,
+        mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target,
+        parse_html_to_parts, parts_to_html, Attachment,
         AttachmentType, Balloon, ConversationData, ExtensionApp, IndexedMessagePart, Message,
         MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, PartExtension,
         ReactMessage, ReactMessageType, Reaction, WrappedConversation,
+        TextFormat,
     };
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
@@ -9691,6 +9735,48 @@ mod reply_target_tests {
             (Some("target-guid".to_string()), Some("0".to_string())),
         );
         assert_eq!(normalize_reply_target(None, Some("4".to_string())), (None, None));
+    }
+
+    #[test]
+    fn semantic_html_round_trips_all_modern_text_effects() {
+        let text = "Big Small Shake Nod Explode Ripple Bloom Jitter";
+        let html = concat!(
+            "<span data-mx-imessage-effect=\"big\">Big</span> ",
+            "<span data-mx-imessage-effect=\"small\">Small</span> ",
+            "<span data-mx-imessage-effect=\"shake\">Shake</span> ",
+            "<span data-mx-imessage-effect=\"nod\">Nod</span> ",
+            "<span data-mx-imessage-effect=\"explode\">Explode</span> ",
+            "<span data-mx-imessage-effect=\"ripple\">Ripple</span> ",
+            "<span data-mx-imessage-effect=\"bloom\">Bloom</span> ",
+            "<span data-mx-imessage-effect=\"jitter\">Jitter</span>"
+        );
+        let parts = parse_html_to_parts(html, text).expect("effects should create message parts");
+        let effects = parts.0.iter().filter_map(|part| match &part.part {
+            MessagePart::Text(_, TextFormat::Effect(effect)) => Some(*effect as u32),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(effects, vec![5, 11, 9, 8, 12, 4, 6, 10]);
+        assert_eq!(parts_to_html(&parts).as_deref(), Some(html));
+    }
+
+    #[test]
+    fn semantic_html_parses_all_static_styles() {
+        let parts = parse_html_to_parts(
+            "<strong>bold</strong><em>italic</em><u>underline</u><del>strike</del>",
+            "bolditalicunderlinestrike",
+        ).expect("styles should create message parts");
+        assert_eq!(parts.0.len(), 4);
+        let expected = [(true, false, false, false), (false, true, false, false),
+            (false, false, true, false), (false, false, false, true)];
+        for (part, expected) in parts.0.iter().zip(expected) {
+            let MessagePart::Text(_, TextFormat::Flags(flags)) = &part.part else {
+                panic!("expected a static text style")
+            };
+            assert_eq!(
+                (flags.bold, flags.italic, flags.underline, flags.strikethrough),
+                expected,
+            );
+        }
     }
 
     #[test]
@@ -11808,6 +11894,115 @@ impl Client {
             .await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("Failed to send multipart message: {e}"),
+            })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_sticker_tapback(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        target_part: u64,
+        target_text: String,
+        data: Vec<u8>,
+        mime: String,
+        uti_type: String,
+        filename: String,
+        source: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError {
+                msg: "Sticker reactions require an iMessage conversation".to_string(),
+            });
+        }
+        if data.is_empty() || data.len() > 500 * 1024 {
+            return Err(WrappedError::GenericError {
+                msg: "Sticker reaction images must be between 1 byte and 500 KB".to_string(),
+            });
+        }
+        self.preflight_mmcs_upload_targets(&conversation, &handle)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to resolve sticker reaction targets: {e}"),
+            })?;
+        let prepared = MMCSFile::prepare_put(Cursor::new(&data))
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to prepare sticker upload: {e}"),
+            })?;
+        let attachment = Attachment::new_mmcs(
+            &self.conn,
+            &prepared,
+            Cursor::new(&data),
+            &mime,
+            &uti_type,
+            &filename,
+            |_current, _total| {},
+        )
+        .await
+        .map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to upload sticker reaction: {e}"),
+        })?;
+
+        let digest = openssl::hash::hash(openssl::hash::MessageDigest::md5(), &data)
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to hash sticker reaction: {e}"),
+            })?;
+        let sticker_extension = PartExtension::Sticker {
+            msg_width: 163.73095703,
+            rotation: 0.0,
+            sai: 0,
+            scale: 1.0,
+            update: None,
+            sli: 0,
+            normalized_x: 0.5,
+            normalized_y: 0.5,
+            version: 0,
+            hash: hex::encode(digest),
+            safi: 0,
+            effect_type: -1,
+            sticker_id: filename.clone(),
+        };
+        let (name, bundle_id) = match source.as_str() {
+            "sticker" => ("Stickers", "com.apple.Stickers.UserGenerated.MessagesExtension"),
+            "memoji" => ("Memoji", "com.apple.Animoji.StickersApp.MessagesExtension"),
+            "genmoji" => ("Genmoji", "com.apple.messages.genmoji"),
+            _ => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Unsupported sticker reaction source: {source}"),
+                })
+            }
+        };
+        let body = MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Attachment(attachment),
+            idx: Some(0),
+            ext: Some(sticker_extension),
+        }]);
+        let spec = ExtensionApp {
+            name: name.to_string(),
+            app_id: None,
+            bundle_id: bundle_id.to_string(),
+            balloon: None,
+        };
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::React(ReactMessage {
+                to_uuid: target_uuid,
+                to_part: Some(target_part),
+                reaction: ReactMessageType::React {
+                    reaction: Reaction::Sticker { spec: Some(spec), body },
+                    enable: true,
+                },
+                to_text: target_text,
+                embedded_profile: None,
+            }),
+        );
+        self.send_with_flap_retry(&mut msg).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send sticker reaction: {e}"),
             })?;
         Ok(msg.id.clone())
     }

@@ -32,6 +32,7 @@ import type {
   SendNotifyParams,
   SendReadReceiptParams,
   SendReactionParams,
+  SendStickerReactionParams,
   SendPollVoteParams,
   SendTypingParams,
   SendUnsendParams,
@@ -68,6 +69,7 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   currentSnapshot: EngineSnapshot = { ...snapshot, handles: [...snapshot.handles] };
   readonly messages: SendMessageParams[] = [];
   readonly reactions: SendReactionParams[] = [];
+  readonly stickerReactions: Array<{ params: SendStickerReactionParams; data: Buffer }> = [];
   readonly pollVotes: SendPollVoteParams[] = [];
   readonly attachments: Array<{ params: SendAttachmentParams; data: Buffer }> = [];
   readonly multiparts: Array<{ params: SendMultipartMessageParams; data: Buffer[] }> = [];
@@ -166,6 +168,10 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   sendReaction(params: SendReactionParams): Promise<{ guid: string }> {
     this.reactions.push(params);
     return Promise.resolve({ guid: "reaction-guid" });
+  }
+  async sendStickerReaction(params: SendStickerReactionParams): Promise<{ guid: string }> {
+    this.stickerReactions.push({ params, data: await readFile(params.path) });
+    return { guid: "sticker-reaction-guid" };
   }
   sendPollVote(params: SendPollVoteParams): Promise<{ guid: string }> {
     this.pollVotes.push(params);
@@ -1226,6 +1232,78 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(flairSent.status, 200);
   assert.equal(engine.messages.at(-1)?.effectId, "com.apple.messages.effect.CKConfettiEffect");
 
+  const textEffectCatalog = await fetch(
+    `${listening.address}/api/v1/iblue/message/text-effects?password=secret`,
+  );
+  const textEffectCatalogBody = await textEffectCatalog.json() as {
+    data: { styles: string[]; effects: string[]; rangeEncoding: string };
+  };
+  assert.deepEqual(textEffectCatalogBody.data.styles, ["bold", "italic", "underline", "strikethrough"]);
+  assert.equal(textEffectCatalogBody.data.effects.length, 8);
+  assert.equal(textEffectCatalogBody.data.rangeEncoding, "utf-16");
+
+  const attributedSent = await fetch(`${listening.address}/api/v1/message/text?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      message: "Bold Big",
+      textRuns: [
+        { range: [0, 4], styles: ["bold"] },
+        { range: [5, 3], effect: "big" },
+      ],
+    }),
+  });
+  assert.equal(attributedSent.status, 200);
+  assert.equal(
+    engine.messages.at(-1)?.html,
+    "<strong>Bold</strong> <span data-mx-imessage-effect=\"big\">Big</span>",
+  );
+
+  const emojiReacted = await fetch(`${listening.address}/api/v1/message/react?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      selectedMessageGuid: "sent-guid",
+      reaction: "emoji",
+      emoji: "🚙",
+    }),
+  });
+  assert.equal(emojiReacted.status, 200);
+  assert.equal(engine.reactions.at(-1)?.reaction, "emoji");
+  assert.equal(engine.reactions.at(-1)?.emoji, "🚙");
+
+  const invalidEmoji = await fetch(`${listening.address}/api/v1/message/react?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      selectedMessageGuid: "sent-guid",
+      reaction: "emoji",
+      emoji: "not emoji",
+    }),
+  });
+  assert.equal(invalidEmoji.status, 400);
+
+  const stickerForm = new FormData();
+  stickerForm.append("chatGuid", "iMessage;-;friend@example.com");
+  stickerForm.append("selectedMessageGuid", "sent-guid");
+  stickerForm.append("source", "genmoji");
+  stickerForm.append("sticker", new Blob([Buffer.from([1, 2, 3])], { type: "image/png" }), "fixture.png");
+  const stickerReacted = await fetch(
+    `${listening.address}/api/v1/iblue/message/sticker?password=secret`,
+    { method: "POST", body: stickerForm },
+  );
+  const stickerReactedBody = await stickerReacted.json() as {
+    data: { attachments: Array<{ isSticker?: boolean }>; iBlue?: { reaction?: { stickerSource?: string } } };
+  };
+  assert.equal(stickerReacted.status, 200);
+  assert.equal(engine.stickerReactions.at(-1)?.params.source, "genmoji");
+  assert.deepEqual(engine.stickerReactions.at(-1)?.data, Buffer.from([1, 2, 3]));
+  assert.equal(stickerReactedBody.data.attachments[0]?.isSticker, true);
+  assert.equal(stickerReactedBody.data.iBlue?.reaction?.stickerSource, "genmoji");
+
   const unknownFlair = await fetch(`${listening.address}/api/v1/message/text?password=secret`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1301,6 +1379,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     attachments: [],
   }, snapshot.handles);
   store.markChatRead("iMessage;-;friend@example.com");
+  const messageCountBeforeReflectedControls = store.countMessages();
   assert.ok((store.getMessage("incoming-unread-guid")?.dateRead ?? 0) > 0);
 
   const directChatGuid = encodeURIComponent("iMessage;-;friend@example.com");
@@ -1347,7 +1426,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     type: "chat-read-status-changed",
     data: { chatGuid: "iMessage;-;friend@example.com", read: false, iBlue: { senderVerificationFailed: false } },
   });
-  assert.equal(store.countMessages(), 2);
+  assert.equal(store.countMessages(), messageCountBeforeReflectedControls);
 
   const reflectedNotifyEvent = new Promise<{ type: string; data: { guid: string; didNotifyRecipient: boolean } }>(
     (resolve) => service.once("event", resolve),
@@ -1367,7 +1446,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(reflectedNotify.type, "updated-message");
   assert.equal(reflectedNotify.data.guid, "sent-guid");
   assert.equal(reflectedNotify.data.didNotifyRecipient, true);
-  assert.equal(store.countMessages(), 2);
+  assert.equal(store.countMessages(), messageCountBeforeReflectedControls);
 
   const upload = new FormData();
   upload.set("attachment", new Blob([Buffer.from("purgly-image")], { type: "image/png" }), "purgly.png");
@@ -1441,8 +1520,8 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     metadata: { total: number };
     data: Array<{ originalROWID: number }>;
   };
-  assert.equal(queriedBody.metadata.total, 3);
-  assert.equal(queriedBody.data.length, 3);
+  assert.equal(queriedBody.metadata.total, 5);
+  assert.equal(queriedBody.data.length, 5);
 
   const rowIds = queriedBody.data.map((message) => message.originalROWID).sort((a, b) => a - b);
   const incremental = await fetch(`${listening.address}/api/v1/message/query?guid=secret`, {
@@ -1462,14 +1541,14 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     metadata: { total: number };
     data: Array<{ originalROWID: number }>;
   };
-  assert.equal(incrementalBody.metadata.total, 2);
+  assert.equal(incrementalBody.metadata.total, 4);
   assert.deepEqual(
     incrementalBody.data.map((message) => message.originalROWID).sort((a, b) => a - b),
     rowIds.slice(1),
   );
 
   const count = await fetch(`${listening.address}/api/v1/message/count?password=secret`);
-  assert.deepEqual(await count.json(), { status: 200, message: "Success", data: { total: 3 } });
+  assert.deepEqual(await count.json(), { status: 200, message: "Success", data: { total: 5 } });
 
   const pollSessionId = "cba9de14-dd9a-45c5-bb63-989e6e32c538";
   const pollBundleId =
@@ -1692,7 +1771,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     `${listening.address}/api/v1/server/statistics/media?password=secret&only=images,videos,locations`,
   );
   assert.deepEqual((await mediaTotals.json() as { data: unknown }).data, {
-    images: 1,
+    images: 2,
     videos: 0,
     locations: 0,
   });
@@ -1702,7 +1781,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.deepEqual((await mediaByChat.json() as { data: unknown }).data, [{
     chatGuid: "iMessage;-;friend@example.com",
     groupName: null,
-    totals: { images: 1 },
+    totals: { images: 2 },
   }]);
   const renamedGroup = await fetch(
     `${listening.address}/api/v1/chat/${encodedGroupGuid}?password=secret`,

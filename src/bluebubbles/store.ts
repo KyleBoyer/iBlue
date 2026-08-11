@@ -22,12 +22,14 @@ import type {
   IBlueContact,
   IBlueContactSource,
   IBlueContactSummary,
+  IBlueReaction,
   IBluePoll,
   IBluePollVote,
   IBlueRichLink,
   IBlueSharedLocation,
   IBlueSharedLocationRecord,
 } from "./contracts.js";
+import { attributedBodyFromText, parseAttributedText } from "./attributed-text.js";
 import { contactAddressKey, type ContactInput } from "./contact.js";
 import {
   chatIdentifier,
@@ -202,10 +204,37 @@ function attachmentGuid(messageGuid: string, index: number): string {
 
 function reactionName(type: number | undefined, remove: boolean): string | null {
   if (type === 7) return remove ? "3007" : "sticker";
+  if (type === 6) return remove ? "-emoji" : "emoji";
   const names = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const;
   const name = type === undefined ? undefined : names[type];
   if (!name) return null;
   return remove ? `-${name}` : name;
+}
+
+function iBlueReaction(
+  tapback: IncomingMessage["tapback"],
+  attachmentGuids: string[],
+  stickerSource?: IBlueReaction["stickerSource"],
+): IBlueReaction | undefined {
+  if (!tapback || tapback.type === undefined) return undefined;
+  const legacyNames = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const;
+  const legacyName = legacyNames[tapback.type];
+  const name = legacyName
+    ?? (tapback.type === 6
+      ? "emoji"
+      : tapback.type === 7
+        ? "sticker"
+        : `unknown-${tapback.type}`);
+  return {
+    kind: tapback.type === 6 ? "emoji" : tapback.type === 7 ? "sticker" : "tapback",
+    name,
+    ...(tapback.emoji ? { emoji: tapback.emoji } : {}),
+    isRemoval: tapback.remove,
+    ...(tapback.targetUuid ? { targetGuid: tapback.targetUuid } : {}),
+    ...(typeof tapback.targetPart === "number" ? { partIndex: tapback.targetPart } : {}),
+    ...(attachmentGuids.length > 0 ? { attachmentGuids } : {}),
+    ...(tapback.type === 7 ? { stickerSource: stickerSource ?? "unknown" } : {}),
+  };
 }
 
 function incomingEventKey(message: IncomingMessage): string {
@@ -626,11 +655,14 @@ export class BlueBubblesStore {
     replyGuid?: string;
     replyPart?: string;
     effect?: string;
+    html?: string;
+    tapback?: NonNullable<IncomingMessage["tapback"]>;
     isVoice?: boolean;
     partCount?: number;
     appBalloon?: IncomingAppBalloon;
     pollParticipantHandle?: string;
     richLink?: IBlueRichLink;
+    stickerSource?: Exclude<IBlueReaction["stickerSource"], "unknown">;
   }): BlueBubblesMessage {
     const conversation = this.conversationForChat(params.chatGuid);
     if (!conversation) throw new Error(`chat does not exist: ${params.chatGuid}`);
@@ -654,6 +686,8 @@ export class BlueBubblesStore {
         JSON.stringify({
           ...(params.tempGuid ? { tempGuid: params.tempGuid } : {}),
           ...(params.effect ? { effect: params.effect } : {}),
+          ...(params.html ? { html: params.html } : {}),
+          ...(params.tapback ? { tapback: params.tapback } : {}),
           ...(params.isVoice ? { isVoice: true } : {}),
           ...(params.replyGuid
             ? { reply: { guid: params.replyGuid, part: params.replyPart ?? "0" } }
@@ -664,6 +698,7 @@ export class BlueBubblesStore {
             ? { pollParticipantHandle: params.pollParticipantHandle }
             : {}),
           ...(params.richLink ? { richLink: params.richLink } : {}),
+          ...(params.stickerSource ? { stickerSource: params.stickerSource } : {}),
         }),
       );
     const message = this.getMessage(params.guid);
@@ -678,6 +713,7 @@ export class BlueBubblesStore {
     filename: string;
     mimeType: string;
     utiType: string;
+    isSticker?: boolean;
   }): Promise<BlueBubblesMessage> {
     return this.persistOutgoingAttachments({
       messageGuid: params.messageGuid,
@@ -692,6 +728,7 @@ export class BlueBubblesStore {
       filename: string;
       mimeType: string;
       utiType: string;
+      isSticker?: boolean;
     }>;
   }): Promise<BlueBubblesMessage> {
     const directory = join(this.attachmentRoot, params.messageGuid.replace(/[^a-zA-Z0-9._-]/g, "_"));
@@ -707,14 +744,15 @@ export class BlueBubblesStore {
         .prepare(`
           INSERT INTO attachment (
             guid, message_guid, mime_type, uti, transfer_name, total_bytes,
-            file_path, is_outgoing, has_live_photo
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
+            file_path, is_outgoing, has_live_photo, is_sticker
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0, ?)
           ON CONFLICT(guid) DO UPDATE SET
             mime_type=excluded.mime_type,
             uti=excluded.uti,
             transfer_name=excluded.transfer_name,
             file_path=excluded.file_path,
-            total_bytes=excluded.total_bytes
+            total_bytes=excluded.total_bytes,
+            is_sticker=excluded.is_sticker
         `)
         .run(
           guid,
@@ -724,6 +762,7 @@ export class BlueBubblesStore {
           transferName,
           size,
           path,
+          attachment.isSticker ? 1 : 0,
         );
     }
     const message = this.getMessage(params.messageGuid);
@@ -1675,6 +1714,7 @@ export class BlueBubblesStore {
       didNotifyRecipient?: boolean;
       pollParticipantHandle?: string;
       richLink?: IBlueRichLink;
+      stickerSource?: Exclude<IBlueReaction["stickerSource"], "unknown">;
     };
     const attachments = this.#attachmentsByMessage
       .all(row.guid) as unknown as AttachmentRow[];
@@ -1683,6 +1723,7 @@ export class BlueBubblesStore {
     const sharedLocation = this.getSharedLocation(row.guid);
     const icloudShare = iCloudShareFromBalloon(raw.appBalloon);
     const messageFlair = messageFlairFromEffectId(raw.effect);
+    const attributedText = raw.html ? parseAttributedText(raw.html) : undefined;
     const audioTranscription = raw.attachments
       ?.map((attachment) => attachment.audioTranscription?.trim())
       .find((value): value is string => Boolean(value));
@@ -1713,6 +1754,11 @@ export class BlueBubblesStore {
         : undefined;
       return [this.serializeAttachment(attachment, artworkMimeType)];
     });
+    const reaction = iBlueReaction(
+      raw.tapback,
+      visibleAttachments.filter((attachment) => attachment.isSticker).map((attachment) => attachment.guid),
+      raw.stickerSource,
+    );
     const pollParticipantHandle = typeof raw.pollParticipantHandle === "string"
       ? stripTransport(raw.pollParticipantHandle)
       : row.sender
@@ -1728,7 +1774,7 @@ export class BlueBubblesStore {
       originalROWID: row.rowid,
       guid: row.guid,
       text: row.text,
-      attributedBody: null,
+      attributedBody: attributedText ? attributedBodyFromText(attributedText) : null,
       messageSummaryInfo: null,
       handle,
       handleId: handle?.originalROWID ?? 0,
@@ -1769,6 +1815,7 @@ export class BlueBubblesStore {
       associatedMessageGuid: row.associated_guid,
       associatedMessageType: row.associated_type
         ?? (raw.tapback ? reactionName(raw.tapback.type, raw.tapback.remove) : null),
+      associatedMessageEmoji: raw.tapback?.type === 6 ? raw.tapback.emoji ?? null : null,
       expressiveSendStyleId: raw.effect ?? null,
       timeExpressiveSendPlayed: null,
       replyToGuid: row.reply_guid,
@@ -1794,6 +1841,8 @@ export class BlueBubblesStore {
         ...(senderContact ? { senderContact } : {}),
         ...(sharedLocation ? { sharedLocation: locationSummary(sharedLocation) } : {}),
         ...(messageFlair ? { messageFlair } : {}),
+        ...(attributedText ? { attributedText } : {}),
+        ...(reaction ? { reaction } : {}),
         ...(audioTranscription
           ? { audioTranscription: { text: audioTranscription, source: "apple" } }
           : {}),

@@ -59,6 +59,57 @@ export interface IBlueMessageFlair {
   known: boolean;
 }
 
+export type IBlueTextStyle = "bold" | "italic" | "underline" | "strikethrough";
+
+export type IBlueTextEffect =
+  | "big"
+  | "small"
+  | "shake"
+  | "nod"
+  | "explode"
+  | "ripple"
+  | "bloom"
+  | "jitter";
+
+export interface IBlueTextRun {
+  /** NSRange-compatible [location, length] measured in UTF-16 code units. */
+  range: [number, number];
+  text: string;
+  styles?: IBlueTextStyle[];
+  effect?: IBlueTextEffect;
+}
+
+export interface IBlueAttributedText {
+  text: string;
+  /** Semantic transport HTML accepted by iBlue's outbound API. */
+  html: string;
+  rangeEncoding: "utf-16";
+  runs: IBlueTextRun[];
+}
+
+export interface IBlueAttributedBodyRun {
+  range: [number, number];
+  attributes: Record<string, string | number | boolean | string[]>;
+}
+
+export interface IBlueAttributedBody {
+  string: string;
+  runs: IBlueAttributedBodyRun[];
+}
+
+export interface IBlueReaction {
+  kind: "tapback" | "emoji" | "sticker";
+  /** Legacy Tapback name, "emoji", or "sticker". */
+  name: string;
+  emoji?: string;
+  isRemoval: boolean;
+  targetGuid?: string;
+  partIndex?: number;
+  /** Sticker attachment GUIDs are populated after the media is persisted. */
+  attachmentGuids?: string[];
+  stickerSource?: "sticker" | "memoji" | "genmoji" | "unknown";
+}
+
 export interface IBlueAudioTranscription {
   text: string;
   /** iBlue preserves Apple's value and does not run speech recognition. */
@@ -239,7 +290,7 @@ export interface BlueBubblesMessage {
   tempGuid?: string;
   guid: string;
   text: string | null;
-  attributedBody?: unknown[] | null;
+  attributedBody?: IBlueAttributedBody[] | null;
   messageSummaryInfo?: Record<string, unknown>[] | null;
   handle: BlueBubblesHandle | null;
   handleId: number;
@@ -271,6 +322,8 @@ export interface BlueBubblesMessage {
   balloonBundleId: string | null;
   associatedMessageGuid: string | null;
   associatedMessageType: string | null;
+  /** iBlue extension: the arbitrary emoji used by a modern emoji Tapback. */
+  associatedMessageEmoji?: string | null;
   expressiveSendStyleId: string | null;
   timeExpressiveSendPlayed?: number | null;
   replyToGuid?: string | null;
@@ -295,6 +348,8 @@ export interface BlueBubblesMessage {
     senderContact?: IBlueContactSummary;
     sharedLocation?: IBlueSharedLocation;
     messageFlair?: IBlueMessageFlair;
+    attributedText?: IBlueAttributedText;
+    reaction?: IBlueReaction;
     audioTranscription?: IBlueAudioTranscription;
     richLink?: IBlueRichLink;
     icloudShare?: IBlueICloudShareSummary;
@@ -316,6 +371,8 @@ export type BlueBubblesReaction =
   | "-laugh"
   | "-emphasize"
   | "-question";
+
+export type IBlueReactionRequest = BlueBubblesReaction | "emoji" | "-emoji";
 
 export interface BlueBubblesWebhook {
   id: number;

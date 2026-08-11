@@ -155,6 +155,21 @@ export interface SendReactionParams {
   from?: string;
 }
 
+export type StickerReactionSource = "sticker" | "memoji" | "genmoji";
+
+export interface SendStickerReactionParams {
+  conversation: Conversation;
+  targetUuid: string;
+  targetPart?: number;
+  targetText?: string;
+  path: string;
+  mimeType: string;
+  utiType: string;
+  filename?: string;
+  source: StickerReactionSource;
+  from?: string;
+}
+
 export interface SendPollVoteParams {
   conversation: Conversation;
   targetUuid: string;

@@ -12,15 +12,17 @@ import type {
   PersistedSession,
   SendAttachmentParams,
   SendMultipartMessageParams,
+  SendStickerReactionParams,
   NativeFindMyFollow,
 } from "../types.js";
 import type {
   BlueBubblesChat,
   BlueBubblesMessage,
-  BlueBubblesReaction,
   IBlueLiveLocation,
   IBluePoll,
+  IBlueReactionRequest,
 } from "./contracts.js";
+import { assertSingleEmoji } from "./attributed-text.js";
 import { contactAddressKey } from "./contact.js";
 import {
   conversationFromDirectChatGuid,
@@ -234,6 +236,7 @@ export class BlueBubblesService extends EventEmitter {
         text: body.message,
         ...(body.subject ? { subject: body.subject } : {}),
         ...(body.effectId ? { effect: body.effectId } : {}),
+        ...(body.attributedBody ? { html: body.attributedBody } : {}),
         ...reply,
       });
       this.#publishOutgoing(result.guid, "new-message", message);
@@ -247,20 +250,34 @@ export class BlueBubblesService extends EventEmitter {
   async sendReaction(body: {
     chatGuid: string;
     selectedMessageGuid: string;
-    reaction: BlueBubblesReaction;
+    reaction: IBlueReactionRequest;
+    emoji?: string;
     partIndex?: number;
   }): Promise<BlueBubblesMessage> {
     this.requireOutboundIds("send a reaction");
     const target = this.store.getMessage(body.selectedMessageGuid);
     if (!target) throw new Error("Selected message does not exist!");
     const remove = body.reaction.startsWith("-");
-    const reaction = body.reaction.replace(/^-/, "") as Exclude<BlueBubblesReaction, `-${string}`>;
+    const reaction = body.reaction.replace(/^-/, "") as Exclude<IBlueReactionRequest, `-${string}`>;
+    if (reaction === "emoji") assertSingleEmoji(body.emoji);
+    const targetPart = body.partIndex ?? 0;
+    const nativeReaction = reaction === "love" ? "heart" : reaction;
+    const reactionTypes: Readonly<Record<Exclude<typeof reaction, "love"> | "love", number>> = {
+      love: 0,
+      like: 1,
+      dislike: 2,
+      laugh: 3,
+      emphasize: 4,
+      question: 5,
+      emoji: 6,
+    };
     const result = await this.engine.sendReaction({
       conversation: this.resolveConversation(body.chatGuid),
       targetUuid: body.selectedMessageGuid,
-      targetPart: body.partIndex ?? 0,
+      targetPart,
       targetText: target.text ?? (target.attachments.length > 0 ? "\u{fffc}" : ""),
-      reaction: reaction === "love" ? "heart" : reaction,
+      reaction: nativeReaction,
+      ...(reaction === "emoji" ? { emoji: body.emoji } : {}),
       remove,
     });
     this.#beginOutgoingAnnouncement(result.guid);
@@ -269,9 +286,74 @@ export class BlueBubblesService extends EventEmitter {
       message = this.store.insertOutgoing({
         guid: result.guid,
         chatGuid: body.chatGuid,
-        text: nullReactionText(body.reaction),
+        text: nullReactionText(body.reaction, body.emoji),
         associatedGuid: body.selectedMessageGuid,
         associatedType: body.reaction,
+        tapback: {
+          type: reactionTypes[reaction],
+          targetUuid: body.selectedMessageGuid,
+          targetPart,
+          ...(reaction === "emoji" ? { emoji: body.emoji } : {}),
+          remove,
+        },
+      });
+      this.#publishOutgoing(result.guid, "new-message", message);
+    } finally {
+      this.#finishOutgoingAnnouncement(result.guid);
+    }
+    this.scheduleSnapshot();
+    return message;
+  }
+
+  async sendStickerReaction(
+    body: Omit<SendStickerReactionParams, "conversation" | "targetText" | "targetUuid"> & {
+      chatGuid: string;
+      selectedMessageGuid: string;
+    },
+  ): Promise<BlueBubblesMessage> {
+    this.requireOutboundIds("send a sticker reaction");
+    if (!this.engine.sendStickerReaction) {
+      throw new Error("The native engine does not support sticker reactions");
+    }
+    const target = this.store.getMessage(body.selectedMessageGuid);
+    if (!target) throw new Error("Selected message does not exist!");
+    const targetPart = body.targetPart ?? 0;
+    const result = await this.engine.sendStickerReaction({
+      conversation: this.resolveConversation(body.chatGuid),
+      targetUuid: body.selectedMessageGuid,
+      targetPart,
+      targetText: target.text ?? (target.attachments.length > 0 ? "\u{fffc}" : ""),
+      path: body.path,
+      mimeType: body.mimeType,
+      utiType: body.utiType,
+      ...(body.filename ? { filename: body.filename } : {}),
+      source: body.source,
+      ...(body.from ? { from: body.from } : {}),
+    });
+    this.#beginOutgoingAnnouncement(result.guid);
+    let message: BlueBubblesMessage;
+    try {
+      this.store.insertOutgoing({
+        guid: result.guid,
+        chatGuid: body.chatGuid,
+        text: "Sent sticker reaction",
+        associatedGuid: body.selectedMessageGuid,
+        associatedType: "sticker",
+        stickerSource: body.source,
+        tapback: {
+          type: 7,
+          targetUuid: body.selectedMessageGuid,
+          targetPart,
+          remove: false,
+        },
+      });
+      message = await this.store.persistOutgoingAttachment({
+        messageGuid: result.guid,
+        sourcePath: body.path,
+        filename: body.filename ?? body.path.split("/").at(-1) ?? "sticker",
+        mimeType: body.mimeType,
+        utiType: body.utiType,
+        isSticker: true,
       });
       this.#publishOutgoing(result.guid, "new-message", message);
     } finally {
@@ -1268,8 +1350,8 @@ function withoutSharedProfileAvatar(message: IncomingMessage): IncomingMessage {
   return { ...message, sharedProfile };
 }
 
-function nullReactionText(reaction: BlueBubblesReaction): string {
+function nullReactionText(reaction: IBlueReactionRequest, emoji?: string): string {
   const removed = reaction.startsWith("-");
   const name = reaction.replace(/^-/, "");
-  return `${removed ? "Removed" : "Sent"} ${name} reaction`;
+  return `${removed ? "Removed" : "Sent"} ${name === "emoji" && emoji ? emoji : name} reaction`;
 }

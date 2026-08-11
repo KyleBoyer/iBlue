@@ -565,6 +565,22 @@ struct SendReactionParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SendStickerReactionParams {
+    conversation: ConversationParams,
+    target_uuid: String,
+    #[serde(default)]
+    target_part: u64,
+    target_text: Option<String>,
+    path: String,
+    mime_type: String,
+    uti_type: String,
+    filename: Option<String>,
+    source: String,
+    from: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SendPollVoteParams {
     conversation: ConversationParams,
     target_uuid: String,
@@ -1818,6 +1834,36 @@ impl Engine {
                         reaction,
                         params.emoji,
                         params.remove,
+                        sender,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({ "guid": guid }))
+            }
+            "reaction.sticker.send" => {
+                let params: SendStickerReactionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let sender = self.sender(params.from)?;
+                let data = tokio::fs::read(&params.path).await.map_err(RpcError::native)?;
+                let filename = params.filename.unwrap_or_else(|| {
+                    std::path::Path::new(&params.path)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("sticker")
+                        .to_string()
+                });
+                let guid = self
+                    .client()?
+                    .send_sticker_tapback(
+                        params.conversation.into(),
+                        params.target_uuid,
+                        params.target_part,
+                        params.target_text.unwrap_or_default(),
+                        data,
+                        params.mime_type,
+                        params.uti_type,
+                        filename,
+                        params.source,
                         sender,
                     )
                     .await

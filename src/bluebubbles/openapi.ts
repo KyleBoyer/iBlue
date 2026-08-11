@@ -72,6 +72,98 @@ const routeDocumentation: Record<string, FastifySchema> = {
     description: "Returns friendly names and Apple wire identifiers for bubble and screen effects.",
     tags: ["iBlue Messages"],
   },
+  "GET /api/v1/iblue/message/text-effects": {
+    summary: "List modern attributed-text capabilities",
+    description: "Returns the four static styles, eight inline animations, and UTF-16 range convention supported by iBlue.",
+    tags: ["iBlue Messages"],
+  },
+  "POST /api/v1/message/text": {
+    summary: "Send a text message",
+    description: "BlueBubbles-compatible text send with additive iBlue textRuns for static formatting and per-range animations.",
+    tags: ["Messages"],
+    body: {
+      type: "object",
+      required: ["chatGuid", "message"],
+      additionalProperties: true,
+      properties: {
+        chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
+        message: { type: "string" },
+        attributedBody: { type: "string", description: "Advanced semantic HTML input." },
+        textRuns: {
+          type: "array",
+          description: "Sorted, non-overlapping NSRange-compatible runs measured in UTF-16 code units.",
+          items: {
+            type: "object",
+            required: ["range"],
+            properties: {
+              range: {
+                type: "array",
+                minItems: 2,
+                maxItems: 2,
+                prefixItems: [
+                  { type: "integer", minimum: 0 },
+                  { type: "integer", minimum: 1 },
+                ],
+              },
+              styles: {
+                type: "array",
+                uniqueItems: true,
+                items: { type: "string", enum: ["bold", "italic", "underline", "strikethrough"] },
+              },
+              effect: {
+                type: "string",
+                enum: ["big", "small", "shake", "nod", "explode", "ripple", "bloom", "jitter"],
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+  "POST /api/v1/message/react": {
+    summary: "Send a Tapback reaction",
+    description: "Supports the six BlueBubbles Tapbacks plus additive emoji/-emoji reactions with an emoji field.",
+    tags: ["Messages"],
+    body: {
+      type: "object",
+      required: ["chatGuid", "selectedMessageGuid", "reaction"],
+      properties: {
+        chatGuid: stringProperty("Chat containing the target message."),
+        selectedMessageGuid: stringProperty("GUID of the target message."),
+        partIndex: { type: "integer", minimum: 0, default: 0 },
+        reaction: {
+          type: "string",
+          enum: [
+            "love", "like", "dislike", "laugh", "emphasize", "question",
+            "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question",
+            "emoji", "-emoji",
+          ],
+        },
+        emoji: { type: "string", description: "One emoji grapheme; required for emoji and -emoji." },
+      },
+    },
+  },
+  "POST /api/v1/iblue/message/sticker": {
+    summary: "Send a sticker-family Tapback",
+    description: "Uploads a sticker image through MMCS and attaches it to an existing message as an Apple type-7 reaction. The source selects ordinary Sticker, Memoji, or Genmoji attribution.",
+    tags: ["iBlue Messages"],
+    consumes: ["multipart/form-data"],
+    body: {
+      type: "object",
+      required: ["chatGuid", "selectedMessageGuid", "sticker"],
+      properties: {
+        chatGuid: stringProperty("Chat containing the target message."),
+        selectedMessageGuid: stringProperty("GUID of the target message."),
+        partIndex: { type: "integer", minimum: 0, default: 0 },
+        source: { type: "string", enum: ["sticker", "memoji", "genmoji"], default: "sticker" },
+        sticker: {
+          type: "string",
+          format: "binary",
+          description: "PNG, GIF, JPEG, or HEIC sticker image, at most 500 KB.",
+        },
+      },
+    },
+  },
   "POST /api/v1/iblue/rich-link": {
     summary: "Send a rich link or Apple Music card",
     tags: ["iBlue Messages"],

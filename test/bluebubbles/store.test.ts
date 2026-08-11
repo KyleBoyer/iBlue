@@ -339,6 +339,62 @@ test("sticker reactions use BlueBubbles' sticker association type", async (t) =>
     tapback: { type: 7, targetUuid: "target-guid", targetPart: 0, remove: false },
   }, []);
   assert.equal(result.associatedMessageType, "sticker");
+  assert.deepEqual(result.iBlue?.reaction, {
+    kind: "sticker",
+    name: "sticker",
+    isRemoval: false,
+    targetGuid: "target-guid",
+    partIndex: 0,
+    stickerSource: "unknown",
+  });
+});
+
+test("modern attributed bodies and arbitrary emoji Tapbacks are structured", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-modern-message-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const formatted = await store.ingestIncoming({
+    uuid: "formatted-guid",
+    sender: "tel:+15555550100",
+    participants: ["tel:+15555550100"],
+    timestampMs: Date.now(),
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    text: "Bold and Big",
+    html: "<strong>Bold</strong> and <span data-mx-imessage-effect=\"big\">Big</span>",
+  }, []);
+  assert.equal(formatted.attributedBody?.[0]?.string, "Bold and Big");
+  assert.deepEqual(formatted.iBlue?.attributedText?.runs.map(({ text, styles, effect }) => ({
+    text,
+    ...(styles ? { styles } : {}),
+    ...(effect ? { effect } : {}),
+  })), [
+    { text: "Bold", styles: ["bold"] },
+    { text: " and " },
+    { text: "Big", effect: "big" },
+  ]);
+
+  const emoji = await store.ingestIncoming({
+    uuid: "emoji-reaction-guid",
+    sender: "tel:+15555550100",
+    participants: ["tel:+15555550100"],
+    timestampMs: Date.now(),
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    tapback: { type: 6, emoji: "🚙", targetUuid: "formatted-guid", targetPart: 0, remove: false },
+  }, []);
+  assert.equal(emoji.associatedMessageType, "emoji");
+  assert.equal(emoji.associatedMessageEmoji, "🚙");
+  assert.deepEqual(emoji.iBlue?.reaction, {
+    kind: "emoji",
+    name: "emoji",
+    emoji: "🚙",
+    isRemoval: false,
+    targetGuid: "formatted-guid",
+    partIndex: 0,
+  });
 });
 
 test("one-to-one IDS messages with a conversation UUID exclude the local handle", async (t) => {
