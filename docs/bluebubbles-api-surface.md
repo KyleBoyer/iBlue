@@ -10,6 +10,13 @@ and
 The inventory is extracted from the TypeScript syntax tree rather than from API
 documentation or client call guesses.
 
+Every registered `/api/v1` route is also discoverable through the interactive
+Swagger UI at `/docs/`. Its OpenAPI 3.1 document is served at `/openapi.json`,
+`/docs/json`, and `/docs/yaml`. The document models the server password as a
+query API key and includes detailed request schemas for additive `/iblue`
+routes, with generic BlueBubbles-compatible request bodies for legacy routes
+that do not declare Fastify validation schemas.
+
 The extracted inventory is also checked into
 `test/fixtures/bluebubbles-rest-routes.ts` as a regression oracle. The local
 contract suite now exercises all 91 pinned REST method/path pairs and asserts

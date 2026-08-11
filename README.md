@@ -67,6 +67,13 @@ what BlueBubbles clients authenticate with, and it can come from
 `--server-password-file`. Startup prints the listening address, the account's
 handles, and the current IDS mode.
 
+Open `http://127.0.0.1:1234/docs/` for the interactive Swagger UI. Use its
+**Authorize** button to enter the server password once; requests made with
+**Try it out** add it as the `password` query parameter. The same OpenAPI 3.1
+document is available as JSON at `/openapi.json` or `/docs/json`, and as YAML
+at `/docs/yaml`. Documentation routes describe the API but do not expose
+profile data and therefore do not require the server password themselves.
+
 ## Connect a BlueBubbles client
 
 Point the client at the address above and give it the same server password.

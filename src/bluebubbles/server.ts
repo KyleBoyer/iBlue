@@ -10,6 +10,8 @@ import { deflateSync } from "node:zlib";
 
 import cors from "@fastify/cors";
 import multipart, { type MultipartFile, type MultipartValue } from "@fastify/multipart";
+import swagger from "@fastify/swagger";
+import swaggerUi from "@fastify/swagger-ui";
 import Fastify, {
   type FastifyInstance,
   type FastifyReply,
@@ -28,6 +30,7 @@ import { BlueBubblesService, type BlueBubblesEvent } from "./service.js";
 import { stripTransport } from "./guid.js";
 import { parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
+import { completeOpenApiDocument, documentApiRoute } from "./openapi.js";
 import {
   ICloudShareError,
   ICloudShareResolver,
@@ -154,6 +157,7 @@ export class BlueBubblesServer {
     await this.app.register(multipart, {
       limits: { fileSize: 1024 * 1024 * 1024, files: 8, fields: 100 },
     });
+    await this.configureDocumentation();
     this.configureBodyParsing();
     this.configureAuth();
     this.configureRoutes();
@@ -184,6 +188,67 @@ export class BlueBubblesServer {
       this.#socket.close(() => resolve());
     });
     await this.app.close();
+  }
+
+  private async configureDocumentation(): Promise<void> {
+    await this.app.register(swagger, {
+      openapi: {
+        openapi: "3.1.0",
+        info: {
+          title: "iBlue API",
+          version: IBLUE_VERSION,
+          description: "BlueBubbles-compatible REST API with additive iBlue endpoints for contacts, live locations, message effects, polls, rich links, and iCloud Photos shares.",
+        },
+        tags: [
+          { name: "Server", description: "Server health, metadata, and statistics." },
+          { name: "Messages", description: "BlueBubbles-compatible message operations." },
+          { name: "Chats", description: "BlueBubbles-compatible chat operations." },
+          { name: "Attachments", description: "Attachment upload and download operations." },
+          { name: "Handles", description: "iMessage handle lookup and availability." },
+          { name: "Contacts", description: "Stock BlueBubbles contact compatibility routes." },
+          { name: "Webhooks", description: "Webhook registration and management." },
+          { name: "iBlue Contacts", description: "Profile-local contact names, VCF data, and avatars." },
+          { name: "iBlue Messages", description: "Message effects and rich app content." },
+          { name: "iBlue Locations", description: "Static and live shared-location data." },
+          { name: "iBlue Polls", description: "Native Messages polls and votes." },
+          { name: "iBlue iCloud Photos", description: "Resolve, create, download, and send iCloud Photos shares." },
+          { name: "iBlue Extensions", description: "Additional iBlue API extensions." },
+        ],
+        components: {
+          securitySchemes: {
+            serverPassword: {
+              type: "apiKey",
+              in: "query",
+              name: "password",
+              description: "The configured iBlue server password. BlueBubbles aliases `guid` and `token` are also accepted by the API.",
+            },
+          },
+        },
+        security: [{ serverPassword: [] }],
+      },
+      transform: ({ schema, url, route }) => ({
+        schema: documentApiRoute(schema, url, route.method),
+        url,
+      }),
+      transformObject: (document) => (
+        "openapiObject" in document
+          ? completeOpenApiDocument(document.openapiObject)
+          : document.swaggerObject
+      ),
+    });
+    await this.app.register(swaggerUi, {
+      routePrefix: "/docs",
+      staticCSP: true,
+      theme: { title: "iBlue API Documentation" },
+      uiConfig: {
+        deepLinking: true,
+        docExpansion: "list",
+        persistAuthorization: true,
+        displayRequestDuration: true,
+        filter: true,
+      },
+    });
+    this.app.get("/openapi.json", { schema: { hide: true } }, async () => this.app.swagger());
   }
 
   // BlueBubbles clients send payload-free actions — typing, read receipts —

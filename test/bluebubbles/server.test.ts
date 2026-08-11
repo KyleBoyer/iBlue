@@ -882,6 +882,65 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   });
   const api = new BlueBubblesServer({ service, port: 0 });
   const listening = await api.start();
+  t.after(async () => {
+    await api.stop();
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const docs = await fetch(`${listening.address}/docs/`);
+  const docsHtml = await docs.text();
+  assert.equal(docs.status, 200, docsHtml);
+  assert.match(docs.headers.get("content-type") ?? "", /text\/html/i);
+  assert.match(docsHtml, /iBlue API Documentation|SwaggerUIBundle/);
+  const swaggerBundle = await fetch(`${listening.address}/docs/static/swagger-ui-bundle.js`);
+  assert.equal(swaggerBundle.status, 200);
+  assert.match(swaggerBundle.headers.get("content-type") ?? "", /javascript/i);
+  assert.ok((await swaggerBundle.arrayBuffer()).byteLength > 100_000);
+
+  const openApiResponse = await fetch(`${listening.address}/openapi.json`);
+  const openApiText = await openApiResponse.text();
+  assert.equal(openApiResponse.status, 200, openApiText);
+  const openApi = JSON.parse(openApiText) as {
+    openapi: string;
+    info: { title: string };
+    security: Array<Record<string, unknown>>;
+    components: {
+      securitySchemes: Record<string, { type: string; in: string; name: string }>;
+    };
+    paths: Record<string, Record<string, {
+      summary?: string;
+      requestBody?: { content?: Record<string, { schema?: Record<string, unknown> }> };
+    }>>;
+  };
+  assert.equal(openApi.openapi, "3.1.0");
+  assert.equal(openApi.info.title, "iBlue API");
+  assert.deepEqual(openApi.security, [{ serverPassword: [] }]);
+  assert.deepEqual(openApi.components.securitySchemes.serverPassword, {
+    type: "apiKey",
+    in: "query",
+    name: "password",
+    description: "The configured iBlue server password. BlueBubbles aliases `guid` and `token` are also accepted by the API.",
+  });
+  for (const route of PINNED_BLUEBUBBLES_REST_ROUTES) {
+    const path = route.path.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
+    assert.ok(openApi.paths[path]?.[route.method.toLowerCase()], `OpenAPI omitted ${route.method} ${route.path}`);
+  }
+  const createShareDocs = openApi.paths["/api/v1/iblue/icloud-share/create"]?.post;
+  assert.equal(createShareDocs?.summary, "Create and send a fresh iCloud Photos share");
+  const createShareSchema = createShareDocs?.requestBody?.content?.["multipart/form-data"]?.schema;
+  assert.ok(createShareSchema);
+  assert.deepEqual(createShareSchema.required, ["chatGuid", "photo"]);
+  assert.deepEqual(
+    (createShareSchema.properties as Record<string, unknown>).photo,
+    { type: "string", format: "binary", description: "JPEG image." },
+  );
+
+  const pluginOpenApiResponse = await fetch(`${listening.address}/docs/json`);
+  assert.equal(pluginOpenApiResponse.status, 200);
+  assert.equal((await pluginOpenApiResponse.json() as { info: { title: string } }).info.title, "iBlue API");
+
   await assert.rejects(stat(staleUpload));
   type TestWebhook = {
     type: string;
@@ -931,10 +990,6 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   t.after(async () => {
     socket?.disconnect();
     await new Promise<void>((resolve) => webhookReceiver.close(() => resolve()));
-    await api.stop();
-    await service.stop();
-    store.close();
-    await rm(root, { recursive: true, force: true });
   });
 
   const unauthorized = await fetch(`${listening.address}/api/v1/ping`);
