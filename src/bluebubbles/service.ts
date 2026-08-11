@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import type { IMessageEngine } from "../native/engine.js";
@@ -42,6 +42,18 @@ import { encodeICloudShareTransport } from "./icloud-share.js";
 export interface BlueBubblesEvent {
   type: string;
   data: unknown;
+}
+
+/**
+ * Attached stickers are extension messages, not ordinary message parts. Sending
+ * a normal iMessage unsend packet for one leaves a broken Sticker Details entry
+ * on the recipient instead of removing the sticker.
+ */
+export class StickerUnsendUnsupportedError extends Error {
+  constructor() {
+    super("Attached stickers cannot be remotely unsent; remove them locally from Sticker Details instead");
+    this.name = "StickerUnsendUnsupportedError";
+  }
 }
 
 export interface BlueBubblesServiceOptions {
@@ -361,6 +373,49 @@ export class BlueBubblesService extends EventEmitter {
     }
     this.scheduleSnapshot();
     return message;
+  }
+
+  async updateStickerReaction(body: {
+    chatGuid: string;
+    messageGuid: string;
+    scale: number;
+  }): Promise<{ guid: string }> {
+    this.requireOutboundIds("update a sticker reaction");
+    if (!this.engine.updateStickerReaction) {
+      throw new Error("The native engine does not support sticker updates");
+    }
+    const sticker = this.store.getMessage(body.messageGuid);
+    if (!sticker || !sticker.isFromMe || sticker.iBlue?.reaction?.kind !== "sticker") {
+      throw new Error("Sticker reaction does not exist!");
+    }
+    if (!sticker.chats?.some((chat) => chat.guid === body.chatGuid)) {
+      throw new Error("Sticker reaction is not in the requested chat");
+    }
+    if (!Number.isFinite(body.scale) || body.scale < 0.05 || body.scale > 2) {
+      throw new Error("Sticker scale must be between 0.05 and 2");
+    }
+    const attachment = sticker.attachments.find((candidate) => candidate.isSticker);
+    const stored = attachment ? this.store.getAttachment(attachment.guid) : undefined;
+    if (!attachment || !stored?.path) {
+      throw new Error("Sticker reaction attachment is unavailable");
+    }
+    const data = await readFile(stored.path);
+    return this.engine.updateStickerReaction({
+      conversation: this.resolveConversation(body.chatGuid),
+      targetUuid: body.messageGuid,
+      msgWidth: 163.73095703,
+      rotation: 0,
+      sai: 0,
+      scale: body.scale,
+      sli: 0,
+      normalizedX: 0,
+      normalizedY: 0.98,
+      version: 0,
+      hash: createHash("md5").update(data).digest("hex"),
+      safi: 0,
+      effectType: -1,
+      stickerId: attachment.transferName,
+    });
   }
 
   async sendPollVote(body: {
@@ -699,6 +754,9 @@ export class BlueBubblesService extends EventEmitter {
     const target = this.store.getMessage(body.messageGuid);
     const chatGuid = target?.chats?.[0]?.guid;
     if (!target || !chatGuid) throw new Error("Selected message does not exist!");
+    if (target.iBlue?.reaction?.kind === "sticker") {
+      throw new StickerUnsendUnsupportedError();
+    }
     await this.engine.sendUnsend({
       conversation: this.resolveConversation(chatGuid),
       targetUuid: body.messageGuid,

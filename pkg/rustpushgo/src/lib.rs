@@ -21,6 +21,7 @@ use rustpush::{
     IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
     BalloonLayout, ExtensionApp, OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+    ExtensionAttribution, StickerGenerationMetadata,
     ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL, RichLinkImageAttachmentSubstitute,
     TextFlags, TextFormat, TextEffect,
@@ -4869,7 +4870,11 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     // callers can decode the acknowledgement payload.
                     w.tapback_type = Some(7);
                     populate_app_balloon(&mut w, spec);
-                    let sticker = spec.bundle_id.to_ascii_lowercase().contains("sticker");
+                    let normalized_bundle = spec.bundle_id.to_ascii_lowercase();
+                    let sticker = normalized_bundle.contains("sticker")
+                        || normalized_bundle.contains("genmoji")
+                        || normalized_bundle.contains("animoji")
+                        || normalized_bundle.contains("jellyfish");
                     append_wrapped_attachments(&mut w, body, sticker);
                 }
             }
@@ -9814,6 +9819,7 @@ mod reply_target_tests {
                         name: "Polls".to_string(),
                         app_id: None,
                         bundle_id: "com.apple.messages.Polls".to_string(),
+                        attribution: Default::default(),
                         balloon: Some(Balloon {
                             url: "data:,eyJpdGVtIjp7InZvdGVzIjpbXX19".to_string(),
                             session: Some("cba9de14-dd9a-45c5-bb63-989e6e32c538".to_string()),
@@ -11576,6 +11582,7 @@ impl Client {
                 app_id: None,
                 bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.mobileslideshow.PhotosMessagesApp"
                     .to_string(),
+                attribution: Default::default(),
                 balloon: Some(Balloon {
                     url,
                     session: None,
@@ -11633,6 +11640,7 @@ impl Client {
                 app_id: None,
                 bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls"
                     .to_string(),
+                attribution: Default::default(),
                 balloon: Some(Balloon {
                     url: format!("data:,{encoded}?src=p&c={option_count}"),
                     session: Some(session_id.to_string()),
@@ -11949,22 +11957,7 @@ impl Client {
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("Failed to hash sticker reaction: {e}"),
             })?;
-        let sticker_extension = PartExtension::Sticker {
-            msg_width: 163.73095703,
-            rotation: 0.0,
-            sai: 0,
-            scale: 1.0,
-            update: None,
-            sli: 0,
-            normalized_x: 0.5,
-            normalized_y: 0.5,
-            version: 0,
-            hash: hex::encode(digest),
-            safi: 0,
-            effect_type: -1,
-            sticker_id: filename.clone(),
-        };
-        let (name, bundle_id) = match source.as_str() {
+        let (name, source_bundle_id) = match source.as_str() {
             "sticker" => ("Stickers", "com.apple.Stickers.UserGenerated.MessagesExtension"),
             "memoji" => ("Memoji", "com.apple.Animoji.StickersApp.MessagesExtension"),
             "genmoji" => ("Genmoji", "com.apple.messages.genmoji"),
@@ -11974,15 +11967,53 @@ impl Client {
                 })
             }
         };
+        let bundle_id = format!(
+            "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:{source_bundle_id}"
+        );
+        let sticker_extension = PartExtension::Sticker {
+            msg_width: 163.73095703,
+            rotation: 0.0,
+            sai: 0,
+            // Apple renders sticker width as msg_width * scale.
+            scale: 0.5,
+            update: None,
+            sli: 0,
+            normalized_x: 0.0,
+            normalized_y: 0.98,
+            version: 0,
+            hash: hex::encode(digest),
+            safi: 0,
+            effect_type: -1,
+            sticker_id: filename.clone(),
+            pid: Some(bundle_id.clone()),
+            suri: Some(format!("sticker:///imsg/{}", hex::encode(openssl::sha::sha256(&data)))),
+        };
         let body = MessageParts(vec![IndexedMessagePart {
             part: MessagePart::Attachment(attachment),
             idx: Some(0),
             ext: Some(sticker_extension),
         }]);
+        let dimensions = imagesize::blob_size(&data).ok();
+        let attribution = ExtensionAttribution {
+            accessl: Some("Sticker".to_string()),
+            pgensh: Some(dimensions.map_or(0.0, |size| size.height as f64)),
+            pgensw: Some(dimensions.map_or(0.0, |size| size.width as f64)),
+            pgenszc: Some(StickerGenerationMetadata {
+                class: rustpush::NSDictionaryClass::NSMutableDictionary,
+                gm: false,
+                iaig: false,
+                mpw: "600.000000".to_string(),
+                mth: "100.000000".to_string(),
+                mtw: "100.000000".to_string(),
+                s: "1.000000".to_string(),
+                st: false,
+            }),
+        };
         let spec = ExtensionApp {
             name: name.to_string(),
             app_id: None,
-            bundle_id: bundle_id.to_string(),
+            bundle_id,
+            attribution,
             balloon: None,
         };
         let conv: ConversationData = (&conversation).into();
@@ -11992,9 +12023,10 @@ impl Client {
             Message::React(ReactMessage {
                 to_uuid: target_uuid,
                 to_part: Some(target_part),
-                reaction: ReactMessageType::React {
-                    reaction: Reaction::Sticker { spec: Some(spec), body },
-                    enable: true,
+                reaction: ReactMessageType::Extension {
+                    spec,
+                    body,
+                    is_meta: false,
                 },
                 to_text: target_text,
                 embedded_profile: None,
@@ -12080,6 +12112,7 @@ impl Client {
             app_id: None,
             bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.messages.Polls"
                 .to_string(),
+            attribution: Default::default(),
             balloon: Some(Balloon {
                 url: format!("data:,{encoded}"),
                 session: Some(session_id),
@@ -13201,6 +13234,8 @@ impl Client {
             safi: extension.safi,
             effect_type: extension.effect_type,
             sticker_id: extension.sticker_id,
+            pid: None,
+            suri: None,
         };
         let mut msg = MessageInst::new(
             conv,

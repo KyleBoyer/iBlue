@@ -33,6 +33,7 @@ import type {
   SendReadReceiptParams,
   SendReactionParams,
   SendStickerReactionParams,
+  UpdateStickerReactionParams,
   SendPollVoteParams,
   SendTypingParams,
   SendUnsendParams,
@@ -70,6 +71,7 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   readonly messages: SendMessageParams[] = [];
   readonly reactions: SendReactionParams[] = [];
   readonly stickerReactions: Array<{ params: SendStickerReactionParams; data: Buffer }> = [];
+  readonly stickerUpdates: UpdateStickerReactionParams[] = [];
   readonly pollVotes: SendPollVoteParams[] = [];
   readonly attachments: Array<{ params: SendAttachmentParams; data: Buffer }> = [];
   readonly multiparts: Array<{ params: SendMultipartMessageParams; data: Buffer[] }> = [];
@@ -80,6 +82,7 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   readonly typing: SendTypingParams[] = [];
   readonly reads: SendReadReceiptParams[] = [];
   readonly unreads: SendMarkUnreadParams[] = [];
+  readonly unsends: SendUnsendParams[] = [];
   readonly notifications: SendNotifyParams[] = [];
   readonly validations: ValidateHandlesParams[] = [];
   readonly findMyRequests: Array<string | undefined> = [];
@@ -173,6 +176,10 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
     this.stickerReactions.push({ params, data: await readFile(params.path) });
     return { guid: "sticker-reaction-guid" };
   }
+  updateStickerReaction(params: UpdateStickerReactionParams): Promise<{ guid: string }> {
+    this.stickerUpdates.push(params);
+    return Promise.resolve({ guid: "sticker-update-guid" });
+  }
   sendPollVote(params: SendPollVoteParams): Promise<{ guid: string }> {
     this.pollVotes.push(params);
     return Promise.resolve({ guid: "poll-vote-guid" });
@@ -231,7 +238,8 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   sendEdit(_params: SendEditParams): Promise<{ guid: string }> {
     return Promise.resolve({ guid: "edit-guid" });
   }
-  sendUnsend(_params: SendUnsendParams): Promise<{ guid: string }> {
+  sendUnsend(params: SendUnsendParams): Promise<{ guid: string }> {
+    this.unsends.push(params);
     return Promise.resolve({ guid: "unsend-guid" });
   }
   sendTyping(params: SendTypingParams): Promise<{ sent: boolean }> {
@@ -1304,6 +1312,51 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(stickerReactedBody.data.attachments[0]?.isSticker, true);
   assert.equal(stickerReactedBody.data.iBlue?.reaction?.stickerSource, "genmoji");
 
+  const stickerUpdated = await fetch(
+    `${listening.address}/api/v1/iblue/message/sticker/update?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chatGuid: "iMessage;-;friend@example.com",
+        messageGuid: "sticker-reaction-guid",
+        scale: 0.5,
+      }),
+    },
+  );
+  assert.equal(stickerUpdated.status, 200);
+  assert.equal(engine.stickerUpdates.at(-1)?.targetUuid, "sticker-reaction-guid");
+  assert.equal(engine.stickerUpdates.at(-1)?.scale, 0.5);
+  assert.equal(engine.stickerUpdates.at(-1)?.stickerId, "fixture.png");
+  assert.match(engine.stickerUpdates.at(-1)?.hash ?? "", /^[0-9a-f]{32}$/);
+
+  const invalidStickerScale = await fetch(
+    `${listening.address}/api/v1/iblue/message/sticker/update?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chatGuid: "iMessage;-;friend@example.com",
+        messageGuid: "sticker-reaction-guid",
+        scale: 0,
+      }),
+    },
+  );
+  assert.equal(invalidStickerScale.status, 400);
+
+  const stickerUnsend = await fetch(
+    `${listening.address}/api/v1/message/sticker-reaction-guid/unsend?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    },
+  );
+  const stickerUnsendBody = await stickerUnsend.json() as { error: { message: string } };
+  assert.equal(stickerUnsend.status, 400);
+  assert.equal(stickerUnsendBody.error.message, "STICKER_UNSEND_UNSUPPORTED");
+  assert.equal(engine.unsends.length, 0);
+
   const unknownFlair = await fetch(`${listening.address}/api/v1/message/text?password=secret`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -2113,6 +2166,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   });
   const unsentBody = await unsent.json() as { data: { dateRetracted: number } };
   assert.ok(unsentBody.data.dateRetracted > 0);
+  assert.equal(engine.unsends.length, 1);
 
   const deletedByBody = await fetch(`${listening.address}/api/v1/message/delete?password=secret`, {
     method: "POST",

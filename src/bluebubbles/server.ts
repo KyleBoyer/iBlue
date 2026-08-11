@@ -26,7 +26,11 @@ import type {
 } from "./contracts.js";
 import { failure, success, unsupported } from "./response.js";
 import type { ScheduledMessageDraft } from "./scheduler.js";
-import { BlueBubblesService, type BlueBubblesEvent } from "./service.js";
+import {
+  BlueBubblesService,
+  StickerUnsendUnsupportedError,
+  type BlueBubblesEvent,
+} from "./service.js";
 import { stripTransport } from "./guid.js";
 import { parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
@@ -1127,6 +1131,20 @@ export class BlueBubblesServer {
       }
     });
 
+    this.app.post("/api/v1/iblue/message/sticker/update", async (request) => {
+      const body = asRecord(request.body);
+      const scale = numberValue(body.scale, Number.NaN);
+      if (!Number.isFinite(scale) || scale < 0.05 || scale > 2) {
+        throw new RequestError(400, "scale must be between 0.05 and 2", "VALIDATION_ERROR");
+      }
+      const result = await this.service.updateStickerReaction({
+        chatGuid: requiredString(body, "chatGuid"),
+        messageGuid: requiredString(body, "messageGuid"),
+        scale,
+      });
+      return success(result, "Sticker updated!");
+    });
+
     this.app.post("/api/v1/message/attachment", async (request) => {
       const file = await request.file();
       if (!file || file.fieldname !== "attachment") {
@@ -1292,6 +1310,12 @@ export class BlueBubblesServer {
 
   private configureErrors(): void {
     this.app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof StickerUnsendUnsupportedError) {
+        void reply.code(400).send(
+          failure(400, error.message, "Validation Error", "STICKER_UNSEND_UNSUPPORTED"),
+        );
+        return;
+      }
       if (error instanceof RequestError) {
         void reply.code(error.status).send(
           failure(error.status, error.message, error.status === 400 ? "Validation Error" : "iMessage Error", error.code),

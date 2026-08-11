@@ -170,6 +170,24 @@ export interface SendStickerReactionParams {
   from?: string;
 }
 
+export interface UpdateStickerReactionParams {
+  conversation: Conversation;
+  targetUuid: string;
+  msgWidth: number;
+  rotation: number;
+  sai: number;
+  scale: number;
+  sli: number;
+  normalizedX: number;
+  normalizedY: number;
+  version: number;
+  hash: string;
+  safi: number;
+  effectType: number;
+  stickerId: string;
+  from?: string;
+}
+
 export interface SendPollVoteParams {
   conversation: Conversation;
   targetUuid: string;

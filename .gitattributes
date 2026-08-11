@@ -1,4 +1,6 @@
 # Patches are applied with `git apply` by scripts/prepare-rustpush.mjs against
 # LF sources. A Windows checkout that rewrote them to CRLF would fail to apply,
 # so keep their bytes verbatim on every platform.
-*.patch -text
+# Unified-diff context markers on blank lines are required patch syntax, but
+# look like trailing whitespace when the patch itself is added to a Git diff.
+*.patch -text whitespace=-trailing-space

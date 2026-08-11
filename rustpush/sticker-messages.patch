@@ -1,0 +1,310 @@
+diff --git a/src/aps.rs b/src/aps.rs
+index 8204f8d..2481d8b 100644
+--- a/src/aps.rs
++++ b/src/aps.rs
+@@ -1189,7 +1189,7 @@ pub struct APSInterestToken {
+ impl Drop for APSInterestToken {
+     fn drop(&mut self) {
+         // we don't care if it succeeds or not; we want to decrement no matter what
+-        self.topics_channel.try_send((self.topics.clone(), false)).expect("APS backed up??");
++        let _ = self.topics_channel.try_send((self.topics.clone(), false));
+     }
+ }
+ 
+diff --git a/src/imessage/messages.rs b/src/imessage/messages.rs
+index 9ae1556..5c71016 100644
+--- a/src/imessage/messages.rs
++++ b/src/imessage/messages.rs
+@@ -221,8 +221,13 @@ impl MessageParts {
+                         .attr("datasize", &filesize)
+                         .attr("mime-type", &attachment.mime)
+                         .attr("uti-type", &attachment.uti_type)
+-                        .attr("file-size", &filesize)
+-                        .attr("message-part", &part_idx);
++                        .attr("file-size", &filesize);
++                    // Native sticker reaction payloads do not carry the
++                    // normal attachment message-part attribute. Their target
++                    // part lives in the root `amk` associated-message key.
++                    if !matches!(part.ext.as_ref(), Some(PartExtension::Sticker { .. })) {
++                        element = element.attr("message-part", &part_idx);
++                    }
+                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+                     for (key, val) in &ext {
+                         element = element.attr(key.as_str(), val);
+@@ -631,6 +636,7 @@ impl ExtensionApp {
+             name: raw.app_name.clone(),
+             app_id: raw.appid.clone(),
+             bundle_id: bid.to_string(),
++            attribution: Default::default(),
+             balloon: Some(Balloon::from_raw(raw)?)
+         })
+     }
+@@ -856,6 +862,11 @@ pub enum PartExtension {
+         #[serde(rename = "ssa")]
+         scale: f64,
+         #[serde(rename = "sir")]
++        #[serde(
++            skip_serializing_if = "Option::is_none",
++            serialize_with = "serialize_optional_bool",
++            deserialize_with = "deserialize_optional_bool"
++        )]
+         update: Option<bool>, // Some(false) for updates
+         sli: u64,
+         #[serde(rename = "sxs")]
+@@ -871,9 +882,27 @@ pub enum PartExtension {
+         effect_type: i64,
+         #[serde(rename = "sid")]
+         sticker_id: String,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        pid: Option<String>,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        suri: Option<String>,
+     }
+ }
+ 
++fn serialize_optional_bool<S>(value: &Option<bool>, serializer: S) -> Result<S::Ok, S::Error>
++where
++    S: Serializer,
++{
++    serializer.serialize_bool(value.unwrap_or(false))
++}
++
++fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    bool::deserialize(deserializer).map(Some)
++}
++
+ impl PartExtension {
+     fn to_dict(&self) -> HashMap<String, String> {
+         plist::to_value(self).unwrap().into_dictionary().unwrap().into_iter()
+@@ -906,6 +935,8 @@ impl PartExtension {
+             safi: data.get("safi")?.parse().ok()?,
+             effect_type: data.get("stickerEffectType")?.parse().ok()?,
+             sticker_id: data.remove("sid")?,
++            pid: data.remove("pid"),
++            suri: data.remove("suri"),
+         })
+     }
+ }
+@@ -995,7 +1026,10 @@ impl ReactMessageType {
+ 
+     fn prid(&self) -> Option<String> {
+         match self {
+-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _, .. } => Some("3cN".to_string()),
++            // Native sticker reactions (amt=1000) omit pRID. Retain the
++            // legacy value for other balloon-less extension messages.
++            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body, .. }
++                if !body.0.iter().any(|part| matches!(part.ext.as_ref(), Some(PartExtension::Sticker { .. }))) => Some("3cN".to_string()),
+             _ => None,
+         }
+     }
+@@ -2857,6 +2891,7 @@ impl MessageInst {
+                         app_id: None,
+                         name: "None".to_string(),
+                         bundle_id: loaded.balloon_id.clone().unwrap(),
++                        attribution: Default::default(),
+                         balloon: Some(i),
+                     }),
+                     Err(e) => {
+@@ -2932,6 +2967,107 @@ mod audio_transcription_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod sticker_extension_tests {
++    use super::*;
++
++    #[test]
++    fn sticker_attribution_survives_keyed_archive_round_trip() {
++        let app = ExtensionApp {
++            name: "Stickers".to_string(),
++            app_id: None,
++            bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension".to_string(),
++            attribution: ExtensionAttribution {
++                accessl: Some("Sticker".to_string()),
++                pgensh: Some(1_024.0),
++                pgensw: Some(842.0),
++                pgenszc: Some(StickerGenerationMetadata {
++                    class: NSDictionaryClass::NSDictionary,
++                    gm: false,
++                    iaig: false,
++                    mpw: "600".to_string(),
++                    mth: "100".to_string(),
++                    mtw: "100".to_string(),
++                    s: "1".to_string(),
++                    st: false,
++                }),
++            },
++            balloon: None,
++        };
++
++        let (ati, balloon) = app.to_raw().unwrap();
++        assert!(balloon.is_none());
++        let decoded = ExtensionApp::from_ati(&ati, None).unwrap();
++        assert_eq!(decoded.attribution.accessl.as_deref(), Some("Sticker"));
++        assert_eq!(decoded.attribution.pgensh, Some(1_024.0));
++        assert_eq!(decoded.attribution.pgensw, Some(842.0));
++        assert!(decoded.attribution.pgenszc.is_some());
++    }
++
++    #[test]
++    fn sticker_xml_uses_extension_metadata_without_message_part() {
++        let parts = MessageParts(vec![IndexedMessagePart {
++            part: MessagePart::Attachment(Attachment {
++                a_type: AttachmentType::Inline(vec![1, 2, 3]),
++                part: 0,
++                uti_type: "public.heic".to_string(),
++                mime: "image/heic".to_string(),
++                name: "sticker.heic".to_string(),
++                iris: false,
++            }),
++            idx: Some(0),
++            ext: Some(PartExtension::Sticker {
++                msg_width: 163.73095703,
++                rotation: 0.0,
++                sai: 0,
++                scale: 0.5,
++                update: None,
++                sli: 0,
++                normalized_x: 0.0,
++                normalized_y: 0.98,
++                version: 0,
++                hash: "0123456789abcdef0123456789abcdef".to_string(),
++                safi: 0,
++                effect_type: -1,
++                sticker_id: "sticker.heic".to_string(),
++                pid: Some("com.apple.Stickers.UserGenerated.MessagesExtension".to_string()),
++                suri: Some("sha256://fixture".to_string()),
++            }),
++        }]);
++
++        let xml = parts.to_xml(None);
++        assert!(!xml.contains("message-part="));
++        assert!(xml.contains("pid=\"com.apple.Stickers.UserGenerated.MessagesExtension\""));
++        assert!(xml.contains("suri=\"sha256://fixture\""));
++    }
++
++    #[test]
++    fn sticker_update_flag_round_trips_as_boolean() {
++        let extension = PartExtension::Sticker {
++            msg_width: 163.73095703,
++            rotation: 0.0,
++            sai: 0,
++            scale: 0.5,
++            update: Some(false),
++            sli: 0,
++            normalized_x: 0.0,
++            normalized_y: 0.98,
++            version: 0,
++            hash: "0123456789abcdef0123456789abcdef".to_string(),
++            safi: 0,
++            effect_type: -1,
++            sticker_id: "sticker.heic".to_string(),
++            pid: None,
++            suri: None,
++        };
++
++        let value = plist::to_value(&extension).unwrap();
++        assert_eq!(value.as_dictionary().unwrap().get("sir").unwrap().as_boolean(), Some(false));
++        let decoded: PartExtension = plist::from_value(&value).unwrap();
++        assert!(matches!(decoded, PartExtension::Sticker { update: Some(false), .. }));
++    }
++}
++
+ impl fmt::Display for MessageInst {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+diff --git a/src/imessage/rawmessages.rs b/src/imessage/rawmessages.rs
+index 583d106..60fe0ed 100644
+--- a/src/imessage/rawmessages.rs
++++ b/src/imessage/rawmessages.rs
+@@ -1,5 +1,5 @@
+ use plist::Date;
+-use serde::{Serialize, Deserialize, ser::Serializer};
++use serde::{Serialize, Deserialize, ser::{SerializeMap, Serializer}};
+ use crate::mmcs::MMCSTransferData;
+ use crate::util::{NSData, NSUUID, NSURL};
+ 
+@@ -541,13 +541,66 @@ struct RecoverChatMetadataArray {
+ pub struct ExtensionApp {
+     pub name: String,
+     #[serde(rename = "adam-id")]
++    #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub app_id: Option<u64>,
+     pub bundle_id: String,
+ 
++    /// Additional attribution fields used by Messages extensions. Sticker
++    /// sends include preview dimensions and generation metadata here.
++    #[serde(flatten, default)]
++    pub attribution: ExtensionAttribution,
++
+     #[serde(skip)]
+     pub balloon: Option<Balloon>,
+ }
+ 
++#[derive(Deserialize, Clone, Default)]
++pub struct ExtensionAttribution {
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub accessl: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pgensh: Option<f64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pgensw: Option<f64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pgenszc: Option<StickerGenerationMetadata>,
++}
++
++impl Serialize for ExtensionAttribution {
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        let mut fields = serializer.serialize_map(None)?;
++        if let Some(accessibility_label) = &self.accessl {
++            fields.serialize_entry("accessl", accessibility_label)?;
++        }
++        if let Some(height) = self.pgensh {
++            fields.serialize_entry("pgensh", &height)?;
++        }
++        if let Some(width) = self.pgensw {
++            fields.serialize_entry("pgensw", &width)?;
++        }
++        if let Some(metadata) = &self.pgenszc {
++            fields.serialize_entry("pgenszc", metadata)?;
++        }
++        fields.end()
++    }
++}
++
++#[derive(Serialize, Deserialize, Clone)]
++pub struct StickerGenerationMetadata {
++    #[serde(rename = "$class")]
++    pub class: NSDictionaryClass,
++    pub gm: bool,
++    pub iaig: bool,
++    pub mpw: String,
++    pub mth: String,
++    pub mtw: String,
++    pub s: String,
++    pub st: bool,
++}
++
+ #[repr(C)]
+ #[derive(Serialize, Deserialize, Clone)]
+ #[serde(rename_all = "camelCase", tag = "$class")]
+diff --git a/src/lib.rs b/src/lib.rs
+index cd85a7a..6122f0a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -44,7 +44,7 @@ use async_trait::async_trait;
+ pub use auth::{request_update_account, UpdateAccountFinish};
+ pub use mmcs::{FileContainer, prepare_put};
+ pub use omnisette::AnisetteProvider;
+-pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, LPSpecializationMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
++pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, LPSpecializationMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, ExtensionAttribution, StickerGenerationMetadata, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
+ pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
+ use util::encode_hex;
+ pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure, NSAttributedString, NSString, NSDictionaryTypedCoder, NSNumber, coder_encode_flattened, coder_decode_flattened, StCollapsedValue};
+

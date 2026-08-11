@@ -15,7 +15,7 @@ use rustpushgo::{
     restore_token_provider_with_pet_expiration, AccountPersistData, Client,
     LoginSession, MessageCallback, UpdateUsersCallback, WrappedAPSConnection, WrappedAPSState, WrappedAttachment,
     WrappedConversation, WrappedIDSNGMIdentity, WrappedIDSUsers, WrappedMessage, WrappedOSConfig,
-    WrappedMultipartPart, WrappedTokenProvider,
+    WrappedMultipartPart, WrappedStickerExtension, WrappedTokenProvider,
 };
 use rustpushgo::util::plist_from_string;
 use serde::{Deserialize, Serialize};
@@ -576,6 +576,26 @@ struct SendStickerReactionParams {
     uti_type: String,
     filename: Option<String>,
     source: String,
+    from: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStickerReactionParams {
+    conversation: ConversationParams,
+    target_uuid: String,
+    msg_width: f64,
+    rotation: f64,
+    sai: u64,
+    scale: f64,
+    sli: u64,
+    normalized_x: f64,
+    normalized_y: f64,
+    version: u64,
+    hash: String,
+    safi: u64,
+    effect_type: i64,
+    sticker_id: String,
     from: Option<String>,
 }
 
@@ -1864,6 +1884,35 @@ impl Engine {
                         params.uti_type,
                         filename,
                         params.source,
+                        sender,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({ "guid": guid }))
+            }
+            "reaction.sticker.update" => {
+                let params: UpdateStickerReactionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let sender = self.sender(params.from)?;
+                let guid = self
+                    .client()?
+                    .send_update_extension(
+                        params.conversation.into(),
+                        params.target_uuid,
+                        WrappedStickerExtension {
+                            msg_width: params.msg_width,
+                            rotation: params.rotation,
+                            sai: params.sai,
+                            scale: params.scale,
+                            sli: params.sli,
+                            normalized_x: params.normalized_x,
+                            normalized_y: params.normalized_y,
+                            version: params.version,
+                            hash: params.hash,
+                            safi: params.safi,
+                            effect_type: params.effect_type,
+                            sticker_id: params.sticker_id,
+                        },
                         sender,
                     )
                     .await

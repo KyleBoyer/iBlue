@@ -164,6 +164,20 @@ const routeDocumentation: Record<string, FastifySchema> = {
       },
     },
   },
+  "POST /api/v1/iblue/message/sticker/update": {
+    summary: "Resize an outgoing sticker",
+    description: "Sends an Apple extension update for a sticker previously sent by this iBlue profile. Apple does not provide remote deletion for modern attached stickers; deletion from Sticker Details is local to the recipient device.",
+    tags: ["iBlue Messages"],
+    body: {
+      type: "object",
+      required: ["chatGuid", "messageGuid", "scale"],
+      properties: {
+        chatGuid: stringProperty("Chat containing the sticker."),
+        messageGuid: stringProperty("GUID returned when the sticker was sent."),
+        scale: { type: "number", minimum: 0.05, maximum: 2 },
+      },
+    },
+  },
   "POST /api/v1/iblue/rich-link": {
     summary: "Send a rich link or Apple Music card",
     tags: ["iBlue Messages"],
