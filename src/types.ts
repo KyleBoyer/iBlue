@@ -456,6 +456,8 @@ export interface IncomingConversationBackground {
   remove: boolean;
   /** Apple DynamicBackgroundPosterExtension preset identifier, when applicable. */
   preset?: string;
+  /** Two #RRGGBBAA colors for Apple's customizable Color background. */
+  colors?: string[];
   chatId?: string;
   /** Apple's nanosecond revision. Kept as a string because it exceeds JS safe integers. */
   version?: string;

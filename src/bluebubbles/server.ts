@@ -51,6 +51,7 @@ import {
 import {
   IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS,
   isBuiltinConversationBackgroundPreset,
+  normalizeConversationBackgroundColors,
 } from "./backgrounds.js";
 
 const WEBHOOK_EVENTS = new Set([
@@ -655,6 +656,16 @@ export class BlueBubblesServer {
       const body = asRecord(request.body);
       const remove = body.remove === true;
       const preset = body.preset === undefined ? undefined : requiredString(body, "preset");
+      const colors = body.colors === undefined
+        ? undefined
+        : normalizeConversationBackgroundColors(body.colors);
+      if (body.colors !== undefined && !colors) {
+        throw new RequestError(
+          400,
+          "colors must contain exactly two #RRGGBB or #RRGGBBAA values",
+          "VALIDATION_ERROR",
+        );
+      }
       const hasAttachment = typeof body.attachment === "string";
       const hasAttachmentGuid = typeof body.attachmentGuid === "string";
       if (remove && (preset || hasAttachment || hasAttachmentGuid)) {
@@ -673,6 +684,12 @@ export class BlueBubblesServer {
       }
       if (preset && !isBuiltinConversationBackgroundPreset(preset)) {
         throw new RequestError(400, `Unknown built-in conversation background preset: ${preset}`, "VALIDATION_ERROR");
+      }
+      if (preset === "color" && !colors) {
+        throw new RequestError(400, "The Color background requires colors", "VALIDATION_ERROR");
+      }
+      if (preset !== "color" && colors) {
+        throw new RequestError(400, "colors can only be used with the Color background", "VALIDATION_ERROR");
       }
       let path: string | undefined;
       let stagedDirectory: string | undefined;
@@ -704,6 +721,7 @@ export class BlueBubblesServer {
             chatGuid: request.params.guid,
             ...(path ? { path } : {}),
             ...(preset ? { preset } : {}),
+            ...(colors ? { colors } : {}),
           }),
           remove ? "Conversation background removed!" : "Conversation background changed!",
         );

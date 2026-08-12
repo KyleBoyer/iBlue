@@ -7461,8 +7461,28 @@ async fn download_transcript_background_payload(
         Some(Ok(())) => {
             match SimplifiedTranscriptPoster::parse_payload(&payload) {
                 Ok(poster) => {
-                    if let PosterType::TranscriptDynamic { data } = &poster.poster.r#type {
-                        wrapped.transcript_background_preset = Some(data.identifier.clone());
+                    match &poster.poster.r#type {
+                        PosterType::TranscriptDynamic { data } => {
+                            wrapped.transcript_background_preset = Some(data.identifier.clone());
+                        }
+                        PosterType::TranscriptGradient { colors } => {
+                            let colors = colors
+                                .iter()
+                                .map(|color| {
+                                    format!(
+                                        "#{:02X}{:02X}{:02X}{:02X}",
+                                        (color.red.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (color.green.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (color.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                        (color.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            wrapped.transcript_background_preset =
+                                Some(format!("color:{colors}"));
+                        }
+                        _ => {}
                     }
                     info!(
                         "Downloaded transcript background PosterKit payload ({} bytes, extension={}, preset={:?})",
@@ -10668,7 +10688,7 @@ mod reply_target_tests {
         MessagePart, MessageParts, MessageType, NormalMessage, PartExtension, PosterType,
         ReactMessage, ReactMessageType, Reaction, SimplifiedTranscriptPoster, TextFormat,
         WrappedConversation, BASE64_STANDARD, TRANSCRIPT_DYNAMIC_EXTENSION,
-        TRANSCRIPT_DYNAMIC_PRESETS,
+        TRANSCRIPT_DYNAMIC_PRESETS, TRANSCRIPT_GRADIENT_EXTENSION,
     };
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
@@ -11011,12 +11031,53 @@ mod reply_target_tests {
                 parsed.watch.extension_identifier,
                 TRANSCRIPT_DYNAMIC_EXTENSION
             );
+            assert_eq!(
+                &parsed.watch.background_image_data[..8],
+                b"\x89PNG\r\n\x1a\n"
+            );
+            assert_eq!(
+                u32::from_be_bytes(
+                    parsed.watch.background_image_data[16..20]
+                        .try_into()
+                        .unwrap()
+                ),
+                820,
+            );
+            assert_eq!(
+                u32::from_be_bytes(
+                    parsed.watch.background_image_data[20..24]
+                        .try_into()
+                        .unwrap()
+                ),
+                1003,
+            );
             let PosterType::TranscriptDynamic { data } = parsed.poster.r#type else {
                 panic!("{preset} should be a dynamic transcript poster")
             };
             assert_eq!(data.identifier, *preset);
         }
         assert!(build_transcript_dynamic_payload("not_an_apple_preset").is_err());
+    }
+
+    #[test]
+    fn custom_color_background_is_packaged_as_gradient_extension() {
+        let payload = build_transcript_dynamic_payload(
+            "color:1.000000/0.039216/0.694118/1.000000//1.000000/0.058824/0.996078/1.000000",
+        )
+        .expect("Color background should package");
+        let parsed = SimplifiedTranscriptPoster::parse_payload(&payload)
+            .expect("Color background should parse");
+        assert_eq!(
+            parsed.watch.extension_identifier,
+            TRANSCRIPT_GRADIENT_EXTENSION
+        );
+        let PosterType::TranscriptGradient { colors } = parsed.poster.r#type else {
+            panic!("expected a gradient transcript poster")
+        };
+        assert_eq!(colors.len(), 2);
+        assert!((colors[0].green - 0.039216).abs() < f64::EPSILON);
+        assert!((colors[1].blue - 0.996078).abs() < f64::EPSILON);
+        assert!(build_transcript_dynamic_payload("color:1/0/0/1").is_err());
     }
 
     #[test]
@@ -11170,14 +11231,35 @@ fn rewrite_transcript_photo_template_ids(data: &mut [u8], replacements: &[(&str,
 }
 
 const TRANSCRIPT_DYNAMIC_EXTENSION: &str = "com.apple.transcriptBackgroundPoster.DynamicExtension";
+const TRANSCRIPT_GRADIENT_EXTENSION: &str =
+    "com.apple.transcriptBackgroundPoster.GradientExtension";
 const TRANSCRIPT_DYNAMIC_TEMPLATE_DESCRIPTOR_UUID: &str = "2380C19D-52F6-4F79-921E-9D5286B2CAE0";
 const TRANSCRIPT_DYNAMIC_TEMPLATE_CONFIGURATION_UUID: &str = "3E0785D5-409C-4DDC-B3EE-0EE9BA6792AA";
 const TRANSCRIPT_DYNAMIC_USER_INFO_PATH: &str =
     "configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo";
 const TRANSCRIPT_DYNAMIC_PRESETS: &[&str] = &[
     "ocean_1", "ocean_2", "aurora_1", "aurora_2", "aurora_3", "clouds_1", "clouds_2", "clouds_3",
-    "clouds_4", "clouds_5", "clouds_6", "glitter",
+    "clouds_4", "clouds_5", "clouds_6",
 ];
+
+#[derive(serde::Serialize)]
+struct TranscriptGradientUserData {
+    custom: String,
+}
+
+fn validate_transcript_gradient_custom(custom: &str) -> bool {
+    let colors = custom.split("//").collect::<Vec<_>>();
+    colors.len() == 2
+        && colors.iter().all(|color| {
+            let components = color.split('/').collect::<Vec<_>>();
+            components.len() == 4
+                && components.iter().all(|component| {
+                    component
+                        .parse::<f64>()
+                        .is_ok_and(|value| (0.0..=1.0).contains(&value))
+                })
+        })
+}
 
 /// PosterKit is strict about the private metadata graph around a transcript
 /// photo. Start with a captured, image-free schema from current Messages and
@@ -11279,20 +11361,14 @@ fn build_transcript_background_package(
     poster: Vec<u8>,
 ) -> Result<Vec<u8>, WrappedError> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    // Messages emits exactly two deflated files at the outer layer. In
+    // particular, it does not include an explicit transcriptBackground/
+    // directory entry. MessagesBlastDoorService rejects structurally valid
+    // ZIPs that do not follow that layout without returning an IDS error.
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     writer
-        .add_directory(
-            "transcriptBackground/",
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored),
-        )
-        .map_err(|error| WrappedError::GenericError {
-            msg: format!("Failed to start the transcript background package: {error}"),
-        })?;
-    writer
-        .start_file(
-            "transcriptBackground/watchBackground",
-            zip::write::SimpleFileOptions::default(),
-        )
+        .start_file("transcriptBackground/watchBackground", options)
         .map_err(|error| WrappedError::GenericError {
             msg: format!("Failed to add the watch transcript background: {error}"),
         })?;
@@ -11300,10 +11376,7 @@ fn build_transcript_background_package(
         msg: format!("Failed to encode the watch transcript background: {error}"),
     })?;
     writer
-        .start_file(
-            "transcriptBackground/poster",
-            zip::write::SimpleFileOptions::default(),
-        )
+        .start_file("transcriptBackground/poster", options)
         .map_err(|error| WrappedError::GenericError {
             msg: format!("Failed to add the transcript background poster: {error}"),
         })?;
@@ -11336,7 +11409,15 @@ fn build_transcript_photo_template_payload(
 }
 
 fn build_transcript_dynamic_template_poster(preset: &str) -> Result<Vec<u8>, WrappedError> {
-    if !TRANSCRIPT_DYNAMIC_PRESETS.contains(&preset) {
+    let gradient = preset.strip_prefix("color:");
+    if let Some(custom) = gradient {
+        if !validate_transcript_gradient_custom(custom) {
+            return Err(WrappedError::GenericError {
+                msg: "A Color background requires two RGBA colors with values from 0 to 1"
+                    .to_string(),
+            });
+        }
+    } else if !TRANSCRIPT_DYNAMIC_PRESETS.contains(&preset) {
         return Err(WrappedError::GenericError {
             msg: format!("Unknown built-in transcript background preset: {preset}"),
         });
@@ -11384,14 +11465,23 @@ fn build_transcript_dynamic_template_poster(preset: &str) -> Result<Vec<u8>, Wra
 
         let mut contents = Vec::new();
         if name == TRANSCRIPT_DYNAMIC_USER_INFO_PATH {
-            plist::to_writer_binary(
-                &mut contents,
-                &TranscriptDynamicUserData {
-                    identifier: preset.to_string(),
-                },
-            )
+            if let Some(custom) = gradient {
+                plist::to_writer_binary(
+                    &mut contents,
+                    &TranscriptGradientUserData {
+                        custom: custom.to_string(),
+                    },
+                )
+            } else {
+                plist::to_writer_binary(
+                    &mut contents,
+                    &TranscriptDynamicUserData {
+                        identifier: preset.to_string(),
+                    },
+                )
+            }
             .map_err(|error| WrappedError::GenericError {
-                msg: format!("Failed to encode the dynamic background preset: {error}"),
+                msg: format!("Failed to encode the background preset: {error}"),
             })?;
         } else {
             entry
@@ -11400,6 +11490,24 @@ fn build_transcript_dynamic_template_poster(preset: &str) -> Result<Vec<u8>, Wra
                     msg: format!("Failed to read a dynamic background template entry: {error}"),
                 })?;
             rewrite_transcript_photo_template_ids(&mut contents, &replacements);
+            if name == "manifest.plist" && gradient.is_some() {
+                let mut manifest =
+                    plist::from_bytes::<plist::Dictionary>(&contents).map_err(|error| {
+                        WrappedError::GenericError {
+                            msg: format!("Failed to decode the background manifest: {error}"),
+                        }
+                    })?;
+                manifest.insert(
+                    "extensionIdentifier".to_string(),
+                    plist::Value::String(TRANSCRIPT_GRADIENT_EXTENSION.to_string()),
+                );
+                contents.clear();
+                plist::to_writer_binary(&mut contents, &manifest).map_err(|error| {
+                    WrappedError::GenericError {
+                        msg: format!("Failed to encode the background manifest: {error}"),
+                    }
+                })?;
+            }
         }
         writer
             .start_file(name, options)
@@ -11421,19 +11529,25 @@ fn build_transcript_dynamic_template_poster(preset: &str) -> Result<Vec<u8>, Wra
 }
 
 fn build_transcript_dynamic_payload(preset: &str) -> Result<Vec<u8>, WrappedError> {
-    // The dynamic extension renders the animation locally. This tiny PNG is
-    // only a compatibility fallback for clients that cannot load the provider.
+    // The provider renders the background locally, but Messages still validates
+    // the watch fallback before accepting the control. It must be a plausible
+    // full-size PNG; tiny placeholders and JPEG data are silently dropped.
     let fallback = BASE64_STANDARD
-        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        .decode(include_str!("posterkit_static/transcript_dynamic_watch_fallback.png.b64").trim())
         .map_err(|error| WrappedError::GenericError {
             msg: format!("Failed to decode the dynamic background fallback: {error}"),
         })?;
+    let extension = if preset.starts_with("color:") {
+        TRANSCRIPT_GRADIENT_EXTENSION
+    } else {
+        TRANSCRIPT_DYNAMIC_EXTENSION
+    };
     build_transcript_background_package(
         WatchBackground {
             is_high_key: false,
             luminance: 0.2,
             background_image_data: fallback,
-            extension_identifier: TRANSCRIPT_DYNAMIC_EXTENSION.to_string(),
+            extension_identifier: extension.to_string(),
         },
         build_transcript_dynamic_template_poster(preset)?,
     )

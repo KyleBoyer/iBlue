@@ -290,7 +290,14 @@ const routeDocumentation: Record<string, FastifySchema> = {
         preset: {
           type: "string",
           enum: IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS.map((background) => background.identifier),
-          description: "Built-in animated background identifier. Mutually exclusive with attachment and attachmentGuid.",
+          description: "Built-in Color, Sky, Water, or Aurora background identifier. Mutually exclusive with attachment and attachmentGuid.",
+        },
+        colors: {
+          type: "array",
+          minItems: 2,
+          maxItems: 2,
+          items: { type: "string", pattern: "^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$" },
+          description: "Two gradient colors. Required only when preset is color.",
         },
         remove: { type: "boolean" },
       },

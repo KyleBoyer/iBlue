@@ -132,6 +132,7 @@ interface ConversationBackgroundRow {
   chat_guid: string;
   removed: number;
   preset: string | null;
+  colors_json: string | null;
   object_id: string | null;
   url: string | null;
   file_size: number | null;
@@ -391,6 +392,7 @@ export class BlueBubblesStore {
         chat_guid TEXT PRIMARY KEY REFERENCES chat(guid) ON DELETE CASCADE,
         removed INTEGER NOT NULL DEFAULT 0,
         preset TEXT,
+        colors_json TEXT,
         object_id TEXT,
         url TEXT,
         file_size INTEGER,
@@ -461,6 +463,9 @@ export class BlueBubblesStore {
     ).all() as unknown as Array<{ name: string }>;
     if (!conversationBackgroundColumns.some((column) => column.name === "preset")) {
       this.database.exec("ALTER TABLE conversation_background ADD COLUMN preset TEXT");
+    }
+    if (!conversationBackgroundColumns.some((column) => column.name === "colors_json")) {
+      this.database.exec("ALTER TABLE conversation_background ADD COLUMN colors_json TEXT");
     }
     const incomingEventColumns = this.database.prepare("PRAGMA table_info(incoming_event)").all() as unknown as Array<{ name: string }>;
     if (!incomingEventColumns.some((column) => column.name === "owner")) {
@@ -1314,11 +1319,12 @@ export class BlueBubblesStore {
   ): IBlueConversationBackground {
     this.database.prepare(`
       INSERT INTO conversation_background (
-        chat_guid, removed, preset, object_id, url, file_size, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        chat_guid, removed, preset, colors_json, object_id, url, file_size, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(chat_guid) DO UPDATE SET
         removed=excluded.removed,
         preset=excluded.preset,
+        colors_json=excluded.colors_json,
         object_id=excluded.object_id,
         url=excluded.url,
         file_size=excluded.file_size,
@@ -1327,6 +1333,7 @@ export class BlueBubblesStore {
       chatGuid,
       background.removed ? 1 : 0,
       background.preset ?? null,
+      background.colors ? JSON.stringify(background.colors) : null,
       background.objectId ?? null,
       background.url ?? null,
       background.fileSize ?? null,
@@ -1343,6 +1350,7 @@ export class BlueBubblesStore {
     return {
       removed: Boolean(row.removed),
       ...(row.preset ? { preset: row.preset } : {}),
+      ...(row.colors_json ? { colors: JSON.parse(row.colors_json) as string[] } : {}),
       ...(row.object_id ? { objectId: row.object_id } : {}),
       ...(row.url ? { url: row.url } : {}),
       ...(row.file_size === null ? {} : { fileSize: row.file_size }),

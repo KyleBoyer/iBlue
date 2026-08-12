@@ -40,7 +40,10 @@ import { BlueBubblesStore, type QueryOptions } from "./store.js";
 import { encodePollDefinition, encodePollVote } from "./polls.js";
 import { encodeRichLinkTransport } from "./rich-link.js";
 import { encodeICloudShareTransport } from "./icloud-share.js";
-import { isBuiltinConversationBackgroundPreset } from "./backgrounds.js";
+import {
+  conversationBackgroundEnginePreset,
+  isBuiltinConversationBackgroundPreset,
+} from "./backgrounds.js";
 
 export interface BlueBubblesEvent {
   type: string;
@@ -321,6 +324,7 @@ export class BlueBubblesService extends EventEmitter {
     chatGuid: string;
     path?: string;
     preset?: string;
+    colors?: [string, string];
   }): Promise<{ guid: string; chat: BlueBubblesChat }> {
     this.requireOutboundIds("change a conversation background");
     if (!this.engine.setConversationBackground) {
@@ -329,20 +333,32 @@ export class BlueBubblesService extends EventEmitter {
     if (body.path && body.preset) {
       throw new Error("A conversation background cannot be both a photo and a built-in preset");
     }
-    if (body.preset && !isBuiltinConversationBackgroundPreset(body.preset)) {
-      throw new Error(`Unknown built-in conversation background preset: ${body.preset}`);
+    if (body.preset === "color" && !body.colors) {
+      throw new Error("A Color background requires exactly two hex colors");
     }
+    if (body.preset !== "color" && body.colors) {
+      throw new Error("colors can only be used with the Color background");
+    }
+    const enginePreset = body.preset
+      ? (() => {
+        if (!isBuiltinConversationBackgroundPreset(body.preset)) {
+          throw new Error(`Unknown built-in conversation background preset: ${body.preset}`);
+        }
+        return conversationBackgroundEnginePreset(body.preset, body.colors);
+      })()
+      : undefined;
     const conversation = this.resolveConversation(body.chatGuid);
     const groupVersion = this.store.reserveGroupVersion(body.chatGuid);
     const result = await this.engine.setConversationBackground({
       conversation,
       groupVersion,
       ...(body.path ? { path: body.path } : {}),
-      ...(body.preset ? { preset: body.preset } : {}),
+      ...(enginePreset ? { preset: enginePreset } : {}),
     });
     const background = this.store.setConversationBackground(body.chatGuid, {
       removed: !body.path && !body.preset,
       ...(body.preset ? { preset: body.preset } : {}),
+      ...(body.colors ? { colors: body.colors } : {}),
     });
     const chat = this.store.getChat(body.chatGuid, true, false);
     if (!chat) throw new Error("Conversation does not exist after background update");
@@ -1344,6 +1360,9 @@ export class BlueBubblesService extends EventEmitter {
         removed: message.conversationBackground.remove,
         ...(message.conversationBackground.preset
           ? { preset: message.conversationBackground.preset }
+          : {}),
+        ...(message.conversationBackground.colors
+          ? { colors: message.conversationBackground.colors }
           : {}),
         ...(message.conversationBackground.objectId
           ? { objectId: message.conversationBackground.objectId }

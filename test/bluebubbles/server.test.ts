@@ -611,7 +611,7 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
   assert.equal(presetCatalog.data.length, 12);
   assert.deepEqual(
     presetCatalog.data.find((background) => background.identifier === "clouds_4"),
-    { identifier: "clouds_4", family: "clouds", name: "Haze", animated: true },
+    { identifier: "clouds_4", family: "sky", name: "Haze", animated: true },
   );
 
   const presetResponse = await fetch(
@@ -629,6 +629,34 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
     preset: "aurora_1",
     updatedAt: store.getConversationBackground("iMessage;-;friend@example.com")?.updatedAt,
   });
+
+  const colorResponse = await fetch(
+    `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "color", colors: ["#ff006f", "#ff0fffcc"] }),
+    },
+  );
+  assert.equal(colorResponse.status, 200, await colorResponse.text());
+  assert.equal(
+    engine.backgrounds.at(-1)?.preset,
+    "color:1.000000/0.000000/0.435294/1.000000//1.000000/0.058824/1.000000/0.800000",
+  );
+  assert.deepEqual(store.getConversationBackground("iMessage;-;friend@example.com")?.colors, [
+    "#FF006FFF",
+    "#FF0FFFCC",
+  ]);
+
+  const missingColorsResponse = await fetch(
+    `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "color" }),
+    },
+  );
+  assert.equal(missingColorsResponse.status, 400, await missingColorsResponse.text());
 
   const invalidPresetResponse = await fetch(
     `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,
@@ -650,7 +678,8 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
     attachments: [],
     conversationBackground: {
       remove: false,
-      preset: "clouds_4",
+      preset: "color",
+      colors: ["#FF00B1FF", "#FF0FFEFF"],
       objectId: "background-object",
       url: "https://example.invalid/mmcs",
       fileSize: 456,
@@ -658,7 +687,11 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
   });
   await backgroundEvent;
   assert.equal(store.getConversationBackground("iMessage;-;friend@example.com")?.objectId, "background-object");
-  assert.equal(store.getConversationBackground("iMessage;-;friend@example.com")?.preset, "clouds_4");
+  assert.equal(store.getConversationBackground("iMessage;-;friend@example.com")?.preset, "color");
+  assert.deepEqual(store.getConversationBackground("iMessage;-;friend@example.com")?.colors, [
+    "#FF00B1FF",
+    "#FF0FFEFF",
+  ]);
 
   const contactsResponse = await fetch(`${listening.address}/api/v1/iblue/contact/icloud/sync?password=secret`, {
     method: "POST",

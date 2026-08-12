@@ -199,6 +199,7 @@ export interface IBlueMessageComponent {
 export interface IBlueConversationBackground {
   removed: boolean;
   preset?: string;
+  colors?: string[];
   objectId?: string;
   url?: string;
   fileSize?: number;

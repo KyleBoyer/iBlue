@@ -989,6 +989,17 @@ fn message_to_json(message: WrappedMessage) -> Value {
                 "iconBase64": message.app_balloon_icon.map(|data| BASE64.encode(data)),
             })
         });
+    let (conversation_background_preset, conversation_background_colors) = message
+        .transcript_background_preset
+        .as_deref()
+        .and_then(|value| value.strip_prefix("color:"))
+        .map(|colors| {
+            (
+                Some("color".to_string()),
+                Some(colors.split(',').map(str::to_string).collect::<Vec<_>>()),
+            )
+        })
+        .unwrap_or_else(|| (message.transcript_background_preset.clone(), None));
     let conversation_background = message.is_set_transcript_background.then(|| {
         json!({
             "remove": message.transcript_background_remove.unwrap_or(false),
@@ -999,7 +1010,8 @@ fn message_to_json(message: WrappedMessage) -> Value {
             "objectId": message.transcript_background_object_id,
             "url": message.transcript_background_url,
             "fileSize": message.transcript_background_file_size,
-            "preset": message.transcript_background_preset,
+            "preset": conversation_background_preset,
+            "colors": conversation_background_colors,
             "payloadBase64": message.transcript_background_payload_data.map(|data| BASE64.encode(data)),
         })
     });
