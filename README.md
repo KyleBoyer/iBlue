@@ -125,11 +125,13 @@ Apple treats that as a separate web sign-in. Enable it once with
 `iblue icloud-web-setup --profile secondary`; iBlue reuses the encrypted
 password hash already saved by the normal account login, asks only for Apple's
 separate web MFA confirmation, and stores the resulting web session inside the
-profile's encrypted credential record. Then send a JPEG as a newly created
-Photos share with multipart `POST /api/v1/iblue/icloud-share/create`, using the
-fields `photo`, `chatGuid`, and optional `title`, `caption`, `subcaption`, and
-`ldText`. iBlue verifies Apple's public share before it sends the native Photos
-Messages app balloon.
+profile's encrypted credential record. Then send JPEG, PNG, HEIC/HEIF,
+QuickTime MOV, or MP4 media as a newly created Photos share with multipart
+`POST /api/v1/iblue/icloud-share/create`, using the fields `media`, `chatGuid`,
+and optional `title`, `caption`, `subcaption`, and `ldText`. iBlue verifies
+Apple's public share before it sends the native Photos Messages app balloon.
+Apple's web importer rejects GIF; animated GIF remains supported through the
+ordinary iMessage attachment API.
 
 ## Outbound testing
 

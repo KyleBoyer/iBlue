@@ -816,14 +816,14 @@ export class BlueBubblesServer {
       if (!file || !["photo", "media"].includes(file.fieldname)) {
         throw new RequestError(400, "Photos media not provided or was empty!", "VALIDATION_ERROR");
       }
-      const chatGuid = multipartField(file, "chatGuid");
-      if (!chatGuid) throw new RequestError(400, "chatGuid is required", "VALIDATION_ERROR");
       const filename = safeAttachmentName(file.filename || "photo.jpg");
       const mimeType = file.mimetype || mimeForFilename(filename);
-      if (!["image/jpeg", "image/png", "image/gif", "image/heic", "image/heif", "video/quicktime", "video/mp4"].includes(mimeType)) {
+      if (!["image/jpeg", "image/png", "image/heic", "image/heif", "video/quicktime", "video/mp4"].includes(mimeType)) {
         throw new RequestError(
-          400,
-          "Fresh iCloud Photos shares require JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media",
+          mimeType === "image/gif" ? 415 : 400,
+          mimeType === "image/gif"
+            ? "Apple's iCloud Photos web importer does not accept GIF; send it through the ordinary iMessage attachment API"
+            : "Fresh iCloud Photos shares require JPEG, PNG, HEIC/HEIF, MOV, or MP4 media",
           "VALIDATION_ERROR",
         );
       }
@@ -833,6 +833,10 @@ export class BlueBubblesServer {
         if (await saveMultipartFile(file, path) === 0) {
           throw new RequestError(400, "Photos media not provided or was empty!", "VALIDATION_ERROR");
         }
+        // Fields following the file become available only after its stream is
+        // consumed. Accept either multipart order, as the attachment API does.
+        const chatGuid = multipartField(file, "chatGuid");
+        if (!chatGuid) throw new RequestError(400, "chatGuid is required", "VALIDATION_ERROR");
         const created = await this.service.createICloudPhotoShare({
           chatGuid,
           path,
@@ -1565,7 +1569,12 @@ export class BlueBubblesServer {
       }
       if (error instanceof RequestError) {
         void reply.code(error.status).send(
-          failure(error.status, error.message, error.status === 400 ? "Validation Error" : "iMessage Error", error.code),
+          failure(
+            error.status,
+            error.message,
+            [400, 415].includes(error.status) ? "Validation Error" : "iMessage Error",
+            error.code,
+          ),
         );
         return;
       }
@@ -2195,7 +2204,7 @@ export class BlueBubblesServer {
 
 class RequestError extends Error {
   constructor(
-    readonly status: 400 | 404 | 500 | 502 | 504,
+    readonly status: 400 | 404 | 415 | 500 | 502 | 504,
     message: string,
     readonly code: string,
   ) {

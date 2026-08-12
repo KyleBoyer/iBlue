@@ -125,6 +125,7 @@ rand = { version = "0.8.5", features = ["min_const_gen"] }
 keyring = "4.1.6"
 tempfile = "3.24"
 imagesize = { version = "0.15", default-features = false, features = ["png", "gif", "jpeg", "heif"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 roxmltree = "0.20"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 

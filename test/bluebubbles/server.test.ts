@@ -530,9 +530,10 @@ test("iCloud Photos API resolves, downloads, and sends native share balloons", a
   assert.ok(engine.messages.at(-1)?.text.startsWith("\x00ICL\x01"));
 
   const form = new FormData();
+  // Multipart field order is not semantic; media-first clients must work too.
+  form.append("photo", new Blob([Buffer.from("fresh-jpeg-bytes")], { type: "image/jpeg" }), "fresh.jpg");
   form.append("chatGuid", "iMessage;-;friend@example.com");
   form.append("title", "Fresh test share");
-  form.append("photo", new Blob([Buffer.from("fresh-jpeg-bytes")], { type: "image/jpeg" }), "fresh.jpg");
   const created = await fetch(
     `${listening.address}/api/v1/iblue/icloud-share/create?password=secret`,
     { method: "POST", body: form },
@@ -555,6 +556,21 @@ test("iCloud Photos API resolves, downloads, and sends native share balloons", a
   assert.equal(engine.freshICloudShares[0]?.title, "Fresh test share");
   assert.deepEqual(engine.freshICloudShares[0]?.data, Buffer.from("fresh-jpeg-bytes"));
   assert.ok(engine.messages.at(-1)?.text.startsWith("\x00ICL\x01"));
+
+  const shareCountBeforeGif = engine.freshICloudShares.length;
+  const gifForm = new FormData();
+  gifForm.append("media", new Blob([Buffer.from("GIF89a fixture")], { type: "image/gif" }), "animated.gif");
+  gifForm.append("chatGuid", "iMessage;-;friend@example.com");
+  const rejectedGif = await fetch(
+    `${listening.address}/api/v1/iblue/icloud-share/create?password=secret`,
+    { method: "POST", body: gifForm },
+  );
+  assert.equal(rejectedGif.status, 415);
+  const rejectedGifBody = await rejectedGif.json() as { status: number; message: string; error: { type: string } };
+  assert.equal(rejectedGifBody.status, 415);
+  assert.equal(rejectedGifBody.error.type, "Validation Error");
+  assert.match(rejectedGifBody.message, /ordinary iMessage attachment API/);
+  assert.equal(engine.freshICloudShares.length, shareCountBeforeGif);
 });
 
 test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native capabilities", async (t) => {
@@ -1180,6 +1196,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     };
     paths: Record<string, Record<string, {
       summary?: string;
+      description?: string;
       requestBody?: { content?: Record<string, { schema?: Record<string, unknown> }> };
       responses?: Record<string, {
         content?: Record<string, { schema?: Record<string, unknown> }>;
@@ -1201,6 +1218,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   }
   const createShareDocs = openApi.paths["/api/v1/iblue/icloud-share/create"]?.post;
   assert.equal(createShareDocs?.summary, "Create and send a fresh iCloud Photos share");
+  assert.match(String(createShareDocs?.description), /web importer rejects GIF/);
   assert.equal(
     openApi.paths["/api/v1/iblue/focus/sync"]?.post?.summary,
     "Recover Focus sharing keys from iCloud",
@@ -1221,7 +1239,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.deepEqual(createShareSchema.required, ["chatGuid", "media"]);
   assert.deepEqual(
     (createShareSchema.properties as Record<string, unknown>).media,
-    { type: "string", format: "binary", description: "JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media." },
+    { type: "string", format: "binary", description: "JPEG, PNG, HEIC/HEIF, QuickTime MOV, or MP4 media." },
   );
 
   const pluginOpenApiResponse = await fetch(`${listening.address}/docs/json`);

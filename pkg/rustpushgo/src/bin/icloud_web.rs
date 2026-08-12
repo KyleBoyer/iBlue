@@ -112,12 +112,13 @@ enum ShareMediaKind {
 }
 
 const VIDEO_PREVIEW_JPEG_BASE64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=";
+const CMM_PREVIEW_MAX_PIXELS: u64 = 607_500;
+const CMM_PREVIEW_MAX_BYTES: usize = 508 * 1024;
 
 fn validate_share_media(bytes: &[u8], mime_type: &str) -> Result<ShareMediaKind, String> {
     let photo = match mime_type {
         "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         "image/heic" | "image/heif" => {
             bytes.get(4..8) == Some(b"ftyp")
                 && bytes.get(8..12).is_some_and(|brand| {
@@ -136,7 +137,157 @@ fn validate_share_media(bytes: &[u8], mime_type: &str) -> Result<ShareMediaKind,
     if video {
         return Ok(ShareMediaKind::Video);
     }
-    Err("fresh iCloud Photos shares require JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media whose bytes match its MIME type".to_string())
+    Err("fresh iCloud Photos shares require JPEG, PNG, HEIC/HEIF, MOV, or MP4 media whose bytes match its MIME type; animated GIF remains supported by the ordinary iMessage attachment API".to_string())
+}
+
+fn fallback_share_preview() -> Result<Vec<u8>, String> {
+    BASE64
+        .decode(VIDEO_PREVIEW_JPEG_BASE64)
+        .map_err(|_| "built-in share preview is invalid".to_string())
+}
+
+fn jpeg_share_preview(bytes: &[u8], mime_type: &str) -> Result<Vec<u8>, String> {
+    let format = match mime_type {
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/png" => image::ImageFormat::Png,
+        _ => return fallback_share_preview(),
+    };
+    let decoded = image::load_from_memory_with_format(bytes, format)
+        .map_err(|error| format!("failed to decode photo for its share preview: {error}"))?;
+    let width = u64::from(decoded.width());
+    let height = u64::from(decoded.height());
+    let preview = if width.saturating_mul(height) > CMM_PREVIEW_MAX_PIXELS {
+        let scale = (CMM_PREVIEW_MAX_PIXELS as f64 / (width * height) as f64).sqrt();
+        decoded.resize(
+            ((width as f64 * scale).round() as u32).max(1),
+            ((height as f64 * scale).round() as u32).max(1),
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+
+    for quality in [70, 60, 50, 40] {
+        let mut encoded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
+            .encode_image(&preview)
+            .map_err(|error| format!("failed to encode the share JPEG preview: {error}"))?;
+        if encoded.len() <= CMM_PREVIEW_MAX_BYTES {
+            return Ok(encoded);
+        }
+    }
+
+    let smaller = preview.thumbnail(480, 480);
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 40)
+        .encode_image(&smaller)
+        .map_err(|error| format!("failed to encode the bounded share JPEG preview: {error}"))?;
+    if encoded.len() > CMM_PREVIEW_MAX_BYTES {
+        return Err("generated iCloud Photos share preview exceeds 508 KiB".to_string());
+    }
+    Ok(encoded)
+}
+
+#[cfg(target_os = "macos")]
+fn heic_share_preview(path: &Path) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+
+    let output = tempfile::Builder::new()
+        .suffix(".jpg")
+        .tempfile()
+        .map_err(|error| format!("failed to prepare the HEIC share preview: {error}"))?;
+    let conversion = Command::new("/usr/bin/sips")
+        .args([
+            "-s",
+            "format",
+            "jpeg",
+            "-s",
+            "formatOptions",
+            "70",
+            "-Z",
+            "780",
+        ])
+        .arg(path)
+        .arg("--out")
+        .arg(output.path())
+        .output()
+        .map_err(|error| format!("failed to start the macOS HEIC preview converter: {error}"))?;
+    if !conversion.status.success() {
+        let detail = String::from_utf8_lossy(&conversion.stderr)
+            .trim()
+            .to_string();
+        return Err(if detail.is_empty() {
+            "macOS could not convert the HEIC share preview".to_string()
+        } else {
+            format!("macOS could not convert the HEIC share preview: {detail}")
+        });
+    }
+    let bytes = std::fs::read(output.path())
+        .map_err(|error| format!("failed to read the converted HEIC share preview: {error}"))?;
+    jpeg_share_preview(&bytes, "image/jpeg")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn heic_share_preview(_path: &Path) -> Result<Vec<u8>, String> {
+    fallback_share_preview()
+}
+
+#[cfg(target_os = "macos")]
+fn video_share_preview(path: &Path) -> Result<Vec<u8>, String> {
+    use std::process::Command;
+
+    let directory = tempfile::tempdir()
+        .map_err(|error| format!("failed to prepare the video share preview: {error}"))?;
+    let extraction = Command::new("/usr/bin/qlmanage")
+        .args(["-t", "-s", "780", "-o"])
+        .arg(directory.path())
+        .arg(path)
+        .output()
+        .map_err(|error| format!("failed to start the macOS video preview extractor: {error}"))?;
+    if !extraction.status.success() {
+        let detail = String::from_utf8_lossy(&extraction.stderr)
+            .trim()
+            .to_string();
+        return Err(if detail.is_empty() {
+            "macOS could not extract the video share preview".to_string()
+        } else {
+            format!("macOS could not extract the video share preview: {detail}")
+        });
+    }
+    let preview_path = std::fs::read_dir(directory.path())
+        .map_err(|error| format!("failed to inspect the extracted video preview: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("png"))
+        })
+        .ok_or_else(|| "macOS did not produce a video share preview".to_string())?;
+    let bytes = std::fs::read(preview_path)
+        .map_err(|error| format!("failed to read the extracted video share preview: {error}"))?;
+    jpeg_share_preview(&bytes, "image/png")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn video_share_preview(_path: &Path) -> Result<Vec<u8>, String> {
+    fallback_share_preview()
+}
+
+fn share_preview(
+    path: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+    media_kind: ShareMediaKind,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let preview = match media_kind {
+        ShareMediaKind::Photo if matches!(mime_type, "image/heic" | "image/heif") => {
+            heic_share_preview(path)?
+        }
+        ShareMediaKind::Photo => jpeg_share_preview(bytes, mime_type)?,
+        ShareMediaKind::Video => video_share_preview(path)?,
+    };
+    Ok((preview, "image/jpeg"))
 }
 
 #[derive(Deserialize)]
@@ -380,16 +531,9 @@ impl ICloudWebSession {
         let asset_guid = self
             .upload_asset(&client, dsid, &bytes, filename, mime_type, modified_ms)
             .await?;
-        let (preview, preview_mime) = if media_kind == ShareMediaKind::Video {
-            (
-                BASE64
-                    .decode(VIDEO_PREVIEW_JPEG_BASE64)
-                    .map_err(|_| "built-in video preview is invalid".to_string())?,
-                "image/jpeg",
-            )
-        } else {
-            (bytes.clone(), mime_type)
-        };
+        // Photos always publishes a bounded JPEG thumbnail as CMMRoot.previewData,
+        // even when the underlying asset is PNG, HEIC, or video.
+        let (preview, preview_mime) = share_preview(path, &bytes, mime_type, media_kind)?;
         self.create_cmm_share(
             &client,
             dsid,
@@ -974,16 +1118,27 @@ impl ICloudWebSession {
             query.append_pair("clientMasteringNumber", CLIENT_BUILD);
             query.append_pair("clientId", &self.service_client_id);
         }
-        let response = self
-            .request(
-                client,
-                Method::POST,
-                base,
-                common_headers(true)?,
-                Some(body),
-            )
-            .await?;
-        if !response.status.is_success() {
+        for attempt in 0..3 {
+            let response = self
+                .request(
+                    client,
+                    Method::POST,
+                    base.clone(),
+                    common_headers(true)?,
+                    Some(body.clone()),
+                )
+                .await?;
+            if response.status.is_success() {
+                return serde_json::from_slice(&response.body)
+                    .map_err(|_| "Apple iCloud Photos API returned malformed JSON".to_string());
+            }
+            if attempt < 2
+                && response.status == StatusCode::CONFLICT
+                && apple_error_retryable(&response.body)
+            {
+                tokio::time::sleep(Duration::from_millis(250 * (attempt + 1) as u64)).await;
+                continue;
+            }
             let detail = apple_error_summary(&response.body)
                 .map(|value| format!(" ({value})"))
                 .unwrap_or_default();
@@ -992,8 +1147,7 @@ impl ICloudWebSession {
                 response.status,
             ));
         }
-        serde_json::from_slice(&response.body)
-            .map_err(|_| "Apple iCloud Photos API returned malformed JSON".to_string())
+        unreachable!("bounded iCloud Photos retry loop always returns")
     }
 
     async fn auth_json<T: for<'de> Deserialize<'de>>(
@@ -1332,12 +1486,27 @@ fn photo_import_result(row: &Value) -> Result<PhotoImportResult, String> {
         .pointer("/response/status")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    let asset_guid = row
+    let asset_guid = match row
         .get("cplAsset")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Apple Photos import omitted the asset identifier".to_string())?
-        .to_string();
+    {
+        Some(value) => value.to_string(),
+        None => {
+            let detail = serde_json::to_vec(row)
+                .ok()
+                .and_then(|body| apple_error_summary(&body))
+                .map(|value| format!("; {value}"))
+                .unwrap_or_default();
+            let fields = row
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_else(|| "non-object".to_string());
+            return Err(format!(
+                "Apple Photos import omitted the asset identifier (status {response_status}{detail}; fields={fields})"
+            ));
+        }
+    };
     let job_id = row
         .get("uploadJobId")
         .and_then(Value::as_str)
@@ -1435,6 +1604,25 @@ fn apple_error_summary(body: &[u8]) -> Option<String> {
     output.sort();
     output.dedup();
     (!output.is_empty()).then(|| output.join(", "))
+}
+
+fn apple_error_retryable(body: &[u8]) -> bool {
+    fn find(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.get("isRetryable").and_then(Value::as_bool) == Some(true)
+                    || ["serverErrorCode", "errorCode"]
+                        .iter()
+                        .filter_map(|key| map.get(*key).and_then(Value::as_str))
+                        .any(|code| code == "TRY_AGAIN_LATER")
+                    || map.values().any(find)
+            }
+            Value::Array(values) => values.iter().any(find),
+            _ => false,
+        }
+    }
+
+    serde_json::from_slice::<Value>(body).is_ok_and(|value| find(&value))
 }
 
 fn compact_root_record(
@@ -1682,8 +1870,40 @@ mod tests {
             validate_share_media(b"\0\0\0\x18ftypqt  fixture", "video/quicktime").unwrap(),
             ShareMediaKind::Video
         );
+        assert!(validate_share_media(b"GIF89a fixture", "image/gif").is_err());
         assert!(validate_share_media(b"not a png", "image/png").is_err());
         let preview = BASE64.decode(VIDEO_PREVIEW_JPEG_BASE64).unwrap();
         assert!(preview.starts_with(&[0xff, 0xd8, 0xff]));
+    }
+
+    #[test]
+    fn png_share_preview_is_a_bounded_jpeg() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1200,
+            900,
+            image::Rgb([0, 210, 255]),
+        ));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let (preview, mime_type) = share_preview(
+            Path::new("unused.png"),
+            png.get_ref(),
+            "image/png",
+            ShareMediaKind::Photo,
+        )
+        .unwrap();
+        assert_eq!(mime_type, "image/jpeg");
+        assert!(preview.starts_with(&[0xff, 0xd8, 0xff]));
+        assert!(preview.len() <= CMM_PREVIEW_MAX_BYTES);
+    }
+
+    #[test]
+    fn explicit_apple_try_again_later_is_retryable() {
+        assert!(apple_error_retryable(
+            br#"{"response":{"status":409,"isRetryable":true,"serverErrorCode":"TRY_AGAIN_LATER"}}"#,
+        ));
+        assert!(!apple_error_retryable(
+            br#"{"response":{"status":409,"isRetryable":false,"serverErrorCode":"CONFLICT"}}"#,
+        ));
     }
 }

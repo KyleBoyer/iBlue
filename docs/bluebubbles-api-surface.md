@@ -108,7 +108,7 @@ the rest of `/api/v1`:
 | `GET` | `/api/v1/iblue/icloud-share/:messageGuid` | Resolve one received iCloud Photos link into item-level image/video metadata and authenticated media proxy paths. |
 | `GET` | `/api/v1/iblue/icloud-share/:messageGuid/item/:itemGuid/:variant` | Stream an `original`, `medium`, or `thumbnail` shared-media variant without exposing Apple's temporary CDN credentials. |
 | `POST` | `/api/v1/iblue/icloud-share` | Send an existing iCloud Photos link as the native Photos Messages app balloon using `{chatGuid, url, caption?, subcaption?, ldText?}`. |
-| `POST` | `/api/v1/iblue/icloud-share/create` | Upload a JPEG, create a fresh iCloud Photos share, verify the public share, and send its native Photos balloon. Use multipart fields `photo`, `chatGuid`, and optional `title`, `caption`, `subcaption`, and `ldText`; first enable the profile with the opt-in `iblue icloud-web-setup`. |
+| `POST` | `/api/v1/iblue/icloud-share/create` | Upload JPEG, PNG, HEIC/HEIF, QuickTime MOV, or MP4 media; create a fresh iCloud Photos share; verify its public access; and send its native Photos balloon. Use multipart fields `media`, `chatGuid`, and optional `title`, `caption`, `subcaption`, and `ldText`; first enable the profile with the opt-in `iblue icloud-web-setup`. |
 | `GET` | `/api/v1/iblue/poll/:messageGuid` | Fetch an Apple Messages poll definition plus its aggregated current votes. |
 | `POST` | `/api/v1/iblue/poll` | Author and send an Apple Messages poll using `{chatGuid, options, title?}`. |
 | `POST` | `/api/v1/iblue/poll/:messageGuid/vote` | Replace the sending profile's complete selection set using `{optionIdentifiers: string[]}`; an empty array clears its votes. |
@@ -223,9 +223,10 @@ the macOS user's apps or databases:
   `GET /api/v1/iblue/background/presets` returns the complete catalog with
   family and display-name metadata.
 
-Fresh iCloud Photos shares accept JPEG, PNG, GIF, HEIC/HEIF, QuickTime MOV, and
-MP4 media. General-purpose documents are not Photos assets and continue to use
-the ordinary attachment API.
+Fresh iCloud Photos shares accept JPEG, PNG, HEIC/HEIF, QuickTime MOV, and MP4
+media. Apple's iCloud Photos web importer rejects GIF, so animated GIF uses the
+ordinary iMessage attachment API. General-purpose documents are not Photos
+assets and continue to use that ordinary attachment API as well.
 
 Two additional exact routes deliberately report an absent optional capability:
 

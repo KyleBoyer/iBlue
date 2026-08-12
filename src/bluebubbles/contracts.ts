@@ -1,4 +1,4 @@
-export type BlueBubblesStatus = 200 | 201 | 400 | 401 | 403 | 404 | 500 | 501 | 502 | 504;
+export type BlueBubblesStatus = 200 | 201 | 400 | 401 | 403 | 404 | 415 | 500 | 501 | 502 | 504;
 
 export interface BlueBubblesErrorBody {
   type: string;

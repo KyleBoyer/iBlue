@@ -421,7 +421,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/icloud-share/create": {
     summary: "Create and send a fresh iCloud Photos share",
-    description: "Uploads one Photos-compatible image or video to the opted-in iCloud web session, creates a fresh public share, waits for anonymous access, and sends its native Photos Messages card.",
+    description: "Uploads one Photos-compatible image or video to the opted-in iCloud web session, creates a fresh public share, waits for anonymous access, and sends its native Photos Messages card. JPEG, PNG, HEIC/HEIF, QuickTime MOV, and MP4 are live-verified. Apple's web importer rejects GIF; use the ordinary iMessage attachment API for animated GIFs.",
     tags: ["iBlue iCloud Photos"],
     consumes: ["multipart/form-data"],
     body: {
@@ -429,7 +429,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
       required: ["chatGuid", "media"],
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        media: { type: "string", format: "binary", description: "JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media." },
+        media: { type: "string", format: "binary", description: "JPEG, PNG, HEIC/HEIF, QuickTime MOV, or MP4 media." },
         title: { type: "string" },
         caption: { type: "string" },
         subcaption: { type: "string" },
