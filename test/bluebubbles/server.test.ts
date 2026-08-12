@@ -730,6 +730,49 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
   assert.equal(contactsResponse.status, 200, await contactsResponse.text());
   assert.equal(store.getContact("cloud@example.com")?.source, "icloud-carddav");
 
+  const portrait = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+  const portraitForm = new FormData();
+  portraitForm.append("attachment", new Blob([portrait], { type: "image/png" }), "mara.png");
+  const portraitUpload = await fetch(`${listening.address}/api/v1/attachment/upload?password=secret`, {
+    method: "POST",
+    body: portraitForm,
+  });
+  const portraitUploadBody = await portraitUpload.json() as { data: { path: string } };
+  assert.equal(portraitUpload.status, 200, JSON.stringify(portraitUploadBody));
+  const contactCardResponse = await fetch(`${listening.address}/api/v1/iblue/contact-card?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      displayName: "Dr. Mara Voss",
+      firstName: "Mara",
+      lastName: "Voss",
+      organization: "Orbital Garden Lab",
+      title: "Greenhouse Systems Lead",
+      phones: [{ value: "+1 202-555-0147", label: "cell", preferred: true }],
+      emails: [{ value: "mara.voss@example.com", label: "work" }],
+      photo: portraitUploadBody.data.path,
+    }),
+  });
+  const contactCardBody = await contactCardResponse.json() as {
+    data: {
+      attachments: Array<{ guid: string; metadata: { iBlueContactCard?: boolean } }>;
+      iBlue: { contactCards: Array<{ displayName: string; photo: { downloadUrl: string } }> };
+    };
+  };
+  assert.equal(contactCardResponse.status, 200, JSON.stringify(contactCardBody));
+  assert.equal(engine.attachments.at(-1)?.params.mimeType, "text/vcard");
+  assert.equal(engine.attachments.at(-1)?.params.utiType, "public.vcard");
+  assert.match(engine.attachments.at(-1)?.data.toString() ?? "", /FN:Dr\. Mara Voss/);
+  assert.equal(contactCardBody.data.attachments[0]?.metadata.iBlueContactCard, true);
+  assert.equal(contactCardBody.data.iBlue.contactCards[0]?.displayName, "Dr. Mara Voss");
+  const contactPhotoResponse = await fetch(
+    `${listening.address}${contactCardBody.data.iBlue.contactCards[0]!.photo.downloadUrl}&password=secret`,
+  );
+  assert.equal(contactPhotoResponse.status, 200);
+  assert.equal(contactPhotoResponse.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await contactPhotoResponse.arrayBuffer()), portrait);
+
   const focusUrl = `${listening.address}/api/v1/handle/${encodeURIComponent("friend@example.com")}/focus?password=secret`;
   assert.equal((await fetch(focusUrl)).status, 200);
   assert.deepEqual(engine.focusSubscriptions.at(-1), ["mailto:friend@example.com"]);
@@ -1222,6 +1265,10 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(
     openApi.paths["/api/v1/iblue/focus/sync"]?.post?.summary,
     "Recover Focus sharing keys from iCloud",
+  );
+  assert.equal(
+    openApi.paths["/api/v1/iblue/contact-card"]?.post?.summary,
+    "Create and send a contact card",
   );
   const receiptDocs = openApi.paths["/api/v1/iblue/message/{guid}/receipts"]?.get;
   assert.equal(receiptDocs?.summary, "List per-recipient delivery and read receipts");

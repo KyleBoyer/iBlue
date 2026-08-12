@@ -256,6 +256,49 @@ test("incoming IDS messages serialize to stable BlueBubbles payloads", async (t)
   assert.equal(queried.messages[0]?.originalROWID, result.originalROWID);
 });
 
+test("incoming vCard attachments expose normalized contact cards without inline portrait bytes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-store-contact-card-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const portrait = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
+  const vcf = [
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    "N:Example;Shared;;;",
+    "FN:Shared Example",
+    "TEL;TYPE=CELL,PREF:+1 202-555-0111",
+    "EMAIL;TYPE=WORK:shared@example.com",
+    `PHOTO;ENCODING=b;TYPE=PNG:${portrait.toString("base64")}`,
+    "END:VCARD",
+  ].join("\r\n");
+  const message = await store.ingestIncoming({
+    uuid: "shared-card-message",
+    sender: "mailto:friend@example.com",
+    text: "\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 1_000,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [{
+      mimeType: "text/vcard",
+      filename: "Shared Example.vcf",
+      utiType: "public.vcard",
+      size: Buffer.byteLength(vcf),
+      isInline: true,
+      dataBase64: Buffer.from(vcf).toString("base64"),
+      iris: false,
+    }],
+  }, []);
+
+  assert.equal(message.attachments[0]?.metadata?.iBlueContactCard, true);
+  assert.equal(message.iBlue?.contactCards?.[0]?.displayName, "Shared Example");
+  assert.equal(message.iBlue?.contactCards?.[0]?.phones?.[0]?.preferred, true);
+  assert.equal(message.iBlue?.contactCards?.[0]?.photo?.totalBytes, portrait.length);
+  assert.equal(message.iBlue?.contactCards?.[0]?.photo?.downloadUrl,
+    `/api/v1/iblue/contact-card/${message.attachments[0]?.guid}/photo?cardIndex=0`);
+  assert.equal("photoData" in (message.iBlue?.contactCards?.[0] ?? {}), false);
+});
+
 test("Apple-provided audio transcriptions are exposed without synthesizing text", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-audio-transcription-test-"));
   const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));

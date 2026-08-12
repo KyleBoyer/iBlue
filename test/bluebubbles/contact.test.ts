@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { deflateRawSync } from "node:zlib";
 
-import { contactAddressKey, parseVCardContacts } from "../../src/bluebubbles/contact.js";
+import {
+  buildVCardContact,
+  contactAddressKey,
+  parseVCardContactCards,
+  parseVCardContacts,
+} from "../../src/bluebubbles/contact.js";
 import {
   sharedLocationFromBalloon,
   sharedLocationFromMessageText,
@@ -32,6 +37,58 @@ test("profile VCF parsing unfolds cards, normalizes addresses, and decodes photo
   assert.equal(contactAddressKey("tel:+1 (555) 555-0100"), "+15555550100");
   assert.equal(contactAddressKey("(555) 555-0100"), "+15555550100");
   assert.equal(contactAddressKey("MAILTO:Jane@Example.com"), "jane@example.com");
+});
+
+test("shared vCards preserve structured fields, Apple labels, and portrait metadata", () => {
+  const portrait = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.alloc(100, 7),
+  ]);
+  const vcf = buildVCardContact({
+    displayName: "Dr. Mara Voss",
+    firstName: "Mara",
+    lastName: "Voss",
+    prefix: "Dr.",
+    organization: "Orbital Garden Lab",
+    department: "Greenhouse Systems",
+    title: "Lead Botanist",
+    phones: [{ label: "cell", value: "+1 202-555-0147", preferred: true }],
+    emails: [{ label: "work", value: "mara.voss@example.com" }],
+    urls: [{ label: "portfolio", value: "https://example.com/mara-voss" }],
+    addresses: [{ label: "work", street: "1 Tranquility Way", city: "Lunar City" }],
+    socialProfiles: [{ service: "mastodon", userId: "@mara", value: "https://example.social/@mara" }],
+    note: "iBlue round-trip test, line one\nline two",
+  }, { data: portrait, mimeType: "image/png" });
+  assert.match(vcf, /PHOTO;ENCODING=b;TYPE=PNG:/);
+  assert.match(vcf, /\r\n /, "long vCard lines are folded");
+
+  const [card] = parseVCardContactCards(vcf);
+  assert.equal(card?.displayName, "Dr. Mara Voss");
+  assert.equal(card?.organization, "Orbital Garden Lab");
+  assert.equal(card?.department, "Greenhouse Systems");
+  assert.deepEqual(card?.phones?.[0], {
+    value: "+1 202-555-0147",
+    label: "cell",
+    types: ["cell", "pref"],
+    preferred: true,
+  });
+  assert.equal(card?.addresses?.[0]?.city, "Lunar City");
+  assert.equal(card?.socialProfiles?.[0]?.service, "mastodon");
+  assert.equal(card?.note, "iBlue round-trip test, line one\nline two");
+  assert.deepEqual(card?.photoData, portrait);
+  assert.deepEqual(card?.photo, { mimeType: "image/png", totalBytes: portrait.length });
+});
+
+test("shared vCards resolve grouped Apple custom labels", () => {
+  const [card] = parseVCardContactCards([
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    "FN:Label Example",
+    "item1.EMAIL:label@example.com",
+    "item1.X-ABLabel:_$!<Work>!$_",
+    "END:VCARD",
+  ].join("\r\n"));
+  assert.equal(card?.emails?.[0]?.label, "work");
 });
 
 test("Maps balloons normalize coordinates and useful display metadata", () => {

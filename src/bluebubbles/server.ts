@@ -21,6 +21,10 @@ import { Server as SocketIoServer, type Socket } from "socket.io";
 import type {
   BlueBubblesResponse,
   BlueBubblesScheduleInterval,
+  IBlueContactCardAddress,
+  IBlueContactCardField,
+  IBlueContactCardInput,
+  IBlueContactCardSocialProfile,
   IBlueICloudShareVariantName,
   IBlueReactionRequest,
 } from "./contracts.js";
@@ -32,7 +36,7 @@ import {
   type BlueBubblesEvent,
 } from "./service.js";
 import { stripTransport } from "./guid.js";
-import { parseVCardContacts } from "./contact.js";
+import { buildVCardContact, parseVCardContactCards, parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
 import {
   assertSingleEmoji,
@@ -538,6 +542,73 @@ export class BlueBubblesServer {
         reply.header("content-type", detectImageMime(avatar.data));
         reply.header("cache-control", "private, max-age=3600");
         return reply.send(avatar.data);
+      },
+    );
+    this.app.post("/api/v1/iblue/contact-card", async (request) => {
+      const body = asRecord(request.body);
+      const chatGuid = requiredString(body, "chatGuid");
+      const contact = contactCardInput(body);
+      const stagedPhoto = typeof body.photo === "string" && body.photo.length > 0 ? body.photo : undefined;
+      const photoAttachmentGuid = typeof body.photoAttachmentGuid === "string" && body.photoAttachmentGuid.length > 0
+        ? body.photoAttachmentGuid
+        : undefined;
+      if (stagedPhoto && photoAttachmentGuid) {
+        throw new RequestError(400, "Use either photo or photoAttachmentGuid, not both", "VALIDATION_ERROR");
+      }
+
+      let photo: { data: Buffer; mimeType: string } | undefined;
+      let stagedDirectory: string | undefined;
+      if (stagedPhoto) {
+        const staged = this.resolveMultipartUpload(stagedPhoto);
+        const info = await stat(staged.path).catch(() => undefined);
+        if (!info?.isFile() || info.size === 0) {
+          throw new RequestError(400, `Attachment '${stagedPhoto}' does not exist`, "VALIDATION_ERROR");
+        }
+        stagedDirectory = staged.directory;
+        const data = await readFile(staged.path);
+        photo = { data, mimeType: contactPhotoMime(data) };
+      } else if (photoAttachmentGuid) {
+        const stored = this.service.store.getAttachment(photoAttachmentGuid);
+        if (!stored?.path) throw new RequestError(404, "Contact photo attachment not found!", "NOT_FOUND");
+        const data = await readFile(stored.path);
+        photo = { data, mimeType: contactPhotoMime(data) };
+      }
+
+      const directory = await mkdtemp(join(tmpdir(), "iblue-contact-card-"));
+      const filename = safeAttachmentName(`${contact.displayName.replace(/[^\p{L}\p{N} ._-]/gu, "").trim() || "Contact"}.vcf`);
+      const path = join(directory, filename);
+      try {
+        await writeFile(path, buildVCardContact(contact, photo), { mode: 0o600 });
+        const message = await this.service.sendAttachment({
+          chatGuid,
+          path,
+          filename,
+          mimeType: "text/vcard",
+          utiType: "public.vcard",
+        });
+        return success(message, "Contact card sent!");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+        if (stagedDirectory) await rm(stagedDirectory, { recursive: true, force: true });
+      }
+    });
+    this.app.get<{ Params: { attachmentGuid: string }; Querystring: Query }>(
+      "/api/v1/iblue/contact-card/:attachmentGuid/photo",
+      async (request, reply) => {
+        const attachment = this.service.store.getAttachment(request.params.attachmentGuid);
+        if (!attachment?.path || (attachment.response.mimeType !== "text/vcard"
+          && attachment.response.uti !== "public.vcard")) {
+          return reply.code(404).send(notFound("Contact card not found!"));
+        }
+        const cardIndex = Math.max(0, Math.trunc(numberValue(request.query.cardIndex, 0)));
+        const card = parseVCardContactCards(await readFile(attachment.path, "utf8"))[cardIndex];
+        if (!card?.photoData || !card.photo) {
+          return reply.code(404).send(notFound("Contact card photo not found!"));
+        }
+        reply.header("content-type", card.photo.mimeType);
+        reply.header("content-disposition", `inline; filename="contact-${cardIndex}.${card.photo.mimeType === "image/png" ? "png" : "jpg"}"`);
+        reply.header("cache-control", "private, max-age=3600");
+        return reply.send(card.photoData);
       },
     );
 
@@ -2107,6 +2178,7 @@ export class BlueBubblesServer {
         blueBubblesCommit: BLUEBUBBLES_COMPAT_COMMIT,
         extensions: {
           contacts: "/api/v1/iblue/contact",
+          contactCards: "/api/v1/iblue/contact-card",
           icloudContactsSync: "/api/v1/iblue/contact/icloud/sync",
           focus: "/api/v1/handle/:guid/focus",
           focusSync: "/api/v1/iblue/focus/sync",
@@ -2249,6 +2321,121 @@ function requiredString(body: Record<string, unknown>, key: string): string {
     throw new RequestError(400, `${key} is required`, "VALIDATION_ERROR");
   }
   return value;
+}
+
+function contactCardInput(body: Record<string, unknown>): IBlueContactCardInput {
+  const displayName = requiredString(body, "displayName").trim();
+  if (displayName.length > 512) {
+    throw new RequestError(400, "displayName is too long", "VALIDATION_ERROR");
+  }
+  const optional = (key: string): string | undefined => {
+    const value = body[key];
+    if (value === undefined || value === null || value === "") return undefined;
+    if (typeof value !== "string") {
+      throw new RequestError(400, `${key} must be a string`, "VALIDATION_ERROR");
+    }
+    return value.trim();
+  };
+  const fields = (key: string): IBlueContactCardField[] | undefined => {
+    const value = body[key];
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value) || value.length > 32) {
+      throw new RequestError(400, `${key} must be an array with at most 32 entries`, "VALIDATION_ERROR");
+    }
+    return value.map((entry, index) => {
+      const field = asRecord(entry);
+      const fieldValue = requiredString(field, "value").trim();
+      const types = field.types === undefined
+        ? undefined
+        : Array.isArray(field.types) && field.types.every((type) => typeof type === "string")
+          ? field.types.map((type) => type.trim()).filter(Boolean)
+          : (() => {
+            throw new RequestError(400, `${key}[${index}].types must be an array of strings`, "VALIDATION_ERROR");
+          })();
+      return {
+        value: fieldValue,
+        ...(typeof field.label === "string" && field.label.trim() ? { label: field.label.trim() } : {}),
+        ...(types?.length ? { types } : {}),
+        ...(field.preferred === true ? { preferred: true } : {}),
+      };
+    });
+  };
+  const socialProfiles = fields("socialProfiles")?.map((field, index): IBlueContactCardSocialProfile => {
+    const source = asRecord((body.socialProfiles as unknown[])[index]);
+    return {
+      ...field,
+      ...(typeof source.service === "string" && source.service.trim()
+        ? { service: source.service.trim() }
+        : {}),
+      ...(typeof source.userId === "string" && source.userId.trim()
+        ? { userId: source.userId.trim() }
+        : {}),
+    };
+  });
+  let addresses: IBlueContactCardAddress[] | undefined;
+  if (body.addresses !== undefined) {
+    if (!Array.isArray(body.addresses) || body.addresses.length > 32) {
+      throw new RequestError(400, "addresses must be an array with at most 32 entries", "VALIDATION_ERROR");
+    }
+    const addressKeys = ["label", "extended", "street", "city", "region", "postalCode", "country"] as const;
+    addresses = body.addresses.map((entry, index) => {
+      const source = asRecord(entry);
+      const address: IBlueContactCardAddress = {};
+      for (const key of addressKeys) {
+        if (source[key] === undefined || source[key] === "") continue;
+        if (typeof source[key] !== "string") {
+          throw new RequestError(400, `addresses[${index}].${key} must be a string`, "VALIDATION_ERROR");
+        }
+        address[key] = source[key].trim();
+      }
+      if (source.preferred === true) address.preferred = true;
+      return address;
+    });
+  }
+  const firstName = optional("firstName");
+  const middleName = optional("middleName");
+  const lastName = optional("lastName");
+  const prefix = optional("prefix");
+  const suffix = optional("suffix");
+  const nickname = optional("nickname");
+  const organization = optional("organization");
+  const department = optional("department");
+  const title = optional("title");
+  const birthday = optional("birthday");
+  const note = optional("note");
+  const phones = fields("phones");
+  const emails = fields("emails");
+  const urls = fields("urls");
+  return {
+    displayName,
+    ...(firstName ? { firstName } : {}),
+    ...(middleName ? { middleName } : {}),
+    ...(lastName ? { lastName } : {}),
+    ...(prefix ? { prefix } : {}),
+    ...(suffix ? { suffix } : {}),
+    ...(nickname ? { nickname } : {}),
+    ...(organization ? { organization } : {}),
+    ...(department ? { department } : {}),
+    ...(title ? { title } : {}),
+    ...(birthday ? { birthday } : {}),
+    ...(note ? { note } : {}),
+    ...(phones?.length ? { phones } : {}),
+    ...(emails?.length ? { emails } : {}),
+    ...(urls?.length ? { urls } : {}),
+    ...(addresses?.length ? { addresses } : {}),
+    ...(socialProfiles?.length ? { socialProfiles } : {}),
+  };
+}
+
+function contactPhotoMime(data: Buffer): "image/jpeg" | "image/png" {
+  if (data.length > 5 * 1024 * 1024) {
+    throw new RequestError(415, "Contact photo must be at most 5 MB", "VALIDATION_ERROR");
+  }
+  const mimeType = detectImageMime(data);
+  if (mimeType !== "image/jpeg" && mimeType !== "image/png") {
+    throw new RequestError(415, "Contact photo must be JPEG or PNG", "VALIDATION_ERROR");
+  }
+  return mimeType;
 }
 
 function outboundAttributedBody(body: Record<string, unknown>, text: string): string | undefined {
@@ -2461,6 +2648,7 @@ function utiForMime(mime: string): string {
     "audio/mpeg": "public.mp3",
     "audio/mp4": "public.mpeg-4-audio",
     "application/pdf": "com.adobe.pdf",
+    "text/vcard": "public.vcard",
   };
   return map[mime] ?? "public.data";
 }
@@ -2479,6 +2667,7 @@ function mimeForFilename(filename: string): string {
     mp3: "audio/mpeg",
     m4a: "audio/mp4",
     pdf: "application/pdf",
+    vcf: "text/vcard",
   };
   return (extension && map[extension]) || "application/octet-stream";
 }

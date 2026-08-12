@@ -30,6 +30,63 @@ export interface IBlueContact extends IBlueContactSummary {
   updatedAt: number;
 }
 
+export interface IBlueContactCardField {
+  value: string;
+  label?: string;
+  types?: string[];
+  preferred?: boolean;
+}
+
+export interface IBlueContactCardSocialProfile extends IBlueContactCardField {
+  service?: string;
+  userId?: string;
+}
+
+export interface IBlueContactCardAddress {
+  label?: string;
+  types?: string[];
+  extended?: string;
+  street?: string;
+  city?: string;
+  region?: string;
+  postalCode?: string;
+  country?: string;
+  preferred?: boolean;
+}
+
+/** Structured fields accepted when creating a vCard attachment. */
+export interface IBlueContactCardInput {
+  displayName: string;
+  firstName?: string;
+  middleName?: string;
+  lastName?: string;
+  prefix?: string;
+  suffix?: string;
+  nickname?: string;
+  organization?: string;
+  department?: string;
+  title?: string;
+  birthday?: string;
+  note?: string;
+  phones?: IBlueContactCardField[];
+  emails?: IBlueContactCardField[];
+  urls?: IBlueContactCardField[];
+  addresses?: IBlueContactCardAddress[];
+  socialProfiles?: IBlueContactCardSocialProfile[];
+}
+
+/** A shared vCard attachment normalized without embedding its potentially large portrait. */
+export interface IBlueContactCard extends IBlueContactCardInput {
+  attachmentGuid: string;
+  cardIndex: number;
+  version?: string;
+  photo?: {
+    mimeType: string;
+    totalBytes: number;
+    downloadUrl: string;
+  };
+}
+
 export interface IBlueSharedLocation {
   latitude?: number;
   longitude?: number;
@@ -415,6 +472,7 @@ export interface BlueBubblesMessage {
     poll?: IBluePoll;
     pollVote?: IBluePollVoteUpdate;
     component?: IBlueMessageComponent;
+    contactCards?: IBlueContactCard[];
   };
 }
 

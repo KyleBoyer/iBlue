@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync } from "node:fs";
+import { chmodSync, readFileSync } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
@@ -20,6 +20,7 @@ import type {
   BlueBubblesScheduledMessageSchedule,
   BlueBubblesWebhook,
   IBlueContact,
+  IBlueContactCard,
   IBlueContactSource,
   IBlueContactSummary,
   IBlueConversationBackground,
@@ -34,7 +35,7 @@ import type {
   IBlueSharedLocationRecord,
 } from "./contracts.js";
 import { attributedBodyFromText, parseAttributedText } from "./attributed-text.js";
-import { contactAddressKey, type ContactInput } from "./contact.js";
+import { contactAddressKey, parseVCardContactCards, type ContactInput } from "./contact.js";
 import {
   chatIdentifier,
   deriveIncomingChatGuid,
@@ -2069,6 +2070,7 @@ export class BlueBubblesStore {
         : undefined;
       return [this.serializeAttachment(attachment, artworkMimeType)];
     });
+    const contactCards = this.contactCardsForAttachments(attachments);
     const reaction = iBlueReaction(
       raw.tapback,
       visibleAttachments.filter((attachment) => attachment.isSticker).map((attachment) => attachment.guid),
@@ -2166,6 +2168,7 @@ export class BlueBubblesStore {
         ...(poll ? { poll } : {}),
         ...(pollVote ? { pollVote } : {}),
         ...(raw.appBalloon ? { component: { ...raw.appBalloon } } : {}),
+        ...(contactCards.length ? { contactCards } : {}),
       },
     };
     if (raw.tempGuid) output.tempGuid = raw.tempGuid;
@@ -2370,6 +2373,11 @@ export class BlueBubblesStore {
 
   private serializeAttachment(row: AttachmentRow, richLinkMimeType?: string): BlueBubblesAttachment {
     const isRichLinkArtwork = Boolean(richLinkMimeType);
+    const isContactCard = row.mime_type === "text/vcard" || row.uti === "public.vcard";
+    const metadata = {
+      ...(isRichLinkArtwork ? { iBlueRichLinkArtwork: true } : {}),
+      ...(isContactCard ? { iBlueContactCard: true } : {}),
+    };
     return {
       originalROWID: row.rowid,
       guid: row.guid,
@@ -2383,8 +2391,37 @@ export class BlueBubblesStore {
       hideAttachment: false,
       originalGuid: row.guid,
       hasLivePhoto: Boolean(row.has_live_photo),
-      ...(isRichLinkArtwork ? { metadata: { iBlueRichLinkArtwork: true } } : {}),
+      ...(Object.keys(metadata).length ? { metadata } : {}),
     };
+  }
+
+  private contactCardsForAttachments(rows: readonly AttachmentRow[]): IBlueContactCard[] {
+    return rows.flatMap((row) => {
+      if ((row.mime_type !== "text/vcard" && row.uti !== "public.vcard") || !row.file_path) return [];
+      // Shared cards are normally tiny apart from an embedded portrait. Avoid
+      // synchronous parsing of an unexpectedly huge or corrupt attachment.
+      if (row.total_bytes <= 0 || row.total_bytes > 10 * 1024 * 1024) return [];
+      try {
+        return parseVCardContactCards(readFileSync(row.file_path, "utf8")).map((parsed, cardIndex) => {
+          const { photoData: _photoData, photo, ...contact } = parsed;
+          return {
+            ...contact,
+            attachmentGuid: row.guid,
+            cardIndex,
+            ...(photo
+              ? {
+                photo: {
+                  ...photo,
+                  downloadUrl: `/api/v1/iblue/contact-card/${encodeURIComponent(row.guid)}/photo?cardIndex=${cardIndex}`,
+                },
+              }
+              : {}),
+          };
+        });
+      } catch {
+        return [];
+      }
+    });
   }
 
   private richLinkArtworkMimeType(row: AttachmentRow): string | undefined {

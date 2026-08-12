@@ -139,6 +139,76 @@ const routeDocumentation: Record<string, FastifySchema> = {
     summary: "Download a contact avatar",
     tags: ["iBlue Contacts"],
   },
+  "POST /api/v1/iblue/contact-card": {
+    summary: "Create and send a contact card",
+    description: "Builds an Apple-compatible vCard 3.0 attachment from structured fields. To embed a portrait, first upload a JPEG or PNG with POST /api/v1/attachment/upload and pass its returned path as photo, or reference an existing image with photoAttachmentGuid.",
+    tags: ["iBlue Contacts"],
+    body: {
+      type: "object",
+      required: ["chatGuid", "displayName"],
+      additionalProperties: false,
+      properties: {
+        chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
+        displayName: { type: "string", minLength: 1, maxLength: 512 },
+        firstName: { type: "string" },
+        middleName: { type: "string" },
+        lastName: { type: "string" },
+        prefix: { type: "string" },
+        suffix: { type: "string" },
+        nickname: { type: "string" },
+        organization: { type: "string" },
+        department: { type: "string" },
+        title: { type: "string" },
+        birthday: { type: "string", description: "vCard birthday value, normally YYYY-MM-DD." },
+        note: { type: "string" },
+        photo: stringProperty("Staged JPEG or PNG path returned by POST /api/v1/attachment/upload."),
+        photoAttachmentGuid: stringProperty("GUID of an existing downloaded JPEG or PNG attachment."),
+        phones: { type: "array", maxItems: 32, items: contactCardFieldSchema() },
+        emails: { type: "array", maxItems: 32, items: contactCardFieldSchema() },
+        urls: { type: "array", maxItems: 32, items: contactCardFieldSchema() },
+        socialProfiles: {
+          type: "array",
+          maxItems: 32,
+          items: {
+            ...contactCardFieldSchema(),
+            properties: {
+              ...((contactCardFieldSchema().properties ?? {}) as Record<string, unknown>),
+              service: { type: "string" },
+              userId: { type: "string" },
+            },
+          },
+        },
+        addresses: {
+          type: "array",
+          maxItems: 32,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              label: { type: "string" },
+              types: { type: "array", items: { type: "string" } },
+              extended: { type: "string" },
+              street: { type: "string" },
+              city: { type: "string" },
+              region: { type: "string" },
+              postalCode: { type: "string" },
+              country: { type: "string" },
+              preferred: { type: "boolean" },
+            },
+          },
+        },
+      },
+    },
+  },
+  "GET /api/v1/iblue/contact-card/:attachmentGuid/photo": {
+    summary: "Download an embedded contact-card portrait",
+    description: "Returns the decoded portrait without placing its base64 payload in message JSON.",
+    tags: ["iBlue Contacts"],
+    querystring: {
+      type: "object",
+      properties: { cardIndex: { type: "integer", minimum: 0, default: 0 } },
+    },
+  },
   "GET /api/v1/iblue/message/flair": {
     summary: "List supported message effects",
     description: "Returns friendly names and Apple wire identifiers for bubble and screen effects.",
@@ -496,6 +566,20 @@ const routeDocumentation: Record<string, FastifySchema> = {
     tags: ["iBlue Locations"],
   },
 };
+
+function contactCardFieldSchema(): JsonSchema {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["value"],
+    properties: {
+      value: { type: "string", minLength: 1 },
+      label: { type: "string" },
+      types: { type: "array", items: { type: "string" } },
+      preferred: { type: "boolean" },
+    },
+  };
+}
 
 const genericJsonBody: JsonSchema = {
   type: "object",
