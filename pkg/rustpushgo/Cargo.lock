@@ -1692,6 +1692,7 @@ name = "icloud_auth"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "aes-gcm",
  "base64 0.13.1",
  "cbc",
  "hmac",

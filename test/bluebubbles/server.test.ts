@@ -13,7 +13,7 @@ import { BlueBubblesServer, derivePublicComputerId } from "../../src/bluebubbles
 import { BlueBubblesService } from "../../src/bluebubbles/service.js";
 import { BlueBubblesStore } from "../../src/bluebubbles/store.js";
 import { ICloudShareResolver } from "../../src/bluebubbles/icloud-share.js";
-import type { FreshICloudPhotoShare, IMessageEngine } from "../../src/native/engine.js";
+import type { FocusPeersSyncPage, FreshICloudPhotoShare, IMessageEngine } from "../../src/native/engine.js";
 import { SessionStore } from "../../src/profile.js";
 import type {
   EngineSnapshot,
@@ -190,6 +190,21 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   subscribeFocus(handles: string[]): Promise<{ subscribed: string[] }> {
     this.focusSubscriptions.push(handles);
     return Promise.resolve({ subscribed: handles });
+  }
+  syncFocusPeers(cachedZone?: string, continuationToken?: string): Promise<FocusPeersSyncPage> {
+    return Promise.resolve({
+      resolvedZone: cachedZone ?? "0::com.apple.coredata.cloudkit.zone",
+      ...(continuationToken ? {} : { continuationToken: "focus-next" }),
+      done: Boolean(continuationToken),
+      fetched: 1,
+      inserted: 1,
+      alreadyKnown: 0,
+      decodeFailed: 0,
+      recordsSeen: 2,
+      injectedHandles: ["mailto:friend@example.com"],
+      clusterObservations: [{ channelId: "focus-channel", senderHandle: "mailto:friend@example.com" }],
+      discoverySummary: "fixture",
+    });
   }
   shareFocus(): Promise<{ shared: boolean }> {
     return Promise.resolve({ shared: true });
@@ -708,8 +723,26 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
     mode: "com.apple.focus.mode.work",
     updatedAt: 5000,
   });
-  const focus = await (await fetch(focusUrl)).json() as { data: { mode?: string } };
+  const focus = await (await fetch(focusUrl)).json() as {
+    data: { mode?: string; available: boolean; notificationsSilenced: boolean };
+  };
   assert.equal(focus.data.mode, "com.apple.focus.mode.work");
+  assert.equal(focus.data.available, false);
+  assert.equal(focus.data.notificationsSilenced, true);
+  assert.equal(store.getFocusStatus("friend@example.com")?.mode, "com.apple.focus.mode.work");
+
+  const focusSyncResponse = await fetch(`${listening.address}/api/v1/iblue/focus/sync?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const focusSync = await focusSyncResponse.json() as {
+    data: { inserted: number; continuationToken?: string; injectedHandles: string[] };
+  };
+  assert.equal(focusSyncResponse.status, 200, JSON.stringify(focusSync));
+  assert.equal(focusSync.data.inserted, 1);
+  assert.equal(focusSync.data.continuationToken, "focus-next");
+  assert.deepEqual(focusSync.data.injectedHandles, ["mailto:friend@example.com"]);
 
   const cloudResponse = await fetch(
     `${listening.address}/api/v1/iblue/cloud/messages/chats/sync?password=secret`,
@@ -1160,6 +1193,10 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   }
   const createShareDocs = openApi.paths["/api/v1/iblue/icloud-share/create"]?.post;
   assert.equal(createShareDocs?.summary, "Create and send a fresh iCloud Photos share");
+  assert.equal(
+    openApi.paths["/api/v1/iblue/focus/sync"]?.post?.summary,
+    "Recover Focus sharing keys from iCloud",
+  );
   const createShareSchema = createShareDocs?.requestBody?.content?.["multipart/form-data"]?.schema;
   assert.ok(createShareSchema);
   assert.deepEqual(createShareSchema.required, ["chatGuid", "media"]);

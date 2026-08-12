@@ -1819,6 +1819,55 @@ async fn refresh_pet_with_snapshot(
     }
 }
 
+/// Copy the in-memory GrandSlam token map into the persisted SPD snapshot.
+///
+/// Apple returns service-specific tokens (including StatusKit's
+/// `com.apple.gs.sharedchannels.auth`) as repeated response headers during MFA.
+/// Those tokens are not guaranteed to also appear in the decrypted SPD `t`
+/// dictionary. Since account persistence serializes the SPD, mirror the complete
+/// map into it before finishing login so the tokens survive the native-process
+/// restart performed by the TypeScript service.
+fn persist_gsa_tokens_in_spd(
+    tokens: &HashMap<String, icloud_auth::FetchedToken>,
+    spd: &mut plist::Dictionary,
+) {
+    if !matches!(spd.get("t"), Some(plist::Value::Dictionary(_))) {
+        spd.insert(
+            "t".to_string(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
+    }
+    let token_values = spd
+        .get_mut("t")
+        .expect("SPD token map inserted immediately above");
+    if token_values.as_dictionary().is_none() {
+        *token_values = plist::Value::Dictionary(plist::Dictionary::new());
+    }
+    let token_values = token_values
+        .as_dictionary_mut()
+        .expect("SPD token map initialized as a dictionary");
+
+    for (service, fetched) in tokens {
+        let Ok(expiry) = fetched.expiration.duration_since(std::time::UNIX_EPOCH) else {
+            continue;
+        };
+        let expiry_ms = u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX);
+        token_values.insert(
+            service.clone(),
+            plist::Value::Dictionary(plist::Dictionary::from_iter([
+                (
+                    "token".to_string(),
+                    plist::Value::String(fetched.token.clone()),
+                ),
+                (
+                    "expiry".to_string(),
+                    plist::Value::Integer(expiry_ms.into()),
+                ),
+            ])),
+        );
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl WrappedTokenProvider {
     /// Get HTTP headers needed for iCloud MobileMe API calls.
@@ -2127,6 +2176,46 @@ fn normalize_mme_delegate_dict(value: plist::Value) -> plist::Value {
 // to read state previously available via `TokenProvider::get_xxx()` methods that
 // rustpush doesn't expose. These are not exported as FFI symbols.
 impl WrappedTokenProvider {
+    /// Ensure one specialized GrandSlam token is present. AppleAccount's
+    /// generic get_token implementation returns None immediately when the
+    /// token map is non-empty but the requested service is absent. After a
+    /// bounded password-derived refresh, mint the missing service token with
+    /// GrandSlam's authenticated `apptokens` operation. Kept outside the
+    /// UniFFI impl because only iblue-native uses this readiness check.
+    pub async fn ensure_gsa_token_available(&self, service: &str) -> Result<(), WrappedError> {
+        if self.inner.get_gsa_token(service).await.is_some() {
+            return Ok(());
+        }
+
+        // Restored accounts retain the SPD session key/cookie/IDMS token and
+        // can mint a missing app token directly. Do this before SRP refresh:
+        // Apple expects `apptokens` on a new TLS session after login, and a
+        // restored process naturally has one.
+        {
+            let mut account = self.account.lock().await;
+            match account.fetch_app_token(service).await {
+                Ok(_) => return Ok(()),
+                Err(error) => debug!(
+                    "Direct GrandSlam app-token fetch for {} failed; refreshing the account session: {}",
+                    service, error
+                ),
+            }
+        }
+
+        self.refresh_pet_token().await?;
+        if self.inner.get_gsa_token(service).await.is_some() {
+            return Ok(());
+        }
+        let mut account = self.account.lock().await;
+        account
+            .fetch_app_token(service)
+            .await
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to fetch GrandSlam app token {service}: {error}"),
+            })?;
+        Ok(())
+    }
+
     /// Get the ADSID from the AppleAccount's SPD dictionary.
     pub(crate) async fn get_adsid(&self) -> Result<String, WrappedError> {
         let account = self.account.lock().await;
@@ -2537,6 +2626,54 @@ pub async fn restore_token_provider_with_pet_expiration(
         plist::from_bytes(&spd_bytes).map_err(|e| WrappedError::GenericError {
             msg: format!("Invalid SPD plist: {}", e),
         })?;
+
+    // The encrypted profile snapshot contains the complete GSA token map in
+    // SPD["t"]. Restore every token, not only the PET below. StatusKit needs
+    // com.apple.gs.sharedchannels.auth to allocate and publish its encrypted
+    // presence channel; dropping that token on process restart made Focus
+    // subscriptions permanently fail with StatusKitAuthMissing even though
+    // the original MFA login had supplied the authorization.
+    if let Some(plist::Value::Dictionary(tokens)) = spd.get("t") {
+        for (service, value) in tokens {
+            let Some(token) = value
+                .as_dictionary()
+                .and_then(|fields| fields.get("token"))
+                .and_then(plist::Value::as_string)
+            else {
+                continue;
+            };
+            let fields = value
+                .as_dictionary()
+                .expect("token dictionary checked above");
+            let expiration = if let Some(expiry) = fields
+                .get("expiry")
+                .and_then(plist::Value::as_unsigned_integer)
+            {
+                std::time::UNIX_EPOCH + Duration::from_millis(expiry)
+            } else if let Some(duration) = fields
+                .get("duration")
+                .and_then(plist::Value::as_unsigned_integer)
+            {
+                std::time::SystemTime::now() + Duration::from_secs(duration)
+            } else {
+                continue;
+            };
+            account.tokens.insert(
+                service.clone(),
+                icloud_auth::FetchedToken {
+                    token: token.to_string(),
+                    expiration,
+                },
+            );
+        }
+    }
+    info!(
+        "Restored {} GSA token(s) from persisted SPD (shared-channels auth={})",
+        account.tokens.len(),
+        account
+            .tokens
+            .contains_key("com.apple.gs.sharedchannels.auth"),
+    );
 
     account.spd = Some(spd);
 
@@ -6693,22 +6830,44 @@ impl LoginSession {
                     .ok_or(WrappedError::GenericError {
                         msg: "No hashed password available for post-2FA re-login".to_string(),
                     })?;
+                // The MFA validation response carries the broad service-token
+                // set in headers. login_email_pass replaces account.tokens
+                // with the narrower SPD `t` dictionary, so retain the MFA map
+                // and merge it back after collecting the PET.
+                let mfa_tokens = std::mem::take(&mut account.tokens);
                 let relogin = account
                     .login_email_pass(&self.username, &hashed)
                     .await
                     .map_err(|e| WrappedError::GenericError {
                         msg: format!("Post-2FA re-login failed: {}", e),
                     })?;
+                for (service, token) in mfa_tokens {
+                    account.tokens.entry(service).or_insert(token);
+                }
                 info!(
-                    "Post-2FA re-login returned: {:?}; PET available: {}",
+                    "Post-2FA re-login returned: {:?}; PET available: {}; retained {} GSA token(s) (shared-channels auth={})",
                     relogin,
-                    account.get_pet().is_some()
+                    account.get_pet().is_some(),
+                    account.tokens.len(),
+                    account
+                        .tokens
+                        .contains_key("com.apple.gs.sharedchannels.auth"),
                 );
                 matches!(relogin, icloud_auth::LoginState::LoggedIn) || account.get_pet().is_some()
             }
             _ => false,
         };
         if accepted {
+            if let Some(spd) = account.spd.as_mut() {
+                persist_gsa_tokens_in_spd(&account.tokens, spd);
+                info!(
+                    "Persisted {} GSA token(s) into the account snapshot (shared-channels auth={})",
+                    account.tokens.len(),
+                    account
+                        .tokens
+                        .contains_key("com.apple.gs.sharedchannels.auth"),
+                );
+            }
             *self.sms_verify_body.lock().unwrap() = None;
         }
         Ok(accepted)
@@ -10675,7 +10834,9 @@ fn inline_relay_attachment(
 
 #[cfg(test)]
 mod reply_target_tests {
+    use std::collections::HashMap;
     use std::io::{Cursor, Read};
+    use std::time::{Duration, SystemTime};
 
     use base64::Engine as _;
 
@@ -10683,13 +10844,45 @@ mod reply_target_tests {
         build_transcript_dynamic_payload, build_transcript_photo_payload,
         current_transcript_background_version, inline_relay_attachment, leave_group_participants,
         message_inst_to_wrapped, mmcs_preflight_targets, normalize_findmy_handle,
-        normalize_reply_target, parse_html_to_parts, parts_to_html, Attachment, AttachmentType,
-        Balloon, ConversationData, ExtensionApp, IndexedMessagePart, Message, MessageInst,
-        MessagePart, MessageParts, MessageType, NormalMessage, PartExtension, PosterType,
-        ReactMessage, ReactMessageType, Reaction, SimplifiedTranscriptPoster, TextFormat,
-        WrappedConversation, BASE64_STANDARD, TRANSCRIPT_DYNAMIC_EXTENSION,
+        normalize_reply_target, parse_html_to_parts, parts_to_html, persist_gsa_tokens_in_spd,
+        Attachment, AttachmentType, Balloon, ConversationData, ExtensionApp, IndexedMessagePart,
+        Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, PartExtension,
+        PosterType, ReactMessage, ReactMessageType, Reaction, SimplifiedTranscriptPoster,
+        TextFormat, WrappedConversation, BASE64_STANDARD, TRANSCRIPT_DYNAMIC_EXTENSION,
         TRANSCRIPT_DYNAMIC_PRESETS, TRANSCRIPT_GRADIENT_EXTENSION,
     };
+
+    #[test]
+    fn mfa_service_tokens_are_mirrored_into_persisted_spd() {
+        let expiry = SystemTime::UNIX_EPOCH + Duration::from_millis(1_900_000_000_123);
+        let tokens = HashMap::from([(
+            "com.apple.gs.sharedchannels.auth".to_string(),
+            icloud_auth::FetchedToken {
+                token: "focus-token".to_string(),
+                expiration: expiry,
+            },
+        )]);
+        let mut spd = plist::Dictionary::new();
+
+        persist_gsa_tokens_in_spd(&tokens, &mut spd);
+
+        let focus = spd
+            .get("t")
+            .and_then(plist::Value::as_dictionary)
+            .and_then(|values| values.get("com.apple.gs.sharedchannels.auth"))
+            .and_then(plist::Value::as_dictionary)
+            .expect("shared-channels token should be persisted");
+        assert_eq!(
+            focus.get("token").and_then(plist::Value::as_string),
+            Some("focus-token")
+        );
+        assert_eq!(
+            focus
+                .get("expiry")
+                .and_then(plist::Value::as_unsigned_integer),
+            Some(1_900_000_000_123)
+        );
+    }
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
         ReactMessage {
@@ -11901,6 +12094,19 @@ impl Client {
         // and the shared raw handle (used by the receive loop) both point
         // at the same underlying StatusKitClient.
         let wrapped = self.get_or_init_statuskit_client().await?;
+        // StatusKitClient::new() queues its four APS topics asynchronously.
+        // A peer can answer the c=227 invite before that queued filter reaches
+        // APNs, permanently losing the first key exchange because callers then
+        // suppress duplicate invites. Flush the complete topic union before
+        // exposing StatusKit as ready or allowing an invite to be sent.
+        self.conn
+            .ensure_topics_filtered(&[
+                "com.apple.private.alloy.status.keysharing",
+                "com.apple.icloud.presence.mode.status",
+                "com.apple.icloud.presence.channel.management",
+                "com.apple.private.alloy.status.personal",
+            ])
+            .await?;
         *self.shared_statuskit.write().await = Some(wrapped.inner.clone());
         *self.status_callback.write().await = Some(Arc::from(callback));
         info!("StatusKit: callback registered, recv loop window closed");

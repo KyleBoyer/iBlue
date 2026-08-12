@@ -427,6 +427,7 @@ export class BlueBubblesServer {
       return success(this.service.focusForHandle(handle) ?? {
         handle,
         available: null,
+        notificationsSilenced: null,
         mode: null,
         updatedAt: null,
         subscribed: true,
@@ -489,6 +490,19 @@ export class BlueBubblesServer {
     this.app.post("/api/v1/iblue/contact/icloud/sync", async () =>
       success(await this.service.syncICloudContacts(), "Successfully synced iCloud Contacts!"));
 
+    this.app.post("/api/v1/iblue/focus/sync", async (request) => {
+      const body = asRecord(request.body);
+      const cachedZone = typeof body.cachedZone === "string" && body.cachedZone.trim()
+        ? body.cachedZone.trim()
+        : undefined;
+      const continuationToken = typeof body.continuationToken === "string" && body.continuationToken.trim()
+        ? body.continuationToken.trim()
+        : undefined;
+      return success(
+        await this.service.syncFocusPeers(cachedZone, continuationToken),
+        "Successfully synced Focus sharing keys!",
+      );
+    });
     this.app.post("/api/v1/iblue/focus/subscribe", async (request) => {
       const body = asRecord(request.body);
       const handles = Array.isArray(body.handles)
@@ -2059,6 +2073,7 @@ export class BlueBubblesServer {
           contacts: "/api/v1/iblue/contact",
           icloudContactsSync: "/api/v1/iblue/contact/icloud/sync",
           focus: "/api/v1/handle/:guid/focus",
+          focusSync: "/api/v1/iblue/focus/sync",
           messagesInICloud: "/api/v1/iblue/cloud/messages/messages/sync",
           sharedLocations: "/api/v1/iblue/location/query",
           liveSharedLocations: "/api/v1/iblue/location/live",

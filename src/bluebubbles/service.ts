@@ -164,9 +164,16 @@ export class BlueBubblesService extends EventEmitter {
     });
     this.engine.on("account.stateChanged", (state) => this.#handleAccountStateChanged(state));
     this.engine.on("focus.updated", (status) => {
-      const normalized = { ...status, handle: stripTransport(status.handle) };
-      this.#focusByHandle.set(contactAddressKey(status.handle), normalized);
-      this.dispatch("iblue-focus-updated", normalized);
+      const normalized: IBlueFocusStatus = {
+        handle: stripTransport(status.handle),
+        available: status.available,
+        notificationsSilenced: !status.available,
+        ...(status.mode ? { mode: status.mode } : {}),
+        updatedAt: status.updatedAt,
+      };
+      const persisted = this.store.setFocusStatus(normalized);
+      this.#focusByHandle.set(contactAddressKey(status.handle), persisted);
+      this.dispatch("iblue-focus-updated", persisted);
     });
     this.engine.on("focus.keysReceived", (event) => this.dispatch("iblue-focus-keys-received", event));
     this.engine.on("focus.reshareReceived", (event) =>
@@ -253,8 +260,15 @@ export class BlueBubblesService extends EventEmitter {
     return this.engine.subscribeFocus(normalized);
   }
 
+  async syncFocusPeers(cachedZone?: string, continuationToken?: string) {
+    if (!this.engine.syncFocusPeers) {
+      throw new Error("The native engine does not support iCloud Focus key recovery");
+    }
+    return this.engine.syncFocusPeers(cachedZone, continuationToken);
+  }
+
   focusForHandle(handle: string): IBlueFocusStatus | undefined {
-    return this.#focusByHandle.get(contactAddressKey(handle));
+    return this.#focusByHandle.get(contactAddressKey(handle)) ?? this.store.getFocusStatus(handle);
   }
 
   async shareFocus(active: boolean, mode?: string): Promise<{ shared: boolean }> {

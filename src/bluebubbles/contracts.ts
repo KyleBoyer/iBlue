@@ -209,6 +209,8 @@ export interface IBlueConversationBackground {
 export interface IBlueFocusStatus {
   handle: string;
   available: boolean;
+  notificationsSilenced: boolean;
+  /** Opaque, per-person Focus configuration UUID. Do not use as a portable mode name. */
   mode?: string;
   updatedAt: number;
 }

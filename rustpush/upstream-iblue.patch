@@ -153,6 +153,33 @@ index 6301922..8204f8d 100644
          };
          info!("Generating Opened socket");
  
+@@ -1415,6 +1495,26 @@ impl APSConnectionResource {
+         APSInterestToken { topics: hard_list, topics_channel: self.topics.clone() }
+     }
+ 
++    /// Wait until the topic manager has incorporated every required topic,
++    /// then synchronously write the resulting filter to APNs. `request_topics`
++    /// only queues an update; callers that immediately trigger a peer response
++    /// otherwise race that response against the asynchronous filter write.
++    pub async fn ensure_topics_filtered(&self, required: &[&str]) -> Result<(), PushError> {
++        let enabled = tokio::time::timeout(Duration::from_secs(10), async {
++            loop {
++                let current = self.current_topics.lock().await.clone();
++                if required.iter().all(|topic| current.iter().any(|item| item == topic)) {
++                    break current;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .map_err(|_| PushError::ResourceTimeout)?;
++
++        self.filter(&enabled, &[], &[], &[]).await
++    }
++
+     async fn do_connect(self: &Arc<Self>) -> Result<(), PushError> {
+         info!("Locking state");
+         let mut state = self.state.write().await;
 diff --git a/src/auth.rs b/src/auth.rs
 index 454eff9..f52ba36 100644
 --- a/src/auth.rs
@@ -1861,7 +1888,20 @@ index a8fe25d..c9d3e90 100644
          };
  
          APSChannel {
-@@ -733,7 +733,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
+@@ -180,7 +180,11 @@ pub struct ChannelInterestToken {
+ 
+ impl Drop for ChannelInterestToken {
+     fn drop(&mut self) {
+-        self.topics_channel.try_send((self.topics.clone(), false)).expect("Channel backed up??");
++        // The StatusKit worker may already be gone during client shutdown.
++        // Failing to unregister from a closed channel is harmless; panicking
++        // here can otherwise abort the process because Drop runs while other
++        // async resources are unwinding.
++        let _ = self.topics_channel.try_send((self.topics.clone(), false));
+     }
+ }
+ 
+@@ -733,7 +737,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                  let Some(channel) = &channel else { return Ok(None) };
                  debug!("Got statuskit message {inner:?} on channel {}", encode_hex(&channel.id));
                  let mut state = self.state.write().await;

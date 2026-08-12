@@ -94,6 +94,20 @@ export interface CloudAttachmentsPage extends CloudSyncPage {
   attachments: NativeCloudSyncAttachment[];
 }
 
+export interface FocusPeersSyncPage {
+  resolvedZone?: string;
+  continuationToken?: string;
+  done: boolean;
+  fetched: number;
+  inserted: number;
+  alreadyKnown: number;
+  decodeFailed: number;
+  recordsSeen: number;
+  injectedHandles: string[];
+  clusterObservations: Array<{ channelId: string; senderHandle: string }>;
+  discoverySummary?: string;
+}
+
 export interface IMessageEngine {
   initialize(params: InitializeParams): Promise<EngineSnapshot>;
   loginStart(appleId: string, password: string): Promise<LoginStartResult>;
@@ -131,6 +145,7 @@ export interface IMessageEngine {
   syncCloudChats?(continuationToken?: string): Promise<CloudChatsPage>;
   syncCloudMessages?(continuationToken?: string): Promise<CloudMessagesPage>;
   syncCloudAttachments?(continuationToken?: string): Promise<CloudAttachmentsPage>;
+  syncFocusPeers?(cachedZone?: string, continuationToken?: string): Promise<FocusPeersSyncPage>;
   subscribeFocus?(handles: string[]): Promise<{ subscribed: string[] }>;
   shareFocus?(active: boolean, mode?: string): Promise<{ shared: boolean }>;
   sendReaction(params: SendReactionParams): Promise<{ guid: string }>;
@@ -308,6 +323,10 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
 
   syncCloudAttachments(continuationToken?: string): Promise<CloudAttachmentsPage> {
     return this.rpc.request("cloud.sync.attachments", { continuationToken });
+  }
+
+  syncFocusPeers(cachedZone?: string, continuationToken?: string): Promise<FocusPeersSyncPage> {
+    return this.rpc.request("focus.sync", { cachedZone, continuationToken });
   }
 
   subscribeFocus(handles: string[]): Promise<{ subscribed: string[] }> {

@@ -64,7 +64,20 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/handle/:guid/focus": {
     summary: "Get and subscribe to a handle's Focus status",
+    description: "Returns the portable availability signal and its notificationsSilenced inverse. mode, when present, is an opaque per-person Focus UUID and must not be interpreted as a global mode identifier.",
     tags: ["iBlue Focus"],
+  },
+  "POST /api/v1/iblue/focus/sync": {
+    summary: "Recover Focus sharing keys from iCloud",
+    description: "Fetches and decrypts StatusKit invitations from the signed-in account's private iCloud database, injects recovered peer keys, and subscribes to their Focus channels. While done is false, pass the returned zone and continuation token to fetch the next page. Retain the final token to resume a later incremental sync.",
+    tags: ["iBlue Focus"],
+    body: {
+      type: "object",
+      properties: {
+        cachedZone: { type: "string", description: "Resolved StatusKit CloudKit zone returned by a previous page." },
+        continuationToken: { type: "string", description: "Base64 continuation token returned by a previous page." },
+      },
+    },
   },
   "POST /api/v1/iblue/focus/subscribe": {
     summary: "Subscribe to Focus status updates",

@@ -23,6 +23,7 @@ import type {
   IBlueContactSource,
   IBlueContactSummary,
   IBlueConversationBackground,
+  IBlueFocusStatus,
   IBlueReaction,
   IBluePoll,
   IBluePollVote,
@@ -136,6 +137,14 @@ interface ConversationBackgroundRow {
   object_id: string | null;
   url: string | null;
   file_size: number | null;
+  updated_at: number;
+}
+
+interface FocusStatusRow {
+  address_key: string;
+  handle: string;
+  available: number;
+  mode: string | null;
   updated_at: number;
 }
 
@@ -408,6 +417,13 @@ export class BlueBubblesStore {
         is_live INTEGER NOT NULL DEFAULT 0,
         session_id TEXT,
         bundle_id TEXT
+      );
+      CREATE TABLE IF NOT EXISTS focus_status (
+        address_key TEXT PRIMARY KEY,
+        handle TEXT NOT NULL,
+        available INTEGER NOT NULL,
+        mode TEXT,
+        updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS webhook (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1354,6 +1370,43 @@ export class BlueBubblesStore {
       ...(row.object_id ? { objectId: row.object_id } : {}),
       ...(row.url ? { url: row.url } : {}),
       ...(row.file_size === null ? {} : { fileSize: row.file_size }),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  setFocusStatus(status: IBlueFocusStatus): IBlueFocusStatus {
+    this.database.prepare(`
+      INSERT INTO focus_status (address_key, handle, available, mode, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(address_key) DO UPDATE SET
+        handle=excluded.handle,
+        available=excluded.available,
+        mode=excluded.mode,
+        updated_at=excluded.updated_at
+    `).run(
+      contactAddressKey(status.handle),
+      stripTransport(status.handle),
+      status.available ? 1 : 0,
+      status.mode ?? null,
+      status.updatedAt,
+    );
+    return {
+      ...status,
+      handle: stripTransport(status.handle),
+      notificationsSilenced: !status.available,
+    };
+  }
+
+  getFocusStatus(handle: string): IBlueFocusStatus | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM focus_status WHERE address_key = ?
+    `).get(contactAddressKey(handle)) as unknown as FocusStatusRow | undefined;
+    if (!row) return undefined;
+    return {
+      handle: row.handle,
+      available: Boolean(row.available),
+      notificationsSilenced: !Boolean(row.available),
+      ...(row.mode ? { mode: row.mode } : {}),
       updatedAt: row.updated_at,
     };
   }

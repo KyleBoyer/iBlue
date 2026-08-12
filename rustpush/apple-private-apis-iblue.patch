@@ -1,8 +1,124 @@
+diff --git a/icloud-auth/Cargo.toml b/icloud-auth/Cargo.toml
+index d033701..9589d0e 100644
+--- a/icloud-auth/Cargo.toml
++++ b/icloud-auth/Cargo.toml
+@@ -24,6 +24,7 @@ hmac = "0.12.1"
+ num-bigint = "0.4.3"
+ cbc = { version = "0.1.2", features = ["std"] }
+ aes = "0.8.2"
++aes-gcm = "0.10.3"
+ pkcs7 = "0.3.0"
+ reqwest = { version = "0.11.14", features = ["blocking", "json", "default-tls", "cookies"] }
+ omnisette = {path = "../omnisette"}
+diff --git a/icloud-auth/src/anisette.rs b/icloud-auth/src/anisette.rs
+index d1ed4fb..3a50c8f 100644
+--- a/icloud-auth/src/anisette.rs
++++ b/icloud-auth/src/anisette.rs
+@@ -32,6 +32,47 @@ impl AnisetteData {
+         .collect()
+     }
+ 
++    /// GrandSlam headers for iCloud-owned service tokens. The account may have
++    /// originally authenticated through Messages, but shared-channel JWTs are
++    /// owned by the system iCloud account context used by AppleIDSettings.
++    pub fn get_app_token_headers(&self) -> HashMap<String, String> {
++        const ACCEPTABLE_HEADERS: &[&'static str] = &[
++            "X-Apple-I-MD-LU",
++            "X-Apple-I-MD-RINFO",
++            "X-Apple-I-MD-M",
++            "X-Apple-I-MD",
++            "X-Mme-Device-Id",
++        ];
++        self.base_headers
++            .clone()
++            .into_iter()
++            .filter(|(key, _)| ACCEPTABLE_HEADERS.contains(&key.as_str()))
++            .chain([
++                ("X-Apple-AK-Context-Type".to_string(), "icloud".to_string()),
++                (
++                    "X-Apple-Client-App-Name".to_string(),
++                    "AppleIDSettings".to_string(),
++                ),
++                (
++                    "X-Apple-I-Client-Bundle-Id".to_string(),
++                    "com.apple.systempreferences.AppleIDSettings".to_string(),
++                ),
++                (
++                    "X-MMe-Client-Info".to_string(),
++                    self.client_info.update_account_bundle_id.clone(),
++                ),
++                (
++                    "Accept-Language".to_string(),
++                    "en-US,en;q=0.9".to_string(),
++                ),
++                (
++                    "User-Agent".to_string(),
++                    self.client_info.akd_user_agent.clone(),
++                ),
++            ])
++            .collect()
++    }
++
+     pub fn get_postdata_headers(&self) -> HashMap<String, String> {
+         // user must supply, content-type and accept
+         // unaccounted headers: Accept-Encoding, Connection, Host
+@@ -147,6 +188,40 @@ impl AnisetteData {
+         ).chain(self.client_info.hardware_headers.clone().into_iter().map(|(a, b)| (a, Value::String(b)))).collect()
+     }
+ 
++    /// Minimal client-provided data used by GrandSlam's authenticated
++    /// `apptokens` operation. AuthKit sends an iCloud service context here;
++    /// replaying the larger interactive-login CPD causes Apple to reject an
++    /// otherwise valid authenticated session.
++    pub fn get_app_token_cpd(&self) -> Dictionary {
++        const ACCEPTABLE_HEADERS: &[&'static str] = &[
++            "X-Apple-I-Client-Time",
++            "X-Apple-I-MD",
++            "X-Apple-I-MD-LU",
++            "X-Apple-I-MD-M",
++            "X-Apple-I-MD-RINFO",
++            "X-Mme-Device-Id",
++        ];
++        self.base_headers
++            .clone()
++            .into_iter()
++            .filter(|(key, _)| ACCEPTABLE_HEADERS.contains(&key.as_str()))
++            .map(|(key, value)| (key, Value::String(value)))
++            .chain([
++                ("bootstrap".to_string(), Value::Boolean(true)),
++                (
++                    "capp".to_string(),
++                    Value::String("AppleIDSettings".to_string()),
++                ),
++                ("ckgen".to_string(), Value::Boolean(true)),
++                ("icscrec".to_string(), Value::Boolean(true)),
++                ("loc".to_string(), Value::String("en_US".to_string())),
++                ("pbe".to_string(), Value::Boolean(false)),
++                ("prkgen".to_string(), Value::Boolean(true)),
++                ("svct".to_string(), Value::String("iCloud".to_string())),
++            ])
++            .collect()
++    }
++
+     pub fn get_extra_headers(&self) -> HashMap<String, String> {
+         // unaccounted headers: Accept-Encoding, Connection, Host, content-type
+         const ACCEPTABLE_HEADERS: &[&'static str] = &["X-Apple-I-MD-LU", "X-Apple-I-MD-RINFO", "X-Apple-I-MD-M", "X-Apple-I-MD", "X-Mme-Device-Id"];
 diff --git a/icloud-auth/src/client.rs b/icloud-auth/src/client.rs
-index be878fe..7746de4 100644
+index be878fe..4c95cf7 100644
 --- a/icloud-auth/src/client.rs
 +++ b/icloud-auth/src/client.rs
-@@ -90,8 +90,8 @@ pub struct AuthTokenRequest {
+@@ -3,6 +3,10 @@ use std::{collections::HashMap, str::FromStr, sync::Arc, time::{Duration, System
+ // use crate::anisette::AnisetteData;
+ use crate::{anisette::AnisetteData, Error};
+ use aes::cipher::block_padding::Pkcs7;
++use aes::cipher::consts::U16;
++use aes::Aes256;
++use aes_gcm::aead::{Aead, Payload};
++use aes_gcm::AesGcm;
+ use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+ use hmac::{Hmac, Mac};
+ use omnisette::{AnisetteClient, AnisetteProvider, ArcAnisetteClient, LoginClientInfo};
+@@ -90,8 +94,8 @@ pub struct AuthTokenRequest {
  }
  
  pub struct FetchedToken {
@@ -13,8 +129,162 @@ index be878fe..7746de4 100644
  }
  
  pub struct AppleAccount<T: AnisetteProvider> {
+@@ -359,6 +363,142 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+         Some(self.tokens.get(token)?.token.to_string())
+     }
+ 
++    /// Mint a GrandSlam app token for a service that was not included in the
++    /// initial login response.
++    ///
++    /// Apple's account frameworks use this separate `apptokens` operation for
++    /// specialized JWTs such as StatusKit's
++    /// `com.apple.gs.sharedchannels.auth`. The request is authenticated with
++    /// the session key, cookie, and IDMS token stored in the server-provided
++    /// data (SPD); the response is AES-GCM encrypted with that session key.
++    pub async fn fetch_app_token(&mut self, app_name: &str) -> Result<String, Error> {
++        let spd = self.spd.as_ref().ok_or(Error::Parse)?;
++        let dsid = spd
++            .get("adsid")
++            .and_then(Value::as_string)
++            .ok_or(Error::Parse)?
++            .to_string();
++        let auth_token = spd
++            .get("GsIdmsToken")
++            .and_then(Value::as_string)
++            .ok_or(Error::Parse)?
++            .to_string();
++        let session_key = spd
++            .get("sk")
++            .and_then(Value::as_data)
++            .ok_or(Error::Parse)?
++            .to_vec();
++        let cookie = spd
++            .get("c")
++            .and_then(Value::as_data)
++            .ok_or(Error::Parse)?
++            .to_vec();
++
++        let valid_anisette = self.get_anisette().await?;
++        let checksum = Self::create_checksum(&session_key, &dsid, app_name);
++
++        let mut gsa_headers = HeaderMap::new();
++        gsa_headers.insert(
++            "Content-Type",
++            HeaderValue::from_static("text/x-xml-plist"),
++        );
++        gsa_headers.insert("Accept", HeaderValue::from_static("*/*"));
++        gsa_headers.extend(
++            valid_anisette
++                .get_app_token_headers()
++                .into_iter()
++                .map(|(key, value)| {
++                    (
++                        HeaderName::from_str(&key).unwrap(),
++                        HeaderValue::from_str(&value).unwrap(),
++                    )
++                }),
++        );
++
++        let packet = AuthTokenRequest {
++            header: RequestHeader {
++                version: "1.0.1".to_string(),
++            },
++            request: AuthTokenRequestBody {
++                app: vec![app_name.to_string()],
++                c: Value::Data(cookie),
++                cpd: valid_anisette.get_app_token_cpd(),
++                operation: "apptokens".to_string(),
++                t: auth_token,
++                u: dsid,
++                checksum: Value::Data(checksum),
++            },
++        };
++
++        let mut body = Vec::new();
++        plist::to_writer_xml(&mut body, &packet)?;
++        let response = parse_response(
++            self.client
++                .post(GSA_ENDPOINT)
++                .headers(gsa_headers)
++                .body(body)
++                .send()
++                .await,
++        )
++        .await?;
++        Self::check_error(&response)?;
++
++        let encrypted = response
++            .get("et")
++            .and_then(Value::as_data)
++            .ok_or(Error::Parse)?;
++        if encrypted.len() < 3 + 16 + 16 || &encrypted[..3] != b"XYZ" {
++            return Err(Error::Parse);
++        }
++        let associated_data = &encrypted[..3];
++        let iv = &encrypted[3..19];
++        let ciphertext_and_tag = &encrypted[19..];
++        let cipher =
++            <AesGcm<Aes256, U16> as aes_gcm::KeyInit>::new_from_slice(&session_key)
++                .map_err(|_| Error::Parse)?;
++        let plaintext = cipher
++            .decrypt(
++                iv.try_into().map_err(|_| Error::Parse)?,
++                Payload {
++                    msg: ciphertext_and_tag,
++                    aad: associated_data,
++                },
++            )
++            .map_err(|_| Error::Parse)?;
++        let decoded: Dictionary = plist::from_bytes(&plaintext)?;
++        let token_dict = decoded
++            .get("t")
++            .and_then(Value::as_dictionary)
++            .and_then(|tokens| tokens.get(app_name))
++            .and_then(Value::as_dictionary)
++            .ok_or(Error::Parse)?;
++        let token = token_dict
++            .get("token")
++            .and_then(Value::as_string)
++            .ok_or(Error::Parse)?
++            .to_string();
++        let expiration = if let Some(expiry) = token_dict
++            .get("expiry")
++            .and_then(Value::as_unsigned_integer)
++        {
++            SystemTime::UNIX_EPOCH + Duration::from_millis(expiry)
++        } else {
++            let duration = token_dict
++                .get("duration")
++                .and_then(Value::as_unsigned_integer)
++                .ok_or(Error::Parse)?;
++            SystemTime::now() + Duration::from_secs(duration)
++        };
++        self.tokens.insert(
++            app_name.to_string(),
++            FetchedToken {
++                token: token.clone(),
++                expiration,
++            },
++        );
++        Ok(token)
++    }
++
+     pub async fn generate_verification_token(&mut self, request: GenerateVerificationTokenRequest) -> Result<String, Error> {
+         let valid_anisette = self.get_anisette().await?;
+ 
+@@ -744,6 +884,10 @@ impl<T: AnisetteProvider> AppleAccount<T> {
+             .client
+             .post(GSA_ENDPOINT)
+             .headers(gsa_headers.clone())
++            // AuthKit closes the SRP-complete connection before requesting
++            // app tokens. Apple can reject an app-token request made over the
++            // same TLS session even when its cryptographic inputs are valid.
++            .header("Connection", "close")
+             .body(buffer)
+             .send().await;
+ 
 diff --git a/icloud-auth/src/lib.rs b/icloud-auth/src/lib.rs
-index ede480b..e8311a4 100644
+index ede480b..13abd73 100644
 --- a/icloud-auth/src/lib.rs
 +++ b/icloud-auth/src/lib.rs
 @@ -2,7 +2,7 @@ pub mod anisette;
@@ -26,6 +296,13 @@ index ede480b..e8311a4 100644
  pub use omnisette::{LoginClientInfo, default_provider, ArcAnisetteClient, DefaultAnisetteProvider};
  
  
+@@ -34,4 +34,4 @@ pub enum Error {
+     SerdeError(#[from] serde_json::Error),
+     #[error("Disable hardware authentication keys and try again!")]
+     HardwareKeyError,
+-}
+\ No newline at end of file
++}
 diff --git a/omnisette/Cargo.toml b/omnisette/Cargo.toml
 index f35a4ea..952fb71 100644
 --- a/omnisette/Cargo.toml

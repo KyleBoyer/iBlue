@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -610,6 +611,13 @@ struct ConversationBackgroundParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CloudSyncParams {
+    continuation_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FocusSyncParams {
+    cached_zone: Option<String>,
     continuation_token: Option<String>,
 }
 
@@ -1506,6 +1514,8 @@ struct Engine {
     login_session: Option<Arc<LoginSession>>,
     client: Option<Arc<Client>>,
     statuskit_initialized: bool,
+    statuskit_tokens_primed: bool,
+    statuskit_invited_handles: HashSet<String>,
     state_dir: PathBuf,
     credential_service: String,
     credential_backend: CredentialBackend,
@@ -1528,6 +1538,8 @@ impl Engine {
             login_session: None,
             client: None,
             statuskit_initialized: false,
+            statuskit_tokens_primed: false,
+            statuskit_invited_handles: HashSet::new(),
             state_dir: state_dir.to_path_buf(),
             credential_service,
             credential_backend,
@@ -1628,6 +1640,22 @@ impl Engine {
             self.statuskit_initialized = true;
         }
         Ok(client)
+    }
+
+    async fn prime_statuskit_tokens(&mut self) -> Result<(), RpcError> {
+        if self.statuskit_tokens_primed {
+            return Ok(());
+        }
+        self.token_provider
+            .as_ref()
+            .ok_or_else(|| {
+                RpcError::invalid_state("Focus status requires an Apple Account session")
+            })?
+            .ensure_gsa_token_available("com.apple.gs.sharedchannels.auth")
+            .await
+            .map_err(RpcError::native)?;
+        self.statuskit_tokens_primed = true;
+        Ok(())
     }
 
     async fn snapshot(&self) -> Result<Value, RpcError> {
@@ -2089,6 +2117,8 @@ impl Engine {
                     client.stop().await;
                 }
                 self.statuskit_initialized = false;
+                self.statuskit_tokens_primed = false;
+                self.statuskit_invited_handles.clear();
                 if params.deregister {
                     deregister_account(
                         self.config()?.as_ref(),
@@ -2333,23 +2363,107 @@ impl Engine {
                     .map_err(RpcError::native)?;
                 Ok(cloud_attachments_page_to_json(page))
             }
+            "focus.sync" => {
+                let params: FocusSyncParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let continuation_token = params
+                    .continuation_token
+                    .map(|token| {
+                        BASE64.decode(token).map_err(|error| {
+                            RpcError::invalid_params(format!(
+                                "invalid Focus continuation token: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let requested_continuation_token = continuation_token.clone();
+                let client = self.ensure_statuskit().await?;
+                let page = client
+                    .cloud_sync_statuskit_peers(params.cached_zone, continuation_token)
+                    .await
+                    .map_err(RpcError::native)?;
+                let mut injected_handles = page.injected_handles.clone();
+                injected_handles.sort();
+                injected_handles.dedup();
+                if !injected_handles.is_empty() {
+                    client
+                        .get_statuskit_client()
+                        .await
+                        .map_err(RpcError::native)?
+                        .request_handles(injected_handles.clone())
+                        .await;
+                }
+                // CloudKit returns the current synchronization watermark even
+                // when there are no more records. An empty page is therefore
+                // complete despite carrying a continuation token; callers can
+                // retain that token for a later incremental synchronization.
+                let done = page.next_token.is_none()
+                    || (page.records_seen == 0 && page.next_token == requested_continuation_token);
+                Ok(json!({
+                    "resolvedZone": page.resolved_zone,
+                    "continuationToken": page.next_token.map(|token| BASE64.encode(token)),
+                    "done": done,
+                    "fetched": page.fetched,
+                    "inserted": page.inserted,
+                    "alreadyKnown": page.already_known,
+                    "decodeFailed": page.decode_failed,
+                    "recordsSeen": page.records_seen,
+                    "injectedHandles": injected_handles,
+                    "clusterObservations": page.cluster_observations.into_iter().map(|observation| json!({
+                        "channelId": observation.channel_id,
+                        "senderHandle": observation.sender_handle,
+                    })).collect::<Vec<_>>(),
+                    "discoverySummary": page.discovery_summary,
+                }))
+            }
             "focus.subscribe" => {
                 let params: FocusSubscribeParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
                 let client = self.ensure_statuskit().await?;
                 if !params.handles.is_empty() {
-                    client
+                    let statuskit = client
                         .get_statuskit_client()
                         .await
-                        .map_err(RpcError::native)?
-                        .request_handles(params.handles.clone())
-                        .await;
+                        .map_err(RpcError::native)?;
+                    let known_handles = statuskit
+                        .get_known_handles()
+                        .await
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    let missing_handles = params
+                        .handles
+                        .iter()
+                        .filter(|handle| {
+                            !known_handles.contains(*handle)
+                                && !self.statuskit_invited_handles.contains(*handle)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !missing_handles.is_empty() {
+                        self.prime_statuskit_tokens().await?;
+                        let sender = self.sender(None)?;
+                        client
+                            .invite_to_status_sharing(sender, missing_handles.clone())
+                            .await
+                            .map_err(RpcError::native)?;
+                        self.statuskit_invited_handles
+                            .extend(missing_handles.iter().cloned());
+                    }
+                    statuskit.request_handles(params.handles.clone()).await;
+                    return Ok(json!({
+                        "subscribed": params.handles,
+                        "keyExchangeRequested": missing_handles,
+                    }));
                 }
-                Ok(json!({ "subscribed": params.handles }))
+                Ok(json!({
+                    "subscribed": params.handles,
+                    "keyExchangeRequested": [],
+                }))
             }
             "focus.share" => {
                 let params: FocusShareParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                self.prime_statuskit_tokens().await?;
                 let client = self.ensure_statuskit().await?;
                 client
                     .get_statuskit_client()
