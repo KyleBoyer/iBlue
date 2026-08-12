@@ -16,6 +16,26 @@ const cloudSyncBody: JsonSchema = {
     continuationToken: stringProperty("Opaque token returned by the preceding page."),
   },
 };
+const messageReceiptSchema: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["id", "messageGuid", "chatGuid", "type", "source", "eventAt"],
+  properties: {
+    id: { type: "integer", minimum: 1 },
+    messageGuid: stringProperty("GUID of the outgoing message this receipt acknowledges."),
+    chatGuid: stringProperty("BlueBubbles chat GUID containing the message."),
+    type: { type: "string", enum: ["delivered", "read"] },
+    handle: stringProperty("Recipient that produced the receipt, when Apple supplied one."),
+    source: {
+      type: "string",
+      enum: ["live", "compatibility-backfill"],
+      description: "Whether iBlue observed this receipt live or reconstructed it from an existing BlueBubbles timestamp.",
+    },
+    eventAt: { type: "integer", minimum: 0, description: "Apple event timestamp in Unix milliseconds." },
+    observedAt: { type: "integer", minimum: 0, description: "Timestamp when iBlue observed the receipt locally, in Unix milliseconds. Absent for compatibility-backfill rows." },
+    verificationFailed: { type: "boolean", description: "Whether IDS sender verification failed for this receipt." },
+  },
+};
 
 const routeDocumentation: Record<string, FastifySchema> = {
   "GET /api/v1/ping": {
@@ -128,6 +148,50 @@ const routeDocumentation: Record<string, FastifySchema> = {
     summary: "List modern attributed-text capabilities",
     description: "Returns the four static styles, eight inline animations, and UTF-16 range convention supported by iBlue.",
     tags: ["iBlue Messages"],
+  },
+  "GET /api/v1/iblue/message/:guid/receipts": {
+    summary: "List per-recipient delivery and read receipts",
+    description: "Returns durable receipt history for an outgoing message. Each recipient/type pair is retained once, including Apple event time and, for live receipts, local observation time. Existing BlueBubbles timestamps are retained as compatibility-backfill records without inventing a recipient or observation time. dateDelivered and dateRead remain first-observed compatibility summaries. An empty read history means no receipt was observed; it does not prove the message is unread because recipients can disable read receipts.",
+    tags: ["iBlue Messages"],
+    params: {
+      type: "object",
+      required: ["guid"],
+      properties: {
+        guid: stringProperty("GUID of the outgoing message."),
+      },
+    },
+    querystring: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["delivered", "read"] },
+        handle: stringProperty("Optionally filter by recipient address."),
+        offset: { type: "integer", minimum: 0, default: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+      },
+    },
+    response: {
+      200: {
+        type: "object",
+        additionalProperties: false,
+        required: ["status", "message", "data", "metadata"],
+        properties: {
+          status: { type: "integer", const: 200 },
+          message: { type: "string" },
+          data: { type: "array", items: messageReceiptSchema },
+          metadata: {
+            type: "object",
+            additionalProperties: false,
+            required: ["total", "offset", "limit", "count"],
+            properties: {
+              total: { type: "integer", minimum: 0 },
+              offset: { type: "integer", minimum: 0 },
+              limit: { type: "integer", minimum: 1 },
+              count: { type: "integer", minimum: 0 },
+            },
+          },
+        },
+      },
+    },
   },
   "POST /api/v1/message/text": {
     summary: "Send a text message",

@@ -24,6 +24,8 @@ import type {
   IBlueContactSummary,
   IBlueConversationBackground,
   IBlueFocusStatus,
+  IBlueMessageReceipt,
+  IBlueMessageReceiptType,
   IBlueReaction,
   IBluePoll,
   IBluePollVote,
@@ -146,6 +148,19 @@ interface FocusStatusRow {
   available: number;
   mode: string | null;
   updated_at: number;
+}
+
+interface MessageReceiptRow {
+  id: number;
+  message_guid: string;
+  chat_guid: string;
+  receipt_type: IBlueMessageReceiptType;
+  handle_key: string;
+  handle: string | null;
+  source: "live" | "compatibility-backfill";
+  event_at: number;
+  observed_at: number | null;
+  verification_failed: number | null;
 }
 
 interface WebhookRow {
@@ -425,6 +440,46 @@ export class BlueBubblesStore {
         mode TEXT,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS message_receipt (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_guid TEXT NOT NULL REFERENCES message(guid) ON DELETE CASCADE,
+        receipt_type TEXT NOT NULL CHECK(receipt_type IN ('delivered', 'read')),
+        handle_key TEXT NOT NULL,
+        handle TEXT,
+        source TEXT NOT NULL CHECK(source IN ('live', 'compatibility-backfill')),
+        event_at INTEGER NOT NULL,
+        observed_at INTEGER,
+        verification_failed INTEGER,
+        UNIQUE(message_guid, receipt_type, handle_key)
+      );
+      CREATE INDEX IF NOT EXISTS message_receipt_message_time
+        ON message_receipt(message_guid, event_at, id);
+      INSERT OR IGNORE INTO message_receipt (
+        message_guid, receipt_type, handle_key, handle, source,
+        event_at, observed_at, verification_failed
+      )
+      SELECT guid, 'delivered', '@compatibility-backfill', NULL, 'compatibility-backfill',
+        date_delivered, NULL, NULL
+      FROM message
+      WHERE is_from_me = 1 AND date_delivered IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM message_receipt
+          WHERE message_receipt.message_guid = message.guid
+            AND message_receipt.receipt_type = 'delivered'
+        );
+      INSERT OR IGNORE INTO message_receipt (
+        message_guid, receipt_type, handle_key, handle, source,
+        event_at, observed_at, verification_failed
+      )
+      SELECT guid, 'read', '@compatibility-backfill', NULL, 'compatibility-backfill',
+        date_read, NULL, NULL
+      FROM message
+      WHERE is_from_me = 1 AND date_read IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM message_receipt
+          WHERE message_receipt.message_guid = message.guid
+            AND message_receipt.receipt_type = 'read'
+        );
       CREATE TABLE IF NOT EXISTS webhook (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         url TEXT NOT NULL,
@@ -1486,6 +1541,109 @@ export class BlueBubblesStore {
         AND (is_delivered = 0 OR date_delivered IS NULL OR date_read IS NULL)
     `).run(timestamp, timestamp, guid);
     return Number(result.changes) > 0 ? this.getMessage(guid) : undefined;
+  }
+
+  recordMessageReceipt(input: {
+    messageGuid: string;
+    type: IBlueMessageReceiptType;
+    handle?: string;
+    eventAt: number;
+    observedAt?: number;
+    verificationFailed?: boolean;
+  }): IBlueMessageReceipt | undefined {
+    const message = this.#messageByGuid.get(input.messageGuid) as unknown as MessageRow | undefined;
+    if (!message?.is_from_me) return undefined;
+    const handle = input.handle ? stripTransport(input.handle) : undefined;
+    const observedAt = input.observedAt ?? Date.now();
+    const result = this.database.prepare(`
+      INSERT OR IGNORE INTO message_receipt (
+        message_guid, receipt_type, handle_key, handle, source,
+        event_at, observed_at, verification_failed
+      ) VALUES (?, ?, ?, ?, 'live', ?, ?, ?)
+    `).run(
+      input.messageGuid,
+      input.type,
+      handle ? contactAddressKey(handle) : "",
+      handle ?? null,
+      input.eventAt,
+      observedAt,
+      input.verificationFailed === undefined ? null : input.verificationFailed ? 1 : 0,
+    );
+    // A live receipt supersedes a recipient-less row reconstructed from the
+    // legacy compatibility timestamp on an earlier startup.
+    this.database.prepare(`
+      DELETE FROM message_receipt
+      WHERE message_guid = ? AND receipt_type = ? AND source = 'compatibility-backfill'
+    `).run(input.messageGuid, input.type);
+    if (Number(result.changes) === 0) return undefined;
+    return {
+      id: Number(result.lastInsertRowid),
+      messageGuid: input.messageGuid,
+      chatGuid: message.chat_guid,
+      type: input.type,
+      ...(handle ? { handle } : {}),
+      source: "live",
+      eventAt: input.eventAt,
+      observedAt,
+      ...(input.verificationFailed === undefined
+        ? {}
+        : { verificationFailed: input.verificationFailed }),
+    };
+  }
+
+  queryMessageReceipts(
+    messageGuid: string,
+    options: {
+      type?: IBlueMessageReceiptType;
+      handle?: string;
+      offset?: number;
+      limit?: number;
+    } = {},
+  ): { receipts: IBlueMessageReceipt[]; total: number } {
+    const clauses = ["message_receipt.message_guid = ?"];
+    const params: Array<string | number> = [messageGuid];
+    if (options.type) {
+      clauses.push("message_receipt.receipt_type = ?");
+      params.push(options.type);
+    }
+    if (options.handle) {
+      clauses.push("message_receipt.handle_key = ?");
+      params.push(contactAddressKey(options.handle));
+    }
+    const where = `WHERE ${clauses.join(" AND ")}`;
+    const count = this.database.prepare(`
+      SELECT COUNT(*) AS total FROM message_receipt ${where}
+    `).get(...params) as { total: number };
+    const offset = Math.max(options.offset ?? 0, 0);
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 1000);
+    const rows = this.database.prepare(`
+      SELECT message_receipt.*, message.chat_guid
+      FROM message_receipt
+      JOIN message ON message.guid = message_receipt.message_guid
+      ${where}
+      ORDER BY message_receipt.event_at ASC, message_receipt.id ASC
+      LIMIT ? OFFSET ?
+    `).all(...params, limit, offset) as unknown as MessageReceiptRow[];
+    return {
+      receipts: rows.map((row) => this.serializeMessageReceipt(row)),
+      total: Number(count.total),
+    };
+  }
+
+  private serializeMessageReceipt(row: MessageReceiptRow): IBlueMessageReceipt {
+    return {
+      id: row.id,
+      messageGuid: row.message_guid,
+      chatGuid: row.chat_guid,
+      type: row.receipt_type,
+      ...(row.handle ? { handle: row.handle } : {}),
+      source: row.source,
+      eventAt: row.event_at,
+      ...(row.observed_at === null ? {} : { observedAt: row.observed_at }),
+      ...(row.verification_failed === null
+        ? {}
+        : { verificationFailed: Boolean(row.verification_failed) }),
+    };
   }
 
   markMessageError(

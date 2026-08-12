@@ -78,6 +78,7 @@ const WEBHOOK_EVENTS = new Set([
   "iblue-focus-keys-received",
   "iblue-focus-reshare-received",
   "iblue-focus-decrypt-failed",
+  "iblue-message-receipt",
   "iblue-conversation-background-changed",
   "scheduled-message-created",
   "scheduled-message-updated",
@@ -1207,6 +1208,32 @@ export class BlueBubblesServer {
       if (!message) return reply.code(404).send(notFound("Message does not exist!"));
       return success(message);
     });
+    this.app.get<{ Params: { guid: string }; Querystring: Query }>(
+      "/api/v1/iblue/message/:guid/receipts",
+      async (request, reply) => {
+        if (!this.service.store.getMessage(request.params.guid)) {
+          return reply.code(404).send(notFound("Message does not exist!"));
+        }
+        const type = request.query.type;
+        if (type !== undefined && type !== "delivered" && type !== "read") {
+          throw new RequestError(400, "type must be delivered or read", "VALIDATION_ERROR");
+        }
+        const offset = Math.max(Math.trunc(numberValue(request.query.offset, 0)), 0);
+        const limit = Math.min(Math.max(Math.trunc(numberValue(request.query.limit, 100)), 1), 1000);
+        const result = this.service.store.queryMessageReceipts(request.params.guid, {
+          ...(type ? { type } : {}),
+          ...(request.query.handle ? { handle: request.query.handle } : {}),
+          offset,
+          limit,
+        });
+        return success(result.receipts, "Successfully fetched message receipts!", {
+          total: result.total,
+          offset,
+          limit,
+          count: result.receipts.length,
+        });
+      },
+    );
 
     // BlueBubbles accepts both a path-parameter and a body-parameter spelling
     // of edit and unsend, and clients pick either one. Both spellings share a
@@ -2079,6 +2106,8 @@ export class BlueBubblesServer {
           liveSharedLocations: "/api/v1/iblue/location/live",
           messageFlair: "/api/v1/iblue/message/flair",
           attributedText: "/api/v1/iblue/message/text-effects",
+          messageReceipts: "/api/v1/iblue/message/:guid/receipts",
+          messageReceiptEvent: "iblue-message-receipt",
           stickerReactions: "/api/v1/iblue/message/sticker",
           polls: "/api/v1/iblue/poll/:messageGuid",
           richLinks: "message.iBlue.richLink",

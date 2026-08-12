@@ -215,6 +215,26 @@ export interface IBlueFocusStatus {
   updatedAt: number;
 }
 
+export type IBlueMessageReceiptType = "delivered" | "read";
+
+/**
+ * Additive receipt evidence retained per sender. BlueBubbles' dateDelivered
+ * and dateRead fields remain the first-observed compatibility summary.
+ */
+export interface IBlueMessageReceipt {
+  id: number;
+  messageGuid: string;
+  chatGuid: string;
+  type: IBlueMessageReceiptType;
+  handle?: string;
+  source: "live" | "compatibility-backfill";
+  /** Apple event timestamp in Unix milliseconds. */
+  eventAt: number;
+  /** Local observation time; absent for rows reconstructed from compatibility columns. */
+  observedAt?: number;
+  verificationFailed?: boolean;
+}
+
 export interface IBluePollOption {
   identifier: string;
   text: string;

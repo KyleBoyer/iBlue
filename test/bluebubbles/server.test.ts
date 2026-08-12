@@ -898,7 +898,7 @@ test("receipts racing the send response are published after the outgoing message
     handles: snapshot.handles,
     updatedAt: new Date().toISOString(),
   });
-  const events: Array<{ type: string; data: { guid?: string } }> = [];
+  const events: Array<{ type: string; data: { guid?: string; messageGuid?: string } }> = [];
   service.on("event", (event) => events.push(event));
 
   const sent = await service.sendText({
@@ -909,9 +909,14 @@ test("receipts racing the send response are published after the outgoing message
   assert.deepEqual(events.map(({ type }) => type), [
     "new-message",
     "updated-message",
+    "iblue-message-receipt",
     "updated-message",
+    "iblue-message-receipt",
   ]);
-  assert.deepEqual(events.map(({ data }) => data.guid), ["sent-guid", "sent-guid", "sent-guid"]);
+  assert.deepEqual(
+    events.map(({ data }) => data.guid ?? data.messageGuid),
+    ["sent-guid", "sent-guid", "sent-guid", "sent-guid", "sent-guid"],
+  );
   assert.equal(store.getMessage("sent-guid")?.isDelivered, true);
   assert.equal(store.getMessage("sent-guid")?.dateDelivered, 100);
   assert.equal(store.getMessage("sent-guid")?.dateRead, 200);
@@ -926,7 +931,7 @@ test("receipts racing the send response are published after the outgoing message
     readReceipt: true,
   });
   await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
-  assert.equal(events.length, 3, "duplicate receipt must not emit another updated-message");
+  assert.equal(events.length, 5, "duplicate receipt must not emit another event");
 });
 
 test("APNs replay emits each incoming message and typing envelope only once", async (t) => {
@@ -1176,6 +1181,9 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     paths: Record<string, Record<string, {
       summary?: string;
       requestBody?: { content?: Record<string, { schema?: Record<string, unknown> }> };
+      responses?: Record<string, {
+        content?: Record<string, { schema?: Record<string, unknown> }>;
+      }>;
     }>>;
   };
   assert.equal(openApi.openapi, "3.1.0");
@@ -1197,6 +1205,17 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     openApi.paths["/api/v1/iblue/focus/sync"]?.post?.summary,
     "Recover Focus sharing keys from iCloud",
   );
+  const receiptDocs = openApi.paths["/api/v1/iblue/message/{guid}/receipts"]?.get;
+  assert.equal(receiptDocs?.summary, "List per-recipient delivery and read receipts");
+  const receiptResponseSchema = receiptDocs?.responses?.["200"]?.content?.["application/json"]?.schema;
+  assert.ok(receiptResponseSchema);
+  const receiptDataSchema = (receiptResponseSchema.properties as Record<string, Record<string, unknown>>).data;
+  assert.ok(receiptDataSchema);
+  assert.equal(receiptDataSchema.type, "array");
+  assert.deepEqual(
+    (receiptDataSchema.items as { required: string[] }).required,
+    ["id", "messageGuid", "chatGuid", "type", "source", "eventAt"],
+  );
   const createShareSchema = createShareDocs?.requestBody?.content?.["multipart/form-data"]?.schema;
   assert.ok(createShareSchema);
   assert.deepEqual(createShareSchema.required, ["chatGuid", "media"]);
@@ -1212,7 +1231,14 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   await assert.rejects(stat(staleUpload));
   type TestWebhook = {
     type: string;
-    data: { guid?: string; aliases?: string[]; iBlue?: { senderVerificationFailed?: boolean } };
+    data: {
+      guid?: string;
+      messageGuid?: string;
+      type?: string;
+      handle?: string;
+      aliases?: string[];
+      iBlue?: { senderVerificationFailed?: boolean };
+    };
   };
   let resolveWebhook!: (value: TestWebhook) => void;
   const webhookDelivery = new Promise<TestWebhook>((resolve) => {
@@ -1221,6 +1247,10 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   let resolveAliasWebhook!: (value: TestWebhook) => void;
   const aliasWebhookDelivery = new Promise<TestWebhook>((resolve) => {
     resolveAliasWebhook = resolve;
+  });
+  let resolveReceiptWebhook!: (value: TestWebhook) => void;
+  const receiptWebhookDelivery = new Promise<TestWebhook>((resolve) => {
+    resolveReceiptWebhook = resolve;
   });
   let retryWebhookAttempts = 0;
   const retryWebhookDeliveryIds: string[] = [];
@@ -1241,6 +1271,8 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
           return;
         }
         resolveRetryWebhook(payload);
+      } else if (request.url === "/receipt") {
+        resolveReceiptWebhook(payload);
       } else if (payload.type === "imessage-aliases-removed") {
         resolveAliasWebhook(payload);
       } else {
@@ -1287,6 +1319,8 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
           richLinks: string;
           icloudShares: string;
           icloudShareCreate: string;
+          messageReceipts: string;
+          messageReceiptEvent: string;
         };
       };
     };
@@ -1313,6 +1347,8 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(infoBody.data.iBlue.extensions.richLinks, "message.iBlue.richLink");
   assert.equal(infoBody.data.iBlue.extensions.icloudShares, "/api/v1/iblue/icloud-share/:messageGuid");
   assert.equal(infoBody.data.iBlue.extensions.icloudShareCreate, "/api/v1/iblue/icloud-share/create");
+  assert.equal(infoBody.data.iBlue.extensions.messageReceipts, "/api/v1/iblue/message/:guid/receipts");
+  assert.equal(infoBody.data.iBlue.extensions.messageReceiptEvent, "iblue-message-receipt");
 
   const flairCatalog = await fetch(`${listening.address}/api/v1/iblue/message/flair?password=secret`);
   const flairCatalogBody = await flairCatalog.json() as {
@@ -1627,6 +1663,7 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   );
 
   const deliveredAt = Date.now() + 1_000;
+  const deliveryReceiptEvent = serviceEvent(service, "iblue-message-receipt");
   const deliveryEvent = new Promise<{ type: string; data: {
     guid: string; isDelivered: boolean; dateDelivered: number; subject: string;
     expressiveSendStyleId: string; iBlue?: { senderVerificationFailed?: boolean };
@@ -1650,8 +1687,19 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(deliveredUpdate.data.subject, "subject line");
   assert.equal(deliveredUpdate.data.expressiveSendStyleId, "com.apple.messages.effect.CKConfettiEffect");
   assert.equal(deliveredUpdate.data.iBlue?.senderVerificationFailed, false);
+  const deliveryReceipt = await deliveryReceiptEvent as {
+    messageGuid: string; type: string; handle?: string; eventAt: number;
+    observedAt: number; verificationFailed?: boolean;
+  };
+  assert.equal(deliveryReceipt.messageGuid, "sent-guid");
+  assert.equal(deliveryReceipt.type, "delivered");
+  assert.equal(deliveryReceipt.handle, "friend@example.com");
+  assert.equal(deliveryReceipt.eventAt, deliveredAt);
+  assert.ok(deliveryReceipt.observedAt > 0);
+  assert.equal(deliveryReceipt.verificationFailed, false);
 
   const readAt = deliveredAt + 1_000;
+  const readReceiptEvent = serviceEvent(service, "iblue-message-receipt");
   const readEvent = new Promise<{ type: string; data: {
     guid: string; dateRead: number; dateDelivered: number;
     iBlue?: { senderVerificationFailed?: boolean };
@@ -1673,6 +1721,49 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(readUpdate.data.dateRead, readAt);
   assert.equal(readUpdate.data.dateDelivered, deliveredAt);
   assert.equal(readUpdate.data.iBlue?.senderVerificationFailed, true);
+  const readReceipt = await readReceiptEvent as {
+    messageGuid: string; type: string; handle?: string; eventAt: number;
+    verificationFailed?: boolean;
+  };
+  assert.equal(readReceipt.messageGuid, "sent-guid");
+  assert.equal(readReceipt.type, "read");
+  assert.equal(readReceipt.handle, "friend@example.com");
+  assert.equal(readReceipt.eventAt, readAt);
+  assert.equal(readReceipt.verificationFailed, true);
+
+  const secondReadAt = readAt + 1_000;
+  const secondReadReceiptEvent = serviceEvent(service, "iblue-message-receipt");
+  engine.emit("message.received", {
+    uuid: "sent-guid",
+    sender: "mailto:second@example.com",
+    participants: ["mailto:friend@example.com", "mailto:second@example.com"],
+    timestampMs: secondReadAt,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    readReceipt: true,
+  });
+  const secondReadReceipt = await secondReadReceiptEvent as {
+    messageGuid: string; type: string; handle?: string; eventAt: number;
+  };
+  assert.equal(secondReadReceipt.handle, "second@example.com");
+  assert.equal(secondReadReceipt.eventAt, secondReadAt);
+  assert.equal(store.getMessage("sent-guid")?.dateRead, readAt);
+
+  const receiptsResponse = await fetch(
+    `${listening.address}/api/v1/iblue/message/sent-guid/receipts?password=secret&type=read`,
+  );
+  const receiptsBody = await receiptsResponse.json() as {
+    data: Array<{ type: string; handle?: string; eventAt: number; observedAt: number }>;
+    metadata: { total: number; count: number };
+  };
+  assert.equal(receiptsResponse.status, 200, JSON.stringify(receiptsBody));
+  assert.equal(receiptsBody.metadata.total, 2);
+  assert.equal(receiptsBody.metadata.count, 2);
+  assert.deepEqual(receiptsBody.data.map(({ type, handle, eventAt }) => ({ type, handle, eventAt })), [
+    { type: "read", handle: "friend@example.com", eventAt: readAt },
+    { type: "read", handle: "second@example.com", eventAt: secondReadAt },
+  ]);
 
   await store.ingestIncoming({
     uuid: "incoming-unread-guid",
@@ -2635,6 +2726,46 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(delivered.type, "new-message");
   assert.equal(delivered.data.guid, "incoming-webhook-guid");
   assert.equal(delivered.data.iBlue?.senderVerificationFailed, true);
+
+  const receiptWebhook = await fetch(`${listening.address}/api/v1/webhook?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      url: `http://127.0.0.1:${webhookPort}/receipt`,
+      events: ["iblue-message-receipt"],
+    }),
+  });
+  assert.equal(receiptWebhook.status, 200);
+  const receiptSocketDelivery = new Promise<{
+    messageGuid: string; type: string; handle?: string;
+  }>((resolve) => socket!.once("iblue-message-receipt", resolve));
+  engine.emit("message.received", {
+    uuid: "sent-guid",
+    sender: "mailto:webhook-reader@example.com",
+    participants: ["mailto:webhook-reader@example.com"],
+    timestampMs: readAt + 2_000,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    readReceipt: true,
+  });
+  const [receiptWebhookPayload, receiptSocketPayload] = await Promise.all([
+    Promise.race([
+      receiptWebhookDelivery,
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error("receipt webhook delivery timed out")),
+        2_000,
+      )),
+    ]),
+    receiptSocketDelivery,
+  ]);
+  assert.equal(receiptWebhookPayload.type, "iblue-message-receipt");
+  assert.equal(receiptWebhookPayload.data.messageGuid, "sent-guid");
+  assert.equal(receiptWebhookPayload.data.type, "read");
+  assert.equal(receiptWebhookPayload.data.handle, "webhook-reader@example.com");
+  assert.equal(receiptSocketPayload.messageGuid, "sent-guid");
+  assert.equal(receiptSocketPayload.type, "read");
+  assert.equal(receiptSocketPayload.handle, "webhook-reader@example.com");
 
   const retryWebhook = await fetch(`${listening.address}/api/v1/webhook?password=secret`, {
     method: "POST",

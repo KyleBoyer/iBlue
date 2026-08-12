@@ -1149,19 +1149,22 @@ export class BlueBubblesService extends EventEmitter {
     const controls = this.#pendingOutgoingControls.get(key);
     if (!controls) return;
     this.#pendingOutgoingControls.delete(key);
-    for (const { message } of controls) {
-      if (!this.#applyOutgoingControl(message)) this.#bufferOutgoingControl(message);
+    for (const { message, receivedAt } of controls) {
+      if (!this.#applyOutgoingControl(message, receivedAt)) {
+        this.#bufferOutgoingControl(message, receivedAt);
+      }
     }
   }
 
   #handleOutgoingControl(message: IncomingMessage): void {
     const key = outgoingControlTarget(message).toLowerCase();
-    if (this.#outgoingAnnouncements.has(key) || !this.#applyOutgoingControl(message)) {
-      this.#bufferOutgoingControl(message);
+    const receivedAt = Date.now();
+    if (this.#outgoingAnnouncements.has(key) || !this.#applyOutgoingControl(message, receivedAt)) {
+      this.#bufferOutgoingControl(message, receivedAt);
     }
   }
 
-  #applyOutgoingControl(message: IncomingMessage): boolean {
+  #applyOutgoingControl(message: IncomingMessage, observedAt = Date.now()): boolean {
     const target = outgoingControlTarget(message);
     const existing = this.store.getMessage(target);
     if (!existing) return false;
@@ -1169,25 +1172,40 @@ export class BlueBubblesService extends EventEmitter {
     // buffering forever if corrupt or unrelated traffic reuses that UUID.
     if (!existing.isFromMe) return true;
 
+    const eventAt = message.timestampMs || observedAt;
+    const receipt = message.error
+      ? undefined
+      : this.store.recordMessageReceipt({
+        messageGuid: target,
+        type: message.readReceipt ? "read" : "delivered",
+        ...(message.sender ? { handle: message.sender } : {}),
+        eventAt,
+        observedAt,
+        ...(message.verificationFailed === undefined
+          ? {}
+          : { verificationFailed: message.verificationFailed }),
+      });
     const updated = message.error
       ? this.store.markMessageError(target, message.error)
       : message.readReceipt
-        ? this.store.markMessageRead(target, message.timestampMs || Date.now())
-        : this.store.markMessageDelivered(target, message.timestampMs || Date.now());
-    if (!updated) return true;
-    const serialized = message.verificationFailed === undefined
-      ? updated
-      : {
-          ...updated,
-          iBlue: { ...updated.iBlue, senderVerificationFailed: message.verificationFailed },
-        };
-    this.dispatch(message.error ? "message-send-error" : "updated-message", serialized);
-    this.scheduleSnapshot();
+        ? this.store.markMessageRead(target, eventAt)
+        : this.store.markMessageDelivered(target, eventAt);
+    if (updated) {
+      const serialized = message.verificationFailed === undefined
+        ? updated
+        : {
+            ...updated,
+            iBlue: { ...updated.iBlue, senderVerificationFailed: message.verificationFailed },
+          };
+      this.dispatch(message.error ? "message-send-error" : "updated-message", serialized);
+    }
+    if (receipt) this.dispatch("iblue-message-receipt", receipt);
+    if (updated || receipt) this.scheduleSnapshot();
     return true;
   }
 
-  #bufferOutgoingControl(message: IncomingMessage): void {
-    const now = Date.now();
+  #bufferOutgoingControl(message: IncomingMessage, receivedAt = Date.now()): void {
+    const now = receivedAt;
     const cutoff = now - 15 * 60_000;
     for (const [key, controls] of this.#pendingOutgoingControls) {
       const live = controls.filter(({ receivedAt }) => receivedAt >= cutoff);

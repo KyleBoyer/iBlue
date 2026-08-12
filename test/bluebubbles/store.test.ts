@@ -69,6 +69,107 @@ test("duplicate delivery and read controls do not create repeated state transiti
   assert.equal(store.getMessage("receipt-guid")?.dateRead, 200);
 });
 
+test("message receipt history retains each recipient and receipt type", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-store-receipt-history-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  store.ensureDirectChat("iMessage;-;friend@example.com", {
+    participants: ["mailto:friend@example.com"],
+  });
+  store.insertOutgoing({
+    guid: "history-guid",
+    chatGuid: "iMessage;-;friend@example.com",
+    text: "hello group",
+  });
+
+  assert.ok(store.recordMessageReceipt({
+    messageGuid: "history-guid",
+    type: "delivered",
+    handle: "mailto:friend@example.com",
+    eventAt: 100,
+    observedAt: 110,
+    verificationFailed: false,
+  }));
+  assert.ok(store.recordMessageReceipt({
+    messageGuid: "history-guid",
+    type: "read",
+    handle: "mailto:friend@example.com",
+    eventAt: 200,
+    observedAt: 215,
+  }));
+  assert.ok(store.recordMessageReceipt({
+    messageGuid: "history-guid",
+    type: "read",
+    handle: "mailto:second@example.com",
+    eventAt: 300,
+    observedAt: 320,
+  }));
+  assert.equal(store.recordMessageReceipt({
+    messageGuid: "history-guid",
+    type: "read",
+    handle: "mailto:friend@example.com",
+    eventAt: 400,
+    observedAt: 420,
+  }), undefined);
+
+  const all = store.queryMessageReceipts("history-guid");
+  assert.equal(all.total, 3);
+  assert.deepEqual(all.receipts.map(({ type, handle, source, eventAt, observedAt }) => ({
+    type, handle, source, eventAt, observedAt,
+  })), [
+    { type: "delivered", handle: "friend@example.com", source: "live", eventAt: 100, observedAt: 110 },
+    { type: "read", handle: "friend@example.com", source: "live", eventAt: 200, observedAt: 215 },
+    { type: "read", handle: "second@example.com", source: "live", eventAt: 300, observedAt: 320 },
+  ]);
+  const secondReader = store.queryMessageReceipts("history-guid", {
+    type: "read",
+    handle: "second@example.com",
+  });
+  assert.equal(secondReader.total, 1);
+  assert.equal(secondReader.receipts[0]?.chatGuid, "iMessage;-;friend@example.com");
+});
+
+test("legacy message timestamps backfill receipt history without fabricated provenance", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-store-receipt-backfill-test-"));
+  const databasePath = join(root, "test.sqlite");
+  const attachmentRoot = join(root, "attachments");
+  let store = new BlueBubblesStore(databasePath, attachmentRoot);
+  t.after(() => store.close());
+  store.ensureDirectChat("iMessage;-;friend@example.com", {
+    participants: ["mailto:friend@example.com"],
+  });
+  store.insertOutgoing({
+    guid: "legacy-receipt-guid",
+    chatGuid: "iMessage;-;friend@example.com",
+    text: "legacy receipt",
+  });
+  store.markMessageDelivered("legacy-receipt-guid", 100);
+  store.markMessageRead("legacy-receipt-guid", 200);
+  store.database.exec("DROP TABLE message_receipt");
+  store.close();
+
+  store = new BlueBubblesStore(databasePath, attachmentRoot);
+  const history = store.queryMessageReceipts("legacy-receipt-guid");
+  assert.deepEqual(history.receipts.map(({ type, source, eventAt, handle, observedAt }) => ({
+    type, source, eventAt, handle, observedAt,
+  })), [
+    {
+      type: "delivered",
+      source: "compatibility-backfill",
+      eventAt: 100,
+      handle: undefined,
+      observedAt: undefined,
+    },
+    {
+      type: "read",
+      source: "compatibility-backfill",
+      eventAt: 200,
+      handle: undefined,
+      observedAt: undefined,
+    },
+  ]);
+});
+
 test("incoming event claims reclaim crashes, survive completion, and release failures", async () => {
   const root = await mkdtemp(join(tmpdir(), "iblue-store-event-claim-test-"));
   const databasePath = join(root, "test.sqlite");
