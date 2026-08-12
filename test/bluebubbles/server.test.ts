@@ -21,6 +21,8 @@ import type {
   InitializeParams,
   NativeFindMyFollow,
   SendAttachmentParams,
+  SendComponentParams,
+  SendConversationBackgroundParams,
   SendEditParams,
   SendGroupIconParams,
   SendGroupLeaveParams,
@@ -69,6 +71,9 @@ test("BlueBubbles public computer IDs are stable, profile-scoped, and opaque", (
 class FakeEngine extends EventEmitter implements IMessageEngine {
   currentSnapshot: EngineSnapshot = { ...snapshot, handles: [...snapshot.handles] };
   readonly messages: SendMessageParams[] = [];
+  readonly components: SendComponentParams[] = [];
+  readonly backgrounds: SendConversationBackgroundParams[] = [];
+  readonly focusSubscriptions: string[][] = [];
   readonly reactions: SendReactionParams[] = [];
   readonly stickerReactions: Array<{ params: SendStickerReactionParams; data: Buffer }> = [];
   readonly stickerUpdates: UpdateStickerReactionParams[] = [];
@@ -167,6 +172,36 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   sendMessage(params: SendMessageParams): Promise<{ guid: string }> {
     this.messages.push(params);
     return Promise.resolve({ guid: "sent-guid" });
+  }
+  sendComponent(params: SendComponentParams): Promise<{ guid: string }> {
+    this.components.push(params);
+    return Promise.resolve({ guid: "component-guid" });
+  }
+  setConversationBackground(params: SendConversationBackgroundParams): Promise<{ guid: string }> {
+    this.backgrounds.push(params);
+    return Promise.resolve({ guid: "background-guid" });
+  }
+  syncICloudContacts(): Promise<{ vcards: string[]; syncedAt: number }> {
+    return Promise.resolve({
+      syncedAt: 1234,
+      vcards: ["BEGIN:VCARD\nVERSION:3.0\nFN:Cloud Friend\nEMAIL:cloud@example.com\nEND:VCARD"],
+    });
+  }
+  subscribeFocus(handles: string[]): Promise<{ subscribed: string[] }> {
+    this.focusSubscriptions.push(handles);
+    return Promise.resolve({ subscribed: handles });
+  }
+  shareFocus(): Promise<{ shared: boolean }> {
+    return Promise.resolve({ shared: true });
+  }
+  syncCloudChats() {
+    return Promise.resolve({ continuationToken: "chat-next", status: 2, done: false, chats: [] });
+  }
+  syncCloudMessages() {
+    return Promise.resolve({ status: 3, done: true, messages: [] });
+  }
+  syncCloudAttachments() {
+    return Promise.resolve({ status: 3, done: true, attachments: [] });
   }
   sendReaction(params: SendReactionParams): Promise<{ guid: string }> {
     this.reactions.push(params);
@@ -505,6 +540,155 @@ test("iCloud Photos API resolves, downloads, and sends native share balloons", a
   assert.equal(engine.freshICloudShares[0]?.title, "Fresh test share");
   assert.deepEqual(engine.freshICloudShares[0]?.data, Buffer.from("fresh-jpeg-bytes"));
   assert.ok(engine.messages.at(-1)?.text.startsWith("\x00ICL\x01"));
+});
+
+test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native capabilities", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-protocol-extensions-test-"));
+  const engine = new FakeEngine();
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  store.ensureDirectChat("iMessage;-;friend@example.com", {
+    participants: ["mailto:friend@example.com"],
+  });
+  const service = new BlueBubblesService({
+    profile: "test",
+    password: "secret",
+    engine,
+    store,
+    sessionStore: new SessionStore("test", join(root, "session.json")),
+  });
+  await service.start({
+    version: 1,
+    profile: "test",
+    users: "users",
+    identity: "identity",
+    handles: snapshot.handles,
+    updatedAt: new Date().toISOString(),
+  });
+  const api = new BlueBubblesServer({ service, port: 0 });
+  const listening = await api.start();
+  t.after(async () => {
+    await api.stop();
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const componentResponse = await fetch(`${listening.address}/api/v1/iblue/message/component?password=secret`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      chatGuid: "iMessage;-;friend@example.com",
+      bundleId: "com.example.MessagesExtension",
+      appName: "Example",
+      url: "data:,fixture",
+      caption: "Component title",
+      isLive: true,
+    }),
+  });
+  assert.equal(componentResponse.status, 200, await componentResponse.text());
+  assert.equal(engine.components[0]?.caption, "Component title");
+  assert.equal(store.getMessage("component-guid")?.iBlue?.component?.url, "data:,fixture");
+
+  const backgroundResponse = await fetch(
+    `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ remove: true }),
+    },
+  );
+  assert.equal(backgroundResponse.status, 200, await backgroundResponse.text());
+  assert.equal(engine.backgrounds.length, 1);
+  assert.equal(store.getConversationBackground("iMessage;-;friend@example.com")?.removed, true);
+
+  const presetCatalogResponse = await fetch(
+    `${listening.address}/api/v1/iblue/background/presets?password=secret`,
+  );
+  assert.equal(presetCatalogResponse.status, 200);
+  const presetCatalog = await presetCatalogResponse.json() as {
+    data: Array<{ identifier: string; family: string; animated: boolean }>;
+  };
+  assert.equal(presetCatalog.data.length, 12);
+  assert.deepEqual(
+    presetCatalog.data.find((background) => background.identifier === "clouds_4"),
+    { identifier: "clouds_4", family: "clouds", name: "Haze", animated: true },
+  );
+
+  const presetResponse = await fetch(
+    `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "aurora_1" }),
+    },
+  );
+  assert.equal(presetResponse.status, 200, await presetResponse.text());
+  assert.equal(engine.backgrounds.at(-1)?.preset, "aurora_1");
+  assert.deepEqual(store.getConversationBackground("iMessage;-;friend@example.com"), {
+    removed: false,
+    preset: "aurora_1",
+    updatedAt: store.getConversationBackground("iMessage;-;friend@example.com")?.updatedAt,
+  });
+
+  const invalidPresetResponse = await fetch(
+    `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ preset: "clouds_7" }),
+    },
+  );
+  assert.equal(invalidPresetResponse.status, 400, await invalidPresetResponse.text());
+  const backgroundEvent = serviceEvent(service, "iblue-conversation-background-changed");
+  engine.emit("message.received", {
+    uuid: "incoming-background-guid",
+    sender: "mailto:friend@example.com",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 4_000,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [],
+    conversationBackground: {
+      remove: false,
+      preset: "clouds_4",
+      objectId: "background-object",
+      url: "https://example.invalid/mmcs",
+      fileSize: 456,
+    },
+  });
+  await backgroundEvent;
+  assert.equal(store.getConversationBackground("iMessage;-;friend@example.com")?.objectId, "background-object");
+  assert.equal(store.getConversationBackground("iMessage;-;friend@example.com")?.preset, "clouds_4");
+
+  const contactsResponse = await fetch(`${listening.address}/api/v1/iblue/contact/icloud/sync?password=secret`, {
+    method: "POST",
+  });
+  assert.equal(contactsResponse.status, 200, await contactsResponse.text());
+  assert.equal(store.getContact("cloud@example.com")?.source, "icloud-carddav");
+
+  const focusUrl = `${listening.address}/api/v1/handle/${encodeURIComponent("friend@example.com")}/focus?password=secret`;
+  assert.equal((await fetch(focusUrl)).status, 200);
+  assert.deepEqual(engine.focusSubscriptions.at(-1), ["mailto:friend@example.com"]);
+  engine.emit("focus.updated", {
+    handle: "mailto:friend@example.com",
+    available: false,
+    mode: "com.apple.focus.mode.work",
+    updatedAt: 5000,
+  });
+  const focus = await (await fetch(focusUrl)).json() as { data: { mode?: string } };
+  assert.equal(focus.data.mode, "com.apple.focus.mode.work");
+
+  const cloudResponse = await fetch(
+    `${listening.address}/api/v1/iblue/cloud/messages/chats/sync?password=secret`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    },
+  );
+  const cloudBody = await cloudResponse.json() as { data: { continuationToken?: string } };
+  assert.equal(cloudResponse.status, 200, JSON.stringify(cloudBody));
+  assert.equal(cloudBody.data.continuationToken, "chat-next");
 });
 
 test("passive IDS mode rejects BlueBubbles outbound traffic locally", async (t) => {
@@ -945,10 +1129,10 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(createShareDocs?.summary, "Create and send a fresh iCloud Photos share");
   const createShareSchema = createShareDocs?.requestBody?.content?.["multipart/form-data"]?.schema;
   assert.ok(createShareSchema);
-  assert.deepEqual(createShareSchema.required, ["chatGuid", "photo"]);
+  assert.deepEqual(createShareSchema.required, ["chatGuid", "media"]);
   assert.deepEqual(
-    (createShareSchema.properties as Record<string, unknown>).photo,
-    { type: "string", format: "binary", description: "JPEG image." },
+    (createShareSchema.properties as Record<string, unknown>).media,
+    { type: "string", format: "binary", description: "JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media." },
   );
 
   const pluginOpenApiResponse = await fetch(`${listening.address}/docs/json`);

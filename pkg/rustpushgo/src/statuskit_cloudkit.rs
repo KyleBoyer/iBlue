@@ -271,9 +271,8 @@ impl Client {
         let cm = self.get_or_init_cloud_messages_client().await?;
 
         // Decide which candidate(s) to try.
-        let parsed_cache: Option<(usize, String)> = cached_zone
-            .as_deref()
-            .and_then(parse_cached_zone);
+        let parsed_cache: Option<(usize, String)> =
+            cached_zone.as_deref().and_then(parse_cached_zone);
         let candidates_to_try: Vec<usize> = match &parsed_cache {
             Some((idx, _)) => vec![*idx],
             None => (0..CANDIDATE_CONTAINERS.len()).collect(),
@@ -354,10 +353,7 @@ impl Client {
                         idx, e
                     );
                     return Err(WrappedError::GenericError {
-                        msg: format!(
-                            "StatusKit-CloudKit cached-path failed (idx={}): {}",
-                            idx, e
-                        ),
+                        msg: format!("StatusKit-CloudKit cached-path failed (idx={}): {}", idx, e),
                     });
                 }
             }
@@ -635,18 +631,14 @@ async fn try_fetch_zone<P: omnisette::AnisetteProvider>(
     Ok(None)
 }
 
-fn record_type_name(
-    rec: &cloudkit_proto::retrieve_changes_response::RecordChange,
-) -> Option<&str> {
+fn record_type_name(rec: &cloudkit_proto::retrieve_changes_response::RecordChange) -> Option<&str> {
     rec.record
         .as_ref()
         .and_then(|r| r.r#type.as_ref())
         .and_then(|t| t.name.as_deref())
 }
 
-fn record_id_name(
-    rec: &cloudkit_proto::retrieve_changes_response::RecordChange,
-) -> Option<&str> {
+fn record_id_name(rec: &cloudkit_proto::retrieve_changes_response::RecordChange) -> Option<&str> {
     rec.identifier
         .as_ref()
         .and_then(|i| i.value.as_ref())
@@ -716,12 +708,10 @@ fn find_field<'a>(
     name: &str,
 ) -> Option<&'a cloudkit_proto::record::Field> {
     let record = rec.record.as_ref()?;
-    record.record_field.iter().find(|f| {
-        f.identifier
-            .as_ref()
-            .and_then(|i| i.name.as_deref())
-            == Some(name)
-    })
+    record
+        .record_field
+        .iter()
+        .find(|f| f.identifier.as_ref().and_then(|i| i.name.as_deref()) == Some(name))
 }
 
 /// Decrypt an encrypted STRING_TYPE field through the PCS encryptor.
@@ -997,10 +987,7 @@ fn build_shared_device(
     // Build the canonical serialized form of StatusKitSharedDevice.
     let mut dict = plist::Dictionary::new();
     dict.insert("from".into(), PlistValue::String(sender));
-    dict.insert(
-        "signature".into(),
-        PlistValue::Data(sig_der),
-    );
+    dict.insert("signature".into(), PlistValue::Data(sig_der));
     dict.insert(
         "keys".into(),
         PlistValue::Array(keys_protos.into_iter().map(PlistValue::Data).collect()),
@@ -1011,8 +998,12 @@ fn build_shared_device(
     let mut buf = Vec::new();
     plist::to_writer_binary(Cursor::new(&mut buf), &device_value)
         .map_err(|e| format!("plist::to_writer_binary: {:?}", e))?;
-    plist::from_bytes::<StatusKitSharedDevice>(&buf)
-        .map_err(|e| format!("plist::from_bytes(StatusKitSharedDevice) round-trip: {:?}", e))
+    plist::from_bytes::<StatusKitSharedDevice>(&buf).map_err(|e| {
+        format!(
+            "plist::from_bytes(StatusKitSharedDevice) round-trip: {:?}",
+            e
+        )
+    })
 }
 
 /// Take a 32-byte X9.62 raw EC public key (P-256, "compact" form: just the
@@ -1136,7 +1127,10 @@ async fn inject_into_state(
             dates.insert(cid, plist::Value::Integer(d.into()));
         }
         if let Err(e) = plist::to_file_xml(&dates_path, &dates) {
-            info!("StatusKit-CloudKit inject: failed to persist channel dates: {}", e);
+            info!(
+                "StatusKit-CloudKit inject: failed to persist channel dates: {}",
+                e
+            );
         }
     }
 

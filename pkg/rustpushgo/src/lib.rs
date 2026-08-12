@@ -1,40 +1,51 @@
-pub mod util;
-#[cfg(target_os = "macos")]
-pub mod local_config;
 #[cfg(all(not(target_os = "macos"), feature = "anisette-remote-v3"))]
 pub mod anisette;
 mod ids_guard;
-mod statuskitgo;
+#[cfg(target_os = "macos")]
+pub mod local_config;
 mod statuskit_cloudkit;
+mod statuskitgo;
 #[cfg(test)]
 mod test_hwinfo;
+pub mod util;
 
-use std::{collections::HashMap, io::Cursor, path::PathBuf, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    collections::HashMap,
+    io::{Cursor, Read, Write},
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use icloud_auth::AppleAccount;
-use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
-use log::{debug, error, info, warn};
-use rustpush::{
-    authenticate_apple, deregister as deregister_ids, login_apple_delegates, register, APSConnectionResource,
-    APSState, Attachment, AttachmentType, Balloon, ConversationData, DeleteTarget, EditMessage,
-    IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
-    MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
-    BalloonLayout, ExtensionApp, OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
-    ExtensionAttribution, StickerGenerationMetadata,
-    ChangeParticipantMessage, IconChangeMessage, UnsendMessage, TypingApp,
-    IndexedMessagePart, LinkMeta, LPLinkMetadata, NSURL, RichLinkImageAttachmentSubstitute,
-    TextFlags, TextFormat, TextEffect,
-    ShareProfileMessage, SharedPoster, PartExtension, UpdateExtensionMessage, UpdateProfileMessage,
-    UpdateProfileSharingMessage, SetTranscriptBackgroundMessage,
-    TokenProvider,
-    ScheduleMode,
-    cloudkit::{ZoneDeleteOperation, CloudKitSession},
-    ResourceState,
+use keystore::{
+    init_keystore, keystore,
+    software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState},
 };
+use log::{debug, error, info, warn};
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
 use rustpush::findmy::MULTIPLEX_SERVICE;
+use rustpush::{
+    authenticate_apple,
+    cloudkit::{CloudKitSession, ZoneDeleteOperation},
+    deregister as deregister_ids, login_apple_delegates,
+    posterkit::{
+        PosterType, SimplifiedTranscriptPoster, TranscriptDynamicUserData, WatchBackground,
+    },
+    register, APSConnectionResource, APSState, Attachment, AttachmentType, Balloon, BalloonLayout,
+    ChangeParticipantMessage, ConversationData, DeleteTarget, EditMessage, ExtensionApp,
+    ExtensionAttribution, IDSNGMIdentity, IDSUser, IMClient, IconChangeMessage, IndexedMessagePart,
+    LPLinkMetadata, LinkMeta, LoginDelegate, MMCSFile, Message, MessageInst, MessagePart,
+    MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, OSConfig, OperatedChat,
+    PartExtension, PermanentDeleteMessage, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+    ResourceState, RichLinkImageAttachmentSubstitute, ScheduleMode, SetTranscriptBackgroundMessage,
+    ShareProfileMessage, SharedPoster, StickerGenerationMetadata, TextEffect, TextFlags,
+    TextFormat, TokenProvider, TypingApp, UnsendMessage, UpdateExtensionMessage,
+    UpdateProfileMessage, UpdateProfileSharingMessage, MADRID_SERVICE, NSURL,
+};
 
 use std::sync::RwLock;
 
@@ -148,7 +159,10 @@ pub fn register_ford_key(key: Vec<u8>) {
     }
     let size = cache.len();
     drop(cache);
-    debug!("register_ford_key: cached Ford key for dedup fallback (size={})", size);
+    debug!(
+        "register_ford_key: cached Ford key for dedup fallback (size={})",
+        size
+    );
 }
 
 /// Number of Ford keys currently cached. Diagnostic only.
@@ -256,8 +270,8 @@ fn is_ford_encrypted_asset(
 
 mod manual_ford {
     use super::*;
-    use aes_siv::{siv::CmacSiv, KeyInit};
     use aes::Aes256;
+    use aes_siv::{siv::CmacSiv, KeyInit};
     use hkdf::Hkdf;
     use once_cell::sync::Lazy;
     use openssl::{
@@ -340,7 +354,12 @@ mod manual_ford {
     /// same order as the file's `wanted_chunks.chunk_references`.
     pub(super) fn flatten_ford_entries(chunk: LocalFordChunk) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
         if let Some(item) = chunk.item {
-            Some(item.chunks.into_iter().map(|c| (c.key, c.chunk_len)).collect())
+            Some(
+                item.chunks
+                    .into_iter()
+                    .map(|c| (c.key, c.chunk_len))
+                    .collect(),
+            )
         } else if let Some(item_v2) = chunk.item_v2 {
             let mut out = Vec::new();
             for group in item_v2.chunks {
@@ -463,7 +482,10 @@ mod manual_ford {
             return Err(format!("V2 key wrong length: {}", key33.len()));
         }
         if chunk_len_bytes.len() != 4 {
-            return Err(format!("V2 chunk_len wrong length: {}", chunk_len_bytes.len()));
+            return Err(format!(
+                "V2 chunk_len wrong length: {}",
+                chunk_len_bytes.len()
+            ));
         }
 
         let hk = Hkdf::<Sha256>::new(None, &key33[1..]);
@@ -481,8 +503,7 @@ mod manual_ford {
         id_padded[..20].copy_from_slice(&chunk_id21[1..]);
         id_padded[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
 
-        let auth_pkey = PKey::hmac(auth_hmac_key)
-            .map_err(|e| format!("V2 auth PKey: {e}"))?;
+        let auth_pkey = PKey::hmac(auth_hmac_key).map_err(|e| format!("V2 auth PKey: {e}"))?;
         let mut signer = Signer::new(MessageDigest::sha256(), &auth_pkey)
             .map_err(|e| format!("V2 auth Signer: {e}"))?;
         let iv_material = signer
@@ -508,8 +529,7 @@ mod manual_ford {
             h.update(&result);
             h.finalize()
         };
-        let sig_pkey = PKey::hmac(sig_hmac_key)
-            .map_err(|e| format!("V2 sig PKey: {e}"))?;
+        let sig_pkey = PKey::hmac(sig_hmac_key).map_err(|e| format!("V2 sig PKey: {e}"))?;
         let mut verifier = Signer::new(MessageDigest::sha256(), &sig_pkey)
             .map_err(|e| format!("V2 sig Signer: {e}"))?;
         let computed_id = verifier
@@ -562,12 +582,16 @@ mod manual_ford {
             "GET" => HTTP_CLIENT.get(&url),
             other => return Err(format!("unsupported MMCS method: {}", other)),
         }
-        .header("x-apple-request-uuid", uuid::Uuid::new_v4().to_string().to_uppercase())
+        .header(
+            "x-apple-request-uuid",
+            uuid::Uuid::new_v4().to_string().to_uppercase(),
+        )
         .header("user-agent", user_agent);
 
-        let complete_at_edge = req.headers.iter().any(|h| {
-            h.name == "x-apple-put-complete-at-edge-version" && h.value == "2"
-        });
+        let complete_at_edge = req
+            .headers
+            .iter()
+            .any(|h| h.name == "x-apple-put-complete-at-edge-version" && h.value == "2");
 
         for header in &req.headers {
             if (header.name == "Content-Length" && complete_at_edge) || header.name == "Host" {
@@ -725,9 +749,7 @@ mod manual_ford {
                     .containers
                     .get(cidx)
                     .and_then(|c| c.chunks.get(kidx))
-                    .ok_or_else(|| {
-                        format!("chunk_ref ({},{}) OOB", cidx, kidx)
-                    })?;
+                    .ok_or_else(|| format!("chunk_ref ({},{}) OOB", cidx, kidx))?;
                 let meta = chunk
                     .meta
                     .as_ref()
@@ -832,8 +854,8 @@ fn ensure_crypto_provider() {
 // Imports the derive macro sees at its expansion site. The `CloudKitRecord`
 // derive emits references to `CloudKitEncryptor` unqualified, and to
 // `cloudkit_proto::*` by crate name — both need to resolve in our scope.
-use rustpush::cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::{Asset, CloudKitEncryptor};
+use rustpush::cloudkit_derive::CloudKitRecord;
 
 #[derive(CloudKitRecord, Debug, Default, Clone)]
 #[cloudkit_record(type = "attachment", encrypted)]
@@ -965,9 +987,11 @@ impl WrappedIDSUsers {
     }
 
     pub fn get_handles(&self) -> Vec<String> {
-        self.inner.iter()
+        self.inner
+            .iter()
             .flat_map(|user| {
-                user.registration.get("com.apple.madrid")
+                user.registration
+                    .get("com.apple.madrid")
                     .map(|reg| reg.handles.clone())
                     .unwrap_or_default()
             })
@@ -984,7 +1008,10 @@ impl WrappedIDSUsers {
         for user in &self.inner {
             let alias = &user.auth_keypair.private.0;
             if keystore().get_key_type(alias).ok().flatten().is_none() {
-                warn!("Keystore key '{}' not found for user '{}' — keystore/state mismatch", alias, user.user_id);
+                warn!(
+                    "Keystore key '{}' not found for user '{}' — keystore/state mismatch",
+                    alias, user.user_id
+                );
                 return false;
             }
         }
@@ -1048,7 +1075,9 @@ pub enum WrappedError {
 
 impl From<rustpush::PushError> for WrappedError {
     fn from(e: rustpush::PushError) -> Self {
-        WrappedError::GenericError { msg: format!("{}", e) }
+        WrappedError::GenericError {
+            msg: format!("{}", e),
+        }
     }
 }
 
@@ -1110,13 +1139,18 @@ async fn recover_keychain_after_exclusion(
     };
     if let Some(identity) = identity_opt {
         match keychain.fetch_shares_for(&identity).await {
-            Ok(shares) if !shares.is_empty() => {
-                match keychain.store_keys(&shares).await {
-                    Ok(()) => info!("{}: refreshed {} TLK share(s) despite exclusion", context, shares.len()),
-                    Err(e) => warn!("{}: store_keys failed (non-fatal): {}", context, e),
-                }
-            }
-            Ok(_) => info!("{}: no TLK shares returned; using persisted keystore", context),
+            Ok(shares) if !shares.is_empty() => match keychain.store_keys(&shares).await {
+                Ok(()) => info!(
+                    "{}: refreshed {} TLK share(s) despite exclusion",
+                    context,
+                    shares.len()
+                ),
+                Err(e) => warn!("{}: store_keys failed (non-fatal): {}", context, e),
+            },
+            Ok(_) => info!(
+                "{}: no TLK shares returned; using persisted keystore",
+                context
+            ),
             Err(e) => warn!("{}: fetch_shares_for failed (non-fatal): {}", context, e),
         }
     }
@@ -1139,7 +1173,10 @@ async fn recover_keychain_after_exclusion(
 
     // Step 3: nothing to fall back on — propagate the error.
     Err(WrappedError::GenericError {
-        msg: format!("{} keychain sync failed: not in clique and no cached keys available", context),
+        msg: format!(
+            "{} keychain sync failed: not in clique and no cached keys available",
+            context
+        ),
     })
 }
 
@@ -1151,10 +1188,17 @@ async fn sync_keychain_with_retries(
     let attempts = max_attempts.max(1);
     let mut last_err: Option<rustpush::PushError> = None;
     for attempt in 0..attempts {
-        match keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await {
+        match keychain
+            .sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES)
+            .await
+        {
             Ok(()) => {
                 if attempt > 0 {
-                    info!("{} keychain sync recovered after {} attempt(s)", context, attempt + 1);
+                    info!(
+                        "{} keychain sync recovered after {} attempt(s)",
+                        context,
+                        attempt + 1
+                    );
                 }
                 return Ok(());
             }
@@ -1199,20 +1243,30 @@ async fn refresh_recoverable_tlk_shares(
     };
 
     let Some(identity) = identity_opt else {
-        warn!("{}: no keychain user identity available for TLK share refresh", context);
+        warn!(
+            "{}: no keychain user identity available for TLK share refresh",
+            context
+        );
         return Ok(());
     };
 
     match keychain.fetch_shares_for(&identity).await {
         Ok(shares) => {
-            info!("{}: fetched {} recoverable TLK share(s)", context, shares.len());
+            info!(
+                "{}: fetched {} recoverable TLK share(s)",
+                context,
+                shares.len()
+            );
             if !shares.is_empty() {
                 keychain.store_keys(&shares).await?;
             }
         }
         Err(err) => {
             // Best-effort: we still attempt regular keychain sync / CloudKit probes.
-            warn!("{}: failed to fetch recoverable TLK shares: {}", context, err);
+            warn!(
+                "{}: failed to fetch recoverable TLK shares: {}",
+                context, err
+            );
         }
     }
 
@@ -1224,7 +1278,8 @@ async fn finalize_keychain_setup_with_probe(
     cloudkit: Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
     max_attempts: usize,
 ) -> Result<(), WrappedError> {
-    let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit, keychain.clone());
+    let cloud_messages =
+        rustpush::cloud_messages::CloudMessagesClient::new(cloudkit, keychain.clone());
     let attempts = max_attempts.max(1);
 
     for attempt in 0..attempts {
@@ -1278,7 +1333,10 @@ async fn finalize_keychain_setup_with_probe(
                     continue;
                 }
                 return Err(WrappedError::GenericError {
-                    msg: format!("CloudKit decrypt probe failed after retries (chats): {}", err),
+                    msg: format!(
+                        "CloudKit decrypt probe failed after retries (chats): {}",
+                        err
+                    ),
                 });
             }
         }
@@ -1326,7 +1384,10 @@ async fn finalize_keychain_setup_with_probe(
                     continue;
                 }
                 return Err(WrappedError::GenericError {
-                    msg: format!("CloudKit decrypt probe failed after retries (messages): {}", err),
+                    msg: format!(
+                        "CloudKit decrypt probe failed after retries (messages): {}",
+                        err
+                    ),
                 });
             }
         }
@@ -1398,10 +1459,12 @@ pub struct WrappedTokenProvider {
     // from the first call and skips the second ckAppInit entirely, which
     // sidesteps the rustpush bug and any Apple-side rate limiting on
     // ckAppInit for the same DSID.
-    keychain_clients_cache: tokio::sync::Mutex<Option<(
-        Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
-        Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
-    )>>,
+    keychain_clients_cache: tokio::sync::Mutex<
+        Option<(
+            Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+            Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+        )>,
+    >,
     // Serializes concurrent callers into `ensure_mme_delegate_bytes_seeded`
     // so a cold start with empty `mme_delegate_bytes` produces ONE
     // login_apple_delegates POST regardless of how many CloudKit/contacts
@@ -1419,10 +1482,13 @@ pub struct WrappedTokenProvider {
 /// TokenProvider itself (which rustpush does not expose).
 async fn create_keychain_clients(
     wp: &WrappedTokenProvider,
-) -> Result<(
-    Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
-    Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
-), WrappedError> {
+) -> Result<
+    (
+        Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
+        Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
+    ),
+    WrappedError,
+> {
     // Fast path: return the cached pair if we've already built one in this
     // process. See the keychain_clients_cache field docstring on
     // WrappedTokenProvider for why caching is required (Apple returns empty
@@ -1441,13 +1507,19 @@ async fn create_keychain_clients(
         let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
             msg: "AppleAccount has no SPD — not fully logged in".into(),
         })?;
-        let dsid = spd.get("DsPrsId")
+        let dsid = spd
+            .get("DsPrsId")
             .and_then(|v| v.as_unsigned_integer())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
+            .ok_or(WrappedError::GenericError {
+                msg: "SPD missing DsPrsId".into(),
+            })?
             .to_string();
-        let adsid = spd.get("adsid")
+        let adsid = spd
+            .get("adsid")
             .and_then(|v| v.as_string())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+            .ok_or(WrappedError::GenericError {
+                msg: "SPD missing adsid".into(),
+            })?
             .to_string();
         let anisette = account.anisette.clone();
         (dsid, adsid, anisette)
@@ -1460,44 +1532,62 @@ async fn create_keychain_clients(
     let os_config = wp.os_config.clone();
     let token_provider = wp.inner.clone();
 
-    let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
-        .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+    let cloudkit_state =
+        rustpush::cloudkit::CloudKitState::new(dsid.clone()).ok_or(WrappedError::GenericError {
+            msg: "Failed to create CloudKitState".into(),
+        })?;
     let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: rustpush::DebugRwLock::new(cloudkit_state),
+        state: rustpush::DebugRwLock::new(cloudkit_state),
         anisette: anisette.clone(),
         config: os_config.clone(),
         token_provider: token_provider.clone(),
     });
     let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
-    let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
-        Ok(data) => match plist::from_bytes(&data) {
-            Ok(state) => Some(state),
+    let mut keychain_state: Option<rustpush::keychain::KeychainClientState> =
+        match std::fs::read(&keychain_state_path) {
+            Ok(data) => match plist::from_bytes(&data) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    warn!(
+                        "Failed to parse keychain state at {}: {}",
+                        keychain_state_path, e
+                    );
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                warn!(
+                    "Failed to read keychain state at {}: {}",
+                    keychain_state_path, e
+                );
                 None
             }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
-            None
-        }
-    };
+        };
     if keychain_state.is_none() {
         keychain_state = Some(
-            rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
-                .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?
+            rustpush::keychain::KeychainClientState::new(
+                dsid.clone(),
+                adsid.clone(),
+                &mme_delegate,
+            )
+            .ok_or(WrappedError::GenericError {
+                msg: "Missing KeychainSync config in MobileMe delegate".into(),
+            })?,
         );
     }
     let path_for_closure = keychain_state_path.clone();
     let keychain = Arc::new(rustpush::keychain::KeychainClient {
         anisette: anisette.clone(),
         token_provider: token_provider.clone(),
-            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+        state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
         config: os_config.clone(),
         update_state: Box::new(move |state| {
             if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
-                warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+                warn!(
+                    "Failed to persist keychain state to {}: {}",
+                    path_for_closure, e
+                );
             } else {
                 info!("Persisted keychain state to {}", path_for_closure);
             }
@@ -1533,7 +1623,10 @@ fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, St
 async fn join_keychain_with_bottles(
     keychain: Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>,
     cloudkit: Arc<rustpush::cloudkit::CloudKitClient<BridgeDefaultAnisetteProvider>>,
-    bottles: &[(rustpush::cloudkit_proto::EscrowData, rustpush::keychain::EscrowMetadata)],
+    bottles: &[(
+        rustpush::cloudkit_proto::EscrowData,
+        rustpush::keychain::EscrowMetadata,
+    )],
     passcode: &str,
     preferred_index: Option<u32>,
 ) -> Result<String, WrappedError> {
@@ -1567,7 +1660,10 @@ async fn join_keychain_with_bottles(
         for &i in &indices {
             let (data, meta) = &bottles[i];
             info!("Trying bottle {} (serial={})...", i, meta.serial);
-            match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
+            match keychain
+                .join_clique_from_escrow(data, passcode_bytes, passcode_bytes)
+                .await
+            {
                 Ok(()) => {
                     joined_any = true;
                     last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
@@ -1576,7 +1672,13 @@ async fn join_keychain_with_bottles(
                         "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
                         per_bottle_probe_attempts
                     );
-                    match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
+                    match finalize_keychain_setup_with_probe(
+                        keychain.clone(),
+                        cloudkit.clone(),
+                        per_bottle_probe_attempts,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             probe_succeeded = true;
                             break; // probe passed, go to stability check
@@ -1600,7 +1702,11 @@ async fn join_keychain_with_bottles(
 
         if !joined_any {
             return Err(WrappedError::GenericError {
-                msg: format!("All {} bottles failed. Last error: {}", bottles.len(), last_err)
+                msg: format!(
+                    "All {} bottles failed. Last error: {}",
+                    bottles.len(),
+                    last_err
+                ),
             });
         }
 
@@ -1613,11 +1719,17 @@ async fn join_keychain_with_bottles(
         if !probe_succeeded && !keychain.is_in_clique().await {
             if rejoin_attempt >= MAX_REJOIN_ATTEMPTS {
                 return Err(WrappedError::GenericError {
-                    msg: format!("Excluded from clique after {} rejoin attempts. Last error: {}", rejoin_attempt, last_err)
+                    msg: format!(
+                        "Excluded from clique after {} rejoin attempts. Last error: {}",
+                        rejoin_attempt, last_err
+                    ),
                 });
             }
             rejoin_attempt += 1;
-            warn!("Not in clique after bottle probes, rejoin attempt {}/{}", rejoin_attempt, MAX_REJOIN_ATTEMPTS);
+            warn!(
+                "Not in clique after bottle probes, rejoin attempt {}/{}",
+                rejoin_attempt, MAX_REJOIN_ATTEMPTS
+            );
             continue 'stability;
         }
 
@@ -1630,7 +1742,9 @@ async fn join_keychain_with_bottles(
                 rejoin_attempt += 1;
                 warn!(
                     "Excluded from clique during stability check {} — re-joining (attempt {}/{})",
-                    check + 1, rejoin_attempt, MAX_REJOIN_ATTEMPTS
+                    check + 1,
+                    rejoin_attempt,
+                    MAX_REJOIN_ATTEMPTS
                 );
                 if rejoin_attempt > MAX_REJOIN_ATTEMPTS {
                     return Err(WrappedError::GenericError {
@@ -1694,7 +1808,10 @@ async fn refresh_pet_with_snapshot(
             }
         }
         Err(err) => {
-            warn!("{}: proactive PET refresh failed (non-fatal): {}", context, err);
+            warn!(
+                "{}: proactive PET refresh failed (non-fatal): {}",
+                context, err
+            );
         }
     }
     for (k, v) in snapshot {
@@ -1712,7 +1829,10 @@ impl WrappedTokenProvider {
     /// Apple-required HTTP headers (X-MobileMe-AuthToken, X-Client-UDID,
     /// X-MMe-Client-Info, plus anisette) locally from our stored state.
     pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, WrappedError> {
-        let token = self.inner.get_mme_token("mmeAuthToken").await
+        let token = self
+            .inner
+            .get_mme_token("mmeAuthToken")
+            .await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("Failed to fetch mmeAuthToken: {}", e),
             })?;
@@ -1727,10 +1847,14 @@ impl WrappedTokenProvider {
 
         let mut headers: HashMap<String, String> = HashMap::new();
         headers.insert("Authorization".to_string(), auth_header_value);
-        headers.insert("X-Client-UDID".to_string(), self.os_config.get_udid().to_lowercase());
+        headers.insert(
+            "X-Client-UDID".to_string(),
+            self.os_config.get_udid().to_lowercase(),
+        );
         headers.insert(
             "X-MMe-Client-Info".to_string(),
-            self.os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"),
+            self.os_config
+                .get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"),
         );
         headers.insert("X-MMe-Country".to_string(), "US".to_string());
         headers.insert("X-MMe-Language".to_string(), "en".to_string());
@@ -1742,10 +1866,13 @@ impl WrappedTokenProvider {
             account.anisette.clone()
         };
         let mut anisette_guard = anisette.lock().await;
-        let anisette_headers = anisette_guard.get_headers().await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to fetch anisette headers: {}", e),
-            })?;
+        let anisette_headers =
+            anisette_guard
+                .get_headers()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to fetch anisette headers: {}", e),
+                })?;
         for (k, v) in anisette_headers.iter() {
             headers.insert(k.clone(), v.clone());
         }
@@ -1768,15 +1895,19 @@ impl WrappedTokenProvider {
         // contacts lookup with no URL is recoverable. The self-heal logs
         // the failure mode itself.
         if let Err(e) = self.ensure_mme_delegate_bytes_seeded().await {
-            debug!("get_contacts_url: self-heal did not populate bytes: {:?}", e);
+            debug!(
+                "get_contacts_url: self-heal did not populate bytes: {:?}",
+                e
+            );
         }
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         let Some(bytes) = bytes_guard.as_ref() else {
             return Ok(None);
         };
-        let value: plist::Value = plist::from_bytes(bytes).map_err(|e| {
-            WrappedError::GenericError { msg: format!("Invalid MobileMe delegate plist: {}", e) }
-        })?;
+        let value: plist::Value =
+            plist::from_bytes(bytes).map_err(|e| WrappedError::GenericError {
+                msg: format!("Invalid MobileMe delegate plist: {}", e),
+            })?;
         let normalized = normalize_mme_delegate_dict(value);
         // After normalize: `{tokens, config: {com.apple.Dataclass.Contacts: {url}, ...}}`.
         let url = normalized
@@ -1797,9 +1928,12 @@ impl WrappedTokenProvider {
         let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
             msg: "AppleAccount has no SPD — not fully logged in".into(),
         })?;
-        let dsid = spd.get("DsPrsId")
+        let dsid = spd
+            .get("DsPrsId")
             .and_then(|v| v.as_unsigned_integer())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing DsPrsId".into() })?
+            .ok_or(WrappedError::GenericError {
+                msg: "SPD missing DsPrsId".into(),
+            })?
             .to_string();
         Ok(dsid)
     }
@@ -1809,7 +1943,9 @@ impl WrappedTokenProvider {
     /// and passed through as UTF-8 text.
     pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
         let bytes_guard = self.mme_delegate_bytes.lock().await;
-        Ok(bytes_guard.as_ref().map(|b| String::from_utf8_lossy(b).to_string()))
+        Ok(bytes_guard
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).to_string()))
     }
 
     /// Seed the MobileMe delegate from persisted plist string. Validates as a
@@ -1817,10 +1953,11 @@ impl WrappedTokenProvider {
     /// need a typed `MobileMeDelegateResponse` reconstruct it via
     /// `parse_mme_delegate()`.
     pub async fn seed_mme_delegate_json(&self, json: String) -> Result<(), WrappedError> {
-        plist::from_bytes::<plist::Value>(json.as_bytes())
-            .map_err(|e| WrappedError::GenericError {
+        plist::from_bytes::<plist::Value>(json.as_bytes()).map_err(|e| {
+            WrappedError::GenericError {
                 msg: format!("Failed to deserialize MobileMe delegate: {}", e),
-            })?;
+            }
+        })?;
         *self.mme_delegate_bytes.lock().await = Some(json.into_bytes());
         Ok(())
     }
@@ -1855,10 +1992,20 @@ impl WrappedTokenProvider {
         let username = account.username.clone().ok_or(WrappedError::GenericError {
             msg: "refresh_pet_token: account has no username".into(),
         })?;
-        let hashed_password = account.hashed_password.clone().ok_or(WrappedError::GenericError {
-            msg: "refresh_pet_token: account has no hashed_password".into(),
-        })?;
-        refresh_pet_with_snapshot(&mut account, &username, &hashed_password, "refresh_pet_token").await;
+        let hashed_password =
+            account
+                .hashed_password
+                .clone()
+                .ok_or(WrappedError::GenericError {
+                    msg: "refresh_pet_token: account has no hashed_password".into(),
+                })?;
+        refresh_pet_with_snapshot(
+            &mut account,
+            &username,
+            &hashed_password,
+            "refresh_pet_token",
+        )
+        .await;
         Ok(())
     }
 
@@ -1917,7 +2064,10 @@ impl WrappedTokenProvider {
                 Ok(())
             }
             Err(e) => {
-                warn!("GSA announce: update_postdata failed: {:?} — will retry on next restart", e);
+                warn!(
+                    "GSA announce: update_postdata failed: {:?} — will retry on next restart",
+                    e
+                );
                 Err(WrappedError::GenericError {
                     msg: format!("update_postdata failed: {:?}", e),
                 })
@@ -1983,9 +2133,12 @@ impl WrappedTokenProvider {
         let spd = account.spd.as_ref().ok_or(WrappedError::GenericError {
             msg: "AppleAccount has no SPD — not fully logged in".into(),
         })?;
-        let adsid = spd.get("adsid")
+        let adsid = spd
+            .get("adsid")
             .and_then(|v| v.as_string())
-            .ok_or(WrappedError::GenericError { msg: "SPD missing adsid".into() })?
+            .ok_or(WrappedError::GenericError {
+                msg: "SPD missing adsid".into(),
+            })?
             .to_string();
         Ok(adsid)
     }
@@ -2028,9 +2181,15 @@ impl WrappedTokenProvider {
         // `panic!("No pet!")`), so guard against a cold/expired PET
         // with get_gsa_token, which auto-refreshes via login_email_pass
         // when the cached PET is stale.
-        if self.inner.get_gsa_token("com.apple.gs.idms.pet").await.is_none() {
+        if self
+            .inner
+            .get_gsa_token("com.apple.gs.idms.pet")
+            .await
+            .is_none()
+        {
             return Err(WrappedError::GenericError {
-                msg: "MobileMe self-heal: no PET token available (Apple may require re-login)".into(),
+                msg: "MobileMe self-heal: no PET token available (Apple may require re-login)"
+                    .into(),
             });
         }
 
@@ -2072,7 +2231,8 @@ impl WrappedTokenProvider {
             plist::Value::Dictionary(mobileme.config.clone()),
         );
         let mut buf = Vec::new();
-        plist::Value::Dictionary(root).to_writer_xml(&mut buf)
+        plist::Value::Dictionary(root)
+            .to_writer_xml(&mut buf)
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("MobileMe self-heal: serialize delegate to plist: {}", e),
             })?;
@@ -2092,15 +2252,18 @@ impl WrappedTokenProvider {
     /// the inner iCloud service dict (the one holding `com.apple.Dataclass.KeychainSync`
     /// etc.) regardless of which shape was stored. See `normalize_mme_delegate_dict`
     /// below for the three shapes we accept.
-    pub(crate) async fn parse_mme_delegate<T: serde::de::DeserializeOwned>(&self) -> Result<T, WrappedError> {
+    pub(crate) async fn parse_mme_delegate<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<T, WrappedError> {
         self.ensure_mme_delegate_bytes_seeded().await?;
         let bytes_guard = self.mme_delegate_bytes.lock().await;
         let bytes = bytes_guard.as_ref().ok_or(WrappedError::GenericError {
             msg: "MobileMe delegate not seeded — call seed_mme_delegate_json first".into(),
         })?;
-        let value: plist::Value = plist::from_bytes(bytes).map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to parse MobileMe delegate bytes: {}", e),
-        })?;
+        let value: plist::Value =
+            plist::from_bytes(bytes).map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to parse MobileMe delegate bytes: {}", e),
+            })?;
         let normalized = normalize_mme_delegate_dict(value);
         plist::from_value::<T>(&normalized).map_err(|e| WrappedError::GenericError {
             msg: format!("Failed to deserialize MobileMe delegate: {}", e),
@@ -2108,7 +2271,9 @@ impl WrappedTokenProvider {
     }
 
     /// Clone the shared AppleAccount handle.
-    pub(crate) fn get_account(&self) -> Arc<rustpush::DebugMutex<AppleAccount<BridgeDefaultAnisetteProvider>>> {
+    pub(crate) fn get_account(
+        &self,
+    ) -> Arc<rustpush::DebugMutex<AppleAccount<BridgeDefaultAnisetteProvider>>> {
         self.account.clone()
     }
 
@@ -2125,7 +2290,9 @@ impl WrappedTokenProvider {
     /// display-name field so peer sees a real name instead of a phone number.
     pub(crate) async fn get_apple_account_full_name(&self) -> String {
         let account = self.account.lock().await;
-        let Some(spd) = account.spd.as_ref() else { return String::new(); };
+        let Some(spd) = account.spd.as_ref() else {
+            return String::new();
+        };
         let first = spd
             .get("fn")
             .and_then(|v| v.as_string())
@@ -2164,8 +2331,13 @@ impl WrappedTokenProvider {
         info!("Fetching escrow devices...");
         let (keychain, _cloudkit) = create_keychain_clients(self).await?;
 
-        let bottles = keychain.get_viable_bottles().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+        let bottles =
+            keychain
+                .get_viable_bottles()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get escrow bottles: {}", e),
+                })?;
 
         if bottles.is_empty() {
             return Err(WrappedError::GenericError {
@@ -2173,17 +2345,24 @@ impl WrappedTokenProvider {
             });
         }
 
-        let devices: Vec<EscrowDeviceInfo> = bottles.iter().enumerate().map(|(i, (_data, meta))| {
-            let (device_name, device_model) = extract_device_info(meta);
-            info!("  [{}] name={:?} model={} serial={} timestamp={}", i, device_name, device_model, meta.serial, meta.timestamp);
-            EscrowDeviceInfo {
-                index: i as u32,
-                device_name,
-                device_model,
-                serial: meta.serial.clone(),
-                timestamp: meta.timestamp.clone(),
-            }
-        }).collect();
+        let devices: Vec<EscrowDeviceInfo> = bottles
+            .iter()
+            .enumerate()
+            .map(|(i, (_data, meta))| {
+                let (device_name, device_model) = extract_device_info(meta);
+                info!(
+                    "  [{}] name={:?} model={} serial={} timestamp={}",
+                    i, device_name, device_model, meta.serial, meta.timestamp
+                );
+                EscrowDeviceInfo {
+                    index: i as u32,
+                    device_name,
+                    device_model,
+                    serial: meta.serial.clone(),
+                    timestamp: meta.timestamp.clone(),
+                }
+            })
+            .collect();
 
         info!("Found {} escrow device(s)", devices.len());
         Ok(devices)
@@ -2199,8 +2378,13 @@ impl WrappedTokenProvider {
         let (keychain, cloudkit) = create_keychain_clients(self).await?;
 
         info!("Fetching escrow bottles...");
-        let bottles = keychain.get_viable_bottles().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+        let bottles =
+            keychain
+                .get_viable_bottles()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get escrow bottles: {}", e),
+                })?;
 
         if bottles.is_empty() {
             return Err(WrappedError::GenericError {
@@ -2210,7 +2394,10 @@ impl WrappedTokenProvider {
 
         info!("Found {} escrow bottle(s)", bottles.len());
         for (i, (_data, meta)) in bottles.iter().enumerate() {
-            info!("  [{}] serial={} build={} timestamp={}", i, meta.serial, meta.build, meta.timestamp);
+            info!(
+                "  [{}] serial={} build={} timestamp={}",
+                i, meta.serial, meta.build, meta.timestamp
+            );
         }
 
         join_keychain_with_bottles(keychain, cloudkit, &bottles, &passcode, None).await
@@ -2219,13 +2406,25 @@ impl WrappedTokenProvider {
     /// Join the iCloud Keychain trust circle, trying the specified device first.
     /// `device_index` is the index from get_escrow_devices(). If that bottle fails,
     /// falls back to trying other bottles.
-    pub async fn join_keychain_clique_for_device(&self, passcode: String, device_index: u32) -> Result<String, WrappedError> {
-        info!("=== Joining iCloud Keychain Trust Circle (preferred device {}) ===", device_index);
+    pub async fn join_keychain_clique_for_device(
+        &self,
+        passcode: String,
+        device_index: u32,
+    ) -> Result<String, WrappedError> {
+        info!(
+            "=== Joining iCloud Keychain Trust Circle (preferred device {}) ===",
+            device_index
+        );
         let (keychain, cloudkit) = create_keychain_clients(self).await?;
 
         info!("Fetching escrow bottles...");
-        let bottles = keychain.get_viable_bottles().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+        let bottles =
+            keychain
+                .get_viable_bottles()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get escrow bottles: {}", e),
+                })?;
 
         if bottles.is_empty() {
             return Err(WrappedError::GenericError {
@@ -2236,13 +2435,20 @@ impl WrappedTokenProvider {
         info!("Found {} escrow bottle(s)", bottles.len());
         for (i, (_data, meta)) in bottles.iter().enumerate() {
             let (name, model) = extract_device_info(meta);
-            info!("  [{}] name={:?} model={} serial={} build={} timestamp={}", i, name, model, meta.serial, meta.build, meta.timestamp);
+            info!(
+                "  [{}] name={:?} model={} serial={} build={} timestamp={}",
+                i, name, model, meta.serial, meta.build, meta.timestamp
+            );
         }
 
         let preferred = if (device_index as usize) < bottles.len() {
             Some(device_index)
         } else {
-            warn!("Device index {} out of range (have {} bottles), trying all", device_index, bottles.len());
+            warn!(
+                "Device index {} out of range (have {} bottles), trying all",
+                device_index,
+                bottles.len()
+            );
             None
         };
 
@@ -2303,23 +2509,34 @@ pub async fn restore_token_provider_with_pet_expiration(
     // and Apple rejects the provision-then-complete churn at GSA `complete` (-22406).
     // A real device provisions once and persists; this matches that.
     let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
-    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
+    let anisette = bridge_default_provider(
+        client_info.clone(),
+        anisette_state_path,
+        os_config.get_device_uuid(),
+    );
 
     // Create a new AppleAccount and populate it with persisted state
-    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette).map_err(|e| {
+        WrappedError::GenericError {
+            msg: format!("Failed to create account: {}", e),
+        }
+    })?;
 
     account.username = Some(username.clone());
 
     // Restore hashed password
-    let hashed_password = decode_hex(&hashed_password_hex)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
+    let hashed_password =
+        decode_hex(&hashed_password_hex).map_err(|e| WrappedError::GenericError {
+            msg: format!("Invalid hashed_password hex: {}", e),
+        })?;
     account.hashed_password = Some(hashed_password.clone());
 
     // Restore SPD from base64-encoded plist
     let spd_bytes = base64_decode(&spd_base64);
-    let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
+    let spd: plist::Dictionary =
+        plist::from_bytes(&spd_bytes).map_err(|e| WrappedError::GenericError {
+            msg: format!("Invalid SPD plist: {}", e),
+        })?;
 
     account.spd = Some(spd);
 
@@ -2357,8 +2574,7 @@ pub async fn restore_token_provider_with_pet_expiration(
         "com.apple.gs.idms.pet".to_string(),
         icloud_auth::FetchedToken {
             token: pet,
-            expiration: std::time::UNIX_EPOCH
-                + Duration::from_millis(pet_expires_at_ms),
+            expiration: std::time::UNIX_EPOCH + Duration::from_millis(pet_expires_at_ms),
         },
     );
 
@@ -2395,6 +2611,27 @@ pub struct WrappedMultipartPart {
     pub mime_type: Option<String>,
     pub uti_type: Option<String>,
     pub filename: Option<String>,
+}
+
+/// A normalized Messages extension envelope. This deliberately models the
+/// stable MSMessageTemplateLayout surface instead of exposing Apple's keyed
+/// archive bytes to API callers.
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedComponentEnvelope {
+    pub app_name: String,
+    pub app_id: Option<u64>,
+    pub bundle_id: String,
+    pub url: String,
+    pub session_id: Option<String>,
+    pub is_live: bool,
+    pub ld_text: Option<String>,
+    pub image_title: String,
+    pub image_subtitle: String,
+    pub caption: String,
+    pub subcaption: String,
+    pub secondary_subcaption: String,
+    pub tertiary_subcaption: String,
+    pub icon: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record, Clone, Default)]
@@ -2552,9 +2789,16 @@ pub struct WrappedMessage {
     pub is_set_transcript_background: bool,
     pub transcript_background_remove: Option<bool>,
     pub transcript_background_chat_id: Option<String>,
+    pub transcript_background_version: Option<u64>,
+    pub transcript_background_id: Option<String>,
+    pub transcript_background_payload_version: Option<u64>,
     pub transcript_background_object_id: Option<String>,
     pub transcript_background_url: Option<String>,
     pub transcript_background_file_size: Option<u64>,
+    /// Apple DynamicExtension preset identifier, such as `clouds_4`.
+    pub transcript_background_preset: Option<String>,
+    /// Decrypted PosterKit ZIP downloaded from MMCS for an incoming set.
+    pub transcript_background_payload_data: Option<Vec<u8>>,
 
     // Sticker data for sticker tapback reactions (tapback_type=7).
     pub sticker_data: Option<Vec<u8>>,
@@ -2579,6 +2823,7 @@ pub struct WrappedMessage {
     // Apple's keyed-archive payload on its public API.
     pub app_balloon_bundle_id: Option<String>,
     pub app_balloon_app_name: Option<String>,
+    pub app_balloon_app_id: Option<u64>,
     pub app_balloon_url: Option<String>,
     pub app_balloon_session_id: Option<String>,
     pub app_balloon_is_live: bool,
@@ -2589,6 +2834,7 @@ pub struct WrappedMessage {
     pub app_balloon_subcaption: Option<String>,
     pub app_balloon_secondary_subcaption: Option<String>,
     pub app_balloon_tertiary_subcaption: Option<String>,
+    pub app_balloon_icon: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record, Clone, serde::Serialize)]
@@ -2862,7 +3108,9 @@ pub struct WrappedCloudSyncChat {
     pub is_filtered: i64,
 }
 
-fn recoverable_record_field_names(fields: &[rustpush::cloudkit_proto::record::Field]) -> Vec<String> {
+fn recoverable_record_field_names(
+    fields: &[rustpush::cloudkit_proto::record::Field],
+) -> Vec<String> {
     fields
         .iter()
         .filter_map(|field| field.identifier.as_ref()?.name.clone())
@@ -2871,20 +3119,32 @@ fn recoverable_record_field_names(fields: &[rustpush::cloudkit_proto::record::Fi
 
 fn record_looks_chat_like(fields: &[rustpush::cloudkit_proto::record::Field]) -> bool {
     let names = recoverable_record_field_names(fields);
-    names.iter().any(|name| matches!(name.as_str(), "stl" | "cid" | "gid" | "ptcpts" | "name" | "lah"))
+    names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "stl" | "cid" | "gid" | "ptcpts" | "name" | "lah"
+        )
+    })
 }
 
-fn wrap_recoverable_chat(record_name: String, mut chat: rustpush::cloud_messages::CloudChat) -> Option<WrappedCloudSyncChat> {
+fn wrap_recoverable_chat(
+    record_name: String,
+    mut chat: rustpush::cloud_messages::CloudChat,
+) -> Option<WrappedCloudSyncChat> {
     if chat.participants.is_empty() && chat.style == 45 && !chat.last_addressed_handle.is_empty() {
-        chat.participants.push(rustpush::cloud_messages::CloudParticipant {
-            uri: chat.last_addressed_handle.clone(),
-        });
+        chat.participants
+            .push(rustpush::cloud_messages::CloudParticipant {
+                uri: chat.last_addressed_handle.clone(),
+            });
     }
 
     let has_identity = !chat.chat_identifier.is_empty()
         || !chat.group_id.is_empty()
         || !chat.participants.is_empty()
-        || chat.display_name.as_ref().is_some_and(|name| !name.is_empty());
+        || chat
+            .display_name
+            .as_ref()
+            .is_some_and(|name| !name.is_empty());
     if !has_identity || !matches!(chat.style, 43 | 45) {
         return None;
     }
@@ -2934,14 +3194,19 @@ fn encode_recoverable_message_entry(
         record_name: record_name.to_string(),
         cloud_chat_id: msg.chat_id.clone(),
         sender: msg.sender.clone(),
-        is_from_me: msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+        is_from_me: msg
+            .flags
+            .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
         service: msg.service.clone(),
         timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
     };
     match serde_json::to_vec(&metadata) {
         Ok(payload) => format!("{}|{}", guid, BASE64_STANDARD.encode(payload)),
         Err(err) => {
-            debug!("list_recoverable_message_guids: failed to encode metadata for {}: {}", guid, err);
+            debug!(
+                "list_recoverable_message_guids: failed to encode metadata for {}: {}",
+                guid, err
+            );
             guid.to_string()
         }
     }
@@ -3085,7 +3350,9 @@ struct SharedWriter {
 
 impl SharedWriter {
     fn new() -> Self {
-        Self { inner: Arc::new(std::sync::Mutex::new(Vec::new())) }
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 
     fn into_bytes(self) -> Vec<u8> {
@@ -3125,13 +3392,17 @@ fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
 
     let mut guids = Vec::new();
     for (_len, dict) in &decoded.ranges {
-        if let Some(StCollapsedValue::Object { fields, .. }) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
+        if let Some(StCollapsedValue::Object { fields, .. }) =
+            dict.0.get("__kIMFileTransferGUIDAttributeName")
+        {
             if let Some(first) = fields.first().and_then(|f| f.first()) {
                 if let StCollapsedValue::String(s) = first {
                     guids.push(s.clone());
                 }
             }
-        } else if let Some(StCollapsedValue::String(s)) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
+        } else if let Some(StCollapsedValue::String(s)) =
+            dict.0.get("__kIMFileTransferGUIDAttributeName")
+        {
             guids.push(s.clone());
         }
     }
@@ -3147,7 +3418,11 @@ fn extract_attachment_guids_from_summary_info(data: &[u8]) -> Vec<String> {
     let value: plist::Value = match plist::from_bytes(data) {
         Ok(v) => v,
         Err(e) => {
-            warn!("messageSummaryInfo: plist parse failed ({} bytes): {}", data.len(), e);
+            warn!(
+                "messageSummaryInfo: plist parse failed ({} bytes): {}",
+                data.len(),
+                e
+            );
             return vec![];
         }
     };
@@ -3179,12 +3454,14 @@ fn apple_timestamp_ns_to_unix_ms(timestamp_ns: i64) -> i64 {
 
 fn decode_continuation_token(token_b64: Option<String>) -> Result<Option<Vec<u8>>, WrappedError> {
     match token_b64 {
-        Some(token) if !token.is_empty() => BASE64_STANDARD
-            .decode(token)
-            .map(Some)
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Invalid continuation token: {}", e),
-            }),
+        Some(token) if !token.is_empty() => {
+            BASE64_STANDARD
+                .decode(token)
+                .map(Some)
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Invalid continuation token: {}", e),
+                })
+        }
         _ => Ok(None),
     }
 }
@@ -3222,6 +3499,7 @@ fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<S
 fn populate_app_balloon(w: &mut WrappedMessage, app: &rustpush::ExtensionApp) {
     w.app_balloon_bundle_id = Some(app.bundle_id.clone());
     w.app_balloon_app_name = Some(app.name.clone());
+    w.app_balloon_app_id = app.app_id;
     let Some(balloon) = &app.balloon else { return };
 
     w.app_balloon_url = Some(balloon.url.clone());
@@ -3247,6 +3525,7 @@ fn populate_app_balloon(w: &mut WrappedMessage, app: &rustpush::ExtensionApp) {
     }
     if let Some(icon_data) = &balloon.icon {
         if !icon_data.is_empty() {
+            w.app_balloon_icon = Some(icon_data.clone());
             w.sticker_data = Some(icon_data.clone());
             w.sticker_mime = Some("image/png".to_string());
         }
@@ -3280,7 +3559,15 @@ fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
 /// skip HTML encoding.
 fn parts_to_html(parts: &MessageParts) -> Option<String> {
     let has_formatting = parts.0.iter().any(|p| match &p.part {
-        MessagePart::Text(_, fmt) => !matches!(fmt, TextFormat::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false })),
+        MessagePart::Text(_, fmt) => !matches!(
+            fmt,
+            TextFormat::Flags(TextFlags {
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false
+            })
+        ),
         MessagePart::Mention(_, _) => true,
         _ => false,
     });
@@ -3297,10 +3584,22 @@ fn parts_to_html(parts: &MessageParts) -> Option<String> {
                     TextFormat::Flags(flags) => {
                         let mut open = String::new();
                         let mut close = String::new();
-                        if flags.bold { open.push_str("<strong>"); close.insert_str(0, "</strong>"); }
-                        if flags.italic { open.push_str("<em>"); close.insert_str(0, "</em>"); }
-                        if flags.underline { open.push_str("<u>"); close.insert_str(0, "</u>"); }
-                        if flags.strikethrough { open.push_str("<del>"); close.insert_str(0, "</del>"); }
+                        if flags.bold {
+                            open.push_str("<strong>");
+                            close.insert_str(0, "</strong>");
+                        }
+                        if flags.italic {
+                            open.push_str("<em>");
+                            close.insert_str(0, "</em>");
+                        }
+                        if flags.underline {
+                            open.push_str("<u>");
+                            close.insert_str(0, "</u>");
+                        }
+                        if flags.strikethrough {
+                            open.push_str("<del>");
+                            close.insert_str(0, "</del>");
+                        }
                         html.push_str(&open);
                         html.push_str(&escaped);
                         html.push_str(&close);
@@ -3347,9 +3646,9 @@ fn parts_to_html(parts: &MessageParts) -> Option<String> {
 /// Minimal HTML escaping for user-provided text.
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Parse Matrix HTML into iMessage MessageParts with formatting.
@@ -3411,11 +3710,18 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
                 "/del" | "/s" | "/strike" => strikethrough = false,
                 "/span" => active_effect = None,
                 "br" | "br/" | "br /" => {
-                    let flags = TextFlags { bold, italic, underline, strikethrough };
+                    let flags = TextFlags {
+                        bold,
+                        italic,
+                        underline,
+                        strikethrough,
+                    };
                     parts.push(IndexedMessagePart {
                         part: MessagePart::Text(
                             "\n".to_string(),
-                            active_effect.map(TextFormat::Effect).unwrap_or(TextFormat::Flags(flags)),
+                            active_effect
+                                .map(TextFormat::Effect)
+                                .unwrap_or(TextFormat::Flags(flags)),
                         ),
                         idx: None,
                         ext: None,
@@ -3438,11 +3744,18 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
                 .replace("&gt;", ">")
                 .replace("&quot;", "\"");
             if !decoded.is_empty() {
-                let flags = TextFlags { bold, italic, underline, strikethrough };
+                let flags = TextFlags {
+                    bold,
+                    italic,
+                    underline,
+                    strikethrough,
+                };
                 parts.push(IndexedMessagePart {
                     part: MessagePart::Text(
                         decoded,
-                        active_effect.map(TextFormat::Effect).unwrap_or(TextFormat::Flags(flags)),
+                        active_effect
+                            .map(TextFormat::Effect)
+                            .unwrap_or(TextFormat::Flags(flags)),
                     ),
                     idx: None,
                     ext: None,
@@ -3456,10 +3769,13 @@ fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
         return None;
     }
 
-    let reconstructed: String = parts.iter().map(|p| match &p.part {
-        MessagePart::Text(t, _) => t.as_str(),
-        _ => "",
-    }).collect();
+    let reconstructed: String = parts
+        .iter()
+        .map(|p| match &p.part {
+            MessagePart::Text(t, _) => t.as_str(),
+            _ => "",
+        })
+        .collect();
     let has_formatting = parts.iter().any(|p| match &p.part {
         MessagePart::Text(_, TextFormat::Effect(_)) => true,
         MessagePart::Text(_, TextFormat::Flags(flags)) => {
@@ -3529,7 +3845,11 @@ fn pending_ft_rings() -> &'static tokio::sync::Mutex<HashMap<String, PendingFTRi
     PENDING_FT_RINGS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, joiner_handle: &str) {
+async fn maybe_fire_pending_ring(
+    ft: &rustpush::facetime::FTClient,
+    guid: &str,
+    joiner_handle: &str,
+) {
     let targets = {
         let mut map = pending_ft_rings().lock().await;
         let Some(entry) = map.get(guid) else {
@@ -3608,7 +3928,10 @@ async fn maybe_fire_pending_ring(ft: &rustpush::facetime::FTClient, guid: &str, 
         if let Some(session) = state.sessions.get_mut(guid) {
             if session.is_propped {
                 if let Err(e) = ft.unprop_conv(session).await {
-                    warn!("pending ring: unprop_conv failed for session {}: {:?}", guid, e);
+                    warn!(
+                        "pending ring: unprop_conv failed for session {}: {:?}",
+                        guid, e
+                    );
                 } else {
                     info!(
                         "pending ring: unpropped bridge from session {} — web client carries the call from here",
@@ -3656,7 +3979,10 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
         match session.my_handles.first().cloned() {
             Some(h) => h,
             None => {
-                warn!("suppress_own_device_ring: session {} has no my_handles", guid);
+                warn!(
+                    "suppress_own_device_ring: session {} has no my_handles",
+                    guid
+                );
                 return;
             }
         }
@@ -3677,7 +4003,10 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
             &relevant_people,
             &handle,
             false,
-            &QueryOptions { required_for_message: true, result_expected: true },
+            &QueryOptions {
+                required_for_message: true,
+                result_expected: true,
+            },
         )
         .await
     {
@@ -3791,6 +4120,7 @@ async fn prop_up_conv_inbound_video_on(
     facetime: &rustpush::facetime::FTClient,
     session: &mut rustpush::facetime::FTSession,
 ) -> Result<(), rustpush::PushError> {
+    use plist::{Dictionary, Value};
     use prost::Message as _;
     use rustpush::facetime::facetimep::{
         ConversationInvitationPreference, ConversationMember, ConversationMessage,
@@ -3798,7 +4128,6 @@ async fn prop_up_conv_inbound_video_on(
     };
     use rustpush::ids::identity_manager::{IDSSendMessage, Raw};
     use rustpush::ids::user::QueryOptions;
-    use plist::{Dictionary, Value};
 
     const UNIX_TO_2001_MS: u64 = 978_307_200_000;
 
@@ -3834,14 +4163,12 @@ async fn prop_up_conv_inbound_video_on(
         .ok_or(rustpush::PushError::NoParticipantTokenIndex)?;
     let my_participant_id = my_participant.participant_id;
 
-    let members: Vec<rustpush::facetime::FTMember> =
-        session.members.iter().cloned().collect();
+    let members: Vec<rustpush::facetime::FTMember> = session.members.iter().cloned().collect();
     let link = session.link.clone();
     let start_time_ms = session
         .start_time
         .ok_or(rustpush::PushError::NoParticipantTokenIndex)?;
-    let timebase_secs =
-        (start_time_ms as f64 - UNIX_TO_2001_MS as f64) / 1000.0;
+    let timebase_secs = (start_time_ms as f64 - UNIX_TO_2001_MS as f64) / 1000.0;
     let report_data = ConversationReport {
         conversation_id: session.report_id.clone(),
         timebase: timebase_secs,
@@ -3864,7 +4191,8 @@ async fn prop_up_conv_inbound_video_on(
     // other devices registered to it stop ringing.
     if is_ringing_inaccurate {
         let mut message = ConversationMessage::default();
-        message.set_type(rustpush::facetime::facetimep::ConversationMessageType::RespondedElsewhere);
+        message
+            .set_type(rustpush::facetime::facetimep::ConversationMessageType::RespondedElsewhere);
         message.conversation_group_uuid_string = group_id.clone();
         message.disconnected_reason = 4;
 
@@ -3912,8 +4240,7 @@ async fn prop_up_conv_inbound_video_on(
     }
 
     // Cache keys for the prop fan-out (the actual peers).
-    let member_handles: Vec<String> =
-        members.iter().map(|m| m.handle.clone()).collect();
+    let member_handles: Vec<String> = members.iter().map(|m| m.handle.clone()).collect();
     facetime
         .identity
         .cache_keys(
@@ -4010,10 +4337,7 @@ async fn prop_up_conv_inbound_video_on(
             .to_vec(),
         ),
     );
-    wire_dict.insert(
-        "is-initiator-key".to_string(),
-        Value::Boolean(is_initiator),
-    );
+    wire_dict.insert("is-initiator-key".to_string(), Value::Boolean(is_initiator));
     wire_dict.insert(
         "fanout-groupMembers-key".to_string(),
         Value::Array(
@@ -4038,10 +4362,7 @@ async fn prop_up_conv_inbound_video_on(
 
     let mut uri_to_pid_dict = Dictionary::new();
     for (h, ids) in participants_map.iter() {
-        let arr: Vec<Value> = ids
-            .iter()
-            .map(|id| Value::Integer((*id).into()))
-            .collect();
+        let arr: Vec<Value> = ids.iter().map(|id| Value::Integer((*id).into())).collect();
         uri_to_pid_dict.insert(h.clone(), Value::Array(arr));
     }
     wire_dict.insert(
@@ -4171,11 +4492,21 @@ async fn ft_handle_with_join_recovery(
         return upstream_result;
     }
 
-    let Some(message_unenc) = recv.message_unenc else { return upstream_result };
-    let Some(sender) = recv.sender.clone() else { return upstream_result };
-    let Some(target) = recv.target.clone() else { return upstream_result };
-    let Some(token_bytes) = recv.token.clone() else { return upstream_result };
-    let Some(ns_since_epoch) = recv.ns_since_epoch else { return upstream_result };
+    let Some(message_unenc) = recv.message_unenc else {
+        return upstream_result;
+    };
+    let Some(sender) = recv.sender.clone() else {
+        return upstream_result;
+    };
+    let Some(target) = recv.target.clone() else {
+        return upstream_result;
+    };
+    let Some(token_bytes) = recv.token.clone() else {
+        return upstream_result;
+    };
+    let Some(ns_since_epoch) = recv.ns_since_epoch else {
+        return upstream_result;
+    };
 
     let payload_value: plist::Value = match message_unenc.plist() {
         Ok(v) => v,
@@ -4250,8 +4581,7 @@ async fn ft_handle_with_join_recovery(
 // Stamped onto the bridge webview's LetMeIn nickname so the peer sees the
 // user's name instead of the raw temp:<uuid> pseud — the URL &n= pre-fill only
 // fills Apple's join-page name box client-side and never reaches the wire.
-static FACETIME_SELF_DISPLAY_NAME: std::sync::RwLock<Option<String>> =
-    std::sync::RwLock::new(None);
+static FACETIME_SELF_DISPLAY_NAME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 fn facetime_self_display_name() -> Option<String> {
     FACETIME_SELF_DISPLAY_NAME
@@ -4299,7 +4629,11 @@ async fn auto_approve_bridge_letmein(
             if !session.my_handles.iter().any(|h| h == &link.handle) {
                 return None;
             }
-            if session.members.iter().any(|member| member.handle == request.requestor) {
+            if session
+                .members
+                .iter()
+                .any(|member| member.handle == request.requestor)
+            {
                 Some(group.clone())
             } else {
                 None
@@ -4336,7 +4670,13 @@ async fn auto_approve_bridge_letmein(
             .map(|s| matches!(s.mode, Some(rustpush::facetime::FTMode::Incoming)))
             .unwrap_or(false);
 
-        (link.handle.clone(), linked_group, member_group, ringing_group, inbound_session)
+        (
+            link.handle.clone(),
+            linked_group,
+            member_group,
+            ringing_group,
+            inbound_session,
+        )
     };
 
     // Priority: linked > member > ringing.
@@ -4365,7 +4705,11 @@ async fn auto_approve_bridge_letmein(
         // strip-own-devices wrapper caused the callee not to ring (see
         // WrappedFaceTimeClient::create_session for the full writeup).
         facetime
-            .create_session(group.clone(), link_handle.clone(), &[request.requestor.clone()])
+            .create_session(
+                group.clone(),
+                link_handle.clone(),
+                &[request.requestor.clone()],
+            )
             .await?;
         group
     };
@@ -4511,12 +4855,21 @@ async fn auto_approve_bridge_letmein(
         // wire, facetime.rs:127-131) instead of the raw temp:<uuid> pseud. The
         // webview's own LetMeIn carries no usable nickname (Apple's &n= join-
         // page pre-fill stays client-side), so we set it bridge-side.
-        if retry_request.nickname.as_deref().unwrap_or("").trim().is_empty() {
+        if retry_request
+            .nickname
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             if let Some(name) = facetime_self_display_name() {
                 retry_request.nickname = Some(name);
             }
         }
-        match facetime.respond_letmein(retry_request, Some(&approved_group)).await {
+        match facetime
+            .respond_letmein(retry_request, Some(&approved_group))
+            .await
+        {
             Ok(()) => {
                 info!(
                     "FaceTime auto-approved LetMeIn request for bridge link: requestor={} group={} inbound={}",
@@ -4556,13 +4909,15 @@ async fn facetime_event_to_wrapped(
     event: &rustpush::facetime::FTMessage,
 ) -> Option<WrappedMessage> {
     let (guid, mut sender, marker) = match event {
-        rustpush::facetime::FTMessage::Ring { guid } => {
-            (guid.clone(), None, FACETIME_RING_MARKER)
-        }
-        rustpush::facetime::FTMessage::JoinEvent { guid, handle, ring, .. } if *ring => {
-            (guid.clone(), Some(handle.clone()), FACETIME_RING_MARKER)
-        }
-        rustpush::facetime::FTMessage::AddMembers { guid, members, ring } if *ring => {
+        rustpush::facetime::FTMessage::Ring { guid } => (guid.clone(), None, FACETIME_RING_MARKER),
+        rustpush::facetime::FTMessage::JoinEvent {
+            guid, handle, ring, ..
+        } if *ring => (guid.clone(), Some(handle.clone()), FACETIME_RING_MARKER),
+        rustpush::facetime::FTMessage::AddMembers {
+            guid,
+            members,
+            ring,
+        } if *ring => {
             let fallback = members.iter().next().map(|member| member.handle.clone());
             (guid.clone(), fallback, FACETIME_RING_MARKER)
         }
@@ -4596,7 +4951,8 @@ async fn facetime_event_to_wrapped(
             let my_handles: std::collections::HashSet<String> =
                 session.my_handles.iter().cloned().collect();
             let link = session.link.as_ref().map(|link| {
-                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
+                let encoded =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.public_key);
                 let pseud = link
                     .pseudonym
                     .strip_prefix("temp:")
@@ -4715,9 +5071,14 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         is_set_transcript_background: false,
         transcript_background_remove: None,
         transcript_background_chat_id: None,
+        transcript_background_version: None,
+        transcript_background_id: None,
+        transcript_background_payload_version: None,
         transcript_background_object_id: None,
         transcript_background_url: None,
         transcript_background_file_size: None,
+        transcript_background_preset: None,
+        transcript_background_payload_data: None,
         sticker_data: None,
         sticker_mime: None,
         is_share_profile: false,
@@ -4730,6 +5091,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         share_profile_avatar: None,
         app_balloon_bundle_id: None,
         app_balloon_app_name: None,
+        app_balloon_app_id: None,
         app_balloon_url: None,
         app_balloon_session_id: None,
         app_balloon_is_live: false,
@@ -4740,6 +5102,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         app_balloon_subcaption: None,
         app_balloon_secondary_subcaption: None,
         app_balloon_tertiary_subcaption: None,
+        app_balloon_icon: None,
     };
 
     match &msg.message {
@@ -4749,7 +5112,11 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.reply_guid = normal.reply_guid.clone();
             w.reply_part = normal.reply_part.clone();
             w.is_sms = matches!(normal.service, MessageType::SMS { .. });
-            if let MessageType::SMS { from_handle: Some(ref fh), .. } = normal.service {
+            if let MessageType::SMS {
+                from_handle: Some(ref fh),
+                ..
+            } = normal.service
+            {
                 // Apple's SMS relay puts the forwarding iPhone's handle in the APNs
                 // envelope sender, causing the bridge to misidentify it as IsFromMe.
                 // The true sender of an inbound SMS is stored in from_handle.
@@ -4789,8 +5156,10 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                 };
 
                 // Metadata: original_url\x01url\x01title\x01summary\x01image_mime
-                let meta = format!("{}\x01{}\x01{}\x01{}\x01{}",
-                    original_url, url, title, summary, image_mime);
+                let meta = format!(
+                    "{}\x01{}\x01{}\x01{}\x01{}",
+                    original_url, url, title, summary, image_mime
+                );
                 w.attachments.push(WrappedAttachment {
                     mime_type: "x-richlink/meta".to_string(),
                     filename: String::new(),
@@ -4989,13 +5358,31 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         Message::SetTranscriptBackground(update) => {
             w.is_set_transcript_background = true;
             match update {
-                SetTranscriptBackgroundMessage::Remove { chat_id, remove, .. } => {
+                SetTranscriptBackgroundMessage::Remove {
+                    bid,
+                    chat_id,
+                    remove,
+                    ..
+                } => {
                     w.transcript_background_remove = Some(*remove);
                     w.transcript_background_chat_id = chat_id.clone();
+                    w.transcript_background_version = Some(*bid);
                 }
-                SetTranscriptBackgroundMessage::Set { chat_id, object_id, url, file_size, .. } => {
+                SetTranscriptBackgroundMessage::Set {
+                    bid,
+                    chat_id,
+                    background_id,
+                    payload_version,
+                    object_id,
+                    url,
+                    file_size,
+                    ..
+                } => {
                     w.transcript_background_remove = Some(false);
                     w.transcript_background_chat_id = chat_id.clone();
+                    w.transcript_background_version = Some(*bid);
+                    w.transcript_background_id = Some(background_id.clone());
+                    w.transcript_background_payload_version = Some(*payload_version as u64);
                     w.transcript_background_object_id = Some(object_id.clone());
                     w.transcript_background_url = Some(url.clone());
                     w.transcript_background_file_size = Some(*file_size as u64);
@@ -5034,7 +5421,10 @@ fn append_wrapped_attachments(
             inline_data,
             iris: att.iris,
             is_sticker: force_sticker
-                || matches!(indexed_part.ext.as_ref(), Some(PartExtension::Sticker { .. })),
+                || matches!(
+                    indexed_part.ext.as_ref(),
+                    Some(PartExtension::Sticker { .. })
+                ),
             audio_transcription: match &indexed_part.ext {
                 Some(PartExtension::AudioTranscription { text }) => Some(text.clone()),
                 _ => None,
@@ -5133,10 +5523,7 @@ pub fn init_logger() {
         //   RUST_LOG=info,rustpush=info          # all rustpush info logs
         //   RUST_LOG=info,rustpush::icloud=debug # deep cloudkit/mmcs/pcs
         //   RUST_LOG=debug                       # everything
-        std::env::set_var(
-            "RUST_LOG",
-            "warn,rustpush=warn,rustpushgo=info",
-        );
+        std::env::set_var("RUST_LOG", "warn,rustpush=warn,rustpushgo=info");
     }
     let _ = pretty_env_logger::try_init();
 
@@ -5336,7 +5723,10 @@ pub fn init_logger() {
 
     let state: SoftwareKeystoreState = match std::fs::read(&state_path) {
         Ok(data) => plist::from_bytes(&data).unwrap_or_else(|e| {
-            warn!("Failed to parse keystore at {}: {} — starting with empty keystore", state_path, e);
+            warn!(
+                "Failed to parse keystore at {}: {} — starting with empty keystore",
+                state_path, e
+            );
             SoftwareKeystoreState::default()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -5344,7 +5734,10 @@ pub fn init_logger() {
             SoftwareKeystoreState::default()
         }
         Err(e) => {
-            warn!("Failed to read keystore at {}: {} — starting with empty keystore", state_path, e);
+            warn!(
+                "Failed to read keystore at {}: {} — starting with empty keystore",
+                state_path, e
+            );
             SoftwareKeystoreState::default()
         }
     };
@@ -5470,7 +5863,9 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
     #[cfg(target_os = "macos")]
     {
         let config = local_config::LocalMacOSConfig::new()
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to read hardware info: {}", e),
+            })?
             .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
             config: Arc::new(config),
@@ -5487,11 +5882,15 @@ pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError>
 /// Create a local macOS config with a persisted device ID.
 /// Only works on macOS — returns an error on other platforms.
 #[uniffi::export]
-pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+pub fn create_local_macos_config_with_device_id(
+    device_id: String,
+) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     #[cfg(target_os = "macos")]
     {
         let config = local_config::LocalMacOSConfig::new()
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to read hardware info: {}", e),
+            })?
             .with_device_id(device_id)
             .into_macos_config();
         Ok(Arc::new(WrappedOSConfig {
@@ -5517,21 +5916,29 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
 /// Building Linux through the Makefile enables this `hardware-key` API while
 /// keeping the clean-room NAC default active.
 #[uniffi::export]
-pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+pub fn create_config_from_hardware_key(
+    base64_key: String,
+) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     _create_config_from_hardware_key_inner(base64_key, None)
 }
 
 /// Create a cross-platform config from a base64-encoded JSON hardware key
 /// with a persisted device ID.
 #[uniffi::export]
-pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+pub fn create_config_from_hardware_key_with_device_id(
+    base64_key: String,
+    device_id: String,
+) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     _create_config_from_hardware_key_inner(base64_key, Some(device_id))
 }
 
 #[cfg(feature = "hardware-key")]
-fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    use rustpush::macos::{MacOSConfig, HardwareConfig};
+fn _create_config_from_hardware_key_inner(
+    base64_key: String,
+    device_id: Option<String>,
+) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use rustpush::macos::{HardwareConfig, MacOSConfig};
     use serde::Deserialize;
 
     // Local wire-compatible struct: MacOSConfig only has
@@ -5567,71 +5974,73 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     while clean_key.len() % 4 != 0 {
         clean_key.push('=');
     }
-    let json_bytes = STANDARD.decode(&clean_key)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
+    let json_bytes = STANDARD
+        .decode(&clean_key)
+        .map_err(|e| WrappedError::GenericError {
+            msg: format!("Invalid base64: {}", e),
+        })?;
 
     // Try parsing as FullHardwareKey first (extract-key tool output). Fall
     // back to bare HardwareConfig for legacy keys that are just the hw blob.
-    let (hw, version, protocol_version, icloud_ua, aoskit_version) =
-        if let Ok(full) = serde_json::from_slice::<FullHardwareKey>(&json_bytes) {
-            if let Some(hw) = full.inner {
-                let version = full.version
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "13.6.4".to_string());
-                let protocol_version = full.protocol_version
-                    .filter(|v| *v != 0)
-                    .unwrap_or(1660);
-                // get_normal_ua() expects icloud_ua to contain whitespace so
-                // it can split out the "com.apple.iCloudHelper/..." prefix.
-                let icloud_ua = full.icloud_ua
-                    .filter(|v| v.split_once(char::is_whitespace).is_some())
-                    .unwrap_or_else(|| "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string());
-                let aoskit_version = full.aoskit_version
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
-                (
-                    hw,
-                    version,
-                    protocol_version,
-                    icloud_ua,
-                    aoskit_version,
-                )
-            } else {
-                // JSON parsed as FullHardwareKey but has no `inner` field —
-                // retry as bare HardwareConfig.
-                let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
-                    .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
-                let version = full.version
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "13.6.4".to_string());
-                let protocol_version = full.protocol_version
-                    .filter(|v| *v != 0)
-                    .unwrap_or(1660);
-                let icloud_ua = full.icloud_ua
-                    .filter(|v| v.split_once(char::is_whitespace).is_some())
-                    .unwrap_or_else(|| "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string());
-                let aoskit_version = full.aoskit_version
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
-                (
-                    hw,
-                    version,
-                    protocol_version,
-                    icloud_ua,
-                    aoskit_version,
-                )
-            }
+    let (hw, version, protocol_version, icloud_ua, aoskit_version) = if let Ok(full) =
+        serde_json::from_slice::<FullHardwareKey>(&json_bytes)
+    {
+        if let Some(hw) = full.inner {
+            let version = full
+                .version
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "13.6.4".to_string());
+            let protocol_version = full.protocol_version.filter(|v| *v != 0).unwrap_or(1660);
+            // get_normal_ua() expects icloud_ua to contain whitespace so
+            // it can split out the "com.apple.iCloudHelper/..." prefix.
+            let icloud_ua = full
+                .icloud_ua
+                .filter(|v| v.split_once(char::is_whitespace).is_some())
+                .unwrap_or_else(|| {
+                    "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string()
+                });
+            let aoskit_version = full
+                .aoskit_version
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
+            (hw, version, protocol_version, icloud_ua, aoskit_version)
         } else {
-            let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
-                .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
-            (
-                hw,
-                "13.6.4".to_string(),
-                1660,
-                "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
-                "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-            )
-        };
+            // JSON parsed as FullHardwareKey but has no `inner` field —
+            // retry as bare HardwareConfig.
+            let hw: HardwareConfig =
+                serde_json::from_slice(&json_bytes).map_err(|e| WrappedError::GenericError {
+                    msg: format!("Invalid hardware key JSON: {}", e),
+                })?;
+            let version = full
+                .version
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "13.6.4".to_string());
+            let protocol_version = full.protocol_version.filter(|v| *v != 0).unwrap_or(1660);
+            let icloud_ua = full
+                .icloud_ua
+                .filter(|v| v.split_once(char::is_whitespace).is_some())
+                .unwrap_or_else(|| {
+                    "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string()
+                });
+            let aoskit_version = full
+                .aoskit_version
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string());
+            (hw, version, protocol_version, icloud_ua, aoskit_version)
+        }
+    } else {
+        let hw: HardwareConfig =
+            serde_json::from_slice(&json_bytes).map_err(|e| WrappedError::GenericError {
+                msg: format!("Invalid hardware key JSON: {}", e),
+            })?;
+        (
+            hw,
+            "13.6.4".to_string(),
+            1660,
+            "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
+            "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        )
+    };
 
     // Use the extracted key's REAL hardware identity verbatim — exactly like
     // a native Mac. Apple's GSA validates the device identity at login `init`; a
@@ -5673,18 +6082,20 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
 
     // Coerce the concrete MacOSConfig into the trait object the wrapper holds.
     let config: Arc<dyn OSConfig> = config;
-    Ok(Arc::new(WrappedOSConfig {
-        config,
-    }))
+    Ok(Arc::new(WrappedOSConfig { config }))
 }
 
 #[cfg(not(feature = "hardware-key"))]
-fn _create_config_from_hardware_key_inner(base64_key: String, _device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+fn _create_config_from_hardware_key_inner(
+    base64_key: String,
+    _device_id: Option<String>,
+) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     let _ = base64_key;
     Err(WrappedError::GenericError {
         msg: "Hardware key support not available in this build. \
               On macOS, use the Apple ID login flow instead (which uses native validation). \
-              To enable hardware key support, rebuild with: cargo build --features hardware-key".into(),
+              To enable hardware key support, rebuild with: cargo build --features hardware-key"
+            .into(),
     })
 }
 
@@ -5851,8 +6262,8 @@ fn aps_apply_keepalive(fd: i32) -> bool {
             const TCP_KEEPINTVL: libc::c_int = 0x101;
             const TCP_KEEPCNT: libc::c_int = 0x102;
             const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80; // seconds to drop after retransmit failures
-            // 90s idle is ABOVE rustpush's existing 60s app-level Ping cadence (see Linux
-            // note above): healthy links never emit an extra probe.
+                                                            // 90s idle is ABOVE rustpush's existing 60s app-level Ping cadence (see Linux
+                                                            // note above): healthy links never emit an extra probe.
             setopt(fd, tcp, TCP_KEEPALIVE, 90);
             setopt(fd, tcp, TCP_KEEPINTVL, 15);
             setopt(fd, tcp, TCP_KEEPCNT, 4);
@@ -5970,10 +6381,13 @@ async fn gsa_init_capture_sim(
     request.insert("A2k".into(), Value::Data(a2k));
     request.insert("cpd".into(), Value::Dictionary(cpd));
     request.insert("o".into(), Value::String("init".into()));
-    request.insert("ps".into(), Value::Array(vec![
-        Value::String("s2k".into()),
-        Value::String("s2k_fo".into()),
-    ]));
+    request.insert(
+        "ps".into(),
+        Value::Array(vec![
+            Value::String("s2k".into()),
+            Value::String("s2k_fo".into()),
+        ]),
+    );
     request.insert("u".into(), Value::String(username.to_string()));
     let mut header = plist::Dictionary::new();
     header.insert("Version".into(), Value::String("1.0.1".into()));
@@ -6016,7 +6430,10 @@ async fn gsa_init_capture_sim(
     let parsed = plist::Value::from_reader(std::io::Cursor::new(text.into_bytes())).ok()?;
     let status = parsed.as_dictionary()?.get("Status")?.as_dictionary()?;
     let sim = status.get("X-Apple-I-MD-DATA")?.as_string()?.to_string();
-    info!("login_start: captured native-sync SIM via self-init (len={})", sim.len());
+    info!(
+        "login_start: captured native-sync SIM via self-init (len={})",
+        sim.len()
+    );
     Some(sim)
 }
 
@@ -6035,7 +6452,7 @@ pub async fn login_start(
     // Apple's GSA SRP expects the password to be pre-hashed with SHA-256.
     // See test.rs: sha256(password.as_bytes())
     let pw_bytes = {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(password.trim().as_bytes());
         hasher.finalize().to_vec()
@@ -6043,7 +6460,10 @@ pub async fn login_start(
     // Never log password-derived material. The old Matrix-oriented diagnostic
     // emitted a reusable SHA-256 password fingerprint; iBlue accepts credentials
     // over its private stdin RPC channel and keeps logs safe to forward.
-    debug!("login_start: received credential input for account (identifier length={})", user_trimmed.len());
+    debug!(
+        "login_start: received credential input for account (identifier length={})",
+        user_trimmed.len()
+    );
 
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
     // LoginClientInfo contains stable hardware headers and the APNs token. Do
@@ -6058,12 +6478,22 @@ pub async fn login_start(
     // A real device provisions once and persists; this matches that.
     let anisette_state_path = PathBuf::from(subsystem_state_path("anisette"));
     let state_plist = anisette_state_path.join("state.plist");
-    info!("login_start: persisted anisette state exists={}", state_plist.exists());
+    info!(
+        "login_start: persisted anisette state exists={}",
+        state_plist.exists()
+    );
 
-    let anisette = bridge_default_provider(client_info.clone(), anisette_state_path, os_config.get_device_uuid());
+    let anisette = bridge_default_provider(
+        client_info.clone(),
+        anisette_state_path,
+        os_config.get_device_uuid(),
+    );
 
-    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette).map_err(|e| {
+        WrappedError::GenericError {
+            msg: format!("Failed to create account: {}", e),
+        }
+    })?;
 
     info!("login_start: calling login_email_pass");
     // The clean-room now registers as a phantom Mac (synthetic identity), so the
@@ -6071,8 +6501,12 @@ pub async fn login_start(
     // challenge should not fire. The old capture-SIM + anisette-sync + retry dance
     // (which only ever produced -29003 and extra GSA requests that fed Apple's
     // rate-limiter) is removed — a single login attempt.
-    let result = account.login_email_pass(&user_trimmed, &pw_bytes).await
-        .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
+    let result = account
+        .login_email_pass(&user_trimmed, &pw_bytes)
+        .await
+        .map_err(|e| WrappedError::GenericError {
+            msg: format!("Login failed: {}", e),
+        })?;
     info!("login_start: login_email_pass returned ok");
 
     info!("login_email_pass returned: {:?}", result);
@@ -6119,11 +6553,15 @@ pub async fn login_start(
                 info!("Login completed (extra step ignored, PET available)");
                 false
             } else {
-                return Err(WrappedError::GenericError { msg: format!("Login requires extra step: {}", step) });
+                return Err(WrappedError::GenericError {
+                    msg: format!("Login requires extra step: {}", step),
+                });
             }
         }
         icloud_auth::LoginState::NeedsLogin => {
-            return Err(WrappedError::GenericError { msg: "Login failed - bad credentials".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Login failed - bad credentials".to_string(),
+            });
         }
     };
 
@@ -6154,14 +6592,19 @@ impl LoginSession {
 
     /// Fetch the phone choices Apple permits for an SMS fallback. Do not
     /// expose full phone numbers across the native RPC boundary.
-    pub async fn two_factor_phone_options(&self) -> Result<Vec<TwoFactorPhoneOption>, WrappedError> {
+    pub async fn two_factor_phone_options(
+        &self,
+    ) -> Result<Vec<TwoFactorPhoneOption>, WrappedError> {
         let guard = self.account.lock().await;
         let account = guard.as_ref().ok_or(WrappedError::GenericError {
             msg: "No active session".to_string(),
         })?;
-        let extras = account.get_auth_extras().await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to fetch trusted phone numbers: {}", e),
-        })?;
+        let extras = account
+            .get_auth_extras()
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to fetch trusted phone numbers: {}", e),
+            })?;
         Ok(extras
             .trusted_phone_numbers
             .into_iter()
@@ -6192,14 +6635,19 @@ impl LoginSession {
                 Ok(true)
             }
             other => Err(WrappedError::GenericError {
-                msg: format!("Apple returned an unexpected SMS challenge state: {:?}", other),
+                msg: format!(
+                    "Apple returned an unexpected SMS challenge state: {:?}",
+                    other
+                ),
             }),
         }
     }
 
     pub async fn submit_2fa(&self, code: String) -> Result<bool, WrappedError> {
         let mut guard = self.account.lock().await;
-        let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError {
+            msg: "No active session".to_string(),
+        })?;
 
         // SMS (secondaryAuth) accounts must verify via verify_sms_2fa with the body
         // captured at login_start; trusted-device accounts use verify_2fa.
@@ -6209,12 +6657,20 @@ impl LoginSession {
         let sms_body = self.sms_verify_body.lock().unwrap().clone();
         let result = if let Some(body) = sms_body {
             info!("Verifying 2FA code via SMS securitycode endpoint (verify_sms_2fa)");
-            account.verify_sms_2fa(code, body).await
-                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?
+            account
+                .verify_sms_2fa(code, body)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("2FA verification failed: {}", e),
+                })?
         } else {
             info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
-            account.verify_2fa(code).await
-                .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?
+            account
+                .verify_2fa(code)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("2FA verification failed: {}", e),
+                })?
         };
 
         info!("2FA verification returned: {:?}", result);
@@ -6228,17 +6684,26 @@ impl LoginSession {
         // surfacing as "2FA verification failed — invalid code" on a perfectly valid code.
         let accepted = match result {
             icloud_auth::LoginState::LoggedIn => true,
-            icloud_auth::LoginState::NeedsExtraStep(_) => {
-                account.get_pet().is_some()
-            }
+            icloud_auth::LoginState::NeedsExtraStep(_) => account.get_pet().is_some(),
             icloud_auth::LoginState::NeedsLogin => {
                 info!("2FA code accepted; re-running login_email_pass to collect the PET");
-                let hashed = account.hashed_password.clone().ok_or(WrappedError::GenericError {
-                    msg: "No hashed password available for post-2FA re-login".to_string(),
-                })?;
-                let relogin = account.login_email_pass(&self.username, &hashed).await
-                    .map_err(|e| WrappedError::GenericError { msg: format!("Post-2FA re-login failed: {}", e) })?;
-                info!("Post-2FA re-login returned: {:?}; PET available: {}", relogin, account.get_pet().is_some());
+                let hashed = account
+                    .hashed_password
+                    .clone()
+                    .ok_or(WrappedError::GenericError {
+                        msg: "No hashed password available for post-2FA re-login".to_string(),
+                    })?;
+                let relogin = account
+                    .login_email_pass(&self.username, &hashed)
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Post-2FA re-login failed: {}", e),
+                    })?;
+                info!(
+                    "Post-2FA re-login returned: {:?}; PET available: {}",
+                    relogin,
+                    account.get_pet().is_some()
+                );
                 matches!(relogin, icloud_auth::LoginState::LoggedIn) || account.get_pet().is_some()
             }
             _ => false,
@@ -6260,11 +6725,15 @@ impl LoginSession {
         let conn = connection.inner.clone();
 
         let mut guard = self.account.lock().await;
-        let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError {
+            msg: "No active session".to_string(),
+        })?;
 
-        let pet = account.get_pet()
-            .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
-        let pet_expires_at_ms = account.tokens
+        let pet = account.get_pet().ok_or(WrappedError::GenericError {
+            msg: "No PET token available after login".to_string(),
+        })?;
+        let pet_expires_at_ms = account
+            .tokens
             .get("com.apple.gs.idms.pet")
             .and_then(|token| token.expiration.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis() as u64)
@@ -6276,8 +6745,15 @@ impl LoginSession {
             });
 
         let spd = account.spd.as_ref().expect("No SPD after login");
-        let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap().to_string();
-        let dsid = spd.get("DsPrsId").or_else(|| spd.get("dsid"))
+        let adsid = spd
+            .get("adsid")
+            .expect("No adsid")
+            .as_string()
+            .unwrap()
+            .to_string();
+        let dsid = spd
+            .get("DsPrsId")
+            .or_else(|| spd.get("dsid"))
             .and_then(|v| {
                 if let Some(s) = v.as_string() {
                     Some(s.to_string())
@@ -6292,12 +6768,15 @@ impl LoginSession {
             .unwrap_or_default();
 
         // Build persist data before delegates call (while we have SPD access)
-        let hashed_password_hex = account.hashed_password.as_ref()
+        let hashed_password_hex = account
+            .hashed_password
+            .as_ref()
             .map(|p| encode_hex(p))
             .unwrap_or_default();
         let mut spd_bytes = Vec::new();
-        plist::to_writer_binary(&mut spd_bytes, spd)
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
+        plist::to_writer_binary(&mut spd_bytes, spd).map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to serialize SPD: {}", e),
+        })?;
         let spd_base64 = base64_encode(&spd_bytes);
 
         let mut account_persist = AccountPersistData {
@@ -6317,11 +6796,20 @@ impl LoginSession {
             None,
             &*os_config,
             &[LoginDelegate::IDS, LoginDelegate::MobileMe],
-        ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) })?;
+        )
+        .await
+        .map_err(|e| WrappedError::GenericError {
+            msg: format!("Failed to get delegates: {}", e),
+        })?;
 
-        let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
-        let fresh_user = authenticate_apple(ids_delegate, &*os_config).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("IDS authentication failed: {}", e) })?;
+        let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError {
+            msg: "No IDS delegate in response".to_string(),
+        })?;
+        let fresh_user = authenticate_apple(ids_delegate, &*os_config)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("IDS authentication failed: {}", e),
+            })?;
 
         // Resolve identity: reuse existing or generate new
         let identity = match existing_identity {
@@ -6331,10 +6819,9 @@ impl LoginSession {
             }
             None => {
                 info!("Generating new identity (first login)");
-                IDSNGMIdentity::new()
-                    .map_err(|e| WrappedError::GenericError {
-                        msg: format!("Failed to create identity: {}", e)
-                    })?
+                IDSNGMIdentity::new().map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to create identity: {}", e),
+                })?
             }
         };
 
@@ -6342,13 +6829,22 @@ impl LoginSession {
         let users = match existing_users {
             Some(ref wrapped) if !wrapped.inner.is_empty() => {
                 let has_valid_registration = wrapped.inner[0]
-                    .registration.get(MADRID_SERVICE.name)
+                    .registration
+                    .get(MADRID_SERVICE.name)
                     .map(|r| r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false))
                     .unwrap_or(false);
-                let has_required_services = wrapped.inner[0].registration.contains_key(MADRID_SERVICE.name)
-                    && wrapped.inner[0].registration.contains_key(MULTIPLEX_SERVICE.name)
-                    && wrapped.inner[0].registration.contains_key(FACETIME_SERVICE.name)
-                    && wrapped.inner[0].registration.contains_key(VIDEO_SERVICE.name);
+                let has_required_services = wrapped.inner[0]
+                    .registration
+                    .contains_key(MADRID_SERVICE.name)
+                    && wrapped.inner[0]
+                        .registration
+                        .contains_key(MULTIPLEX_SERVICE.name)
+                    && wrapped.inner[0]
+                        .registration
+                        .contains_key(FACETIME_SERVICE.name)
+                    && wrapped.inner[0]
+                        .registration
+                        .contains_key(VIDEO_SERVICE.name);
                 // Also validate MULTIPLEX cert isn't expired and data_hash
                 // (sub_services + client_data) hasn't changed since registration.
                 // A stale MULTIPLEX registration makes the bridge invisible to
@@ -6381,12 +6877,25 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+                        &[
+                            &MADRID_SERVICE,
+                            &MULTIPLEX_SERVICE,
+                            &FACETIME_SERVICE,
+                            &VIDEO_SERVICE,
+                        ],
                         &mut users,
                         &identity,
-                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("4-service registration failed: {}", e) })?;
-                    let registered: Vec<&str> = users[0].registration.keys().map(|s| s.as_str()).collect();
-                    info!("Re-registration OK — services registered: [{}]", registered.join(", "));
+                    )
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("4-service registration failed: {}", e),
+                    })?;
+                    let registered: Vec<&str> =
+                        users[0].registration.keys().map(|s| s.as_str()).collect();
+                    info!(
+                        "Re-registration OK — services registered: [{}]",
+                        registered.join(", ")
+                    );
                     users
                 }
             }
@@ -6397,12 +6906,25 @@ impl LoginSession {
                     register(
                         &*os_config,
                         &*conn.state.read().await,
-                        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+                        &[
+                            &MADRID_SERVICE,
+                            &MULTIPLEX_SERVICE,
+                            &FACETIME_SERVICE,
+                            &VIDEO_SERVICE,
+                        ],
                         &mut users,
                         &identity,
-                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
-                    let registered: Vec<&str> = users[0].registration.keys().map(|s| s.as_str()).collect();
-                    info!("First-login registration OK — services registered: [{}]", registered.join(", "));
+                    )
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Registration failed: {}", e),
+                    })?;
+                    let registered: Vec<&str> =
+                        users[0].registration.keys().map(|s| s.as_str()).collect();
+                    info!(
+                        "First-login registration OK — services registered: [{}]",
+                        registered.join(", ")
+                    );
                 }
                 users
             }
@@ -6412,8 +6934,9 @@ impl LoginSession {
         // The MobileMe delegate from `delegates` is seeded into the WrappedTokenProvider
         // so the first get_contacts_url() / create_keychain_clients() call doesn't
         // need to re-fetch.
-        let owned_account = guard.take()
-            .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
+        let owned_account = guard.take().ok_or(WrappedError::GenericError {
+            msg: "Account already consumed".to_string(),
+        })?;
         let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
         let token_provider = TokenProvider::new(account_arc.clone(), os_config.clone());
 
@@ -6437,7 +6960,8 @@ impl LoginSession {
                 plist::Value::Dictionary(mobileme.config.clone()),
             );
             let mut buf = Vec::new();
-            plist::Value::Dictionary(root).to_writer_xml(&mut buf)
+            plist::Value::Dictionary(root)
+                .to_writer_xml(&mut buf)
                 .map_err(|e| WrappedError::GenericError {
                     msg: format!("Failed to serialize MobileMe delegate: {}", e),
                 })?;
@@ -6458,7 +6982,12 @@ impl LoginSession {
             keychain_clients_cache: tokio::sync::Mutex::new(None),
             mme_self_heal_lock: tokio::sync::Mutex::new(()),
         });
-        if wrapped_token_provider.mme_delegate_bytes.lock().await.is_some() {
+        if wrapped_token_provider
+            .mme_delegate_bytes
+            .lock()
+            .await
+            .is_some()
+        {
             wrapped_token_provider.seed_inner_mme_delegate().await?;
         }
 
@@ -6501,7 +7030,12 @@ pub async fn refresh_registration_once(
     register(
         config.config.as_ref(),
         &*connection.inner.state.read().await,
-        &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+        &[
+            &MADRID_SERVICE,
+            &MULTIPLEX_SERVICE,
+            &FACETIME_SERVICE,
+            &VIDEO_SERVICE,
+        ],
         &mut refreshed_users,
         &identity.inner,
     )
@@ -6625,7 +7159,9 @@ async fn fetch_imessage_mmcs_authorize_body(
         // Value::Data carrying raw plist bytes. Accept both — matches
         // the get_message helper, which doesn't constrain the
         // variant.
-        let rustpush::APSMessage::Notification { payload, .. } = msg else { return None };
+        let rustpush::APSMessage::Notification { payload, .. } = msg else {
+            return None;
+        };
         let parsed = match payload {
             plist::Value::Data(bytes) => plist::from_bytes::<Value>(&bytes).ok()?,
             v => v,
@@ -6698,7 +7234,11 @@ async fn download_mmcs_attachments(
                 if att_idx < wrapped.attachments.len() {
                     match download_one_mmcs_attachment(mmcs, conn, &att.name).await {
                         Ok(buf) => {
-                            info!("Downloaded MMCS attachment: {} ({} bytes)", att.name, buf.len());
+                            info!(
+                                "Downloaded MMCS attachment: {} ({} bytes)",
+                                att.name,
+                                buf.len()
+                            );
                             wrapped.attachments[att_idx].is_inline = true;
                             wrapped.attachments[att_idx].inline_data = Some(buf);
                         }
@@ -6794,14 +7334,9 @@ async fn download_one_mmcs_attachment_once(
     // (V1 AES-128-CFB) — there's no outer Ford SIV layer on the iMessage
     // side.
     let user_agent = conn.os_config.get_normal_ua("IMTransferAgent/1000");
-    let chunked_plaintext = manual_ford::manual_ford_download_asset(
-        &body,
-        &mmcs.signature,
-        &[],
-        &user_agent,
-        name,
-    )
-    .await?;
+    let chunked_plaintext =
+        manual_ford::manual_ford_download_asset(&body, &mmcs.signature, &[], &user_agent, name)
+            .await?;
 
     // Step 3: iMessage outer unwrap — AES-256-CTR(mmcs.key, zero_iv)
     // over the full assembled plaintext. This mirrors what the
@@ -6901,6 +7436,59 @@ async fn download_icon_change_photo(
     }
 }
 
+/// Download the opaque PosterKit package carried by an incoming transcript
+/// background update. Keeping the original bytes lets higher layers expose
+/// the background and, importantly, preserves Apple's exact package instead
+/// of attempting a lossy reconstruction from its MMCS descriptor.
+async fn download_transcript_background_payload(
+    wrapped: &mut WrappedMessage,
+    msg_inst: &MessageInst,
+    conn: &rustpush::APSConnectionResource,
+) {
+    let Message::SetTranscriptBackground(update) = &msg_inst.message else {
+        return;
+    };
+    let Some(mmcs_file) = update.to_mmcs() else {
+        return;
+    };
+    let mut payload = Vec::new();
+    let result = guard_panic(
+        "transcript-background MMCS download",
+        mmcs_file.get_attachment(conn, &mut payload, |_, _| {}),
+    )
+    .await;
+    match result {
+        Some(Ok(())) => {
+            match SimplifiedTranscriptPoster::parse_payload(&payload) {
+                Ok(poster) => {
+                    if let PosterType::TranscriptDynamic { data } = &poster.poster.r#type {
+                        wrapped.transcript_background_preset = Some(data.identifier.clone());
+                    }
+                    info!(
+                        "Downloaded transcript background PosterKit payload ({} bytes, extension={}, preset={:?})",
+                        payload.len(),
+                        poster.watch.extension_identifier,
+                        wrapped.transcript_background_preset,
+                    );
+                }
+                Err(error) => warn!(
+                    "Downloaded transcript background payload ({} bytes) but PosterKit parsing failed: {}",
+                    payload.len(),
+                    error,
+                ),
+            }
+            wrapped.transcript_background_payload_data = Some(payload);
+        }
+        Some(Err(error)) => {
+            error!(
+                "Failed to download transcript background via MMCS: {}",
+                error
+            );
+        }
+        None => {}
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct WrappedFaceTimeClient {
     inner: Arc<rustpush::facetime::FTClient>,
@@ -6919,7 +7507,11 @@ impl WrappedFaceTimeClient {
     /// peers see the user's name instead of the raw temp:<uuid> pseud.
     pub fn set_self_display_name(&self, name: String) {
         if let Ok(mut g) = FACETIME_SELF_DISPLAY_NAME.write() {
-            *g = if name.trim().is_empty() { None } else { Some(name) };
+            *g = if name.trim().is_empty() {
+                None
+            } else {
+                Some(name)
+            };
         }
     }
 
@@ -6928,7 +7520,11 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
-    pub async fn get_link_for_usage(&self, handle: String, usage: String) -> Result<String, WrappedError> {
+    pub async fn get_link_for_usage(
+        &self,
+        handle: String,
+        usage: String,
+    ) -> Result<String, WrappedError> {
         Ok(self.inner.get_link_for_usage(&handle, &usage).await?)
     }
 
@@ -6967,7 +7563,10 @@ impl WrappedFaceTimeClient {
             .find(|(_, link)| link.handle == handle && link.usage.as_deref() == Some(&usage))
             .map(|(pseud, _)| pseud.clone())
             .ok_or_else(|| WrappedError::GenericError {
-                msg: format!("No FaceTime link found for handle={} usage={}", handle, usage),
+                msg: format!(
+                    "No FaceTime link found for handle={} usage={}",
+                    handle, usage
+                ),
             })?;
         if let Some(link) = state.links.get_mut(&pseud) {
             link.session_link = Some(group_id);
@@ -6975,7 +7574,12 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
-    pub async fn create_session(&self, group_id: String, handle: String, participants: Vec<String>) -> Result<(), WrappedError> {
+    pub async fn create_session(
+        &self,
+        group_id: String,
+        handle: String,
+        participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
         // Call rustpush directly. We previously wrapped this with a
         // strip-own-from-session.members pattern to stop the wire ring from
         // fanning out to the owner's other Apple devices (Mac, iPad). The
@@ -7087,9 +7691,13 @@ impl WrappedFaceTimeClient {
     ) -> Result<(), WrappedError> {
         let mut session = {
             let state = self.inner.state.read().await;
-            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("FaceTime session not found: {}", session_id),
-            })?
+            state
+                .sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or(WrappedError::GenericError {
+                    msg: format!("FaceTime session not found: {}", session_id),
+                })?
         };
 
         let members = handles
@@ -7100,19 +7708,29 @@ impl WrappedFaceTimeClient {
             })
             .collect::<Vec<_>>();
 
-        self.inner.add_members(&mut session, members, letmein, to_members).await?;
+        self.inner
+            .add_members(&mut session, members, letmein, to_members)
+            .await?;
 
         let mut state = self.inner.state.write().await;
         state.sessions.insert(session_id, session);
         Ok(())
     }
 
-    pub async fn remove_members(&self, session_id: String, handles: Vec<String>) -> Result<(), WrappedError> {
+    pub async fn remove_members(
+        &self,
+        session_id: String,
+        handles: Vec<String>,
+    ) -> Result<(), WrappedError> {
         let mut session = {
             let state = self.inner.state.read().await;
-            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("FaceTime session not found: {}", session_id),
-            })?
+            state
+                .sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or(WrappedError::GenericError {
+                    msg: format!("FaceTime session not found: {}", session_id),
+                })?
         };
 
         let members = handles
@@ -7130,12 +7748,21 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
-    pub async fn ring(&self, session_id: String, targets: Vec<String>, letmein: bool) -> Result<(), WrappedError> {
+    pub async fn ring(
+        &self,
+        session_id: String,
+        targets: Vec<String>,
+        letmein: bool,
+    ) -> Result<(), WrappedError> {
         let session = {
             let state = self.inner.state.read().await;
-            state.sessions.get(&session_id).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("FaceTime session not found: {}", session_id),
-            })?
+            state
+                .sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or(WrappedError::GenericError {
+                    msg: format!("FaceTime session not found: {}", session_id),
+                })?
         };
         self.inner.ring(&session, &targets, letmein).await?;
         Ok(())
@@ -7156,11 +7783,14 @@ impl WrappedFaceTimeClient {
         ttl_secs: u64,
     ) -> Result<(), WrappedError> {
         let mut map = pending_ft_rings().lock().await;
-        map.insert(session_id, PendingFTRing {
-            caller_handle,
-            targets,
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
-        });
+        map.insert(
+            session_id,
+            PendingFTRing {
+                caller_handle,
+                targets,
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(ttl_secs),
+            },
+        );
         Ok(())
     }
 
@@ -7185,11 +7815,16 @@ impl WrappedFaceTimeClient {
     ) -> Result<(), WrappedError> {
         let request = {
             let delegated = self.inner.delegated_requests.lock().await;
-            delegated.get(&delegation_uuid).cloned().ok_or(WrappedError::GenericError {
-                msg: format!("Delegated LetMeIn request not found: {}", delegation_uuid),
-            })?
+            delegated
+                .get(&delegation_uuid)
+                .cloned()
+                .ok_or(WrappedError::GenericError {
+                    msg: format!("Delegated LetMeIn request not found: {}", delegation_uuid),
+                })?
         };
-        self.inner.respond_letmein(request, approved_group.as_deref()).await?;
+        self.inner
+            .respond_letmein(request, approved_group.as_deref())
+            .await?;
         Ok(())
     }
 }
@@ -7294,7 +7929,11 @@ impl WrappedPasswordsClient {
         Ok(())
     }
 
-    pub async fn delete_password_raw_entry(&self, id: String, group: Option<String>) -> Result<(), WrappedError> {
+    pub async fn delete_password_raw_entry(
+        &self,
+        id: String,
+        group: Option<String>,
+    ) -> Result<(), WrappedError> {
         self.inner
             .delete_password_entry::<rustpush::passwords::PasswordRawEntry>(&id, group)
             .await?;
@@ -7323,13 +7962,19 @@ impl WrappedStatusKitClient {
         self.inner.reset_keys().await;
     }
 
-    pub async fn share_status(&self, active: bool, mode: Option<String>) -> Result<(), WrappedError> {
+    pub async fn share_status(
+        &self,
+        active: bool,
+        mode: Option<String>,
+    ) -> Result<(), WrappedError> {
         let status = if active {
             rustpush::statuskit::StatusKitStatus::new_active()
         } else {
-            rustpush::statuskit::StatusKitStatus::new_away(mode.ok_or(WrappedError::GenericError {
-                msg: "Mode is required when sharing away status".into(),
-            })?)
+            rustpush::statuskit::StatusKitStatus::new_away(mode.ok_or(
+                WrappedError::GenericError {
+                    msg: "Mode is required when sharing away status".into(),
+                },
+            )?)
         };
         self.inner.share_status(&status).await?;
         Ok(())
@@ -7394,7 +8039,9 @@ impl WrappedStatusKitClient {
             Ok(v) => v,
             Err(_) => return Vec::new(),
         };
-        let Some(dict) = value.as_dictionary() else { return Vec::new() };
+        let Some(dict) = value.as_dictionary() else {
+            return Vec::new();
+        };
         let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) else {
             return Vec::new();
         };
@@ -7406,15 +8053,18 @@ impl WrappedStatusKitClient {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut handles = Vec::new();
         for (_channel_id, entry) in keys_dict {
-            let Some(entry_dict) = entry.as_dictionary() else { continue };
-            let Some(from_str) = entry_dict.get("from").and_then(|v| v.as_string()) else { continue };
+            let Some(entry_dict) = entry.as_dictionary() else {
+                continue;
+            };
+            let Some(from_str) = entry_dict.get("from").and_then(|v| v.as_string()) else {
+                continue;
+            };
             if seen.insert(from_str.to_string()) {
                 handles.push(from_str.to_string());
             }
         }
         handles
     }
-
 }
 
 #[derive(uniffi::Record)]
@@ -7451,7 +8101,11 @@ impl WrappedSharedStreamsClient {
 
     pub async fn list_album_ids(&self) -> Vec<String> {
         let state = self.inner.state.read().await;
-        state.albums.iter().map(|album| album.albumguid.clone()).collect()
+        state
+            .albums
+            .iter()
+            .map(|album| album.albumguid.clone())
+            .collect()
     }
 
     pub async fn get_changes(&self) -> Result<Vec<String>, WrappedError> {
@@ -7477,66 +8131,98 @@ impl WrappedSharedStreamsClient {
         Ok(self.inner.get_album_summary(&album).await?)
     }
 
-    pub async fn get_assets_json(&self, album: String, assets: Vec<String>) -> Result<String, WrappedError> {
+    pub async fn get_assets_json(
+        &self,
+        album: String,
+        assets: Vec<String>,
+    ) -> Result<String, WrappedError> {
         let details = self.inner.get_assets(&album, &assets).await?;
         serde_json::to_string(&details).map_err(|e| WrappedError::GenericError {
             msg: format!("Failed to encode asset details: {}", e),
         })
     }
 
-    pub async fn delete_assets(&self, album: String, assets: Vec<String>) -> Result<(), WrappedError> {
+    pub async fn delete_assets(
+        &self,
+        album: String,
+        assets: Vec<String>,
+    ) -> Result<(), WrappedError> {
         self.inner.delete_asset(&album, assets).await?;
         Ok(())
     }
 
     pub async fn list_albums(&self) -> Vec<SharedAlbumInfo> {
         let state = self.inner.state.read().await;
-        state.albums.iter().map(|a| SharedAlbumInfo {
-            albumguid: a.albumguid.clone(),
-            name: a.name.clone(),
-            fullname: a.fullname.clone(),
-            email: a.email.clone(),
-            subscriptiondate: a.subscriptiondate.clone(),
-        }).collect()
+        state
+            .albums
+            .iter()
+            .map(|a| SharedAlbumInfo {
+                albumguid: a.albumguid.clone(),
+                name: a.name.clone(),
+                fullname: a.fullname.clone(),
+                email: a.email.clone(),
+                subscriptiondate: a.subscriptiondate.clone(),
+            })
+            .collect()
     }
 
-    pub async fn get_album_assets(&self, album: String) -> Result<Vec<SharedAssetInfo>, WrappedError> {
+    pub async fn get_album_assets(
+        &self,
+        album: String,
+    ) -> Result<Vec<SharedAssetInfo>, WrappedError> {
         let guids = self.inner.get_album_summary(&album).await?;
         if guids.is_empty() {
             return Ok(vec![]);
         }
         let details = self.inner.get_assets(&album, &guids).await?;
-        Ok(details.iter().map(|d| {
-            let primary = d.files.iter().max_by_key(|f| f.size.parse::<u64>().unwrap_or(0));
-            let media_type = if d.collectionmetadata.video_duration.is_some() {
-                "video".to_string()
-            } else {
-                "image".to_string()
-            };
-            SharedAssetInfo {
-                assetguid: d.assetguid.clone(),
-                filename: d.filename.clone(),
-                date_created: format!("{:?}", d.collectionmetadata.date_created),
-                media_type,
-                width: primary.map(|f| f.width.clone()).unwrap_or_default(),
-                height: primary.map(|f| f.height.clone()).unwrap_or_default(),
-                size: primary.map(|f| f.size.clone()).unwrap_or_default(),
-            }
-        }).collect())
+        Ok(details
+            .iter()
+            .map(|d| {
+                let primary = d
+                    .files
+                    .iter()
+                    .max_by_key(|f| f.size.parse::<u64>().unwrap_or(0));
+                let media_type = if d.collectionmetadata.video_duration.is_some() {
+                    "video".to_string()
+                } else {
+                    "image".to_string()
+                };
+                SharedAssetInfo {
+                    assetguid: d.assetguid.clone(),
+                    filename: d.filename.clone(),
+                    date_created: format!("{:?}", d.collectionmetadata.date_created),
+                    media_type,
+                    width: primary.map(|f| f.width.clone()).unwrap_or_default(),
+                    height: primary.map(|f| f.height.clone()).unwrap_or_default(),
+                    size: primary.map(|f| f.size.clone()).unwrap_or_default(),
+                }
+            })
+            .collect())
     }
 
-    pub async fn download_file(&self, album: String, asset_guid: String) -> Result<Vec<u8>, WrappedError> {
+    pub async fn download_file(
+        &self,
+        album: String,
+        asset_guid: String,
+    ) -> Result<Vec<u8>, WrappedError> {
         let details = self.inner.get_assets(&album, &[asset_guid.clone()]).await?;
-        let asset = details.into_iter().next().ok_or(WrappedError::GenericError {
-            msg: format!("Asset {} not found in album {}", asset_guid, album),
-        })?;
-        let primary = asset.files.into_iter()
+        let asset = details
+            .into_iter()
+            .next()
+            .ok_or(WrappedError::GenericError {
+                msg: format!("Asset {} not found in album {}", asset_guid, album),
+            })?;
+        let primary = asset
+            .files
+            .into_iter()
             .max_by_key(|f| f.size.parse::<u64>().unwrap_or(0))
             .ok_or(WrappedError::GenericError {
                 msg: "Asset has no files".to_string(),
             })?;
         let mut buf = Cursor::new(Vec::new());
-        self.inner.get_file(&mut [(&primary, &mut buf)], |_, _| {}).await?;
+        self.inner
+            .get_file(&mut [(&primary, &mut buf)], |_, _| {})
+            .await?;
         Ok(buf.into_inner())
     }
 }
@@ -7548,21 +8234,35 @@ pub struct Client {
     os_config: Arc<dyn OSConfig>,
     receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     token_provider: Option<Arc<WrappedTokenProvider>>,
-    cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>>>,
-    cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>>>,
+    cloud_messages_client: tokio::sync::Mutex<
+        Option<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>>,
+    >,
+    cloud_keychain_client: tokio::sync::Mutex<
+        Option<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>>,
+    >,
     facetime_client: tokio::sync::Mutex<Option<Arc<WrappedFaceTimeClient>>>,
     passwords_client: tokio::sync::Mutex<Option<Arc<WrappedPasswordsClient>>>,
     statuskit_client: tokio::sync::Mutex<Option<Arc<WrappedStatusKitClient>>>,
     sharedstreams_client: tokio::sync::Mutex<Option<Arc<WrappedSharedStreamsClient>>>,
-    findmy_friends_client: tokio::sync::Mutex<Option<rustpush::findmy::FindMyFriendsClient<BridgeDefaultAnisetteProvider>>>,
-    findmy_client: tokio::sync::Mutex<Option<Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>>>,
+    findmy_friends_client: tokio::sync::Mutex<
+        Option<rustpush::findmy::FindMyFriendsClient<BridgeDefaultAnisetteProvider>>,
+    >,
+    findmy_client: tokio::sync::Mutex<
+        Option<Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>>,
+    >,
     /// Cached Profiles client (Name & Photo Sharing). Initialized lazily the
     /// first time a shared profile needs to be fetched from CloudKit.
-    profiles_client: tokio::sync::Mutex<Option<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>>>,
+    profiles_client: tokio::sync::Mutex<
+        Option<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>>,
+    >,
     /// Shared handle to the raw StatusKit client, used by the APNs receive
     /// loop to intercept presence messages before iMessage handling. Set by
     /// `init_statuskit()`; the loop no-ops when unset.
-    shared_statuskit: Arc<tokio::sync::RwLock<Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>>>,
+    shared_statuskit: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>,
+        >,
+    >,
     /// Shared callback for presence updates delivered by StatusKit. Populated
     /// alongside `shared_statuskit` by `init_statuskit()`.
     status_callback: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>>,
@@ -7653,21 +8353,17 @@ pub async fn new_client(
     // to chdir the child; embedders and future launch changes must not be able
     // to merge two Apple accounts into one IDS key cache.
     let ids_state_dir = PathBuf::from(subsystem_state_path("state"));
-    std::fs::create_dir_all(&ids_state_dir).map_err(|error| {
-        WrappedError::GenericError {
-            msg: format!("Failed to create private IDS state directory: {error}"),
-        }
+    std::fs::create_dir_all(&ids_state_dir).map_err(|error| WrappedError::GenericError {
+        msg: format!("Failed to create private IDS state directory: {error}"),
     })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            &ids_state_dir,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .map_err(|error| WrappedError::GenericError {
-            msg: format!("Failed to protect IDS state directory: {error}"),
-        })?;
+        std::fs::set_permissions(&ids_state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| WrappedError::GenericError {
+                msg: format!("Failed to protect IDS state directory: {error}"),
+            },
+        )?;
     }
     let ids_cache_path = ids_state_dir.join("id_cache.plist");
 
@@ -7689,7 +8385,12 @@ pub async fn new_client(
             conn.clone(),
             users_clone,
             identity_clone,
-            &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+            &[
+                &MADRID_SERVICE,
+                &MULTIPLEX_SERVICE,
+                &FACETIME_SERVICE,
+                &VIDEO_SERVICE,
+            ],
             ids_cache_path,
             config_clone.clone(),
             Box::new(move |updated_keys| {
@@ -7724,7 +8425,8 @@ pub async fn new_client(
     // Pre-warm FaceTime so incoming FT APNs notifications are consumed even
     // before any explicit !facetime command initializes the subsystem.
     let facetime_state_path = subsystem_state_path("facetime-state.plist");
-    let facetime_state = read_plist_state::<rustpush::facetime::FTState>(&facetime_state_path).unwrap_or_default();
+    let facetime_state =
+        read_plist_state::<rustpush::facetime::FTState>(&facetime_state_path).unwrap_or_default();
     let facetime_state_path_for_closure = facetime_state_path.clone();
     let prewarmed_facetime = Arc::new(WrappedFaceTimeClient {
         inner: Arc::new(
@@ -7743,8 +8445,11 @@ pub async fn new_client(
     // and the receive loop below reads them on every message. The raw
     // StatusKit client gets first crack at incoming APNs messages so presence
     // updates are consumed before iMessage handling.
-    let shared_statuskit_for_recv: Arc<tokio::sync::RwLock<Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>>> =
-        Arc::new(tokio::sync::RwLock::new(None));
+    let shared_statuskit_for_recv: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>>,
+        >,
+    > = Arc::new(tokio::sync::RwLock::new(None));
     let status_callback_for_recv: Arc<tokio::sync::RwLock<Option<Arc<dyn StatusCallback>>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
@@ -7753,10 +8458,10 @@ pub async fn new_client(
     // Messages arriving within RECONNECT_WINDOW_MS of a (re)connect are
     // marked as stored — they were cached by Apple's servers while offline.
     const RECONNECT_WINDOW_MS: u64 = 30_000; // 30 seconds
-    // Initialize to 0 — the drain task sets it to now() right before
-    // entering the receive loop. This ensures the window starts when we're
-    // actually listening for messages, not when receive() is called (which
-    // can be 20-30s earlier during Go startup).
+                                             // Initialize to 0 — the drain task sets it to now() right before
+                                             // entering the receive loop. This ensures the window starts when we're
+                                             // actually listening for messages, not when receive() is called (which
+                                             // can be 20-30s earlier during Go startup).
     let reconnected_at = Arc::new(AtomicU64::new(0));
 
     // Weak handle to OUR Client, set after Client is constructed below.
@@ -7776,7 +8481,8 @@ pub async fn new_client(
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         async move {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
 
             // --- Drain task: broadcast → mpsc + reconnect detection ------
@@ -7803,7 +8509,10 @@ pub async fn new_client(
                         .unwrap_or_default()
                         .as_millis() as u64;
                     reconnected_at.store(start_ms, Ordering::Relaxed);
-                    info!("Drain task started, marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+                    info!(
+                        "Drain task started, marking messages as stored for {}ms",
+                        RECONNECT_WINDOW_MS
+                    );
 
                     // APNs inbound-liveness watchdog (backstop for silent
                     // receive-path stalls). A healthy APS connection delivers a
@@ -8070,9 +8779,7 @@ pub async fn new_client(
             const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
             while let Some((msg, drain_ts)) = rx.recv().await {
-                if let Some(client_arc) = client_weak_for_loop
-                    .get()
-                    .and_then(|weak| weak.upgrade())
+                if let Some(client_arc) = client_weak_for_loop.get().and_then(|weak| weak.upgrade())
                 {
                     client_arc.handle_findmy_message(msg.clone()).await;
                 }
@@ -8084,13 +8791,17 @@ pub async fn new_client(
                 // well-understood noise commands (c=255 server ACK, c=120 IDS
                 // per-target retry error, c=97 keysharing noise) to avoid
                 // drowning the real signal in server retry traffic.
-                if let rustpush::APSMessage::Notification { topic: t, payload: ref p, ref channel, .. } = msg {
-                    let ks_hash: [u8; 20] = openssl::sha::sha1(
-                        "com.apple.private.alloy.status.keysharing".as_bytes(),
-                    );
-                    let ps_hash: [u8; 20] = openssl::sha::sha1(
-                        "com.apple.private.alloy.status.personal".as_bytes(),
-                    );
+                if let rustpush::APSMessage::Notification {
+                    topic: t,
+                    payload: ref p,
+                    ref channel,
+                    ..
+                } = msg
+                {
+                    let ks_hash: [u8; 20] =
+                        openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+                    let ps_hash: [u8; 20] =
+                        openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes());
                     if t == ks_hash || t == ps_hash {
                         let cmd = if let plist::Value::Dictionary(d) = p {
                             d.get("c").and_then(|v| v.as_unsigned_integer())
@@ -8099,7 +8810,11 @@ pub async fn new_client(
                         };
                         let is_noise = matches!(cmd, Some(255) | Some(120) | Some(97));
                         if !is_noise {
-                            let topic_name = if t == ks_hash { "status.keysharing" } else { "status.personal" };
+                            let topic_name = if t == ks_hash {
+                                "status.keysharing"
+                            } else {
+                                "status.personal"
+                            };
                             let shape = match p {
                                 plist::Value::Data(_) => "Data",
                                 plist::Value::Dictionary(_) => "Dictionary",
@@ -8154,19 +8869,47 @@ pub async fn new_client(
                     // status.personal) flow through sk.handle() natively and were
                     // working at 31ad87b — don't divert them into our workaround.
                     let sk_msg = {
-                        let sk_topics: [[u8; 20]; 1] = [
-                            openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes()),
-                        ];
-                        if let rustpush::APSMessage::Notification { topic: t, payload: plist::Value::Data(ref bytes), .. } = msg {
+                        let sk_topics: [[u8; 20]; 1] = [openssl::sha::sha1(
+                            "com.apple.private.alloy.status.keysharing".as_bytes(),
+                        )];
+                        if let rustpush::APSMessage::Notification {
+                            topic: t,
+                            payload: plist::Value::Data(ref bytes),
+                            ..
+                        } = msg
+                        {
                             if sk_topics.contains(&t) {
                                 if let Ok(decoded) = plist::from_bytes::<plist::Value>(bytes) {
                                     if matches!(decoded, plist::Value::Dictionary(_)) {
-                                        let rustpush::APSMessage::Notification { id, topic, token, channel, .. } = msg.clone() else { unreachable!() };
-                                        Some(rustpush::APSMessage::Notification { id, topic, token, payload: decoded, channel })
-                                    } else { None }
-                                } else { None }
-                            } else { None }
-                        } else { None }
+                                        let rustpush::APSMessage::Notification {
+                                            id,
+                                            topic,
+                                            token,
+                                            channel,
+                                            ..
+                                        } = msg.clone()
+                                        else {
+                                            unreachable!()
+                                        };
+                                        Some(rustpush::APSMessage::Notification {
+                                            id,
+                                            topic,
+                                            token,
+                                            payload: decoded,
+                                            channel,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     };
                     let sk_msg_ref = sk_msg.as_ref().unwrap_or(&msg);
 
@@ -8185,11 +8928,14 @@ pub async fn new_client(
                         {
                             // Extract command byte from payload for diagnostics
                             // before the async block moves msg.
-                            let diag_cmd_workaround = if let plist::Value::Dictionary(ref d) = payload {
-                                d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8)
-                            } else {
-                                None
-                            };
+                            let diag_cmd_workaround =
+                                if let plist::Value::Dictionary(ref d) = payload {
+                                    d.get("c")
+                                        .and_then(|v| v.as_unsigned_integer())
+                                        .map(|v| v as u8)
+                                } else {
+                                    None
+                                };
 
                             // c=255 = server ACK for our own outgoing invite.
                             // c=120 = IDS per-target error (recipient unreachable,
@@ -8198,7 +8944,8 @@ pub async fn new_client(
                             // Both are non-keysharing envelopes (no P/E/sT), so
                             // the workaround's decrypt path produces nothing
                             // useful. Skip to avoid log spam.
-                            if diag_cmd_workaround == Some(255) || diag_cmd_workaround == Some(120) {
+                            if diag_cmd_workaround == Some(255) || diag_cmd_workaround == Some(120)
+                            {
                                 debug!(
                                     "StatusKit workaround: skipping c={} server ACK/error on keysharing topic",
                                     diag_cmd_workaround.unwrap()
@@ -8207,13 +8954,28 @@ pub async fn new_client(
                                 // through to rustpush's handle() which also skips
                                 // these via its own suppression path.
                             } else {
+                                let diag_has_sP = if let plist::Value::Dictionary(ref d) = payload {
+                                    d.contains_key("sP")
+                                } else {
+                                    false
+                                };
+                                let diag_has_P = if let plist::Value::Dictionary(ref d) = payload {
+                                    d.contains_key("P")
+                                } else {
+                                    false
+                                };
+                                let diag_has_E = if let plist::Value::Dictionary(ref d) = payload {
+                                    d.contains_key("E")
+                                } else {
+                                    false
+                                };
+                                let diag_has_t = if let plist::Value::Dictionary(ref d) = payload {
+                                    d.contains_key("t")
+                                } else {
+                                    false
+                                };
 
-                            let diag_has_sP = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("sP") } else { false };
-                            let diag_has_P = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("P") } else { false };
-                            let diag_has_E = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("E") } else { false };
-                            let diag_has_t = if let plist::Value::Dictionary(ref d) = payload { d.contains_key("t") } else { false };
-
-                            let result: Result<bool, String> = async {
+                                let result: Result<bool, String> = async {
                                 use prost::Message as _;
                                 let recv = sk
                                     .identity
@@ -8368,20 +9130,20 @@ pub async fn new_client(
                             }
                             .await;
 
-                            match result {
-                                Ok(true) => {
-                                    workaround_consumed = true;
-                                }
-                                Ok(false) => {
-                                    // Detailed diagnostics already logged inside the async block.
-                                }
-                                Err(e) => {
-                                    warn!(
+                                match result {
+                                    Ok(true) => {
+                                        workaround_consumed = true;
+                                    }
+                                    Ok(false) => {
+                                        // Detailed diagnostics already logged inside the async block.
+                                    }
+                                    Err(e) => {
+                                        warn!(
                                         "StatusKit workaround failed: {} — falling back to upstream handle()",
                                         e
                                     );
+                                    }
                                 }
-                            }
                             } // else (non-c=255)
                         }
 
@@ -8459,7 +9221,9 @@ pub async fn new_client(
                             }.await;
 
                             match personal_result {
-                                Ok(true) => { workaround_consumed = true; }
+                                Ok(true) => {
+                                    workaround_consumed = true;
+                                }
                                 Ok(false) => {}
                                 Err(e) => {
                                     warn!("StatusKit personal handler failed: {}", e);
@@ -8501,29 +9265,58 @@ pub async fn new_client(
                     // an isolated current-thread runtime.
                     let sk_clone = sk.clone();
                     let sk_msg_for_handle = sk_msg_ref.clone();
-                    let handle_result = tokio::task::spawn(async move {
-                        sk_clone.handle(sk_msg_for_handle).await
-                    }).await;
+                    let handle_result =
+                        tokio::task::spawn(async move { sk_clone.handle(sk_msg_for_handle).await })
+                            .await;
                     // Build a human-readable topic label for diagnostic log lines.
                     let topic_label = if let Some(t) = msg_topic {
-                        let ks: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
-                        let ps: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
-                        let cm: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.channel.management".as_bytes());
-                        let sp: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.personal".as_bytes());
-                        if t == ks { "keysharing" } else if t == ps { "presence" } else if t == cm { "channel-mgmt" } else if t == sp { "personal" } else { "unknown" }
+                        let ks: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.private.alloy.status.keysharing".as_bytes(),
+                        );
+                        let ps: [u8; 20] =
+                            openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                        let cm: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.icloud.presence.channel.management".as_bytes(),
+                        );
+                        let sp: [u8; 20] = openssl::sha::sha1(
+                            "com.apple.private.alloy.status.personal".as_bytes(),
+                        );
+                        if t == ks {
+                            "keysharing"
+                        } else if t == ps {
+                            "presence"
+                        } else if t == cm {
+                            "channel-mgmt"
+                        } else if t == sp {
+                            "personal"
+                        } else {
+                            "unknown"
+                        }
                     } else {
                         "no-topic"
                     };
-                    let diag_cmd = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                    let diag_cmd = if let rustpush::APSMessage::Notification {
+                        payload: plist::Value::Data(payload),
+                        ..
+                    } = &msg
+                    {
                         plist::from_bytes::<plist::Value>(payload)
                             .ok()
                             .and_then(|v| v.into_dictionary())
-                            .and_then(|d| d.get("c").and_then(|c| c.as_unsigned_integer()).map(|v| v as u8))
+                            .and_then(|d| {
+                                d.get("c")
+                                    .and_then(|c| c.as_unsigned_integer())
+                                    .map(|v| v as u8)
+                            })
                     } else {
                         None
                     };
                     match handle_result {
-                        Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged { user, mode, allowed }))) => {
+                        Ok(Ok(Some(rustpush::statuskit::StatusKitMessage::StatusChanged {
+                            user,
+                            mode,
+                            allowed,
+                        }))) => {
                             if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                 cb.on_status_update(user, mode, allowed);
                             } else {
@@ -8541,13 +9334,23 @@ pub async fn new_client(
                             // not channel keys, so a re-pull can't help it — only
                             // presence.mode.status is the stale-key signal. Over-firing is
                             // bounded by the Go-side cooldown.)
-                            let presence_topic: [u8; 20] = openssl::sha::sha1("com.apple.icloud.presence.mode.status".as_bytes());
+                            let presence_topic: [u8; 20] = openssl::sha::sha1(
+                                "com.apple.icloud.presence.mode.status".as_bytes(),
+                            );
                             if msg_topic == Some(presence_topic) {
-                                let df_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
+                                let df_sender = if let rustpush::APSMessage::Notification {
+                                    payload: plist::Value::Data(payload),
+                                    ..
+                                } = &msg
+                                {
                                     plist::from_bytes::<plist::Value>(payload)
                                         .ok()
                                         .and_then(|v| v.into_dictionary())
-                                        .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
+                                        .and_then(|d| {
+                                            d.get("sP")
+                                                .and_then(|v| v.as_string())
+                                                .map(|s| s.to_string())
+                                        })
                                 } else {
                                     None
                                 };
@@ -8559,12 +9362,15 @@ pub async fn new_client(
                             // Not a StatusKit presence update — but check whether it
                             // was a key-sharing message. Only fire on_keys_received
                             // if state.keys gained a new channel id.
-                            let keysharing_topic: [u8; 20] = openssl::sha::sha1("com.apple.private.alloy.status.keysharing".as_bytes());
+                            let keysharing_topic: [u8; 20] = openssl::sha::sha1(
+                                "com.apple.private.alloy.status.keysharing".as_bytes(),
+                            );
                             if let Some(topic) = msg_topic {
                                 if topic == keysharing_topic {
                                     let keys_after: std::collections::HashSet<String> =
                                         sk.state.read().await.keys.keys().cloned().collect();
-                                    let new_channels: Vec<&String> = keys_after.difference(&keys_before).collect();
+                                    let new_channels: Vec<&String> =
+                                        keys_after.difference(&keys_before).collect();
                                     if !new_channels.is_empty() {
                                         // Extract sP (sender participant) from the raw IDS
                                         // envelope so we can stamp this reshare's sender
@@ -8577,14 +9383,23 @@ pub async fn new_client(
                                         // the same way the workaround case used to, just
                                         // silently. Mirrors the workaround stamping at the
                                         // cb.on_reshare_sender call above.
-                                        let upstream_sender = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
-                                            plist::from_bytes::<plist::Value>(payload)
-                                                .ok()
-                                                .and_then(|v| v.into_dictionary())
-                                                .and_then(|d| d.get("sP").and_then(|v| v.as_string()).map(|s| s.to_string()))
-                                        } else {
-                                            None
-                                        };
+                                        let upstream_sender =
+                                            if let rustpush::APSMessage::Notification {
+                                                payload: plist::Value::Data(payload),
+                                                ..
+                                            } = &msg
+                                            {
+                                                plist::from_bytes::<plist::Value>(payload)
+                                                    .ok()
+                                                    .and_then(|v| v.into_dictionary())
+                                                    .and_then(|d| {
+                                                        d.get("sP")
+                                                            .and_then(|v| v.as_string())
+                                                            .map(|s| s.to_string())
+                                                    })
+                                            } else {
+                                                None
+                                            };
                                         info!("StatusKit key-sharing message received — state.keys gained {} new channel(s), sender={:?}", new_channels.len(), upstream_sender);
                                         if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                             if let Some(sender) = upstream_sender {
@@ -8596,7 +9411,10 @@ pub async fn new_client(
                                                 // but iterating handles the rare
                                                 // multi-channel case correctly.
                                                 for channel_id in &new_channels {
-                                                    cb.on_reshare_sender(sender.clone(), (*channel_id).clone());
+                                                    cb.on_reshare_sender(
+                                                        sender.clone(),
+                                                        (*channel_id).clone(),
+                                                    );
                                                 }
                                             }
                                             cb.on_keys_received();
@@ -8607,14 +9425,23 @@ pub async fn new_client(
                                         // Parse the command byte and IDS envelope field presence
                                         // from the raw payload for diagnostics.
                                         let (cmd_byte, ids_fields) =
-                                            if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
-                                                if let Ok(plist::Value::Dictionary(d)) = plist::from_bytes::<plist::Value>(payload) {
-                                                    let c = d.get("c").and_then(|v| v.as_unsigned_integer()).map(|v| v as u8);
+                                            if let rustpush::APSMessage::Notification {
+                                                payload: plist::Value::Data(payload),
+                                                ..
+                                            } = &msg
+                                            {
+                                                if let Ok(plist::Value::Dictionary(d)) =
+                                                    plist::from_bytes::<plist::Value>(payload)
+                                                {
+                                                    let c = d
+                                                        .get("c")
+                                                        .and_then(|v| v.as_unsigned_integer())
+                                                        .map(|v| v as u8);
                                                     let sp = d.contains_key("sP");
                                                     let tp = d.contains_key("tP");
-                                                    let p  = d.contains_key("P");
-                                                    let t  = d.contains_key("t");
-                                                    let e  = d.contains_key("E");
+                                                    let p = d.contains_key("P");
+                                                    let t = d.contains_key("t");
+                                                    let e = d.contains_key("E");
                                                     (c, Some((sp, tp, p, t, e)))
                                                 } else {
                                                     (None, None)
@@ -8632,8 +9459,9 @@ pub async fn new_client(
                                         //         a real iOS keysharing message in a different format
                                         //         than the expected c=227. Other commands also logged.
                                         let is_silent = cmd_byte.map(|c| c == 255).unwrap_or(false);
-                                        let is_reinvite = cmd_byte.map(|c| c == 227).unwrap_or(false)
-                                            && !keys_before.is_empty();
+                                        let is_reinvite =
+                                            cmd_byte.map(|c| c == 227).unwrap_or(false)
+                                                && !keys_before.is_empty();
                                         // Non-Notification APS frames (ACKs, connection state,
                                         // keepalives) flow through the keysharing subscription and
                                         // reach this path, but they can never carry a real
@@ -8644,20 +9472,36 @@ pub async fn new_client(
                                         // informative to say).
                                         let is_notification = matches!(
                                             &msg,
-                                            rustpush::APSMessage::Notification { payload: plist::Value::Data(_), .. }
+                                            rustpush::APSMessage::Notification {
+                                                payload: plist::Value::Data(_),
+                                                ..
+                                            }
                                         );
                                         if is_reinvite {
                                             info!("StatusKit peer re-invite received for existing channel (c=227) — keys replaced in place");
-                                        } else if !is_silent && is_notification && cmd_byte.is_some() {
-                                            let all_keys = if let rustpush::APSMessage::Notification { payload: plist::Value::Data(payload), .. } = &msg {
-                                                plist::from_bytes::<plist::Value>(payload)
-                                                    .ok()
-                                                    .and_then(|v| v.into_dictionary())
-                                                    .map(|d| d.keys().cloned().collect::<Vec<_>>().join(", "))
-                                                    .unwrap_or_else(|| "<unparseable>".into())
-                                            } else {
-                                                "<not a notification>".into()
-                                            };
+                                        } else if !is_silent
+                                            && is_notification
+                                            && cmd_byte.is_some()
+                                        {
+                                            let all_keys =
+                                                if let rustpush::APSMessage::Notification {
+                                                    payload: plist::Value::Data(payload),
+                                                    ..
+                                                } = &msg
+                                                {
+                                                    plist::from_bytes::<plist::Value>(payload)
+                                                        .ok()
+                                                        .and_then(|v| v.into_dictionary())
+                                                        .map(|d| {
+                                                            d.keys()
+                                                                .cloned()
+                                                                .collect::<Vec<_>>()
+                                                                .join(", ")
+                                                        })
+                                                        .unwrap_or_else(|| "<unparseable>".into())
+                                                } else {
+                                                    "<not a notification>".into()
+                                                };
                                             warn!(
                                                 "StatusKit inbound keysharing message (c={}) did not grow state.keys — plist keys: [{}]  IDS fields: sP={} tP={} P={} t={} E={}",
                                                 cmd_byte.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
@@ -8677,7 +9521,10 @@ pub async fn new_client(
                             warn!("StatusKit signature verification failed (c={:?} topic={}) — key ratchet mismatch, will resolve on next keysharing message", diag_cmd, topic_label);
                         }
                         Ok(Err(e)) => {
-                            warn!("StatusKit handle error (c={:?} topic={}): {:?}", diag_cmd, topic_label, e);
+                            warn!(
+                                "StatusKit handle error (c={:?} topic={}): {:?}",
+                                diag_cmd, topic_label, e
+                            );
                         }
                         Err(_) => {
                             warn!("StatusKit handle panicked (c={:?} topic={}) — channel may lack shared keys", diag_cmd, topic_label);
@@ -8698,7 +9545,8 @@ pub async fn new_client(
                 // auto_approve even runs. A single retry after 2s usually
                 // lands on the reconnected APNs.
                 let ft_result = {
-                    let first = ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await;
+                    let first =
+                        ft_handle_with_join_recovery(ft_for_recv.as_ref(), msg.clone()).await;
                     if matches!(&first, Err(rustpush::PushError::SendTimedOut)) {
                         warn!("FaceTime handle SendTimedOut, retrying in 2s");
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -8709,15 +9557,22 @@ pub async fn new_client(
                 };
                 match ft_result {
                     Ok(Some(ft_message)) => {
-                        if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message {
-                            if let Err(e) = auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await {
+                        if let rustpush::facetime::FTMessage::LetMeInRequest(request) = &ft_message
+                        {
+                            if let Err(e) =
+                                auto_approve_bridge_letmein(ft_for_recv.as_ref(), request).await
+                            {
                                 warn!("FaceTime auto-approve LetMeIn failed: {:?}", e);
                             }
                         }
-                        if let rustpush::facetime::FTMessage::JoinEvent { guid, handle, .. } = &ft_message {
+                        if let rustpush::facetime::FTMessage::JoinEvent { guid, handle, .. } =
+                            &ft_message
+                        {
                             maybe_fire_pending_ring(ft_for_recv.as_ref(), guid, handle).await;
                         }
-                        if let Some(wrapped) = facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message).await {
+                        if let Some(wrapped) =
+                            facetime_event_to_wrapped(ft_for_recv.as_ref(), &ft_message).await
+                        {
                             callback.on_message(wrapped);
                         }
                     }
@@ -8748,9 +9603,9 @@ pub async fn new_client(
                     // them up, which is not guaranteed. Staying up and losing
                     // one sender's messages beats losing every sender's.
                     use futures::FutureExt;
-                    let handled = std::panic::AssertUnwindSafe(
-                        client_for_recv.handle(msg.clone())
-                    ).catch_unwind().await;
+                    let handled = std::panic::AssertUnwindSafe(client_for_recv.handle(msg.clone()))
+                        .catch_unwind()
+                        .await;
                     let handled = match handled {
                         Ok(res) => res,
                         Err(_) => {
@@ -8823,10 +9678,17 @@ pub async fn new_client(
                                     if let Some(ref context) = msg_inst.certified_context {
                                         if let Err(e) = client_for_recv
                                             .identity
-                                            .certify_delivery("com.apple.madrid", context, msg_inst.send_delivered)
+                                            .certify_delivery(
+                                                "com.apple.madrid",
+                                                context,
+                                                msg_inst.send_delivered,
+                                            )
                                             .await
                                         {
-                                            warn!("Failed to certify delivery for {}: {:?}", msg_inst.id, e);
+                                            warn!(
+                                                "Failed to certify delivery for {}: {:?}",
+                                                msg_inst.id, e
+                                            );
                                         }
                                     }
 
@@ -8856,7 +9718,16 @@ pub async fn new_client(
                                         _ => {}
                                     }
 
-                                    if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
+                                    if msg_inst.has_payload()
+                                        || matches!(
+                                            msg_inst.message,
+                                            Message::Typing(_, _)
+                                                | Message::Read
+                                                | Message::Delivered
+                                                | Message::Error(_)
+                                                | Message::PeerCacheInvalidate
+                                        )
+                                    {
                                         let mut wrapped = message_inst_to_wrapped(&msg_inst);
 
                                         // Mark as stored if within the post-reconnect window.
@@ -8873,20 +9744,50 @@ pub async fn new_client(
                                         }
 
                                         // Download MMCS attachments so Go receives inline data
-                                        download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                        download_mmcs_attachments(
+                                            &mut wrapped,
+                                            &msg_inst,
+                                            &conn_for_download,
+                                        )
+                                        .await;
                                         // Download group photo for IconChange messages via MMCS
                                         if wrapped.is_icon_change && !wrapped.group_photo_cleared {
-                                            download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                            download_icon_change_photo(
+                                                &mut wrapped,
+                                                &msg_inst,
+                                                &conn_for_download,
+                                            )
+                                            .await;
+                                        }
+                                        // Preserve Apple's original PosterKit package for
+                                        // transcript backgrounds. Besides making the incoming
+                                        // background available to the API, this avoids trying to
+                                        // infer presentation metadata from the MMCS descriptor.
+                                        if wrapped.is_set_transcript_background
+                                            && !wrapped
+                                                .transcript_background_remove
+                                                .unwrap_or(false)
+                                        {
+                                            download_transcript_background_payload(
+                                                &mut wrapped,
+                                                &msg_inst,
+                                                &conn_for_download,
+                                            )
+                                            .await;
                                         }
                                         // Download Name & Photo Sharing profile from CloudKit
                                         // (mirrors the IconChange MMCS pattern: fetch in Rust,
                                         // hand Go ready-to-display name + avatar bytes).
                                         if wrapped.is_share_profile {
-                                            if let Some(client_arc) = client_weak_for_loop
-                                                .get()
-                                                .and_then(|w| w.upgrade())
+                                            if let Some(client_arc) =
+                                                client_weak_for_loop.get().and_then(|w| w.upgrade())
                                             {
-                                                client_arc.populate_inline_share_profile(&msg_inst, &mut wrapped).await;
+                                                client_arc
+                                                    .populate_inline_share_profile(
+                                                        &msg_inst,
+                                                        &mut wrapped,
+                                                    )
+                                                    .await;
                                             }
                                         }
                                         callback.on_message(wrapped);
@@ -8977,7 +9878,8 @@ pub async fn new_client(
 impl Client {
     async fn get_or_init_findmy_client(
         &self,
-    ) -> Result<Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+    ) -> Result<Arc<rustpush::findmy::FindMyClient<BridgeDefaultAnisetteProvider>>, WrappedError>
+    {
         {
             let locked = self.findmy_client.lock().await;
             if let Some(client) = &*locked {
@@ -8985,9 +9887,12 @@ impl Client {
             }
         }
 
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
+        let tp = self
+            .token_provider
+            .as_ref()
+            .ok_or(WrappedError::GenericError {
+                msg: "No TokenProvider available".into(),
+            })?;
         let dsid = tp.get_dsid().await?;
         let keychain = self.get_or_init_cloud_keychain_client().await?;
         let cloudkit = keychain.client.clone();
@@ -8995,14 +9900,20 @@ impl Client {
         let state_path = subsystem_state_path("findmy-state.bin");
         let state = match std::fs::read(&state_path) {
             Ok(data) => rustpush::findmy::FindMyState::restore(&data).unwrap_or_else(|error| {
-                warn!("Failed to restore Find My state at {}: {}; starting fresh", state_path, error);
+                warn!(
+                    "Failed to restore Find My state at {}: {}; starting fresh",
+                    state_path, error
+                );
                 rustpush::findmy::FindMyState::new(dsid.clone())
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 rustpush::findmy::FindMyState::new(dsid.clone())
             }
             Err(error) => {
-                warn!("Failed to read Find My state at {}: {}; starting fresh", state_path, error);
+                warn!(
+                    "Failed to read Find My state at {}: {}; starting fresh",
+                    state_path, error
+                );
                 rustpush::findmy::FindMyState::new(dsid.clone())
             }
         };
@@ -9043,7 +9954,12 @@ impl Client {
         }
     }
 
-    pub(crate) async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+    pub(crate) async fn get_or_init_cloud_messages_client(
+        &self,
+    ) -> Result<
+        Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>,
+        WrappedError,
+    > {
         // Fast path: return cached client without doing any slow work.
         // IMPORTANT: the lock is released before any network calls so that
         // tokio timeouts can fire and concurrent callers are never blocked by
@@ -9085,26 +10001,34 @@ impl Client {
         });
 
         let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
-        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
-            Ok(data) => match plist::from_bytes(&data) {
-                Ok(state) => Some(state),
+        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> =
+            match std::fs::read(&keychain_state_path) {
+                Ok(data) => match plist::from_bytes(&data) {
+                    Ok(state) => Some(state),
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse keychain state at {}: {}",
+                            keychain_state_path, e
+                        );
+                        None
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => {
-                    warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                    warn!(
+                        "Failed to read keychain state at {}: {}",
+                        keychain_state_path, e
+                    );
                     None
                 }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
-                None
-            }
-        };
+            };
         if keychain_state.is_none() {
             keychain_state = Some(
-                rustpush::keychain::KeychainClientState::new(dsid, adsid, &mme_delegate)
-                    .ok_or(WrappedError::GenericError {
+                rustpush::keychain::KeychainClientState::new(dsid, adsid, &mme_delegate).ok_or(
+                    WrappedError::GenericError {
                         msg: "Missing KeychainSync config in MobileMe delegate".into(),
-                    })?
+                    },
+                )?,
             );
         }
         let path_for_closure = keychain_state_path.clone();
@@ -9116,7 +10040,10 @@ impl Client {
             config: os_config,
             update_state: Box::new(move |state| {
                 if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
-                    warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+                    warn!(
+                        "Failed to persist keychain state to {}: {}",
+                        path_for_closure, e
+                    );
                 }
             }),
             container: tokio::sync::Mutex::new(None),
@@ -9135,7 +10062,8 @@ impl Client {
         // by recover_cloud_pcs_state, which retries the keychain sync then.
 
         let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
-            cloudkit, keychain.clone(),
+            cloudkit,
+            keychain.clone(),
         ));
         info!("Cloud client init: complete");
 
@@ -9151,7 +10079,10 @@ impl Client {
         Ok(cloud_messages)
     }
 
-    async fn get_or_init_cloud_keychain_client(&self) -> Result<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+    async fn get_or_init_cloud_keychain_client(
+        &self,
+    ) -> Result<Arc<rustpush::keychain::KeychainClient<BridgeDefaultAnisetteProvider>>, WrappedError>
+    {
         let _ = self.get_or_init_cloud_messages_client().await?;
         self.cloud_keychain_client
             .lock()
@@ -9171,7 +10102,12 @@ impl Client {
         sync_keychain_with_retries(&keychain, 6, context).await
     }
 
-    async fn get_or_init_profiles_client(&self) -> Result<Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+    async fn get_or_init_profiles_client(
+        &self,
+    ) -> Result<
+        Arc<rustpush::name_photo_sharing::ProfilesClient<BridgeDefaultAnisetteProvider>>,
+        WrappedError,
+    > {
         let mut locked = self.profiles_client.lock().await;
         if let Some(client) = &*locked {
             return Ok(client.clone());
@@ -9239,7 +10175,12 @@ impl Client {
         // panics whenever the peer has rotated or deleted the record we cached
         // a key for, which is routine. Keys stay on the wrapped message either
         // way, so the Go-side periodic refresh can still recover the profile.
-        match guard_panic("inline ShareProfile CloudKit fetch", profiles.get_record(&share_msg)).await {
+        match guard_panic(
+            "inline ShareProfile CloudKit fetch",
+            profiles.get_record(&share_msg),
+        )
+        .await
+        {
             Some(Ok(record)) => {
                 info!(
                     "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
@@ -9269,14 +10210,17 @@ impl Client {
         }
     }
 
-    async fn get_or_init_facetime_client(&self) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
+    async fn get_or_init_facetime_client(
+        &self,
+    ) -> Result<Arc<WrappedFaceTimeClient>, WrappedError> {
         let mut locked = self.facetime_client.lock().await;
         if let Some(client) = &*locked {
             return Ok(client.clone());
         }
 
         let state_path = subsystem_state_path("facetime-state.plist");
-        let state = read_plist_state::<rustpush::facetime::FTState>(&state_path).unwrap_or_default();
+        let state =
+            read_plist_state::<rustpush::facetime::FTState>(&state_path).unwrap_or_default();
         let state_path_for_closure = state_path.clone();
 
         let wrapped = Arc::new(WrappedFaceTimeClient {
@@ -9295,7 +10239,9 @@ impl Client {
         Ok(wrapped)
     }
 
-    async fn get_or_init_passwords_client(&self) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
+    async fn get_or_init_passwords_client(
+        &self,
+    ) -> Result<Arc<WrappedPasswordsClient>, WrappedError> {
         let mut locked = self.passwords_client.lock().await;
         if let Some(client) = &*locked {
             return Ok(client.clone());
@@ -9304,7 +10250,8 @@ impl Client {
         let keychain = self.get_or_init_cloud_keychain_client().await?;
         let cloudkit = keychain.client.clone();
         let state_path = subsystem_state_path("passwords-state.plist");
-        let state = read_plist_state::<rustpush::passwords::PasswordState>(&state_path).unwrap_or_default();
+        let state =
+            read_plist_state::<rustpush::passwords::PasswordState>(&state_path).unwrap_or_default();
         let state_path_for_closure = state_path.clone();
 
         let wrapped = Arc::new(WrappedPasswordsClient {
@@ -9323,7 +10270,9 @@ impl Client {
         Ok(wrapped)
     }
 
-    pub(crate) async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+    pub(crate) async fn get_or_init_statuskit_client(
+        &self,
+    ) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
         // Fast path: return cached client without holding the lock during init.
         {
             let locked = self.statuskit_client.lock().await;
@@ -9335,9 +10284,12 @@ impl Client {
         // Slow path: StatusKitClient::new() calls request_topics which can
         // block the tokio thread. Build the client WITHOUT holding the mutex
         // so concurrent callers are not blocked.
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
+        let tp = self
+            .token_provider
+            .as_ref()
+            .ok_or(WrappedError::GenericError {
+                msg: "No TokenProvider available".into(),
+            })?;
         let state_path = subsystem_state_path("statuskit-state.plist");
         let state = match read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path) {
             Some(s) => {
@@ -9381,15 +10333,20 @@ impl Client {
         Ok(wrapped)
     }
 
-    async fn get_or_init_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
+    async fn get_or_init_sharedstreams_client(
+        &self,
+    ) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
         let mut locked = self.sharedstreams_client.lock().await;
         if let Some(client) = &*locked {
             return Ok(client.clone());
         }
 
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
+        let tp = self
+            .token_provider
+            .as_ref()
+            .ok_or(WrappedError::GenericError {
+                msg: "No TokenProvider available".into(),
+            })?;
         let dsid = tp.get_dsid().await?;
         let mme_delegate = tp.parse_mme_delegate().await?;
         let account = tp.get_account();
@@ -9558,8 +10515,7 @@ impl Client {
                     account.tokens.contains_key("com.apple.gs.idms.pet")
                 };
                 if !pet_present {
-                    PET_REFRESH_STUCK_UNTIL_MS
-                        .store(now_ms + STUCK_COOLDOWN_MS, Ordering::Relaxed);
+                    PET_REFRESH_STUCK_UNTIL_MS.store(now_ms + STUCK_COOLDOWN_MS, Ordering::Relaxed);
                     warn!(
                         "PET refresh produced no valid PET — engaging {}m cooldown to \
                          avoid hammering Apple auth (manual re-login likely required)",
@@ -9605,9 +10561,7 @@ impl Client {
                     timeout_retries += 1;
                     warn!(
                         "SendTimedOut retry {}/{} for uuid={}; reusing MessageInst",
-                        timeout_retries,
-                        MAX_TIMEOUT_RETRIES,
-                        msg.id
+                        timeout_retries, MAX_TIMEOUT_RETRIES, msg.id
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(
                         1000 * timeout_retries as u64,
@@ -9615,7 +10569,8 @@ impl Client {
                     .await;
                 }
                 Err(rustpush::PushError::NoValidTargets)
-                    if allow_target_refresh && !target_refresh_attempted => {
+                    if allow_target_refresh && !target_refresh_attempted =>
+                {
                     target_refresh_attempted = true;
                     let handles = self.client.identity.get_handles().await;
                     let targets = msg.get_send_participants(&handles);
@@ -9629,16 +10584,19 @@ impl Client {
                         "NoValidTargets for uuid={}; requesting one bounded IDS cache refresh",
                         msg.id
                     );
-                    self.client.identity.cache_keys(
-                        topic,
-                        &targets,
-                        sender,
-                        true,
-                        &rustpush::ids::user::QueryOptions {
-                            required_for_message: true,
-                            result_expected: true,
-                        },
-                    ).await?;
+                    self.client
+                        .identity
+                        .cache_keys(
+                            topic,
+                            &targets,
+                            sender,
+                            true,
+                            &rustpush::ids::user::QueryOptions {
+                                required_for_message: true,
+                                result_expected: true,
+                            },
+                        )
+                        .await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -9697,14 +10655,20 @@ fn inline_relay_attachment(
 
 #[cfg(test)]
 mod reply_target_tests {
+    use std::io::{Cursor, Read};
+
+    use base64::Engine as _;
+
     use super::{
-        inline_relay_attachment, leave_group_participants, message_inst_to_wrapped,
-        mmcs_preflight_targets, normalize_findmy_handle, normalize_reply_target,
-        parse_html_to_parts, parts_to_html, Attachment,
-        AttachmentType, Balloon, ConversationData, ExtensionApp, IndexedMessagePart, Message,
-        MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, PartExtension,
-        ReactMessage, ReactMessageType, Reaction, WrappedConversation,
-        TextFormat,
+        build_transcript_dynamic_payload, build_transcript_photo_payload,
+        current_transcript_background_version, inline_relay_attachment, leave_group_participants,
+        message_inst_to_wrapped, mmcs_preflight_targets, normalize_findmy_handle,
+        normalize_reply_target, parse_html_to_parts, parts_to_html, Attachment, AttachmentType,
+        Balloon, ConversationData, ExtensionApp, IndexedMessagePart, Message, MessageInst,
+        MessagePart, MessageParts, MessageType, NormalMessage, PartExtension, PosterType,
+        ReactMessage, ReactMessageType, Reaction, SimplifiedTranscriptPoster, TextFormat,
+        WrappedConversation, BASE64_STANDARD, TRANSCRIPT_DYNAMIC_EXTENSION,
+        TRANSCRIPT_DYNAMIC_PRESETS,
     };
 
     fn reaction_target(text: &str, part: Option<u64>) -> ReactMessage {
@@ -9739,7 +10703,10 @@ mod reply_target_tests {
             normalize_reply_target(Some("target-guid".to_string()), None),
             (Some("target-guid".to_string()), Some("0".to_string())),
         );
-        assert_eq!(normalize_reply_target(None, Some("4".to_string())), (None, None));
+        assert_eq!(
+            normalize_reply_target(None, Some("4".to_string())),
+            (None, None)
+        );
     }
 
     #[test]
@@ -9756,10 +10723,14 @@ mod reply_target_tests {
             "<span data-mx-imessage-effect=\"jitter\">Jitter</span>"
         );
         let parts = parse_html_to_parts(html, text).expect("effects should create message parts");
-        let effects = parts.0.iter().filter_map(|part| match &part.part {
-            MessagePart::Text(_, TextFormat::Effect(effect)) => Some(*effect as u32),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let effects = parts
+            .0
+            .iter()
+            .filter_map(|part| match &part.part {
+                MessagePart::Text(_, TextFormat::Effect(effect)) => Some(*effect as u32),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(effects, vec![5, 11, 9, 8, 12, 4, 6, 10]);
         assert_eq!(parts_to_html(&parts).as_deref(), Some(html));
     }
@@ -9769,16 +10740,26 @@ mod reply_target_tests {
         let parts = parse_html_to_parts(
             "<strong>bold</strong><em>italic</em><u>underline</u><del>strike</del>",
             "bolditalicunderlinestrike",
-        ).expect("styles should create message parts");
+        )
+        .expect("styles should create message parts");
         assert_eq!(parts.0.len(), 4);
-        let expected = [(true, false, false, false), (false, true, false, false),
-            (false, false, true, false), (false, false, false, true)];
+        let expected = [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ];
         for (part, expected) in parts.0.iter().zip(expected) {
             let MessagePart::Text(_, TextFormat::Flags(flags)) = &part.part else {
                 panic!("expected a static text style")
             };
             assert_eq!(
-                (flags.bold, flags.italic, flags.underline, flags.strikethrough),
+                (
+                    flags.bold,
+                    flags.italic,
+                    flags.underline,
+                    flags.strikethrough
+                ),
                 expected,
             );
         }
@@ -9840,7 +10821,10 @@ mod reply_target_tests {
         assert!(wrapped.is_tapback);
         assert_eq!(wrapped.tapback_target_uuid.as_deref(), Some("poll-guid"));
         assert_eq!(wrapped.tapback_type, Some(7));
-        assert_eq!(wrapped.app_balloon_bundle_id.as_deref(), Some("com.apple.messages.Polls"));
+        assert_eq!(
+            wrapped.app_balloon_bundle_id.as_deref(),
+            Some("com.apple.messages.Polls")
+        );
         assert_eq!(
             wrapped.app_balloon_session_id.as_deref(),
             Some("cba9de14-dd9a-45c5-bb63-989e6e32c538"),
@@ -9961,6 +10945,86 @@ mod reply_target_tests {
             Some("Meet at five")
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transcript_background_photo_is_packaged_as_posterkit_payload() {
+        let image = BASE64_STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("test PNG should decode");
+        let payload =
+            build_transcript_photo_payload(image.clone()).expect("photo background should package");
+        assert!(payload.starts_with(b"PK"));
+
+        let mut poster_archive = Vec::new();
+        {
+            let mut outer = zip::ZipArchive::new(Cursor::new(&payload))
+                .expect("outer transcript background ZIP should open");
+            outer
+                .by_name("transcriptBackground/poster")
+                .expect("outer ZIP should contain the poster archive")
+                .read_to_end(&mut poster_archive)
+                .expect("poster archive should read");
+        }
+        let mut poster = zip::ZipArchive::new(Cursor::new(&poster_archive))
+            .expect("inner PosterKit ZIP should open");
+        for required in [
+            "configuration/com.apple.posterkit.role.identifier",
+            "configuration/com.apple.posterkit.provider.descriptor.identifier",
+            "configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo",
+        ] {
+            poster
+                .by_name(required)
+                .unwrap_or_else(|_| panic!("inner PosterKit ZIP should contain {required}"));
+        }
+
+        let parsed = SimplifiedTranscriptPoster::parse_payload(&payload)
+            .expect("generated PosterKit payload should parse");
+        assert_eq!(parsed.watch.background_image_data, image);
+        assert_eq!(
+            parsed.watch.extension_identifier,
+            "com.apple.PhotosUIPrivate.PhotosPosterProvider"
+        );
+        let PosterType::Photo { assets } = parsed.poster.r#type else {
+            panic!("expected a photo poster")
+        };
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].contents.layers.len(), 1);
+        assert_eq!(assets[0].contents.version, 10);
+        assert!(assets[0]
+            .files
+            .contains_key("portrait-layer_background.HEIC"));
+
+        let replay = build_transcript_photo_payload(payload.clone())
+            .expect("an existing PosterKit package should be replayable");
+        assert_eq!(replay, payload);
+    }
+
+    #[test]
+    fn every_builtin_dynamic_background_is_packaged_as_posterkit_payload() {
+        for preset in TRANSCRIPT_DYNAMIC_PRESETS {
+            let payload = build_transcript_dynamic_payload(preset)
+                .unwrap_or_else(|error| panic!("{preset} should package: {error}"));
+            let parsed = SimplifiedTranscriptPoster::parse_payload(&payload)
+                .unwrap_or_else(|error| panic!("{preset} should parse: {error}"));
+            assert_eq!(
+                parsed.watch.extension_identifier,
+                TRANSCRIPT_DYNAMIC_EXTENSION
+            );
+            let PosterType::TranscriptDynamic { data } = parsed.poster.r#type else {
+                panic!("{preset} should be a dynamic transcript poster")
+            };
+            assert_eq!(data.identifier, *preset);
+        }
+        assert!(build_transcript_dynamic_payload("not_an_apple_preset").is_err());
+    }
+
+    #[test]
+    fn transcript_background_version_uses_apple_nanoseconds() {
+        // Current NSDate nanoseconds are an 18-digit value. This catches the
+        // seconds-scale regression that iOS silently rejects as stale.
+        assert!(current_transcript_background_version() > 100_000_000_000_000_000);
+    }
 }
 
 /// Per-address evidence from one bounded Madrid directory lookup. A fresh
@@ -9986,6 +11050,437 @@ pub struct WrappedIdsLookupReport {
     pub panicked: bool,
     pub timed_out: bool,
     pub attempts: u64,
+}
+
+const APPLE_REFERENCE_UNIX_SECONDS: u128 = 978_307_200;
+
+/// Messages compares transcript-background revisions using NSDate's
+/// nanosecond representation (nanoseconds since 2001-01-01), not the ordinary
+/// group-chat integer revision.  A seconds-scale value is silently treated as
+/// ancient by current iOS releases, so the control is acknowledged but never
+/// applied.
+fn current_transcript_background_version() -> u64 {
+    let unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    unix_nanos
+        .saturating_sub(APPLE_REFERENCE_UNIX_SECONDS * 1_000_000_000)
+        .min(u64::MAX as u128) as u64
+}
+
+fn transcript_background_filename(data: &[u8]) -> &'static str {
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        "portrait-layer_background.jpg"
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "portrait-layer_background.png"
+    } else if data.starts_with(b"GIF8") {
+        "portrait-layer_background.gif"
+    } else if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        "portrait-layer_background.heic"
+    } else {
+        "portrait-layer_background.image"
+    }
+}
+
+fn is_heic_image(data: &[u8]) -> bool {
+    data.len() >= 12
+        && &data[4..8] == b"ftyp"
+        && matches!(
+            &data[8..12],
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1"
+        )
+}
+
+#[cfg(target_os = "macos")]
+fn transcript_background_heic_layer(image_data: &[u8]) -> Result<Vec<u8>, WrappedError> {
+    if is_heic_image(image_data) {
+        return Ok(image_data.to_vec());
+    }
+
+    let temporary = tempfile::tempdir().map_err(|error| WrappedError::GenericError {
+        msg: format!("Failed to create a temporary directory for HEIC conversion: {error}"),
+    })?;
+    let input_path = temporary
+        .path()
+        .join(transcript_background_filename(image_data));
+    let output_path = temporary.path().join("portrait-layer_background.HEIC");
+    std::fs::write(&input_path, image_data).map_err(|error| WrappedError::GenericError {
+        msg: format!("Failed to stage the transcript background for HEIC conversion: {error}"),
+    })?;
+
+    let conversion = std::process::Command::new("/usr/bin/sips")
+        .args(["-s", "format", "heic"])
+        .arg(&input_path)
+        .arg("--out")
+        .arg(&output_path)
+        .output()
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to launch the macOS HEIC converter: {error}"),
+        })?;
+    if !conversion.status.success() {
+        let detail = String::from_utf8_lossy(&conversion.stderr)
+            .trim()
+            .to_string();
+        return Err(WrappedError::GenericError {
+            msg: if detail.is_empty() {
+                format!("macOS HEIC conversion exited with {}", conversion.status)
+            } else {
+                format!("macOS HEIC conversion failed: {detail}")
+            },
+        });
+    }
+
+    let heic = std::fs::read(&output_path).map_err(|error| WrappedError::GenericError {
+        msg: format!("Failed to read the converted transcript background: {error}"),
+    })?;
+    if !is_heic_image(&heic) {
+        return Err(WrappedError::GenericError {
+            msg: "macOS returned an invalid HEIC transcript background".to_string(),
+        });
+    }
+    Ok(heic)
+}
+
+const TRANSCRIPT_PHOTO_TEMPLATE_DESCRIPTOR_UUID: &str = "874AA095-A20D-4D1E-AB35-982350EBB251";
+const TRANSCRIPT_PHOTO_TEMPLATE_CONFIGURATION_UUID: &str = "CF2B77F2-C06D-4510-ACC7-CB69AB0D0E06";
+const TRANSCRIPT_PHOTO_TEMPLATE_MODEL_UUID: &str = "B35BF2DA-F510-44D1-A503-5DCF8584240B";
+const TRANSCRIPT_PHOTO_TEMPLATE_ASSET_UUID: &str = "7DD47A36-BD05-4E61-819F-E1F675007CDB";
+
+fn replace_equal_length_bytes(data: &mut [u8], from: &[u8], to: &[u8]) {
+    debug_assert_eq!(from.len(), to.len());
+    let mut offset = 0;
+    while offset + from.len() <= data.len() {
+        let Some(relative) = data[offset..]
+            .windows(from.len())
+            .position(|candidate| candidate == from)
+        else {
+            break;
+        };
+        let start = offset + relative;
+        data[start..start + to.len()].copy_from_slice(to);
+        offset = start + to.len();
+    }
+}
+
+fn rewrite_transcript_photo_template_ids(data: &mut [u8], replacements: &[(&str, &str)]) {
+    for (from, to) in replacements {
+        replace_equal_length_bytes(data, from.as_bytes(), to.as_bytes());
+    }
+}
+
+const TRANSCRIPT_DYNAMIC_EXTENSION: &str = "com.apple.transcriptBackgroundPoster.DynamicExtension";
+const TRANSCRIPT_DYNAMIC_TEMPLATE_DESCRIPTOR_UUID: &str = "2380C19D-52F6-4F79-921E-9D5286B2CAE0";
+const TRANSCRIPT_DYNAMIC_TEMPLATE_CONFIGURATION_UUID: &str = "3E0785D5-409C-4DDC-B3EE-0EE9BA6792AA";
+const TRANSCRIPT_DYNAMIC_USER_INFO_PATH: &str =
+    "configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo";
+const TRANSCRIPT_DYNAMIC_PRESETS: &[&str] = &[
+    "ocean_1", "ocean_2", "aurora_1", "aurora_2", "aurora_3", "clouds_1", "clouds_2", "clouds_3",
+    "clouds_4", "clouds_5", "clouds_6", "glitter",
+];
+
+/// PosterKit is strict about the private metadata graph around a transcript
+/// photo. Start with a captured, image-free schema from current Messages and
+/// append only the freshly encoded layer. Every opaque template ID is replaced
+/// on each send because iOS caches PosterKit media by those internal IDs.
+fn build_transcript_photo_template_poster(heic_layer: &[u8]) -> Result<Vec<u8>, WrappedError> {
+    let skeleton = BASE64_STANDARD
+        .decode(include_str!("posterkit_static/transcript_photo_template.zip.b64").trim())
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to decode the transcript background template: {error}"),
+        })?;
+    let descriptor_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let configuration_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let model_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let asset_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let replacements = [
+        (
+            TRANSCRIPT_PHOTO_TEMPLATE_DESCRIPTOR_UUID,
+            descriptor_uuid.as_str(),
+        ),
+        (
+            TRANSCRIPT_PHOTO_TEMPLATE_CONFIGURATION_UUID,
+            configuration_uuid.as_str(),
+        ),
+        (TRANSCRIPT_PHOTO_TEMPLATE_MODEL_UUID, model_uuid.as_str()),
+        (TRANSCRIPT_PHOTO_TEMPLATE_ASSET_UUID, asset_uuid.as_str()),
+    ];
+
+    let mut template = zip::ZipArchive::new(Cursor::new(skeleton)).map_err(|error| {
+        WrappedError::GenericError {
+            msg: format!("Failed to open the transcript background template: {error}"),
+        }
+    })?;
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..template.len() {
+        let mut entry = template
+            .by_index(index)
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to read the transcript background template: {error}"),
+            })?;
+        let mut name = entry.name().as_bytes().to_vec();
+        rewrite_transcript_photo_template_ids(&mut name, &replacements);
+        let name = String::from_utf8(name).map_err(|error| WrappedError::GenericError {
+            msg: format!("Transcript background template has an invalid path: {error}"),
+        })?;
+        let options =
+            zip::write::SimpleFileOptions::default().compression_method(entry.compression());
+        if entry.is_dir() {
+            writer
+                .add_directory(name, options)
+                .map_err(|error| WrappedError::GenericError {
+                    msg: format!("Failed to copy the transcript background template: {error}"),
+                })?;
+            continue;
+        }
+
+        let mut contents = Vec::new();
+        entry
+            .read_to_end(&mut contents)
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to read the transcript background template entry: {error}"),
+            })?;
+        rewrite_transcript_photo_template_ids(&mut contents, &replacements);
+        writer
+            .start_file(name, options)
+            .and_then(|_| {
+                writer
+                    .write_all(&contents)
+                    .map_err(zip::result::ZipError::Io)
+            })
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to copy the transcript background template entry: {error}"),
+            })?;
+    }
+
+    let layer_path = format!(
+        "configuration/versions/0/contents/{asset_uuid}/output.layerStack/portrait-layer_background.HEIC"
+    );
+    writer
+        .start_file(layer_path, zip::write::SimpleFileOptions::default())
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to add the HEIC transcript background layer: {error}"),
+        })?;
+    writer
+        .write_all(heic_layer)
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to write the HEIC transcript background layer: {error}"),
+        })?;
+    writer
+        .finish()
+        .map(Cursor::into_inner)
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to finish the transcript background poster: {error}"),
+        })
+}
+
+fn build_transcript_background_package(
+    watch: WatchBackground,
+    poster: Vec<u8>,
+) -> Result<Vec<u8>, WrappedError> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .add_directory(
+            "transcriptBackground/",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to start the transcript background package: {error}"),
+        })?;
+    writer
+        .start_file(
+            "transcriptBackground/watchBackground",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to add the watch transcript background: {error}"),
+        })?;
+    plist::to_writer_binary(&mut writer, &watch).map_err(|error| WrappedError::GenericError {
+        msg: format!("Failed to encode the watch transcript background: {error}"),
+    })?;
+    writer
+        .start_file(
+            "transcriptBackground/poster",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to add the transcript background poster: {error}"),
+        })?;
+    writer
+        .write_all(&poster)
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to write the transcript background poster: {error}"),
+        })?;
+    writer
+        .finish()
+        .map(Cursor::into_inner)
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to finish the transcript background package: {error}"),
+        })
+}
+
+fn build_transcript_photo_template_payload(
+    image_data: Vec<u8>,
+    heic_layer: Vec<u8>,
+) -> Result<Vec<u8>, WrappedError> {
+    build_transcript_background_package(
+        WatchBackground {
+            is_high_key: false,
+            luminance: 0.5,
+            background_image_data: image_data,
+            extension_identifier: "com.apple.PhotosUIPrivate.PhotosPosterProvider".to_string(),
+        },
+        build_transcript_photo_template_poster(&heic_layer)?,
+    )
+}
+
+fn build_transcript_dynamic_template_poster(preset: &str) -> Result<Vec<u8>, WrappedError> {
+    if !TRANSCRIPT_DYNAMIC_PRESETS.contains(&preset) {
+        return Err(WrappedError::GenericError {
+            msg: format!("Unknown built-in transcript background preset: {preset}"),
+        });
+    }
+    let skeleton = BASE64_STANDARD
+        .decode(include_str!("posterkit_static/transcript_dynamic_template.zip.b64").trim())
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to decode the dynamic background template: {error}"),
+        })?;
+    let descriptor_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let configuration_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let replacements = [
+        (
+            TRANSCRIPT_DYNAMIC_TEMPLATE_DESCRIPTOR_UUID,
+            descriptor_uuid.as_str(),
+        ),
+        (
+            TRANSCRIPT_DYNAMIC_TEMPLATE_CONFIGURATION_UUID,
+            configuration_uuid.as_str(),
+        ),
+    ];
+    let mut template = zip::ZipArchive::new(Cursor::new(skeleton)).map_err(|error| {
+        WrappedError::GenericError {
+            msg: format!("Failed to open the dynamic background template: {error}"),
+        }
+    })?;
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..template.len() {
+        let mut entry = template
+            .by_index(index)
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to read the dynamic background template: {error}"),
+            })?;
+        let name = entry.name().to_string();
+        let options =
+            zip::write::SimpleFileOptions::default().compression_method(entry.compression());
+        if entry.is_dir() {
+            writer
+                .add_directory(name, options)
+                .map_err(|error| WrappedError::GenericError {
+                    msg: format!("Failed to copy the dynamic background template: {error}"),
+                })?;
+            continue;
+        }
+
+        let mut contents = Vec::new();
+        if name == TRANSCRIPT_DYNAMIC_USER_INFO_PATH {
+            plist::to_writer_binary(
+                &mut contents,
+                &TranscriptDynamicUserData {
+                    identifier: preset.to_string(),
+                },
+            )
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to encode the dynamic background preset: {error}"),
+            })?;
+        } else {
+            entry
+                .read_to_end(&mut contents)
+                .map_err(|error| WrappedError::GenericError {
+                    msg: format!("Failed to read a dynamic background template entry: {error}"),
+                })?;
+            rewrite_transcript_photo_template_ids(&mut contents, &replacements);
+        }
+        writer
+            .start_file(name, options)
+            .and_then(|_| {
+                writer
+                    .write_all(&contents)
+                    .map_err(zip::result::ZipError::Io)
+            })
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to copy a dynamic background template entry: {error}"),
+            })?;
+    }
+    writer
+        .finish()
+        .map(Cursor::into_inner)
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to finish the dynamic background poster: {error}"),
+        })
+}
+
+fn build_transcript_dynamic_payload(preset: &str) -> Result<Vec<u8>, WrappedError> {
+    // The dynamic extension renders the animation locally. This tiny PNG is
+    // only a compatibility fallback for clients that cannot load the provider.
+    let fallback = BASE64_STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to decode the dynamic background fallback: {error}"),
+        })?;
+    build_transcript_background_package(
+        WatchBackground {
+            is_high_key: false,
+            luminance: 0.2,
+            background_image_data: fallback,
+            extension_identifier: TRANSCRIPT_DYNAMIC_EXTENSION.to_string(),
+        },
+        build_transcript_dynamic_template_poster(preset)?,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn transcript_background_heic_layer(image_data: &[u8]) -> Result<Vec<u8>, WrappedError> {
+    if is_heic_image(image_data) {
+        Ok(image_data.to_vec())
+    } else {
+        Err(WrappedError::GenericError {
+            msg: "Conversation background photo layers must be HEIC on this platform".to_string(),
+        })
+    }
+}
+
+/// Build the PosterKit package consumed by MessagesBlastDoorService.  The
+/// MMCS object for a conversation background is a ZIP containing a full
+/// poster plus a watch fallback, never the source image by itself.
+fn build_transcript_photo_payload(image_data: Vec<u8>) -> Result<Vec<u8>, WrappedError> {
+    // An incoming background is already the complete, decrypted PosterKit
+    // package. Preserve it exactly when callers deliberately replay one; this
+    // is also useful for lossless forwarding between chats.
+    if image_data.starts_with(b"PK") {
+        SimplifiedTranscriptPoster::parse_payload(&image_data).map_err(|error| {
+            WrappedError::GenericError {
+                msg: format!("Invalid transcript background PosterKit package: {error}"),
+            }
+        })?;
+        return Ok(image_data);
+    }
+
+    let dimensions =
+        imagesize::blob_size(&image_data).map_err(|error| WrappedError::GenericError {
+            msg: format!("Failed to read transcript background image dimensions: {error}"),
+        })?;
+    if dimensions.width == 0 || dimensions.height == 0 {
+        return Err(WrappedError::GenericError {
+            msg: "Transcript background image has zero width or height".to_string(),
+        });
+    }
+    // MessagesBlastDoorService rejects otherwise-valid photo posters whose
+    // background layer is PNG/JPEG. The watch fallback retains the caller's
+    // original bytes, while the PosterKit layer must be HEIC.
+    let heic_layer = transcript_background_heic_layer(&image_data)?;
+
+    build_transcript_photo_template_payload(image_data, heic_layer)
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -10044,9 +11539,12 @@ impl Client {
         address: Option<String>,
         find_my_id: Option<String>,
     ) -> Result<Vec<WrappedFindMyFollow>, WrappedError> {
-        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
-            msg: "No TokenProvider available".into(),
-        })?;
+        let tp = self
+            .token_provider
+            .as_ref()
+            .ok_or(WrappedError::GenericError {
+                msg: "No TokenProvider available".into(),
+            })?;
         let dsid = tp.get_dsid().await?;
         let mut findmy = self.get_or_init_findmy_client().await?;
         for attempt in 0..2 {
@@ -10280,7 +11778,10 @@ impl Client {
     /// Initialize the StatusKit presence system. Must be called after login
     /// when a TokenProvider is available. The callback receives presence
     /// updates for subscribed handles via the APNs receive loop.
-    pub async fn init_statuskit(&self, callback: Box<dyn StatusCallback>) -> Result<(), WrappedError> {
+    pub async fn init_statuskit(
+        &self,
+        callback: Box<dyn StatusCallback>,
+    ) -> Result<(), WrappedError> {
         // Reuse the existing get_or_init_statuskit_client() path so the
         // WrappedStatusKitClient sub-client (used for share_status etc.)
         // and the shared raw handle (used by the receive loop) both point
@@ -10357,26 +11858,40 @@ impl Client {
     /// Publish our own presence status. `active=true` → online;
     /// `active=false` → away/DND (mode defaults to do-not-disturb).
     pub async fn set_status(&self, active: bool) -> Result<(), WrappedError> {
-        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
-            msg: "StatusKit not initialized".into(),
-        })?;
+        let sk = self
+            .shared_statuskit
+            .read()
+            .await
+            .clone()
+            .ok_or(WrappedError::GenericError {
+                msg: "StatusKit not initialized".into(),
+            })?;
         let status = if active {
             rustpush::statuskit::StatusKitStatus::new_active()
         } else {
-            rustpush::statuskit::StatusKitStatus::new_away("com.apple.donotdisturb.mode.default".to_string())
+            rustpush::statuskit::StatusKitStatus::new_away(
+                "com.apple.donotdisturb.mode.default".to_string(),
+            )
         };
-        sk.share_status(&status).await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Failed to publish status: {}", e),
-        })
+        sk.share_status(&status)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to publish status: {}", e),
+            })
     }
 
     /// Subscribe to presence updates for the given handles (e.g. "tel:+1...",
     /// "mailto:..."). The subscription is held internally until
     /// `unsubscribe_all_status()` is called.
     pub async fn subscribe_to_status(&self, handles: Vec<String>) -> Result<(), WrappedError> {
-        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
-            msg: "StatusKit not initialized".into(),
-        })?;
+        let sk = self
+            .shared_statuskit
+            .read()
+            .await
+            .clone()
+            .ok_or(WrappedError::GenericError {
+                msg: "StatusKit not initialized".into(),
+            })?;
 
         let ghost_count = handles.len();
 
@@ -10409,8 +11924,9 @@ impl Client {
             if let Ok(data) = std::fs::read(&state_path) {
                 if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
                     let root = value.as_dictionary();
-                    if let Some(keys_dict) =
-                        root.and_then(|d| d.get("keys")).and_then(|v| v.as_dictionary())
+                    if let Some(keys_dict) = root
+                        .and_then(|d| d.get("keys"))
+                        .and_then(|v| v.as_dictionary())
                     {
                         for (cid, entry) in keys_dict {
                             if let Some(from_str) = entry
@@ -10430,7 +11946,9 @@ impl Client {
                         .and_then(|v| v.as_array())
                     {
                         for rc in recents {
-                            let Some(rc) = rc.as_dictionary() else { continue };
+                            let Some(rc) = rc.as_dictionary() else {
+                                continue;
+                            };
                             let Some(id_bytes) = rc
                                 .get("identifier")
                                 .and_then(|v| v.as_dictionary())
@@ -10672,13 +12190,20 @@ impl Client {
     /// The `known_handles` parameter is a list of ghost handles from the bridge
     /// database — we check each one against the IDS cache for a matching
     /// correlation ID.
-    pub async fn resolve_handle(&self, handle: String, known_handles: Vec<String>) -> Result<Vec<String>, WrappedError> {
+    pub async fn resolve_handle(
+        &self,
+        handle: String,
+        known_handles: Vec<String>,
+    ) -> Result<Vec<String>, WrappedError> {
         use rustpush::ids::user::QueryOptions;
 
         let my_handles = self.client.identity.get_handles().await;
-        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
-            msg: "no handle available".into(),
-        })?.clone();
+        let my_handle = my_handles
+            .first()
+            .ok_or(WrappedError::GenericError {
+                msg: "no handle available".into(),
+            })?
+            .clone();
 
         // Try IDS services in order. Each service's lookup may return zero
         // keys for a hidden alias (e.g. an Apple-ID-linked mailto: that
@@ -10755,16 +12280,25 @@ impl Client {
                 &QueryOptions::default(),
                 timeout_secs,
                 ids_guard::QuarantinePolicy::Enforce,
-            ).await;
+            )
+            .await;
             if let Some(err) = &report.error {
-                info!("resolve_handle: cache_keys({}, n={}) failed: {}", service, targets.len(), err);
+                info!(
+                    "resolve_handle: cache_keys({}, n={}) failed: {}",
+                    service,
+                    targets.len(),
+                    err
+                );
             }
 
             let cache = self.client.identity.cache.lock().await;
             let correlation_id = match cache.get_correlation_id(service, &my_handle, &handle) {
                 Some(cid) if !cid.is_empty() => cid,
                 _ => {
-                    info!("resolve_handle: no correlation ID for {} in {} — trying next service", handle, service);
+                    info!(
+                        "resolve_handle: no correlation ID for {} in {} — trying next service",
+                        handle, service
+                    );
                     continue; // try next service
                 }
             };
@@ -10785,11 +12319,20 @@ impl Client {
                 }
             }
 
-            info!("resolve_handle: {} → {} alias(es) via {} (correlation {})", handle, aliases.len(), service, correlation_id);
+            info!(
+                "resolve_handle: {} → {} alias(es) via {} (correlation {})",
+                handle,
+                aliases.len(),
+                service,
+                correlation_id
+            );
             return Ok(aliases);
         }
 
-        info!("resolve_handle: no correlation ID for {} in any IDS service", handle);
+        info!(
+            "resolve_handle: no correlation ID for {} in any IDS service",
+            handle
+        );
         Ok(vec![])
     }
 
@@ -10805,7 +12348,11 @@ impl Client {
     /// iMessage is sent; the keysharing cache is populated as soon as
     /// invite_to_channel runs. Falling through to keysharing lets the
     /// periodic re-invite path find aliases on subsequent ticks.
-    pub async fn resolve_handle_cached(&self, handle: String, known_handles: Vec<String>) -> Vec<String> {
+    pub async fn resolve_handle_cached(
+        &self,
+        handle: String,
+        known_handles: Vec<String>,
+    ) -> Vec<String> {
         // Mirror resolve_handle's services list — see comment there.
         const SERVICES: &[&str] = &[
             "com.apple.madrid",
@@ -10837,7 +12384,13 @@ impl Client {
                     }
                 }
             }
-            info!("resolve_handle_cached: {} → {} alias(es) via {} (correlation {})", handle, aliases.len(), service, correlation_id);
+            info!(
+                "resolve_handle_cached: {} → {} alias(es) via {} (correlation {})",
+                handle,
+                aliases.len(),
+                service,
+                correlation_id
+            );
             return aliases;
         }
 
@@ -10871,9 +12424,12 @@ impl Client {
         }
 
         let my_handles = self.client.identity.get_handles().await;
-        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
-            msg: "no handle available".into(),
-        })?.clone();
+        let my_handle = my_handles
+            .first()
+            .ok_or(WrappedError::GenericError {
+                msg: "no handle available".into(),
+            })?
+            .clone();
 
         const SERVICES: &[&str] = &[
             "com.apple.madrid",
@@ -10927,9 +12483,15 @@ impl Client {
                 &QueryOptions::default(),
                 unknown_timeout,
                 ids_guard::QuarantinePolicy::Enforce,
-            ).await;
+            )
+            .await;
             if let Some(err) = &report.error {
-                info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {}", service, unknown_targets.len(), err);
+                info!(
+                    "batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {}",
+                    service,
+                    unknown_targets.len(),
+                    err
+                );
                 if !report.systemic {
                     // Ordinary failure: skip this service entirely, exactly as
                     // this loop did before the guard existed.
@@ -10957,7 +12519,8 @@ impl Client {
                     &QueryOptions::default(),
                     sibling_timeout,
                     ids_guard::QuarantinePolicy::Enforce,
-                ).await;
+                )
+                .await;
                 if let Some(err) = &sib.error {
                     info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {}", service, sibling_targets.len(), err);
                 }
@@ -11012,7 +12575,10 @@ impl Client {
             ch.last_msg_ns = 1;
         }
         persist_plist_state(&state_path, &state);
-        info!("Reset {} StatusKit channel cursor(s) to 1 for replay", count);
+        info!(
+            "Reset {} StatusKit channel cursor(s) to 1 for replay",
+            count
+        );
     }
 
     /// Send our StatusKit key to the specified contact handles (via IDS
@@ -11026,9 +12592,14 @@ impl Client {
         sender_handle: String,
         handles: Vec<String>,
     ) -> Result<(), WrappedError> {
-        let sk = self.shared_statuskit.read().await.clone().ok_or(WrappedError::GenericError {
-            msg: "StatusKit not initialized".into(),
-        })?;
+        let sk = self
+            .shared_statuskit
+            .read()
+            .await
+            .clone()
+            .ok_or(WrappedError::GenericError {
+                msg: "StatusKit not initialized".into(),
+            })?;
 
         match statuskitgo::invite_keysharing(&sk, &sender_handle, &handles).await {
             Ok(_) => Ok(()),
@@ -11041,7 +12612,6 @@ impl Client {
             }),
         }
     }
-
 
     /// Fetch a shared iMessage profile (Name & Photo Sharing) from CloudKit.
     /// `record_key` and `decryption_key` are obtained from an incoming
@@ -11099,7 +12669,12 @@ impl Client {
         // takes the bridge down (and systemd restarts into the same row,
         // crashloop). `guard_panic` turns the panic into an error so the
         // Go-side periodic refresh logs+skips the stale row.
-        let record = match guard_panic("fetch_profile CloudKit fetch", profiles.get_record(&share_msg)).await {
+        let record = match guard_panic(
+            "fetch_profile CloudKit fetch",
+            profiles.get_record(&share_msg),
+        )
+        .await
+        {
             Some(Ok(r)) => r,
             Some(Err(e)) => {
                 warn!(
@@ -11116,7 +12691,8 @@ impl Client {
                     key_prefix, has_poster
                 );
                 return Err(WrappedError::GenericError {
-                    msg: "Shared profile record not found in CloudKit (rotated/deleted)".to_string(),
+                    msg: "Shared profile record not found in CloudKit (rotated/deleted)"
+                        .to_string(),
                 });
             }
         };
@@ -11147,7 +12723,9 @@ impl Client {
 
     /// Get iCloud auth headers (Authorization + anisette) for MobileMe API calls.
     /// Returns None if no token provider is available.
-    pub async fn get_icloud_auth_headers(&self) -> Result<Option<HashMap<String, String>>, WrappedError> {
+    pub async fn get_icloud_auth_headers(
+        &self,
+    ) -> Result<Option<HashMap<String, String>>, WrappedError> {
         match &self.token_provider {
             Some(tp) => Ok(Some(tp.get_icloud_auth_headers().await?)),
             None => Ok(None),
@@ -11183,7 +12761,9 @@ impl Client {
         self.get_or_init_statuskit_client().await
     }
 
-    pub async fn get_sharedstreams_client(&self) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
+    pub async fn get_sharedstreams_client(
+        &self,
+    ) -> Result<Arc<WrappedSharedStreamsClient>, WrappedError> {
         self.get_or_init_sharedstreams_client().await
     }
 
@@ -11223,7 +12803,10 @@ impl Client {
             std::slice::from_ref(&handle),
             &handle,
             false,
-            &rustpush::ids::user::QueryOptions { required_for_message: true, result_expected: true },
+            &rustpush::ids::user::QueryOptions {
+                required_for_message: true,
+                result_expected: true,
+            },
             30,
             ids_guard::QuarantinePolicy::Bypass,
         )
@@ -11232,7 +12815,10 @@ impl Client {
         // never exceed MAX_QUARANTINE_PER_PASS, so a caught panic lands in
         // `poisoned` with `error` left None (ids_guard.rs classify_and_record).
         if let Some(err) = &report.error {
-            warn!("has_sms_relay: relay lookup failed; refusing unproven SMS fallback: {}", err);
+            warn!(
+                "has_sms_relay: relay lookup failed; refusing unproven SMS fallback: {}",
+                err
+            );
             return false;
         }
         if !report.poisoned.is_empty() {
@@ -11267,11 +12853,7 @@ impl Client {
         true
     }
 
-    pub async fn validate_targets(
-        &self,
-        targets: Vec<String>,
-        handle: String,
-    ) -> Vec<String> {
+    pub async fn validate_targets(&self, targets: Vec<String>, handle: String) -> Vec<String> {
         // Callers pass a single identifier here (contact_merge.go:86), which is
         // one of the shapes that trips the upstream chunks(0) panic. Prime the
         // cache through the guarded seam first, then read it back with the same
@@ -11305,9 +12887,14 @@ impl Client {
             &rustpush::ids::user::QueryOptions::default(),
             30,
             ids_guard::QuarantinePolicy::Bypass,
-        ).await;
+        )
+        .await;
         if let Some(err) = &report.error {
-            info!("validate_targets: cache_keys(n={}) failed: {}", targets.len(), err);
+            info!(
+                "validate_targets: cache_keys(n={}) failed: {}",
+                targets.len(),
+                err
+            );
         }
         let cache = self.client.identity.cache.lock().await;
         targets
@@ -11349,13 +12936,10 @@ impl Client {
         };
 
         let options = rustpush::ids::user::QueryOptions::default();
-        let lookup = self.client.identity.cache_keys(
-            TOPIC,
-            &targets,
-            &handle,
-            true,
-            &options,
-        );
+        let lookup = self
+            .client
+            .identity
+            .cache_keys(TOPIC, &targets, &handle, true, &options);
         let outcome = tokio::time::timeout(
             Duration::from_secs(30),
             std::panic::AssertUnwindSafe(lookup).catch_unwind(),
@@ -11445,27 +13029,31 @@ impl Client {
         // base64 so user-authored text cannot collide with the framing bytes.
         let (actual_text, link_meta, app) = if text.starts_with("\x00RL2\x01") {
             let rest = &text[5..];
-            let end = rest.find('\x00').ok_or_else(|| WrappedError::GenericError {
-                msg: "Invalid rich-link transport framing".to_string(),
-            })?;
+            let end = rest
+                .find('\x00')
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: "Invalid rich-link transport framing".to_string(),
+                })?;
             let metadata = BASE64_STANDARD.decode(&rest[..end]).map_err(|error| {
                 WrappedError::GenericError {
                     msg: format!("Invalid rich-link metadata encoding: {error}"),
                 }
             })?;
-            let metadata: serde_json::Value = serde_json::from_slice(&metadata).map_err(|error| {
-                WrappedError::GenericError {
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&metadata).map_err(|error| WrappedError::GenericError {
                     msg: format!("Invalid rich-link metadata JSON: {error}"),
-                }
-            })?;
+                })?;
             let required_string = |key: &str| {
-                metadata.get(key).and_then(serde_json::Value::as_str)
+                metadata
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
                     .filter(|value| !value.is_empty())
                     .map(ToOwned::to_owned)
             };
-            let original_url_str = required_string("originalUrl").ok_or_else(|| {
-                WrappedError::GenericError { msg: "Rich link requires originalUrl".to_string() }
-            })?;
+            let original_url_str =
+                required_string("originalUrl").ok_or_else(|| WrappedError::GenericError {
+                    msg: "Rich link requires originalUrl".to_string(),
+                })?;
             let url_str = required_string("url").unwrap_or_else(|| original_url_str.clone());
             let image_mime = required_string("artworkMimeType");
             let image_data = required_string("artworkDataBase64")
@@ -11497,22 +13085,24 @@ impl Client {
                 required_string("appleMusicAlbum"),
                 required_string("appleMusicPreviewUrl"),
             ) {
-                Some(rustpush::LPSpecializationMetadata::LPiTunesMediaSongMetadata {
-                    store_front_identifier,
-                    store_identifier,
-                    name,
-                    artist,
-                    album,
-                    offers: Some(rustpush::NSArray {
-                        objects: vec!["buy".to_string(), "subscription".to_string()],
-                        class: rustpush::NSArrayClass::NSMutableArray,
-                    }),
-                    preview_url: NSURL {
-                        base: "$null".to_string(),
-                        relative: preview_url,
+                Some(
+                    rustpush::LPSpecializationMetadata::LPiTunesMediaSongMetadata {
+                        store_front_identifier,
+                        store_identifier,
+                        name,
+                        artist,
+                        album,
+                        offers: Some(rustpush::NSArray {
+                            objects: vec!["buy".to_string(), "subscription".to_string()],
+                            class: rustpush::NSArrayClass::NSMutableArray,
+                        }),
+                        preview_url: NSURL {
+                            base: "$null".to_string(),
+                            relative: preview_url,
+                        },
+                        artwork: image.clone(),
                     },
-                    artwork: image.clone(),
-                })
+                )
             } else {
                 None
             };
@@ -11522,8 +13112,14 @@ impl Client {
                     image_metadata: None,
                     version: 1,
                     icon_metadata: None,
-                    original_url: Some(NSURL { base: "$null".to_string(), relative: original_url_str }),
-                    url: (!is_apple_music).then(|| NSURL { base: "$null".to_string(), relative: url_str }),
+                    original_url: Some(NSURL {
+                        base: "$null".to_string(),
+                        relative: original_url_str,
+                    }),
+                    url: (!is_apple_music).then(|| NSURL {
+                        base: "$null".to_string(),
+                        relative: url_str,
+                    }),
                     title: title.clone(),
                     original_title: is_apple_music.then_some(title).flatten(),
                     summary: required_string("summary"),
@@ -11542,21 +13138,25 @@ impl Client {
             (rest[end + 1..].to_string(), Some(lm), None)
         } else if text.starts_with("\x00ICL\x01") {
             let rest = &text[5..];
-            let end = rest.find('\x00').ok_or_else(|| WrappedError::GenericError {
-                msg: "Invalid iCloud-share transport framing".to_string(),
-            })?;
+            let end = rest
+                .find('\x00')
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: "Invalid iCloud-share transport framing".to_string(),
+                })?;
             let metadata = BASE64_STANDARD.decode(&rest[..end]).map_err(|error| {
                 WrappedError::GenericError {
                     msg: format!("Invalid iCloud-share metadata encoding: {error}"),
                 }
             })?;
-            let metadata: serde_json::Value = serde_json::from_slice(&metadata).map_err(|error| {
-                WrappedError::GenericError {
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&metadata).map_err(|error| WrappedError::GenericError {
                     msg: format!("Invalid iCloud-share metadata JSON: {error}"),
-                }
-            })?;
+                })?;
             let string_value = |key: &str| {
-                metadata.get(key).and_then(serde_json::Value::as_str).map(ToOwned::to_owned)
+                metadata
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
             };
             let url = string_value("url")
                 .filter(|value| {
@@ -11569,14 +13169,19 @@ impl Client {
                     msg: "iCloud share requires an iCloud Photos HTTPS URL".to_string(),
                 })?;
             let caption = string_value("caption").unwrap_or_default();
-            let subcaption = string_value("subcaption").unwrap_or_else(|| "Shared Photos".to_string());
+            let subcaption =
+                string_value("subcaption").unwrap_or_else(|| "Shared Photos".to_string());
             let ld_text = string_value("ldText")
                 .filter(|value| !value.is_empty())
-                .or_else(|| Some([caption.as_str(), subcaption.as_str()]
-                    .into_iter()
-                    .filter(|value| !value.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" - ")));
+                .or_else(|| {
+                    Some(
+                        [caption.as_str(), subcaption.as_str()]
+                            .into_iter()
+                            .filter(|value| !value.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" - "),
+                    )
+                });
             let app = ExtensionApp {
                 name: "None".to_string(),
                 app_id: None,
@@ -11603,28 +13208,31 @@ impl Client {
             (rest[end + 1..].to_string(), None, Some(app))
         } else if text.starts_with("\x00PL\x01") {
             let rest = &text[4..];
-            let end = rest.find('\x00').ok_or_else(|| WrappedError::GenericError {
-                msg: "Invalid poll transport framing".to_string(),
-            })?;
+            let end = rest
+                .find('\x00')
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: "Invalid poll transport framing".to_string(),
+                })?;
             let metadata = &rest[..end];
-            let (session_id, encoded) = metadata.split_once('\x01').ok_or_else(|| {
-                WrappedError::GenericError {
-                    msg: "Invalid poll transport metadata".to_string(),
-                }
-            })?;
+            let (session_id, encoded) =
+                metadata
+                    .split_once('\x01')
+                    .ok_or_else(|| WrappedError::GenericError {
+                        msg: "Invalid poll transport metadata".to_string(),
+                    })?;
             uuid::Uuid::parse_str(session_id).map_err(|error| WrappedError::GenericError {
                 msg: format!("Invalid poll session ID: {error}"),
             })?;
-            let poll_json = BASE64_STANDARD.decode(encoded).map_err(|error| {
-                WrappedError::GenericError {
-                    msg: format!("Invalid poll definition encoding: {error}"),
-                }
-            })?;
-            let envelope: serde_json::Value = serde_json::from_slice(&poll_json).map_err(|error| {
-                WrappedError::GenericError {
+            let poll_json =
+                BASE64_STANDARD
+                    .decode(encoded)
+                    .map_err(|error| WrappedError::GenericError {
+                        msg: format!("Invalid poll definition encoding: {error}"),
+                    })?;
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&poll_json).map_err(|error| WrappedError::GenericError {
                     msg: format!("Invalid poll definition JSON: {error}"),
-                }
-            })?;
+                })?;
             let option_count = envelope
                 .get("item")
                 .and_then(|item| item.get("orderedPollOptions"))
@@ -11683,10 +13291,21 @@ impl Client {
                         relative: url_str.to_string(),
                     })
                 };
-                let title = if title_str.is_empty() { None } else { Some(title_str.to_string()) };
-                let summary = if summary_str.is_empty() { None } else { Some(summary_str.to_string()) };
+                let title = if title_str.is_empty() {
+                    None
+                } else {
+                    Some(title_str.to_string())
+                };
+                let summary = if summary_str.is_empty() {
+                    None
+                } else {
+                    Some(summary_str.to_string())
+                };
 
-                info!("Sending rich link: url={}, title={:?}", original_url_str, title);
+                info!(
+                    "Sending rich link: url={}, title={:?}",
+                    original_url_str, title
+                );
 
                 let lm = LinkMeta {
                     data: LPLinkMetadata {
@@ -11751,14 +13370,94 @@ impl Client {
             n.scheduled = schedule;
             n
         };
-        let mut msg = MessageInst::new(
-            conv.clone(),
-            &handle,
-            Message::Message(normal),
-        );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message: {}", e) })?;
+        let mut msg = MessageInst::new(conv.clone(), &handle, Message::Message(normal));
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send message: {}", e),
+            })?;
         Ok(msg.id.clone())
+    }
+
+    /// Send a generic Messages extension balloon using the normalized public
+    /// envelope. Feature-specific helpers (Polls, Photos, etc.) can use the
+    /// same primitive without asking callers to manufacture NSKeyedArchives.
+    pub async fn send_component(
+        &self,
+        conversation: WrappedConversation,
+        envelope: WrappedComponentEnvelope,
+        text: String,
+        subject: Option<String>,
+        handle: String,
+        reply_guid: Option<String>,
+        reply_part: Option<String>,
+    ) -> Result<String, WrappedError> {
+        if conversation.is_sms {
+            return Err(WrappedError::GenericError {
+                msg: "Messages components require an iMessage conversation".to_string(),
+            });
+        }
+        if envelope.bundle_id.trim().is_empty() || envelope.bundle_id.len() > 512 {
+            return Err(WrappedError::GenericError {
+                msg: "Component bundle ID must contain between 1 and 512 bytes".to_string(),
+            });
+        }
+        if envelope.url.trim().is_empty() || envelope.url.len() > 16 * 1024 {
+            return Err(WrappedError::GenericError {
+                msg: "Component URL must contain between 1 and 16384 bytes".to_string(),
+            });
+        }
+        if let Some(session_id) = envelope.session_id.as_deref() {
+            uuid::Uuid::parse_str(session_id).map_err(|error| WrappedError::GenericError {
+                msg: format!("Invalid component session ID: {error}"),
+            })?;
+        }
+        if envelope
+            .icon
+            .as_ref()
+            .is_some_and(|icon| icon.len() > 2 * 1024 * 1024)
+        {
+            return Err(WrappedError::GenericError {
+                msg: "Component icon exceeds the 2 MiB limit".to_string(),
+            });
+        }
+
+        let (reply_guid, reply_part) = normalize_reply_target(reply_guid, reply_part);
+        let conv: ConversationData = (&conversation).into();
+        let app = ExtensionApp {
+            name: envelope.app_name,
+            app_id: envelope.app_id,
+            bundle_id: envelope.bundle_id,
+            attribution: Default::default(),
+            balloon: Some(Balloon {
+                url: envelope.url,
+                session: envelope.session_id,
+                layout: Some(BalloonLayout::TemplateLayout {
+                    image_subtitle: envelope.image_subtitle,
+                    image_title: envelope.image_title,
+                    caption: envelope.caption,
+                    secondary_subcaption: envelope.secondary_subcaption,
+                    tertiary_subcaption: envelope.tertiary_subcaption,
+                    subcaption: envelope.subcaption,
+                    class: rustpush::NSDictionaryClass::NSDictionary,
+                }),
+                ld_text: envelope.ld_text,
+                is_live: envelope.is_live,
+                icon: envelope.icon,
+            }),
+        };
+        let mut normal = NormalMessage::new(text, MessageType::IMessage);
+        normal.app = Some(app);
+        normal.subject = subject;
+        normal.reply_guid = reply_guid;
+        normal.reply_part = reply_part;
+        let mut message = MessageInst::new(conv, &handle, Message::Message(normal));
+        self.send_with_flap_retry(&mut message)
+            .await
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Failed to send Messages component: {error}"),
+            })?;
+        Ok(message.id.clone())
     }
 
     /// Send one iMessage containing ordered text, mention, and attachment
@@ -11801,7 +13500,10 @@ impl Client {
                 }
             } else if part.text.as_deref().unwrap_or("").is_empty() {
                 return Err(WrappedError::GenericError {
-                    msg: format!("Multipart part {} has no text or attachment", part.part_index),
+                    msg: format!(
+                        "Multipart part {} has no text or attachment",
+                        part.part_index
+                    ),
                 });
             }
             if part.mention.is_some() && part.text.as_deref().unwrap_or("").is_empty() {
@@ -11832,11 +13534,10 @@ impl Client {
         let mut message_parts = Vec::with_capacity(parts.len());
 
         for part in parts {
-            let part_index = usize::try_from(part.part_index).map_err(|_| {
-                WrappedError::GenericError {
+            let part_index =
+                usize::try_from(part.part_index).map_err(|_| WrappedError::GenericError {
                     msg: format!("Multipart part index {} is too large", part.part_index),
-                }
-            })?;
+                })?;
 
             // BlueBubbles' helper gives filePath precedence when a part also
             // contains text, so match that behavior here.
@@ -11847,11 +13548,12 @@ impl Client {
                 let attachment = if conversation.is_sms {
                     inline_relay_attachment(data, mime, uti_type, filename)
                 } else {
-                    let prepared = MMCSFile::prepare_put(Cursor::new(&data))
-                        .await
-                        .map_err(|e| WrappedError::GenericError {
-                            msg: format!("Failed to prepare multipart MMCS upload: {e}"),
-                        })?;
+                    let prepared =
+                        MMCSFile::prepare_put(Cursor::new(&data))
+                            .await
+                            .map_err(|e| WrappedError::GenericError {
+                                msg: format!("Failed to prepare multipart MMCS upload: {e}"),
+                            })?;
                     Attachment::new_mmcs(
                         &self.conn,
                         &prepared,
@@ -11953,12 +13655,17 @@ impl Client {
             msg: format!("Failed to upload sticker reaction: {e}"),
         })?;
 
-        let digest = openssl::hash::hash(openssl::hash::MessageDigest::md5(), &data)
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to hash sticker reaction: {e}"),
+        let digest =
+            openssl::hash::hash(openssl::hash::MessageDigest::md5(), &data).map_err(|e| {
+                WrappedError::GenericError {
+                    msg: format!("Failed to hash sticker reaction: {e}"),
+                }
             })?;
         let (name, source_bundle_id) = match source.as_str() {
-            "sticker" => ("Stickers", "com.apple.Stickers.UserGenerated.MessagesExtension"),
+            "sticker" => (
+                "Stickers",
+                "com.apple.Stickers.UserGenerated.MessagesExtension",
+            ),
             "memoji" => ("Memoji", "com.apple.Animoji.StickersApp.MessagesExtension"),
             "genmoji" => ("Genmoji", "com.apple.messages.genmoji"),
             _ => {
@@ -11986,7 +13693,10 @@ impl Client {
             effect_type: -1,
             sticker_id: filename.clone(),
             pid: Some(bundle_id.clone()),
-            suri: Some(format!("sticker:///imsg/{}", hex::encode(openssl::sha::sha256(&data)))),
+            suri: Some(format!(
+                "sticker:///imsg/{}",
+                hex::encode(openssl::sha::sha256(&data))
+            )),
         };
         let body = MessageParts(vec![IndexedMessagePart {
             part: MessagePart::Attachment(attachment),
@@ -12032,7 +13742,8 @@ impl Client {
                 embedded_profile: None,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
+        self.send_with_flap_retry(&mut msg)
+            .await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("Failed to send sticker reaction: {e}"),
             })?;
@@ -12067,13 +13778,19 @@ impl Client {
             Message::React(ReactMessage {
                 to_uuid: target_uuid,
                 to_part: Some(target_part),
-                reaction: ReactMessageType::React { reaction: reaction_val, enable: !remove },
+                reaction: ReactMessageType::React {
+                    reaction: reaction_val,
+                    enable: !remove,
+                },
                 to_text: target_text,
                 embedded_profile: None,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send tapback: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send tapback: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12092,11 +13809,14 @@ impl Client {
         uuid::Uuid::parse_str(&session_id).map_err(|error| WrappedError::GenericError {
             msg: format!("Invalid poll session ID: {error}"),
         })?;
-        let envelope: serde_json::Value = serde_json::from_str(&poll_response_json)
-            .map_err(|error| WrappedError::GenericError {
-                msg: format!("Invalid poll response JSON: {error}"),
+        let envelope: serde_json::Value =
+            serde_json::from_str(&poll_response_json).map_err(|error| {
+                WrappedError::GenericError {
+                    msg: format!("Invalid poll response JSON: {error}"),
+                }
             })?;
-        if !envelope.get("item")
+        if !envelope
+            .get("item")
             .and_then(|item| item.get("votes"))
             .is_some_and(serde_json::Value::is_array)
         {
@@ -12153,8 +13873,12 @@ impl Client {
     ) -> Result<(), WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, None));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send typing: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12169,8 +13893,12 @@ impl Client {
         let conv: ConversationData = (&conversation).into();
         let app = TypingApp { bundle_id, icon };
         let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, Some(app)));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing with app: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send typing with app: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12183,8 +13911,12 @@ impl Client {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::Read);
         msg.id = for_uuid;
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send read receipt: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send read receipt: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12195,8 +13927,12 @@ impl Client {
     ) -> Result<(), WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::Delivered);
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send delivery receipt: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send delivery receipt: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12222,8 +13958,11 @@ impl Client {
                 }]),
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send edit: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send edit: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12243,8 +13982,11 @@ impl Client {
                 edit_part,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unsend: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send unsend: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12261,7 +14003,9 @@ impl Client {
         // not the user's own handle. Including it causes the Mac to not
         // recognise the chat being deleted.
         let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
-        let bare_participants: Vec<String> = conv.participants.iter()
+        let bare_participants: Vec<String> = conv
+            .participants
+            .iter()
             .map(|p| p.replace("mailto:", "").replace("tel:", ""))
             .filter(|p| p != &bare_handle)
             .collect();
@@ -12280,8 +14024,12 @@ impl Client {
                 .unwrap_or(0),
         };
         let mut msg = MessageInst::new(conv, &handle, Message::MoveToRecycleBin(delete_msg));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send MoveToRecycleBin: {}", e),
+            })?;
         // Note: We intentionally do NOT send PermanentDelete. MoveToRecycleBin
         // moves the chat to Apple's "Recently Deleted" (30-day retention),
         // respecting the user's recycle bin. The chat can be restored with
@@ -12300,7 +14048,9 @@ impl Client {
     ) -> Result<(), WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
-        let bare_participants: Vec<String> = conv.participants.iter()
+        let bare_participants: Vec<String> = conv
+            .participants
+            .iter()
             .map(|p| p.replace("mailto:", "").replace("tel:", ""))
             .filter(|p| p != &bare_handle)
             .collect();
@@ -12312,8 +14062,12 @@ impl Client {
             was_reported_as_junk: None,
         };
         let mut msg = MessageInst::new(conv, &handle, Message::RecoverChat(operated_chat));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send RecoverChat: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send RecoverChat: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12342,7 +14096,10 @@ impl Client {
             service_name: service,
             original_group_id: group_id,
             properties: None,
-            participants: participants.into_iter().map(|uri| rustpush::cloud_messages::CloudParticipant { uri }).collect(),
+            participants: participants
+                .into_iter()
+                .map(|uri| rustpush::cloud_messages::CloudParticipant { uri })
+                .collect(),
             prop001: Default::default(),
             last_read_message_timestamp: 0,
             last_addressed_handle: String::new(),
@@ -12354,23 +14111,31 @@ impl Client {
         };
         let mut chats = std::collections::HashMap::new();
         chats.insert(record_name.clone(), chat);
-        let results = cloud_messages.save_chats(chats).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to restore CloudKit chat: {}", e) })?;
+        let results =
+            cloud_messages
+                .save_chats(chats)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to restore CloudKit chat: {}", e),
+                })?;
         // Check individual result
         if let Some(Err(e)) = results.get(&record_name) {
-            return Err(WrappedError::GenericError { msg: format!("Failed to save restored chat record: {}", e) });
+            return Err(WrappedError::GenericError {
+                msg: format!("Failed to save restored chat record: {}", e),
+            });
         }
         Ok(())
     }
 
     /// Delete chat records from CloudKit so they don't reappear during future syncs.
-    pub async fn delete_cloud_chats(
-        &self,
-        chat_ids: Vec<String>,
-    ) -> Result<(), WrappedError> {
+    pub async fn delete_cloud_chats(&self, chat_ids: Vec<String>) -> Result<(), WrappedError> {
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        cloud_messages.delete_chats(&chat_ids).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit chats: {}", e) })?;
+        cloud_messages
+            .delete_chats(&chat_ids)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to delete CloudKit chats: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12380,8 +14145,12 @@ impl Client {
         message_ids: Vec<String>,
     ) -> Result<(), WrappedError> {
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        cloud_messages.delete_messages(&message_ids).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit messages: {}", e) })?;
+        cloud_messages
+            .delete_messages(&message_ids)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to delete CloudKit messages: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12390,17 +14159,30 @@ impl Client {
     /// in recoverableMessageDeleteZone; nuking that zone ensures they stay dead.
     pub async fn purge_recoverable_zones(&self) -> Result<(), WrappedError> {
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let container = cloud_messages.get_container().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
-        container.perform_operations_checked(
-            &CloudKitSession::new(),
-            &[
-                ZoneDeleteOperation::new(container.private_zone("recoverableMessageDeleteZone".to_string())),
-                ZoneDeleteOperation::new(container.private_zone("chatBotRecoverableMessageDeleteZone".to_string())),
-            ],
-            IsolationLevel::Operation,
-        ).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to purge recoverable zones: {}", e) })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get CloudKit container: {}", e),
+                })?;
+        container
+            .perform_operations_checked(
+                &CloudKitSession::new(),
+                &[
+                    ZoneDeleteOperation::new(
+                        container.private_zone("recoverableMessageDeleteZone".to_string()),
+                    ),
+                    ZoneDeleteOperation::new(
+                        container.private_zone("chatBotRecoverableMessageDeleteZone".to_string()),
+                    ),
+                ],
+                IsolationLevel::Operation,
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to purge recoverable zones: {}", e),
+            })?;
         Ok(())
     }
 
@@ -12408,15 +14190,22 @@ impl Client {
     /// Paginates through all known recoverable-delete zones and returns all
     /// non-tombstone chat records found there.
     pub async fn list_recoverable_chats(&self) -> Result<Vec<WrappedCloudSyncChat>, WrappedError> {
-        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::{CloudChat, MESSAGES_SERVICE};
+        use rustpush::cloudkit::{
+            pcs_keys_for_record, CloudKitSession, FetchRecordChangesOperation, NO_ASSETS,
+        };
         use rustpush::cloudkit_proto::CloudKitRecord;
-        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudChat};
 
         info!("list_recoverable_chats: starting recycle bin query");
 
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let container = cloud_messages.get_container().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get CloudKit container: {}", e),
+                })?;
 
         let mut all_chats = Vec::new();
         let mut seen_record_names = std::collections::HashSet::new();
@@ -12424,7 +14213,10 @@ impl Client {
         // (which we KNOW gets output even if per-page logs are lost).
         let mut zone_diag: Vec<String> = Vec::new();
 
-        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+        for zone_name in [
+            "recoverableMessageDeleteZone",
+            "chatBotRecoverableMessageDeleteZone",
+        ] {
             let mut token: Option<Vec<u8>> = None;
             let mut zone_total_changes = 0usize;
             let mut zone_tombstones = 0usize;
@@ -12436,19 +14228,29 @@ impl Client {
             let mut zone_pages = 0usize;
             let mut zone_last_status = 0i32;
 
-            debug!("list_recoverable_chats: fetching zone encryption config for {}", zone_name);
+            debug!(
+                "list_recoverable_chats: fetching zone encryption config for {}",
+                zone_name
+            );
 
             for page in 0..256 {
                 zone_pages = page + 1;
                 let zone_id = container.private_zone(zone_name.to_string());
                 let key = container
-                    .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                    .get_zone_encryption_config(
+                        &zone_id,
+                        &cloud_messages.keychain,
+                        &MESSAGES_SERVICE,
+                    )
                     .await
                     .map_err(|e| WrappedError::GenericError {
                         msg: format!("Failed to get zone key for {}: {}", zone_name, e),
                     })?;
 
-                debug!("list_recoverable_chats: performing FetchRecordChanges on {} page {}", zone_name, page);
+                debug!(
+                    "list_recoverable_chats: performing FetchRecordChanges on {} page {}",
+                    zone_name, page
+                );
 
                 let (_assets, response) = container
                     .perform(
@@ -12457,14 +14259,20 @@ impl Client {
                     )
                     .await
                     .map_err(|e| WrappedError::GenericError {
-                        msg: format!("Failed to fetch recoverable chats from {} page {}: {}", zone_name, page, e),
+                        msg: format!(
+                            "Failed to fetch recoverable chats from {} page {}: {}",
+                            zone_name, page, e
+                        ),
                     })?;
 
                 let changes_count = response.change.len();
                 let status = response.status();
                 zone_last_status = status;
                 zone_total_changes += changes_count;
-                debug!("list_recoverable_chats: zone={} page={} changes={} status={}", zone_name, page, changes_count, status);
+                debug!(
+                    "list_recoverable_chats: zone={} page={} changes={} status={}",
+                    zone_name, page, changes_count, status
+                );
 
                 for change in &response.change {
                     let id_proto = match change.identifier.as_ref() {
@@ -12481,7 +14289,10 @@ impl Client {
                         Some(r) => r,
                         None => {
                             zone_tombstones += 1;
-                            debug!("list_recoverable_chats: tombstone record {} in {}", identifier, zone_name);
+                            debug!(
+                                "list_recoverable_chats: tombstone record {} in {}",
+                                identifier, zone_name
+                            );
                             continue;
                         }
                     };
@@ -12538,9 +14349,13 @@ impl Client {
                         }
                         Err(e) => {
                             zone_panic += 1;
-                            let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                                      else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                                      else { "unknown panic".to_string() };
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
                             warn!(
                                 "list_recoverable_chats: skipping record {} in {}: deserialization panic: {} (type={}, fields={:?})",
                                 identifier,
@@ -12569,7 +14384,11 @@ impl Client {
 
         // Single summary line with ALL diagnostic info embedded.
         // This line is confirmed to appear in logs — embed everything here.
-        info!("list_recoverable_chats: found {} chat(s) in recycle bin [{}]", all_chats.len(), zone_diag.join(" | "));
+        info!(
+            "list_recoverable_chats: found {} chat(s) in recycle bin [{}]",
+            all_chats.len(),
+            zone_diag.join(" | ")
+        );
         Ok(all_chats)
     }
 
@@ -12583,15 +14402,22 @@ impl Client {
     /// include base64-encoded metadata after `guid|...`; GUID-only callers can
     /// safely ignore the suffix.
     pub async fn list_recoverable_message_guids(&self) -> Result<Vec<String>, WrappedError> {
-        use std::collections::HashSet;
-        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+        use rustpush::cloud_messages::{CloudMessage, MESSAGES_SERVICE};
+        use rustpush::cloudkit::{
+            pcs_keys_for_record, CloudKitSession, FetchRecordChangesOperation, NO_ASSETS,
+        };
         use rustpush::cloudkit_proto::CloudKitRecord;
-        use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+        use std::collections::HashSet;
 
         info!("list_recoverable_message_guids: starting");
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let container = cloud_messages.get_container().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get CloudKit container: {}", e),
+                })?;
 
         let mut guids = Vec::new();
         let mut seen = HashSet::new();
@@ -12599,7 +14425,10 @@ impl Client {
         let mut successful_zones = 0usize;
         let mut zone_errors = Vec::new();
 
-        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+        for zone_name in [
+            "recoverableMessageDeleteZone",
+            "chatBotRecoverableMessageDeleteZone",
+        ] {
             let mut token: Option<Vec<u8>> = None;
             let zone_id = container.private_zone(zone_name.to_string());
             let key = match container
@@ -12612,7 +14441,10 @@ impl Client {
                 }
                 Err(e) => {
                     let err = format!("{}: {}", zone_name, e);
-                    warn!("list_recoverable_message_guids: failed to get zone key for {}", err);
+                    warn!(
+                        "list_recoverable_message_guids: failed to get zone key for {}",
+                        err
+                    );
                     zone_errors.push(err);
                     continue;
                 }
@@ -12641,7 +14473,9 @@ impl Client {
                 let status = response.status();
 
                 for change in &response.change {
-                    let identifier = change.identifier.as_ref()
+                    let identifier = change
+                        .identifier
+                        .as_ref()
                         .and_then(|i| i.value.as_ref())
                         .map(|v| v.name().to_string())
                         .unwrap_or_default();
@@ -12650,7 +14484,9 @@ impl Client {
                         None => continue,
                     };
 
-                    let record_type = record.r#type.as_ref()
+                    let record_type = record
+                        .r#type
+                        .as_ref()
                         .map(|t| t.name().to_string())
                         .unwrap_or_default();
                     if record_type != "recoverableMessage" {
@@ -12666,7 +14502,11 @@ impl Client {
                     }));
                     if let Ok(msg) = result {
                         if !msg.guid.is_empty() && seen.insert(msg.guid.clone()) {
-                            guids.push(encode_recoverable_message_entry(&msg.guid, &identifier, &msg));
+                            guids.push(encode_recoverable_message_entry(
+                                &msg.guid,
+                                &identifier,
+                                &msg,
+                            ));
                             zone_guid_count += 1;
                         }
                     }
@@ -12685,11 +14525,18 @@ impl Client {
 
         if successful_zones == 0 && !zone_errors.is_empty() {
             return Err(WrappedError::GenericError {
-                msg: format!("Failed to read recoverable message zones: {}", zone_errors.join(" | ")),
+                msg: format!(
+                    "Failed to read recoverable message zones: {}",
+                    zone_errors.join(" | ")
+                ),
             });
         }
 
-        info!("list_recoverable_message_guids: found {} deleted message GUID(s) [{}]", guids.len(), zone_diag.join(" | "));
+        info!(
+            "list_recoverable_message_guids: found {} deleted message GUID(s) [{}]",
+            guids.len(),
+            zone_diag.join(" | ")
+        );
         Ok(guids)
     }
 
@@ -12697,16 +14544,24 @@ impl Client {
     /// string describing every change record in the zone (not just chat-like
     /// ones). Used by the !debug-recycle-bin bridgebot command.
     pub async fn debug_recoverable_zones(&self) -> Result<String, WrappedError> {
-        use rustpush::cloudkit::{FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::cloudkit::{CloudKitSession, FetchRecordChangesOperation, NO_ASSETS};
 
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let container = cloud_messages.get_container().await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to get CloudKit container: {}", e),
+                })?;
 
         let mut lines = Vec::new();
 
-        for zone_name in ["recoverableMessageDeleteZone", "chatBotRecoverableMessageDeleteZone"] {
+        for zone_name in [
+            "recoverableMessageDeleteZone",
+            "chatBotRecoverableMessageDeleteZone",
+        ] {
             let mut token: Option<Vec<u8>> = None;
             let mut total_changes = 0usize;
 
@@ -12721,7 +14576,10 @@ impl Client {
                     k
                 }
                 Err(e) => {
-                    lines.push(format!("❌ Zone {} — encryption config FAILED: {}", zone_name, e));
+                    lines.push(format!(
+                        "❌ Zone {} — encryption config FAILED: {}",
+                        zone_name, e
+                    ));
                     continue;
                 }
             };
@@ -12746,10 +14604,15 @@ impl Client {
                 let status = response.status();
                 let changes = response.change.len();
                 total_changes += changes;
-                lines.push(format!("  Page {}: {} changes, status={}", page, changes, status));
+                lines.push(format!(
+                    "  Page {}: {} changes, status={}",
+                    page, changes, status
+                ));
 
                 for change in &response.change {
-                    let id = change.identifier.as_ref()
+                    let id = change
+                        .identifier
+                        .as_ref()
                         .and_then(|i| i.value.as_ref())
                         .map(|v| v.name().to_string())
                         .unwrap_or_else(|| "<no-id>".to_string());
@@ -12759,12 +14622,17 @@ impl Client {
                             lines.push(format!("    [tombstone] {}", id));
                         }
                         Some(record) => {
-                            let rtype = record.r#type.as_ref()
+                            let rtype = record
+                                .r#type
+                                .as_ref()
                                 .map(|t| t.name().to_string())
                                 .unwrap_or_else(|| "<missing>".to_string());
                             let fields = recoverable_record_field_names(&record.record_field);
                             let chat_like = record_looks_chat_like(&record.record_field);
-                            lines.push(format!("    [record] {} type={} chat_like={} fields={:?}", id, rtype, chat_like, fields));
+                            lines.push(format!(
+                                "    [record] {} type={} chat_like={} fields={:?}",
+                                id, rtype, chat_like, fields
+                            ));
                         }
                     }
                 }
@@ -12776,7 +14644,10 @@ impl Client {
                 token = Some(next_token);
             }
 
-            lines.push(format!("  Total: {} changes in {}", total_changes, zone_name));
+            lines.push(format!(
+                "  Total: {} changes in {}",
+                total_changes, zone_name
+            ));
         }
 
         Ok(lines.join("\n"))
@@ -12872,8 +14743,11 @@ impl Client {
                 embedded_profile: None,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send attachment: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12884,13 +14758,13 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
-        let mut msg = MessageInst::new(
-            conv,
-            &handle,
-            Message::Unschedule,
-        );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unschedule: {}", e) })?;
+        let mut msg = MessageInst::new(conv, &handle, Message::Unschedule);
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send unschedule: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12903,7 +14777,9 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         if conversation.is_sms {
-            return Err(WrappedError::GenericError { msg: "Group rename is only available for iMessage chats".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Group rename is only available for iMessage chats".to_string(),
+            });
         }
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(
@@ -12911,8 +14787,11 @@ impl Client {
             &handle,
             Message::RenameMessage(RenameMessage { new_name }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send rename: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send rename: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12929,7 +14808,9 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         if conversation.is_sms {
-            return Err(WrappedError::GenericError { msg: "Participant changes are only available for iMessage chats".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Participant changes are only available for iMessage chats".to_string(),
+            });
         }
         if !new_participants.contains(&handle) {
             new_participants.push(handle.clone());
@@ -12943,8 +14824,11 @@ impl Client {
                 group_version,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send participant change: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send participant change: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -12992,17 +14876,26 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         if conversation.is_sms {
-            return Err(WrappedError::GenericError { msg: "Group icons are only available for iMessage chats".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Group icons are only available for iMessage chats".to_string(),
+            });
         }
         // Prepare the MMCS encryption envelope (computes signature/key).
         let cursor = Cursor::new(&photo_data);
-        let prepared = MMCSFile::prepare_put(cursor).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare icon MMCS upload: {}", e) })?;
+        let prepared =
+            MMCSFile::prepare_put(cursor)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to prepare icon MMCS upload: {}", e),
+                })?;
 
         // Upload to Apple's MMCS servers and get back the file descriptor.
         let cursor2 = Cursor::new(&photo_data);
-        let mmcs = MMCSFile::new(&self.conn, &prepared, cursor2, |_current, _total| {}).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload icon to MMCS: {}", e) })?;
+        let mmcs = MMCSFile::new(&self.conn, &prepared, cursor2, |_current, _total| {})
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to upload icon to MMCS: {}", e),
+            })?;
 
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(
@@ -13013,8 +14906,11 @@ impl Client {
                 group_version,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon change: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send icon change: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13027,7 +14923,9 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         if conversation.is_sms {
-            return Err(WrappedError::GenericError { msg: "Group icons are only available for iMessage chats".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Group icons are only available for iMessage chats".to_string(),
+            });
         }
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(
@@ -13038,8 +14936,11 @@ impl Client {
                 group_version,
             }),
         );
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon clear: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send icon clear: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13053,8 +14954,12 @@ impl Client {
     ) -> Result<(), WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::PeerCacheInvalidate);
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send peer cache invalidate: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send peer cache invalidate: {}", e),
+            })?;
         Ok(())
     }
 
@@ -13073,13 +14978,7 @@ impl Client {
     /// the bundled services). Same path the resource manager takes when
     /// registration expires; just triggered on demand.
     pub async fn force_reregister_identity(&self) -> Result<u32, WrappedError> {
-        let current_users: Vec<rustpush::IDSUser> = self
-            .client
-            .identity
-            .users
-            .read()
-            .await
-            .clone();
+        let current_users: Vec<rustpush::IDSUser> = self.client.identity.users.read().await.clone();
         let registered_count = current_users
             .first()
             .map(|u| u.registration.len() as u32)
@@ -13110,13 +15009,7 @@ impl Client {
 
         // 2. Re-register (update_users → refresh_now → register) so the
         //    identity is re-established and the cache rebuilds.
-        let current_users: Vec<rustpush::IDSUser> = self
-            .client
-            .identity
-            .users
-            .read()
-            .await
-            .clone();
+        let current_users: Vec<rustpush::IDSUser> = self.client.identity.users.read().await.clone();
         let registered_count = current_users
             .first()
             .map(|u| u.registration.len() as u32)
@@ -13140,8 +15033,12 @@ impl Client {
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::EnableSmsActivation(enable));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS activation: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send SMS activation: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13153,8 +15050,12 @@ impl Client {
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::SmsConfirmSent(sms_status));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS confirm sent: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send SMS confirm sent: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13165,8 +15066,12 @@ impl Client {
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::MessageReadOnDevice);
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message-read-on-device: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send message-read-on-device: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13177,15 +15082,20 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         if conversation.is_sms {
-            return Err(WrappedError::GenericError { msg: "Mark unread is only available for iMessage chats".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Mark unread is only available for iMessage chats".to_string(),
+            });
         }
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::MarkUnread);
         // MarkUnread serializes this ID into the `r` field as the message being
         // marked. A fresh control UUID would mark nothing on recipient devices.
         msg.id = for_uuid;
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send mark unread: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send mark unread: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13207,8 +15117,12 @@ impl Client {
                 status_str,
             }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send error message: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send error message: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13242,8 +15156,12 @@ impl Client {
             &handle,
             Message::UpdateExtension(UpdateExtensionMessage { for_uuid, ext }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update extension: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send update extension: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13263,8 +15181,12 @@ impl Client {
                 is_scheduled,
             }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send permanent delete (messages): {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send permanent delete (messages): {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13277,7 +15199,9 @@ impl Client {
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
-        let bare_participants: Vec<String> = conv.participants.iter()
+        let bare_participants: Vec<String> = conv
+            .participants
+            .iter()
             .map(|p| p.replace("mailto:", "").replace("tel:", ""))
             .filter(|p| p != &bare_handle)
             .collect();
@@ -13291,10 +15215,17 @@ impl Client {
         let mut msg = MessageInst::new(
             conv,
             &handle,
-            Message::PermanentDelete(PermanentDeleteMessage { target, is_scheduled }),
+            Message::PermanentDelete(PermanentDeleteMessage {
+                target,
+                is_scheduled,
+            }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send permanent delete (chat): {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send permanent delete (chat): {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13329,8 +15260,12 @@ impl Client {
                 share_contacts,
             }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update profile: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send update profile: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13362,8 +15297,12 @@ impl Client {
                 poster,
             }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send share profile: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send share profile: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13385,8 +15324,12 @@ impl Client {
                 version,
             }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send update profile sharing: {}", e) })?;
+        self.client
+            .send(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send update profile sharing: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13397,15 +15340,20 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         if conversation.is_sms {
-            return Err(WrappedError::GenericError { msg: "Notify Anyway is only available for iMessage chats".to_string() });
+            return Err(WrappedError::GenericError {
+                msg: "Notify Anyway is only available for iMessage chats".to_string(),
+            });
         }
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::NotifyAnyways);
         // Command 113 has no encrypted body; the envelope UUID is the message
         // whose Focus override is being requested.
         msg.id = for_uuid;
-        self.send_with_flap_retry(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send notify anyways: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send notify anyways: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13414,23 +15362,52 @@ impl Client {
         conversation: WrappedConversation,
         group_version: u64,
         image_data: Option<Vec<u8>>,
+        preset: Option<String>,
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let chat_id = conv.sender_guid.clone();
-        let mmcs_file = if let Some(data) = image_data {
-            let prepared = MMCSFile::prepare_put(Cursor::new(&data)).await
-                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare transcript background MMCS upload: {}", e) })?;
-            let uploaded = MMCSFile::new(&self.conn, &prepared, Cursor::new(&data), |_current, _total| {}).await
-                .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload transcript background to MMCS: {}", e) })?;
+        if image_data.is_some() && preset.is_some() {
+            return Err(WrappedError::GenericError {
+                msg: "A transcript background cannot be both a photo and a built-in preset"
+                    .to_string(),
+            });
+        }
+        let poster_payload = match (image_data, preset) {
+            (Some(data), None) => Some(build_transcript_photo_payload(data)?),
+            (None, Some(preset)) => Some(build_transcript_dynamic_payload(&preset)?),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!(),
+        };
+        let mmcs_file = if let Some(poster_payload) = poster_payload {
+            let prepared = MMCSFile::prepare_put(Cursor::new(&poster_payload))
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to prepare transcript background MMCS upload: {}", e),
+                })?;
+            let uploaded = MMCSFile::new(
+                &self.conn,
+                &prepared,
+                Cursor::new(&poster_payload),
+                |_current, _total| {},
+            )
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to upload transcript background to MMCS: {}", e),
+            })?;
             Some(uploaded)
         } else {
             None
         };
-        let update = SetTranscriptBackgroundMessage::from_mmcs(mmcs_file, group_version, chat_id);
+        let background_version = group_version.max(current_transcript_background_version());
+        let update =
+            SetTranscriptBackgroundMessage::from_mmcs(mmcs_file, background_version, chat_id);
         let mut msg = MessageInst::new(conv, &handle, Message::SetTranscriptBackground(update));
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send transcript background update: {}", e) })?;
+        self.send_with_flap_retry(&mut msg)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to send transcript background update: {}", e),
+            })?;
         Ok(msg.id.clone())
     }
 
@@ -13456,9 +15433,7 @@ impl Client {
                     let attempt_no = attempt + 1;
                     warn!(
                         "CloudKit chats sync hit PCS key error on attempt {}/{}: {}",
-                        attempt_no,
-                        MAX_SYNC_ATTEMPTS,
-                        err
+                        attempt_no, MAX_SYNC_ATTEMPTS, err
                     );
                     last_pcs_err = Some(err);
                     if attempt_no < MAX_SYNC_ATTEMPTS {
@@ -13492,9 +15467,14 @@ impl Client {
         let (next_token, chats, status) = match sync_result {
             Some(result) => result,
             None => {
-                let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                let err = last_pcs_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".into());
                 return Err(WrappedError::GenericError {
-                    msg: format!("Failed to sync CloudKit chats after PCS recovery retries: {}", err),
+                    msg: format!(
+                        "Failed to sync CloudKit chats after PCS recovery retries: {}",
+                        err
+                    ),
                 });
             }
         };
@@ -13559,10 +15539,13 @@ impl Client {
         let mut token: Option<Vec<u8>> = None;
 
         for page in 0..256 {
-            let (next_token, chats, status) = cloud_messages.sync_chats(token).await
-                .map_err(|e| WrappedError::GenericError {
-                    msg: format!("CloudKit chat dump page {} failed: {}", page, e),
-                })?;
+            let (next_token, chats, status) =
+                cloud_messages
+                    .sync_chats(token)
+                    .await
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("CloudKit chat dump page {} failed: {}", page, e),
+                    })?;
 
             for (record_name, chat_opt) in &chats {
                 let mut obj = if let Some(chat) = chat_opt {
@@ -13571,12 +15554,20 @@ impl Client {
                     serde_json::json!({"deleted": true})
                 };
                 if let Some(map) = obj.as_object_mut() {
-                    map.insert("_record_name".to_string(), serde_json::Value::String(record_name.clone()));
+                    map.insert(
+                        "_record_name".to_string(),
+                        serde_json::Value::String(record_name.clone()),
+                    );
                 }
                 all_records.push(obj);
             }
 
-            info!("CloudKit chat dump page {}: {} records, status={}", page, chats.len(), status);
+            info!(
+                "CloudKit chat dump page {}: {} records, status={}",
+                page,
+                chats.len(),
+                status
+            );
 
             if status == 3 {
                 break;
@@ -13608,15 +15599,15 @@ impl Client {
         for attempt in 0..MAX_SYNC_ATTEMPTS {
             let cm_spawn = Arc::clone(&cloud_messages);
             let tok_spawn = token.clone();
-            let spawn_result = tokio::task::spawn(async move {
-                cm_spawn.sync_messages(tok_spawn).await
-            }).await;
+            let spawn_result =
+                tokio::task::spawn(async move { cm_spawn.sync_messages(tok_spawn).await }).await;
 
             match spawn_result {
                 Ok(Ok(result)) => {
                     info!(
                         "cloud_sync_messages: sync_messages returned {} records, status={}",
-                        result.1.len(), result.2
+                        result.1.len(),
+                        result.2
                     );
                     sync_result = Some(result);
                     break;
@@ -13625,13 +15616,12 @@ impl Client {
                     let attempt_no = attempt + 1;
                     warn!(
                         "CloudKit messages sync hit PCS key error on attempt {}/{}: {}",
-                        attempt_no,
-                        MAX_SYNC_ATTEMPTS,
-                        err
+                        attempt_no, MAX_SYNC_ATTEMPTS, err
                     );
                     last_pcs_err = Some(err);
                     if attempt_no < MAX_SYNC_ATTEMPTS {
-                        self.recover_cloud_pcs_state("CloudKit messages sync").await?;
+                        self.recover_cloud_pcs_state("CloudKit messages sync")
+                            .await?;
                         continue;
                     }
                 }
@@ -13659,7 +15649,9 @@ impl Client {
                     warn!(
                         "cloud_sync_messages: sync_messages panicked on attempt {}/{} \
                          (malformed CloudKit record); trying per-record fallback. panic={}",
-                        attempt + 1, MAX_SYNC_ATTEMPTS, join_err
+                        attempt + 1,
+                        MAX_SYNC_ATTEMPTS,
+                        join_err
                     );
                     match sync_messages_fallback(&cloud_messages, token.clone()).await {
                         Ok(result) => {
@@ -13683,9 +15675,14 @@ impl Client {
         let (next_token, messages, status) = match sync_result {
             Some(result) => result,
             None => {
-                let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                let err = last_pcs_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".into());
                 return Err(WrappedError::GenericError {
-                    msg: format!("Failed to sync CloudKit messages after PCS recovery retries: {}", err),
+                    msg: format!(
+                        "Failed to sync CloudKit messages after PCS recovery retries: {}",
+                        err
+                    ),
                 });
             }
         };
@@ -13701,7 +15698,7 @@ impl Client {
                 // is user-authored content.
                 if msg.flags.intersects(
                     rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE
-                    | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE
+                        | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE,
                 ) {
                     skipped_messages += 1;
                     continue;
@@ -13721,11 +15718,15 @@ impl Client {
                     // Extract tapback/reaction info from proto fields
                     let tapback_type = msg.msg_proto.associated_message_type;
                     let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
-                    let tapback_emoji = msg.msg_proto_4.as_ref()
+                    let tapback_emoji = msg
+                        .msg_proto_4
+                        .as_ref()
                         .and_then(|p4| p4.associated_message_emoji.clone());
 
                     // Extract attachment GUIDs from attributedBody
-                    let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                    let mut attachment_guids: Vec<String> = msg
+                        .msg_proto
+                        .attributed_body
                         .as_ref()
                         .map(|body| extract_attachment_guids_from_attributed_body(body))
                         .unwrap_or_default()
@@ -13737,7 +15738,9 @@ impl Client {
                     // transfers (e.g. Live Photo MOV) not in attributedBody.
                     if let Some(ref summary) = msg.msg_proto.message_summary_info {
                         for sg in extract_attachment_guids_from_summary_info(summary) {
-                            if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                            if !sg.is_empty()
+                                && sg.len() <= 256
+                                && sg.is_ascii()
                                 && !attachment_guids.contains(&sg)
                             {
                                 attachment_guids.push(sg);
@@ -13745,7 +15748,9 @@ impl Client {
                         }
                     }
 
-                    let date_read_ms = msg.msg_proto.date_read
+                    let date_read_ms = msg
+                        .msg_proto
+                        .date_read
                         .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                         .unwrap_or(0);
 
@@ -13836,7 +15841,9 @@ impl Client {
         let reply_count = normalized.iter().filter(|m| m.reply_guid.is_some()).count();
         info!(
             "CloudKit message sync page: {} messages normalized, {} skipped, {} with reply",
-            normalized.len(), skipped_messages, reply_count
+            normalized.len(),
+            skipped_messages,
+            reply_count
         );
 
         Ok(WrappedCloudSyncMessagesPage {
@@ -13863,9 +15870,11 @@ impl Client {
         &self,
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
-        use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
-        use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
+        use rustpush::cloudkit::{
+            pcs_keys_for_record, CloudKitSession, FetchRecordChangesOperation, NO_ASSETS,
+        };
+        use rustpush::pcs::{PCSEncryptor, PCSShareProtection};
         use rustpush::PushError;
 
         let token = decode_continuation_token(continuation_token)?;
@@ -14154,19 +16163,29 @@ impl Client {
                     // where the byte comparison fails. This is the wrapper-layer
                     // re-implementation of the aecc7ed fix from the vendored tree.
                     if let Some(protection) = &record.protection_info {
-                        let record_protection = PCSShareProtection::from_protection_info(protection);
+                        let record_protection =
+                            PCSShareProtection::from_protection_info(protection);
                         let keychain_state = cloud_messages.keychain.state.read().await;
-                        let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            record_protection.decrypt_with_keychain(&keychain_state, &MESSAGES_SERVICE, false)
-                        }));
+                        let fallback =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                record_protection.decrypt_with_keychain(
+                                    &keychain_state,
+                                    &MESSAGES_SERVICE,
+                                    false,
+                                )
+                            }));
                         match fallback {
                             Ok(Ok((pcs_keys, _))) => {
-                                let record_id = record.record_identifier.clone().expect("no record id");
+                                let record_id =
+                                    record.record_identifier.clone().expect("no record id");
                                 info!(
                                     "cloud_sync_attachments: fallback decrypt_with_keychain succeeded for {}",
                                     identifier
                                 );
-                                Some(PCSEncryptor { keys: pcs_keys, record_id })
+                                Some(PCSEncryptor {
+                                    keys: pcs_keys,
+                                    record_id,
+                                })
                             }
                             Ok(Err(e)) => {
                                 pcs_skipped += 1;
@@ -14200,14 +16219,19 @@ impl Client {
                     container.clear_cache_zone_encryption_config(&zone_id).await;
                     refreshed_zone_key_config = true;
                     match container
-                        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+                        .get_zone_encryption_config(
+                            &zone_id,
+                            &cloud_messages.keychain,
+                            &MESSAGES_SERVICE,
+                        )
                         .await
                     {
                         Ok(new_key) => {
                             zone_key = new_key;
-                            let retry_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                pcs_keys_for_record(record, &zone_key)
-                            }));
+                            let retry_result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    pcs_keys_for_record(record, &zone_key)
+                                }));
                             match retry_result {
                                 Err(_panic) => {
                                     pcs_skipped += 1;
@@ -14252,7 +16276,10 @@ impl Client {
                 }
                 Ok(Err(e)) => {
                     pcs_skipped += 1;
-                    warn!("cloud_sync_attachments: unexpected PCS error for {}: {}", identifier, e);
+                    warn!(
+                        "cloud_sync_attachments: unexpected PCS error for {}: {}",
+                        identifier, e
+                    );
                     None
                 }
             };
@@ -14289,18 +16316,16 @@ impl Client {
             // catch_unwind. `cm` is required (no aguid → skip record);
             // `lqa` and `avid` are best-effort (missing Asset just means
             // we emit the record without a Ford key).
-            let find_field = |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
-                record
-                    .record_field
-                    .iter()
-                    .find(|f| {
-                        f.identifier
-                            .as_ref()
-                            .and_then(|i| i.name.as_deref())
-                            == Some(name)
-                    })
-                    .and_then(|f| f.value.as_ref())
-            };
+            let find_field =
+                |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
+                    record
+                        .record_field
+                        .iter()
+                        .find(|f| {
+                            f.identifier.as_ref().and_then(|i| i.name.as_deref()) == Some(name)
+                        })
+                        .and_then(|f| f.value.as_ref())
+                };
 
             let field_names: Vec<String> = record
                 .record_field
@@ -14397,11 +16422,7 @@ impl Client {
                 },
             };
 
-            let has_avid = avid_asset
-                .as_ref()
-                .and_then(|a| a.size)
-                .unwrap_or(0)
-                > 0;
+            let has_avid = avid_asset.as_ref().and_then(|a| a.size).unwrap_or(0) > 0;
             let avid_ford_key = avid_asset
                 .as_ref()
                 .and_then(|a| a.protection_info.as_ref())
@@ -14490,11 +16511,11 @@ impl Client {
         &self,
         known_record_names: Vec<String>,
     ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
-        use rustpush::cloudkit::{pcs_keys_for_record, CloudKitOp, CloudKitSession, NO_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
-        use rustpush::pcs::{PCSShareProtection, PCSEncryptor};
-        use rustpush::PushError;
+        use rustpush::cloudkit::{pcs_keys_for_record, CloudKitOp, CloudKitSession, NO_ASSETS};
         use rustpush::cloudkit_proto;
+        use rustpush::pcs::{PCSEncryptor, PCSShareProtection};
+        use rustpush::PushError;
 
         struct RawQueryOp(cloudkit_proto::QueryRetrieveRequest);
         impl CloudKitOp for RawQueryOp {
@@ -14505,12 +16526,18 @@ impl Client {
             fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
                 response.query_retrieve_response.clone().unwrap_or_default()
             }
-            fn flow_control_key() -> &'static str { "CKDQueryOperation" }
-            fn link() -> &'static str { "https://gateway.icloud.com/ckdatabase/api/client/query/retrieve" }
+            fn flow_control_key() -> &'static str {
+                "CKDQueryOperation"
+            }
+            fn link() -> &'static str {
+                "https://gateway.icloud.com/ckdatabase/api/client/query/retrieve"
+            }
             fn operation() -> cloudkit_proto::operation::Type {
                 cloudkit_proto::operation::Type::QueryRetrieveType
             }
-            fn tags() -> bool { false }
+            fn tags() -> bool {
+                false
+            }
         }
 
         let seen_ids: std::collections::HashSet<String> = known_record_names.into_iter().collect();
@@ -14526,7 +16553,14 @@ impl Client {
                     msg: format!("cloud_query_attachments_fallback: get_container failed after MME refresh: {}", e),
                 })?
             }
-            Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: get_container failed: {}", e) }),
+            Err(e) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!(
+                        "cloud_query_attachments_fallback: get_container failed: {}",
+                        e
+                    ),
+                })
+            }
         };
         let zone_id = container.private_zone("attachmentManateeZone".to_string());
         let mut zone_key = match container
@@ -14534,7 +16568,11 @@ impl Client {
             .await
         {
             Ok(k) => k,
-            Err(e) => return Err(WrappedError::GenericError { msg: format!("cloud_query_attachments_fallback: zone_key failed: {}", e) }),
+            Err(e) => {
+                return Err(WrappedError::GenericError {
+                    msg: format!("cloud_query_attachments_fallback: zone_key failed: {}", e),
+                })
+            }
         };
 
         let mut normalized: Vec<WrappedCloudAttachmentInfo> = Vec::new();
@@ -14552,36 +16590,54 @@ impl Client {
             let z = zone_id.clone();
             let qr_cont = qr_continuation.clone();
             let join = tokio::task::spawn(async move {
-                c.perform(&CloudKitSession::new(), RawQueryOp(cloudkit_proto::QueryRetrieveRequest {
-                    query: Some(cloudkit_proto::Query {
-                        types: vec![cloudkit_proto::record::Type { name: Some("attachment".to_string()) }],
-                        filters: vec![],
-                        sorts: vec![],
+                c.perform(
+                    &CloudKitSession::new(),
+                    RawQueryOp(cloudkit_proto::QueryRetrieveRequest {
+                        query: Some(cloudkit_proto::Query {
+                            types: vec![cloudkit_proto::record::Type {
+                                name: Some("attachment".to_string()),
+                            }],
+                            filters: vec![],
+                            sorts: vec![],
+                            ..Default::default()
+                        }),
+                        zone_identifier: Some(z),
+                        assets_to_download: Some(NO_ASSETS.clone()),
+                        continuation_marker: qr_cont,
                         ..Default::default()
                     }),
-                    zone_identifier: Some(z),
-                    assets_to_download: Some(NO_ASSETS.clone()),
-                    continuation_marker: qr_cont,
-                    ..Default::default()
-                })).await
-            }).await;
+                )
+                .await
+            })
+            .await;
 
             let qr = match join {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    warn!("cloud_query_attachments_fallback: page {} failed: {}", qr_page, e);
+                    warn!(
+                        "cloud_query_attachments_fallback: page {} failed: {}",
+                        qr_page, e
+                    );
                     break;
                 }
                 Err(e) => {
-                    warn!("cloud_query_attachments_fallback: page {} panicked: {}", qr_page, e);
+                    warn!(
+                        "cloud_query_attachments_fallback: page {} panicked: {}",
+                        qr_page, e
+                    );
                     break;
                 }
             };
             let next_marker = qr.continuation_marker.clone();
 
             for qresult in &qr.query_results {
-                let record = match &qresult.record { Some(r) => r, None => continue };
-                let identifier = match record.record_identifier.as_ref()
+                let record = match &qresult.record {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let identifier = match record
+                    .record_identifier
+                    .as_ref()
                     .and_then(|i| i.value.as_ref())
                     .and_then(|v| v.name.as_deref())
                 {
@@ -14591,7 +16647,10 @@ impl Client {
                 if seen_ids.contains(&identifier) {
                     continue;
                 }
-                info!("cloud_query_attachments_fallback: new record not in change feed: {}", identifier);
+                info!(
+                    "cloud_query_attachments_fallback: new record not in change feed: {}",
+                    identifier
+                );
 
                 let pcs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     pcs_keys_for_record(record, &zone_key)
@@ -14599,18 +16658,36 @@ impl Client {
                 let pcskey_opt = match pcs_result {
                     Err(_panic) => {
                         if let Some(protection) = &record.protection_info {
-                            let record_protection = PCSShareProtection::from_protection_info(protection);
+                            let record_protection =
+                                PCSShareProtection::from_protection_info(protection);
                             let keychain_state = cloud_messages.keychain.state.read().await;
-                            let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                record_protection.decrypt_with_keychain(&keychain_state, &MESSAGES_SERVICE, false)
-                            }));
+                            let fallback =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    record_protection.decrypt_with_keychain(
+                                        &keychain_state,
+                                        &MESSAGES_SERVICE,
+                                        false,
+                                    )
+                                }));
                             match fallback {
                                 Ok(Ok((pcs_keys, _))) => {
-                                    let record_id = record.record_identifier.clone().expect("no record id");
-                                    Some(PCSEncryptor { keys: pcs_keys, record_id })
+                                    let record_id =
+                                        record.record_identifier.clone().expect("no record id");
+                                    Some(PCSEncryptor {
+                                        keys: pcs_keys,
+                                        record_id,
+                                    })
                                 }
-                                Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: pcs panic + fallback failed for {}: {}", identifier, e); None }
-                                Err(_) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: pcs panic + fallback panicked for {}", identifier); None }
+                                Ok(Err(e)) => {
+                                    pcs_skipped += 1;
+                                    warn!("cloud_query_attachments_fallback: pcs panic + fallback failed for {}: {}", identifier, e);
+                                    None
+                                }
+                                Err(_) => {
+                                    pcs_skipped += 1;
+                                    warn!("cloud_query_attachments_fallback: pcs panic + fallback panicked for {}", identifier);
+                                    None
+                                }
                             }
                         } else {
                             pcs_skipped += 1;
@@ -14622,45 +16699,92 @@ impl Client {
                     Ok(Err(PushError::PCSRecordKeyMissing)) if !refreshed_zone_key_config => {
                         container.clear_cache_zone_encryption_config(&zone_id).await;
                         refreshed_zone_key_config = true;
-                        match container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await {
+                        match container
+                            .get_zone_encryption_config(
+                                &zone_id,
+                                &cloud_messages.keychain,
+                                &MESSAGES_SERVICE,
+                            )
+                            .await
+                        {
                             Ok(new_key) => {
                                 zone_key = new_key;
-                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pcs_keys_for_record(record, &zone_key))) {
-                                    Err(_) => { pcs_skipped += 1; None }
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    pcs_keys_for_record(record, &zone_key)
+                                })) {
+                                    Err(_) => {
+                                        pcs_skipped += 1;
+                                        None
+                                    }
                                     Ok(Ok(k)) => Some(k),
-                                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: PCS still missing after refresh for {}: {}", identifier, e); None }
+                                    Ok(Err(e)) => {
+                                        pcs_skipped += 1;
+                                        warn!("cloud_query_attachments_fallback: PCS still missing after refresh for {}: {}", identifier, e);
+                                        None
+                                    }
                                 }
                             }
-                            Err(e) => { warn!("cloud_query_attachments_fallback: zone config refresh failed: {}", e); None }
+                            Err(e) => {
+                                warn!("cloud_query_attachments_fallback: zone config refresh failed: {}", e);
+                                None
+                            }
                         }
                     }
-                    Ok(Err(e)) => { pcs_skipped += 1; warn!("cloud_query_attachments_fallback: PCS error for {}: {}", identifier, e); None }
+                    Ok(Err(e)) => {
+                        pcs_skipped += 1;
+                        warn!(
+                            "cloud_query_attachments_fallback: PCS error for {}: {}",
+                            identifier, e
+                        );
+                        None
+                    }
                 };
-                let pcskey = match pcskey_opt { Some(k) => k, None => continue };
+                let pcskey = match pcskey_opt {
+                    Some(k) => k,
+                    None => continue,
+                };
 
-                let find_field = |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
-                    record.record_field.iter()
-                        .find(|f| f.identifier.as_ref().and_then(|i| i.name.as_deref()) == Some(name))
-                        .and_then(|f| f.value.as_ref())
-                };
-                let field_names: Vec<String> = record.record_field.iter()
+                let find_field =
+                    |name: &str| -> Option<&rustpush::cloudkit_proto::record::field::Value> {
+                        record
+                            .record_field
+                            .iter()
+                            .find(|f| {
+                                f.identifier.as_ref().and_then(|i| i.name.as_deref()) == Some(name)
+                            })
+                            .and_then(|f| f.value.as_ref())
+                    };
+                let field_names: Vec<String> = record
+                    .record_field
+                    .iter()
                     .filter_map(|f| f.identifier.as_ref().and_then(|i| i.name.clone()))
                     .collect();
 
-                let cm_opt: Option<rustpush::cloud_messages::AttachmentMeta> = match find_field("cm") {
+                let cm_opt: Option<rustpush::cloud_messages::AttachmentMeta> = match find_field(
+                    "cm",
+                ) {
                     None => None,
-                    Some(v) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        <rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>
+                    Some(v) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            <rustpush::cloud_messages::GZipWrapper<rustpush::cloud_messages::AttachmentMeta>
                             as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "cm")
-                    })) {
-                        Ok(Some(gzw)) => Some(gzw.0),
-                        Ok(None) => None,
-                        Err(_panic) => { warn!("cloud_query_attachments_fallback: {} cm decode panicked. fields={:?}", identifier, field_names); None }
-                    },
+                        })) {
+                            Ok(Some(gzw)) => Some(gzw.0),
+                            Ok(None) => None,
+                            Err(_panic) => {
+                                warn!("cloud_query_attachments_fallback: {} cm decode panicked. fields={:?}", identifier, field_names);
+                                None
+                            }
+                        }
+                    }
                 };
                 let cm = match cm_opt {
                     Some(cm) => cm,
-                    None => { cm_decode_fail += 1; warn!("cloud_query_attachments_fallback: skipping {} — cm missing/undecodable. fields={:?}", identifier, field_names); continue; }
+                    None => {
+                        cm_decode_fail += 1;
+                        warn!("cloud_query_attachments_fallback: skipping {} — cm missing/undecodable. fields={:?}", identifier, field_names);
+                        continue;
+                    }
                 };
 
                 let lqa_opt: Option<rustpush::cloudkit_proto::Asset> = match find_field("lqa") {
@@ -14669,8 +16793,18 @@ impl Client {
                         <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "lqa")
                     })) {
                         Ok(Some(asset)) => Some(asset),
-                        Ok(None) => { lqa_decode_fail += 1; None }
-                        Err(_panic) => { lqa_decode_fail += 1; warn!("cloud_query_attachments_fallback: {} lqa decode panicked", identifier); None }
+                        Ok(None) => {
+                            lqa_decode_fail += 1;
+                            None
+                        }
+                        Err(_panic) => {
+                            lqa_decode_fail += 1;
+                            warn!(
+                                "cloud_query_attachments_fallback: {} lqa decode panicked",
+                                identifier
+                            );
+                            None
+                        }
                     },
                 };
 
@@ -14680,16 +16814,36 @@ impl Client {
                         <rustpush::cloudkit_proto::Asset as rustpush::cloudkit_proto::CloudKitEncryptedValue>::from_value_encrypted(v, &pcskey, "avid")
                     })) {
                         Ok(parsed) => parsed,
-                        Err(_panic) => { warn!("cloud_query_attachments_fallback: {} avid decode panicked", identifier); None }
+                        Err(_panic) => {
+                            warn!(
+                                "cloud_query_attachments_fallback: {} avid decode panicked",
+                                identifier
+                            );
+                            None
+                        }
                     },
                 };
 
                 let has_avid = avid_asset.as_ref().and_then(|a| a.size).unwrap_or(0) > 0;
-                let avid_ford_key = avid_asset.as_ref().and_then(|a| a.protection_info.as_ref()).and_then(|p| p.protection_info.as_ref()).cloned();
-                let ford_key = lqa_opt.as_ref().and_then(|lqa| lqa.protection_info.as_ref()).and_then(|p| p.protection_info.as_ref()).cloned();
+                let avid_ford_key = avid_asset
+                    .as_ref()
+                    .and_then(|a| a.protection_info.as_ref())
+                    .and_then(|p| p.protection_info.as_ref())
+                    .cloned();
+                let ford_key = lqa_opt
+                    .as_ref()
+                    .and_then(|lqa| lqa.protection_info.as_ref())
+                    .and_then(|p| p.protection_info.as_ref())
+                    .cloned();
 
-                if let Some(ref k) = ford_key { register_ford_key(k.clone()); ford_cached += 1; }
-                if let Some(ref k) = avid_ford_key { register_ford_key(k.clone()); ford_cached += 1; }
+                if let Some(ref k) = ford_key {
+                    register_ford_key(k.clone());
+                    ford_cached += 1;
+                }
+                if let Some(ref k) = avid_ford_key {
+                    register_ford_key(k.clone());
+                    ford_cached += 1;
+                }
 
                 info!(
                     "cloud_query_attachments_fallback: att guid={} record={} mime={:?} size={} lqa_ok={} avid_ok={}",
@@ -14710,7 +16864,9 @@ impl Client {
             }
 
             match next_marker {
-                Some(m) if !m.is_empty() => { qr_continuation = Some(m); }
+                Some(m) if !m.is_empty() => {
+                    qr_continuation = Some(m);
+                }
                 _ => break,
             }
         }
@@ -14747,8 +16903,8 @@ impl Client {
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
         use futures::FutureExt;
-        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
 
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
@@ -14770,9 +16926,16 @@ impl Client {
         // Wrapped in catch_unwind so any SIV panic deep in get_mmcs (Ford
         // dedup with a key not yet in the cache) falls through to
         // `cloud_download_attachment_ford_recovery` for brute-force retry.
-        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
-            msg: format!("cloud_download_attachment {}: get_container: {e}", record_name),
-        })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!(
+                        "cloud_download_attachment {}: get_container: {e}",
+                        record_name
+                    ),
+                })?;
         let zone = container.private_zone("attachmentManateeZone".to_string());
         let zone_key = container
             .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
@@ -14789,7 +16952,10 @@ impl Client {
             )
             .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("cloud_download_attachment {}: perform_operations: {e}", record_name),
+                msg: format!(
+                    "cloud_download_attachment {}: perform_operations: {e}",
+                    record_name
+                ),
             })?;
         let records = FetchedRecords::new(&invoke);
         let record: CloudAttachmentWithAvid = records.get_record(&record_name, Some(&zone_key));
@@ -14837,7 +17003,13 @@ impl Client {
             record_name,
             is_ford_asset,
             record.cm.0.mime_type.as_deref().unwrap_or("<none>"),
-            record.cm.0.transfer_name.as_deref().or(record.cm.0.filename.as_deref()).unwrap_or("<none>")
+            record
+                .cm
+                .0
+                .transfer_name
+                .as_deref()
+                .or(record.cm.0.filename.as_deref())
+                .unwrap_or("<none>")
         );
 
         // Attempt 1 — get_assets with the record's own lqa, wrapped in
@@ -14852,7 +17024,10 @@ impl Client {
             Ok(Ok(())) => return Ok(shared.into_bytes()),
             Ok(Err(e)) => {
                 return Err(WrappedError::GenericError {
-                    msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+                    msg: format!(
+                        "Failed to download CloudKit attachment {}: {}",
+                        record_name, e
+                    ),
                 });
             }
             Err(panic_payload) => {
@@ -14958,19 +17133,29 @@ impl Client {
         record_name: String,
     ) -> Result<Vec<u8>, WrappedError> {
         use futures::FutureExt;
-        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
         use rustpush::cloud_messages::MESSAGES_SERVICE;
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
 
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
-            msg: format!("cloud_download_attachment_avid {}: get_container: {e}", record_name),
-        })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!(
+                        "cloud_download_attachment_avid {}: get_container: {e}",
+                        record_name
+                    ),
+                })?;
         let zone = container.private_zone("attachmentManateeZone".to_string());
         let zone_key = container
             .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
             .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("cloud_download_attachment_avid {}: zone key: {e}", record_name),
+                msg: format!(
+                    "cloud_download_attachment_avid {}: zone key: {e}",
+                    record_name
+                ),
             })?;
 
         let invoke = container
@@ -14981,10 +17166,14 @@ impl Client {
             )
             .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("cloud_download_attachment_avid {}: perform_operations: {e}", record_name),
+                msg: format!(
+                    "cloud_download_attachment_avid {}: perform_operations: {e}",
+                    record_name
+                ),
             })?;
         let records = FetchedRecords::new(&invoke);
-        let base_record: CloudAttachmentWithAvid = records.get_record(&record_name, Some(&zone_key));
+        let base_record: CloudAttachmentWithAvid =
+            records.get_record(&record_name, Some(&zone_key));
 
         // Register this record's Ford keys (both lqa and avid) into the
         // wrapper cache so recovery has visibility if the initial attempt
@@ -15016,7 +17205,10 @@ impl Client {
             Ok(Ok(())) => return Ok(shared.into_bytes()),
             Ok(Err(e)) => {
                 return Err(WrappedError::GenericError {
-                    msg: format!("cloud_download_attachment_avid {}: get_assets: {e}", record_name),
+                    msg: format!(
+                        "cloud_download_attachment_avid {}: get_assets: {e}",
+                        record_name
+                    ),
                 });
             }
             Err(_panic) => {
@@ -15047,9 +17239,14 @@ impl Client {
         let shared = SharedWriter::new();
         let mut files = HashMap::new();
         files.insert(record_name.clone(), shared.clone());
-        cloud_messages.download_group_photo(files).await
+        cloud_messages
+            .download_group_photo(files)
+            .await
             .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to download CloudKit group photo {}: {}", record_name, e),
+                msg: format!(
+                    "Failed to download CloudKit group photo {}: {}",
+                    record_name, e
+                ),
             })?;
         Ok(shared.into_bytes())
     }
@@ -15057,11 +17254,9 @@ impl Client {
     /// Diagnostic: do a full fresh sync from scratch (no continuation token)
     /// and return total record count + the newest message timestamps per chat.
     /// This bypasses any stored token to check what CloudKit actually has.
-    pub async fn cloud_diag_full_count(
-        &self,
-    ) -> Result<String, WrappedError> {
+    pub async fn cloud_diag_full_count(&self) -> Result<String, WrappedError> {
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        
+
         let mut token: Option<Vec<u8>> = None;
         let mut total_records: usize = 0;
         let mut total_deleted: usize = 0;
@@ -15069,11 +17264,15 @@ impl Client {
         let mut newest_ts: i64 = 0;
         let mut newest_guid = String::new();
         let mut newest_chat = String::new();
-        
+
         for page in 0..512 {
-            let (next_token, messages, status) = cloud_messages.sync_messages(token).await
-                .map_err(|e| WrappedError::GenericError { msg: format!("diag sync page {} failed: {}", page, e) })?;
-            
+            let (next_token, messages, status) = cloud_messages
+                .sync_messages(token)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("diag sync page {} failed: {}", page, e),
+                })?;
+
             let page_total = messages.len();
             for (_record_name, msg_opt) in &messages {
                 if let Some(msg) = msg_opt {
@@ -15090,14 +17289,17 @@ impl Client {
                     total_deleted += 1;
                 }
             }
-            info!("diag page {} => {} records (status={})", page, page_total, status);
-            
+            info!(
+                "diag page {} => {} records (status={})",
+                page, page_total, status
+            );
+
             if status == 3 {
                 break;
             }
             token = Some(next_token);
         }
-        
+
         let unique_chats = chat_id_counts.len();
         let result = format!(
             "total_records={} deleted={} unique_chats={} newest_ts={} newest_guid={} newest_chat={}",
@@ -15117,7 +17319,11 @@ impl Client {
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
         let since = since_timestamp_ms as i64;
         let max_pages = if max_pages == 0 { 1 } else { max_pages };
-        let max_results = if max_results == 0 { 1 } else { max_results as usize };
+        let max_results = if max_results == 0 {
+            1
+        } else {
+            max_results as usize
+        };
 
         let mut token: Option<Vec<u8>> = None;
         let mut deduped: HashMap<String, WrappedCloudSyncMessage> = HashMap::new();
@@ -15137,13 +17343,12 @@ impl Client {
                         let attempt_no = attempt + 1;
                         warn!(
                             "CloudKit recent fetch hit PCS key error on attempt {}/{}: {}",
-                            attempt_no,
-                            MAX_SYNC_ATTEMPTS,
-                            err
+                            attempt_no, MAX_SYNC_ATTEMPTS, err
                         );
                         last_pcs_err = Some(err);
                         if attempt_no < MAX_SYNC_ATTEMPTS {
-                            self.recover_cloud_pcs_state("CloudKit recent fetch").await?;
+                            self.recover_cloud_pcs_state("CloudKit recent fetch")
+                                .await?;
                             continue;
                         }
                     }
@@ -15158,9 +17363,14 @@ impl Client {
             let (next_token, messages, status) = match sync_result {
                 Some(result) => result,
                 None => {
-                    let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                    let err = last_pcs_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "unknown error".into());
                     return Err(WrappedError::GenericError {
-                        msg: format!("Failed to sync CloudKit messages after PCS recovery retries: {}", err),
+                        msg: format!(
+                            "Failed to sync CloudKit messages after PCS recovery retries: {}",
+                            err
+                        ),
                     });
                 }
             };
@@ -15173,7 +17383,7 @@ impl Client {
                 // Skip system/service messages (group renames, participant changes, etc.)
                 if msg.flags.intersects(
                     rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE
-                    | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE
+                        | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE,
                 ) {
                     continue;
                 }
@@ -15197,15 +17407,21 @@ impl Client {
 
                 let tapback_type = msg.msg_proto.associated_message_type;
                 let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
-                let tapback_emoji = msg.msg_proto_4.as_ref()
+                let tapback_emoji = msg
+                    .msg_proto_4
+                    .as_ref()
                     .and_then(|p4| p4.associated_message_emoji.clone());
 
-                let date_read_ms = msg.msg_proto.date_read
+                let date_read_ms = msg
+                    .msg_proto
+                    .date_read
                     .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                     .unwrap_or(0);
 
                 // Extract attachment GUIDs from attributedBody + messageSummaryInfo
-                let mut attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                let mut attachment_guids: Vec<String> = msg
+                    .msg_proto
+                    .attributed_body
                     .as_ref()
                     .map(|body| extract_attachment_guids_from_attributed_body(body))
                     .unwrap_or_default()
@@ -15214,7 +17430,9 @@ impl Client {
                     .collect();
                 if let Some(ref summary) = msg.msg_proto.message_summary_info {
                     for sg in extract_attachment_guids_from_summary_info(summary) {
-                        if !sg.is_empty() && sg.len() <= 256 && sg.is_ascii()
+                        if !sg.is_empty()
+                            && sg.len() <= 256
+                            && sg.is_ascii()
                             && !attachment_guids.contains(&sg)
                         {
                             attachment_guids.push(sg);
@@ -15222,9 +17440,8 @@ impl Client {
                     }
                 }
 
-                let (reply_guid, reply_part) = parse_cloud_reply(
-                    msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()),
-                );
+                let (reply_guid, reply_part) =
+                    parse_cloud_reply(msg.msg_proto_2.as_ref().and_then(|p| p.reply.as_deref()));
 
                 deduped.insert(
                     guid.clone(),
@@ -15280,8 +17497,12 @@ impl Client {
     /// Test CloudKit Messages access: creates CloudKitClient + KeychainClient + CloudMessagesClient,
     /// then tries to sync chats and messages. Logs results. Returns a summary string.
     pub async fn test_cloud_messages(&self) -> Result<String, WrappedError> {
-        let tp = self.token_provider.as_ref()
-            .ok_or(WrappedError::GenericError { msg: "No TokenProvider available".into() })?;
+        let tp = self
+            .token_provider
+            .as_ref()
+            .ok_or(WrappedError::GenericError {
+                msg: "No TokenProvider available".into(),
+            })?;
 
         info!("=== CloudKit Messages Test ===");
 
@@ -15298,8 +17519,11 @@ impl Client {
         let anisette = account.lock().await.anisette.clone();
 
         // Create CloudKitState
-        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
-            .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone()).ok_or(
+            WrappedError::GenericError {
+                msg: "Failed to create CloudKitState".into(),
+            },
+        )?;
 
         // Create CloudKitClient
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
@@ -15332,7 +17556,10 @@ impl Client {
 
         // Try to sync the keychain (needed for PCS decryption keys)
         info!("Syncing iCloud Keychain...");
-        match keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await {
+        match keychain
+            .sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES)
+            .await
+        {
             Ok(()) => info!("Keychain sync successful"),
             Err(e) => {
                 let msg = format!("Keychain sync failed: {}. This likely means we need to join the trust circle first.", e);
@@ -15342,14 +17569,19 @@ impl Client {
         }
 
         // Create CloudMessagesClient
-        let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit.clone(), keychain.clone());
+        let cloud_messages =
+            rustpush::cloud_messages::CloudMessagesClient::new(cloudkit.clone(), keychain.clone());
 
         // Try counting records first
         info!("Counting CloudKit message records...");
         match cloud_messages.count_records().await {
             Ok(summary) => {
-                info!("CloudKit record counts — messages: {}, chats: {}, attachments: {}",
-                    summary.messages_summary.len(), summary.chat_summary.len(), summary.attachment_summary.len());
+                info!(
+                    "CloudKit record counts — messages: {}, chats: {}, attachments: {}",
+                    summary.messages_summary.len(),
+                    summary.chat_summary.len(),
+                    summary.attachment_summary.len()
+                );
             }
             Err(e) => {
                 warn!("Failed to count records: {}", e);
@@ -15362,12 +17594,20 @@ impl Client {
         let mut chat_names: Vec<String> = Vec::new();
         match cloud_messages.sync_chats(None).await {
             Ok((_token, chats, status)) => {
-                info!("Chat sync returned {} chats (status={})", chats.len(), status);
+                info!(
+                    "Chat sync returned {} chats (status={})",
+                    chats.len(),
+                    status
+                );
                 for (id, chat_opt) in &chats {
                     if let Some(chat) = chat_opt {
                         let name = chat.display_name.as_deref().unwrap_or("(unnamed)");
-                        let participants: Vec<&str> = chat.participants.iter().map(|p| p.uri.as_str()).collect();
-                        info!("  Chat: {} | id={} | svc={} | participants={:?}", name, chat.chat_identifier, chat.service_name, participants);
+                        let participants: Vec<&str> =
+                            chat.participants.iter().map(|p| p.uri.as_str()).collect();
+                        info!(
+                            "  Chat: {} | id={} | svc={} | participants={:?}",
+                            name, chat.chat_identifier, chat.service_name, participants
+                        );
                         chat_names.push(format!("{}: {} [{}]", id, name, chat.chat_identifier));
                     } else {
                         info!("  Chat {} deleted", id);
@@ -15387,12 +17627,20 @@ impl Client {
         let mut total_messages = 0;
         match cloud_messages.sync_messages(None).await {
             Ok((_token, messages, status)) => {
-                info!("Message sync returned {} messages (status={})", messages.len(), status);
+                info!(
+                    "Message sync returned {} messages (status={})",
+                    messages.len(),
+                    status
+                );
                 for (id, msg_opt) in messages.iter().take(20) {
                     if let Some(msg) = msg_opt {
-                        let from_me = msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME);
-                        info!("  Msg: {} | chat={} | sender={} | from_me={} | svc={} | guid={}",
-                            id, msg.chat_id, msg.sender, from_me, msg.service, msg.guid);
+                        let from_me = msg
+                            .flags
+                            .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME);
+                        info!(
+                            "  Msg: {} | chat={} | sender={} | from_me={} | svc={} | guid={}",
+                            id, msg.chat_id, msg.sender, from_me, msg.service, msg.guid
+                        );
                     } else {
                         info!("  Msg {} deleted", id);
                     }
@@ -15406,11 +17654,17 @@ impl Client {
             Err(e) => {
                 let msg = format!("Message sync failed: {}", e);
                 warn!("{}", msg);
-                return Ok(format!("Chats OK ({} chats), but message sync failed: {}", total_chats, e));
+                return Ok(format!(
+                    "Chats OK ({} chats), but message sync failed: {}",
+                    total_chats, e
+                ));
             }
         }
 
-        let summary = format!("CloudKit sync OK: {} chats, {} messages (first page)", total_chats, total_messages);
+        let summary = format!(
+            "CloudKit sync OK: {} chats, {} messages (first page)",
+            total_chats, total_messages
+        );
         info!("{}", summary);
         Ok(summary)
     }
@@ -15434,7 +17688,9 @@ impl Client {
     /// instead of re-fetching, which saves a CloudKit round-trip per download.
     async fn cloud_download_attachment_ford_recovery_with_record(
         &self,
-        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>>,
+        container: Arc<
+            rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>,
+        >,
         records: rustpush::cloudkit::FetchedRecords,
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
@@ -15468,11 +17724,15 @@ impl Client {
                 msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.bundled_request_id is None", record_name),
             }
         })?;
-        let signature = lqa.signature.as_ref().ok_or_else(|| {
-            WrappedError::GenericError {
-                msg: format!("ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.signature is None", record_name),
-            }
-        })?;
+        let signature = lqa
+            .signature
+            .as_ref()
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!(
+                    "ATTACHMENT_UNRECOVERABLE: manual_ford_download {}: lqa.signature is None",
+                    record_name
+                ),
+            })?;
         let ford_key = lqa
             .protection_info
             .as_ref()
@@ -15502,10 +17762,7 @@ impl Client {
 
         // User agent for MMCS fetches — CloudKit style (matches what
         // the `get_assets` path constructs at cloudkit.rs:2080).
-        let user_agent = container
-            .client
-            .config
-            .get_normal_ua("CloudKit/1970");
+        let user_agent = container.client.config.get_normal_ua("CloudKit/1970");
 
         info!(
             "manual_ford_download {}: starting V1+V2 Ford path (ford_key_len={} cache_size={})",
@@ -15540,7 +17797,11 @@ impl Client {
                 let unrecoverable = e.contains("no references entry matches")
                     || e.contains("AuthorizeGetResponse")
                     || e.to_ascii_lowercase().contains("gone");
-                let tag = if unrecoverable { "ATTACHMENT_UNRECOVERABLE: " } else { "" };
+                let tag = if unrecoverable {
+                    "ATTACHMENT_UNRECOVERABLE: "
+                } else {
+                    ""
+                };
                 Err(WrappedError::GenericError {
                     msg: format!("{}Manual Ford download for {}: {}", tag, record_name, e),
                 })
@@ -15556,16 +17817,22 @@ impl Client {
     #[allow(dead_code)]
     async fn cloud_download_attachment_ford_recovery(
         &self,
-        cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
+        cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<
+            BridgeDefaultAnisetteProvider,
+        >,
         record_name: &str,
     ) -> Result<Vec<u8>, WrappedError> {
         use futures::FutureExt;
-        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
         use rustpush::cloud_messages::{CloudAttachment, MESSAGES_SERVICE};
+        use rustpush::cloudkit::{FetchRecordOperation, FetchedRecords, ALL_ASSETS};
 
-        let container = cloud_messages.get_container().await.map_err(|e| WrappedError::GenericError {
-            msg: format!("Ford recovery: get_container failed: {e}"),
-        })?;
+        let container =
+            cloud_messages
+                .get_container()
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Ford recovery: get_container failed: {e}"),
+                })?;
         let zone = container.private_zone("attachmentManateeZone".to_string());
         let zone_key = container
             .get_zone_encryption_config(&zone, &cloud_messages.keychain, &MESSAGES_SERVICE)
@@ -15615,7 +17882,10 @@ impl Client {
                 record_name
             );
             return Err(WrappedError::GenericError {
-                msg: format!("Ford dedup recovery for {}: lqa asset has no bundled_request_id", record_name),
+                msg: format!(
+                    "Ford dedup recovery for {}: lqa asset has no bundled_request_id",
+                    record_name
+                ),
             });
         }
 
@@ -15680,7 +17950,9 @@ impl Client {
     /// the CloudKit record endpoint per attempt.
     async fn cloud_download_avid_ford_recovery(
         &self,
-        container: Arc<rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>>,
+        container: Arc<
+            rustpush::cloudkit::CloudKitOpenContainer<'static, BridgeDefaultAnisetteProvider>,
+        >,
         records: &rustpush::cloudkit::FetchedRecords,
         base_record: CloudAttachmentWithAvid,
         record_name: &str,
@@ -15689,19 +17961,24 @@ impl Client {
         // Same algorithm as the lqa recovery path, but targeting
         // `base_record.avid` instead of `base_record.lqa`.
         let avid = &base_record.avid;
-        let bundled_id = avid.bundled_request_id.as_ref().ok_or_else(|| {
-            WrappedError::GenericError {
+        let bundled_id =
+            avid.bundled_request_id
+                .as_ref()
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: format!(
+                        "manual_ford_download (avid) {}: avid.bundled_request_id is None",
+                        record_name
+                    ),
+                })?;
+        let signature = avid
+            .signature
+            .as_ref()
+            .ok_or_else(|| WrappedError::GenericError {
                 msg: format!(
-                    "manual_ford_download (avid) {}: avid.bundled_request_id is None",
+                    "manual_ford_download (avid) {}: avid.signature is None",
                     record_name
                 ),
-            }
-        })?;
-        let signature = avid.signature.as_ref().ok_or_else(|| {
-            WrappedError::GenericError {
-                msg: format!("manual_ford_download (avid) {}: avid.signature is None", record_name),
-            }
-        })?;
+            })?;
         let ford_key = avid
             .protection_info
             .as_ref()
@@ -15719,19 +17996,17 @@ impl Client {
                     record_name
                 ),
             })?;
-        let body = asset_response.body.as_ref().ok_or_else(|| {
-            WrappedError::GenericError {
+        let body = asset_response
+            .body
+            .as_ref()
+            .ok_or_else(|| WrappedError::GenericError {
                 msg: format!(
                     "manual_ford_download (avid) {}: AssetGetResponse.body is None",
                     record_name
                 ),
-            }
-        })?;
+            })?;
 
-        let user_agent = container
-            .client
-            .config
-            .get_normal_ua("CloudKit/1970");
+        let user_agent = container.client.config.get_normal_ua("CloudKit/1970");
 
         info!(
             "manual_ford_download (avid) {}: starting V1+V2 Ford path",
@@ -15776,10 +18051,19 @@ impl Client {
 async fn fetch_main_zone_page_newest_first(
     cloud_messages: &rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
     token: Option<Vec<u8>>,
-) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
-    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+) -> Result<
+    (
+        Vec<u8>,
+        HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>,
+        i32,
+    ),
+    rustpush::PushError,
+> {
+    use rustpush::cloud_messages::{CloudMessage, MESSAGES_SERVICE};
+    use rustpush::cloudkit::{
+        pcs_keys_for_record, CloudKitSession, FetchRecordChangesOperation, NO_ASSETS,
+    };
     use rustpush::cloudkit_proto::CloudKitRecord;
-    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
 
     let container = cloud_messages.get_container().await?;
     let zone_id = container.private_zone("messageManateeZone".to_string());
@@ -15797,8 +18081,15 @@ async fn fetch_main_zone_page_newest_first(
     let mut results = HashMap::new();
     let mut refreshed = false;
     for change in &response.change {
-        let identifier = change.identifier.as_ref().unwrap()
-            .value.as_ref().unwrap().name().to_string();
+        let identifier = change
+            .identifier
+            .as_ref()
+            .unwrap()
+            .value
+            .as_ref()
+            .unwrap()
+            .name()
+            .to_string();
         let Some(record) = &change.record else {
             results.insert(identifier, None);
             continue;
@@ -15810,36 +18101,49 @@ async fn fetch_main_zone_page_newest_first(
             Ok(k) => Some(k),
             Err(rustpush::PushError::PCSRecordKeyMissing) if !refreshed => {
                 container.clear_cache_zone_encryption_config(&zone_id).await;
-                key = container.get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE).await?;
+                key = container
+                    .get_zone_encryption_config(
+                        &zone_id,
+                        &cloud_messages.keychain,
+                        &MESSAGES_SERVICE,
+                    )
+                    .await?;
                 refreshed = true;
                 match pcs_keys_for_record(record, &key) {
                     Ok(k) => Some(k),
                     Err(rustpush::PushError::PCSRecordKeyMissing) => {
-                        warn!("Skipping record {}: PCS key missing (newest-first fetch)", identifier);
+                        warn!(
+                            "Skipping record {}: PCS key missing (newest-first fetch)",
+                            identifier
+                        );
                         None
                     }
                     Err(e) => return Err(e),
                 }
             }
-            Err(e) if matches!(e,
-                rustpush::PushError::PCSRecordKeyMissing
-                | rustpush::PushError::ShareKeyNotFound(_)
-                | rustpush::PushError::DecryptionKeyNotFound(_)
-                | rustpush::PushError::MasterKeyNotFound
-            ) => {
+            Err(e)
+                if matches!(
+                    e,
+                    rustpush::PushError::PCSRecordKeyMissing
+                        | rustpush::PushError::ShareKeyNotFound(_)
+                        | rustpush::PushError::DecryptionKeyNotFound(_)
+                        | rustpush::PushError::MasterKeyNotFound
+                ) =>
+            {
                 warn!("Skipping record {} due to PCS key error: {}", identifier, e);
                 None
             }
             Err(e) => return Err(e),
         };
         let Some(pcskey) = pcskey else { continue };
-        let item = CloudMessage::from_record_encrypted(
-            &record.record_field,
-            Some(&pcskey),
-        );
+        let item = CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey));
         results.insert(identifier, Some(item));
     }
-    Ok((response.sync_continuation_token().to_vec(), results, response.status()))
+    Ok((
+        response.sync_continuation_token().to_vec(),
+        results,
+        response.status(),
+    ))
 }
 
 impl Drop for Client {
@@ -15856,12 +18160,23 @@ impl Drop for Client {
 /// Replicates sync_records logic for "messageManateeZone" but handles None proto fields
 /// gracefully (no .unwrap()) and wraps from_record_encrypted in catch_unwind per record.
 async fn sync_messages_fallback(
-    cloud_messages: &Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>,
+    cloud_messages: &Arc<
+        rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>,
+    >,
     token: Option<Vec<u8>>,
-) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
-    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+) -> Result<
+    (
+        Vec<u8>,
+        HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>,
+        i32,
+    ),
+    rustpush::PushError,
+> {
+    use rustpush::cloud_messages::{CloudMessage, MESSAGES_SERVICE};
+    use rustpush::cloudkit::{
+        pcs_keys_for_record, CloudKitSession, FetchRecordChangesOperation, NO_ASSETS,
+    };
     use rustpush::cloudkit_proto::CloudKitRecord;
-    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
 
     let container = cloud_messages.get_container().await?;
     let zone_id = container.private_zone("messageManateeZone".to_string());
@@ -15883,28 +18198,46 @@ async fn sync_messages_fallback(
         // Graceful identifier extraction — no .unwrap()
         let id_proto = match change.identifier.as_ref() {
             Some(p) => p,
-            None => { warn!("sync_messages_fallback: skipping change with missing identifier"); skipped += 1; continue; }
+            None => {
+                warn!("sync_messages_fallback: skipping change with missing identifier");
+                skipped += 1;
+                continue;
+            }
         };
         let id_value = match id_proto.value.as_ref() {
             Some(v) => v,
-            None => { warn!("sync_messages_fallback: skipping change with missing identifier value"); skipped += 1; continue; }
+            None => {
+                warn!("sync_messages_fallback: skipping change with missing identifier value");
+                skipped += 1;
+                continue;
+            }
         };
         let identifier = id_value.name().to_string();
 
         let record = match &change.record {
             Some(r) => r,
-            None => { results.insert(identifier, None); continue; } // deleted record
+            None => {
+                results.insert(identifier, None);
+                continue;
+            } // deleted record
         };
 
         // Graceful type check — no .unwrap()
-        if record.r#type.as_ref().map_or(true, |t| t.name() != CloudMessage::record_type()) {
+        if record
+            .r#type
+            .as_ref()
+            .map_or(true, |t| t.name() != CloudMessage::record_type())
+        {
             continue;
         }
 
         let pcskey = match pcs_keys_for_record(record, &key) {
             Ok(k) => k,
             Err(e) => {
-                warn!("sync_messages_fallback: skipping record {}: PCS key error: {}", identifier, e);
+                warn!(
+                    "sync_messages_fallback: skipping record {}: PCS key error: {}",
+                    identifier, e
+                );
                 skipped += 1;
                 continue;
             }
@@ -15916,19 +18249,31 @@ async fn sync_messages_fallback(
         }));
 
         match result {
-            Ok(msg) => { results.insert(identifier, Some(msg)); }
+            Ok(msg) => {
+                results.insert(identifier, Some(msg));
+            }
             Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                          else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                          else { "unknown panic".to_string() };
-                warn!("sync_messages_fallback: skipping record {}: deserialization panic: {}", identifier, msg);
+                let msg = if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                warn!(
+                    "sync_messages_fallback: skipping record {}: deserialization panic: {}",
+                    identifier, msg
+                );
                 skipped += 1;
             }
         }
     }
 
     if skipped > 0 {
-        warn!("sync_messages_fallback: skipped {} malformed record(s)", skipped);
+        warn!(
+            "sync_messages_fallback: skipped {} malformed record(s)",
+            skipped
+        );
     }
 
     Ok((

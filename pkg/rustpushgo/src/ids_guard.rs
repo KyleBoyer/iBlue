@@ -303,7 +303,6 @@ pub(crate) fn next_attempt_timeout(
     }
 }
 
-
 // ============================================================================
 // Guarded attempt / bisection
 // ============================================================================
@@ -378,7 +377,8 @@ where
         let over_attempts = report.attempts >= MAX_ATTEMPTS;
         // Always allow the first attempt: the budget must never block the
         // caller's own list from being queried once.
-        let over_touches = report.attempts > 0 && touched.saturating_add(batch.len()) > touch_budget;
+        let over_touches =
+            report.attempts > 0 && touched.saturating_add(batch.len()) > touch_budget;
         if over_attempts || over_touches {
             // Bisection is amplifying without converging. Stop rather than
             // keep hammering IDS; the remaining handles simply go unresolved

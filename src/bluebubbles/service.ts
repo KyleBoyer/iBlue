@@ -11,6 +11,7 @@ import type {
   InitializeParams,
   PersistedSession,
   SendAttachmentParams,
+  SendComponentParams,
   SendMultipartMessageParams,
   SendStickerReactionParams,
   NativeFindMyFollow,
@@ -21,9 +22,10 @@ import type {
   IBlueLiveLocation,
   IBluePoll,
   IBlueReactionRequest,
+  IBlueFocusStatus,
 } from "./contracts.js";
 import { assertSingleEmoji } from "./attributed-text.js";
-import { contactAddressKey } from "./contact.js";
+import { contactAddressKey, parseVCardContacts } from "./contact.js";
 import {
   conversationFromDirectChatGuid,
   chatIdentifier,
@@ -38,6 +40,7 @@ import { BlueBubblesStore, type QueryOptions } from "./store.js";
 import { encodePollDefinition, encodePollVote } from "./polls.js";
 import { encodeRichLinkTransport } from "./rich-link.js";
 import { encodeICloudShareTransport } from "./icloud-share.js";
+import { isBuiltinConversationBackgroundPreset } from "./backgrounds.js";
 
 export interface BlueBubblesEvent {
   type: string;
@@ -114,6 +117,7 @@ export class BlueBubblesService extends EventEmitter {
   #webhookWakeRequested = false;
   #incomingTasks = new Set<Promise<void>>();
   #outgoingAnnouncements = new Set<string>();
+  #focusByHandle = new Map<string, IBlueFocusStatus>();
   #pendingOutgoingControls = new Map<
     string,
     Array<{ message: IncomingMessage; receivedAt: number }>
@@ -156,6 +160,16 @@ export class BlueBubblesService extends EventEmitter {
         .finally(() => this.#incomingTasks.delete(task));
     });
     this.engine.on("account.stateChanged", (state) => this.#handleAccountStateChanged(state));
+    this.engine.on("focus.updated", (status) => {
+      const normalized = { ...status, handle: stripTransport(status.handle) };
+      this.#focusByHandle.set(contactAddressKey(status.handle), normalized);
+      this.dispatch("iblue-focus-updated", normalized);
+    });
+    this.engine.on("focus.keysReceived", (event) => this.dispatch("iblue-focus-keys-received", event));
+    this.engine.on("focus.reshareReceived", (event) =>
+      this.dispatch("iblue-focus-reshare-received", event));
+    this.engine.on("focus.decryptFailed", (event) =>
+      this.dispatch("iblue-focus-decrypt-failed", event));
     this.engine.on("engine.log", (entry) => this.emit("log", entry));
   }
 
@@ -211,6 +225,134 @@ export class BlueBubblesService extends EventEmitter {
   }> {
     const health = await this.engine.health();
     return { profile: this.profile, handles: this.handles, ...health };
+  }
+
+  async syncICloudContacts(): Promise<{ contacts: number; addresses: number; syncedAt: number }> {
+    if (!this.engine.syncICloudContacts) {
+      throw new Error("The native engine does not support iCloud Contacts sync");
+    }
+    const result = await this.engine.syncICloudContacts();
+    const parsed = result.vcards.flatMap((vcard) => parseVCardContacts(vcard))
+      .map((contact) => ({ ...contact, source: "icloud-carddav" as const }));
+    const addresses = this.store.replaceContacts("icloud-carddav", parsed);
+    const contacts = new Set(parsed.map((contact) =>
+      `${contact.displayName}\0${contact.addresses.map(contactAddressKey).sort().join(",")}`)).size;
+    const summary = { contacts, addresses, syncedAt: result.syncedAt };
+    this.dispatch("iblue-contacts-synced", summary);
+    return summary;
+  }
+
+  async subscribeFocus(handles: string[]): Promise<{ subscribed: string[] }> {
+    if (!this.engine.subscribeFocus) {
+      throw new Error("The native engine does not support Focus status");
+    }
+    const normalized = [...new Set(handles.map(toTransportAddress))];
+    return this.engine.subscribeFocus(normalized);
+  }
+
+  focusForHandle(handle: string): IBlueFocusStatus | undefined {
+    return this.#focusByHandle.get(contactAddressKey(handle));
+  }
+
+  async shareFocus(active: boolean, mode?: string): Promise<{ shared: boolean }> {
+    if (!this.engine.shareFocus) {
+      throw new Error("The native engine does not support Focus status");
+    }
+    if (!active && !mode) throw new Error("mode is required when sharing an active Focus");
+    return this.engine.shareFocus(active, mode);
+  }
+
+  async syncCloudChats(continuationToken?: string) {
+    if (!this.engine.syncCloudChats) throw new Error("Messages in iCloud sync is unavailable");
+    return this.engine.syncCloudChats(continuationToken);
+  }
+
+  async syncCloudMessages(continuationToken?: string) {
+    if (!this.engine.syncCloudMessages) throw new Error("Messages in iCloud sync is unavailable");
+    return this.engine.syncCloudMessages(continuationToken);
+  }
+
+  async syncCloudAttachments(continuationToken?: string) {
+    if (!this.engine.syncCloudAttachments) throw new Error("Messages in iCloud sync is unavailable");
+    return this.engine.syncCloudAttachments(continuationToken);
+  }
+
+  async sendComponent(body: Omit<SendComponentParams, "conversation"> & { chatGuid: string }): Promise<BlueBubblesMessage> {
+    this.requireOutboundIds("send an iMessage component");
+    if (!this.engine.sendComponent) {
+      throw new Error("The native engine does not support generic iMessage components");
+    }
+    const conversation = this.resolveConversation(body.chatGuid);
+    const result = await this.engine.sendComponent({ ...body, conversation });
+    const appBalloon = {
+      bundleId: body.bundleId,
+      appName: body.appName,
+      url: body.url,
+      ...(body.sessionId ? { sessionId: body.sessionId } : {}),
+      isLive: body.isLive ?? false,
+      ...(body.ldText ? { ldText: body.ldText } : {}),
+      ...(body.imageTitle ? { imageTitle: body.imageTitle } : {}),
+      ...(body.imageSubtitle ? { imageSubtitle: body.imageSubtitle } : {}),
+      ...(body.caption ? { caption: body.caption } : {}),
+      ...(body.subcaption ? { subcaption: body.subcaption } : {}),
+      ...(body.secondarySubcaption ? { secondarySubcaption: body.secondarySubcaption } : {}),
+      ...(body.tertiarySubcaption ? { tertiarySubcaption: body.tertiarySubcaption } : {}),
+    };
+    this.#beginOutgoingAnnouncement(result.guid);
+    let message: BlueBubblesMessage;
+    try {
+      message = this.store.insertOutgoing({
+        guid: result.guid,
+        chatGuid: body.chatGuid,
+        ...(body.text ? { text: body.text } : {}),
+        ...(body.subject ? { subject: body.subject } : {}),
+        ...(body.replyGuid ? { replyGuid: body.replyGuid, replyPart: body.replyPart } : {}),
+        appBalloon,
+      });
+      this.#publishOutgoing(result.guid, "new-message", message);
+    } finally {
+      this.#finishOutgoingAnnouncement(result.guid);
+    }
+    this.scheduleSnapshot();
+    return message;
+  }
+
+  async setConversationBackground(body: {
+    chatGuid: string;
+    path?: string;
+    preset?: string;
+  }): Promise<{ guid: string; chat: BlueBubblesChat }> {
+    this.requireOutboundIds("change a conversation background");
+    if (!this.engine.setConversationBackground) {
+      throw new Error("The native engine does not support conversation backgrounds");
+    }
+    if (body.path && body.preset) {
+      throw new Error("A conversation background cannot be both a photo and a built-in preset");
+    }
+    if (body.preset && !isBuiltinConversationBackgroundPreset(body.preset)) {
+      throw new Error(`Unknown built-in conversation background preset: ${body.preset}`);
+    }
+    const conversation = this.resolveConversation(body.chatGuid);
+    const groupVersion = this.store.reserveGroupVersion(body.chatGuid);
+    const result = await this.engine.setConversationBackground({
+      conversation,
+      groupVersion,
+      ...(body.path ? { path: body.path } : {}),
+      ...(body.preset ? { preset: body.preset } : {}),
+    });
+    const background = this.store.setConversationBackground(body.chatGuid, {
+      removed: !body.path && !body.preset,
+      ...(body.preset ? { preset: body.preset } : {}),
+    });
+    const chat = this.store.getChat(body.chatGuid, true, false);
+    if (!chat) throw new Error("Conversation does not exist after background update");
+    this.dispatch("iblue-conversation-background-changed", {
+      chatGuid: body.chatGuid,
+      guid: result.guid,
+      background,
+    });
+    this.scheduleSnapshot();
+    return { guid: result.guid, chat };
   }
 
   queryMessages(options: QueryOptions): { messages: BlueBubblesMessage[]; total: number } {
@@ -1180,6 +1322,46 @@ export class BlueBubblesService extends EventEmitter {
       if (contact) this.dispatch("iblue-contact-updated", contact);
     }
     if (isSharedProfileOnly(message)) return;
+    if (message.conversationBackground) {
+      if (message.conversationBackground.payloadBase64) {
+        await this.store.persistConversationBackgroundPayload(
+          chatGuid,
+          message.uuid,
+          message.conversationBackground.payloadBase64,
+        );
+      }
+      if (!this.store.conversationForChat(chatGuid)) {
+        const own = new Set(this.handles.map((handle) => stripTransport(handle).toLowerCase()));
+        this.store.upsertChat(chatGuid, {
+          participants: message.participants.filter((participant) =>
+            !own.has(stripTransport(participant).toLowerCase())),
+          ...(message.groupName ? { groupName: message.groupName } : {}),
+          ...(message.senderGuid ? { senderGuid: message.senderGuid } : {}),
+          isSms: false,
+        });
+      }
+      const background = this.store.setConversationBackground(chatGuid, {
+        removed: message.conversationBackground.remove,
+        ...(message.conversationBackground.preset
+          ? { preset: message.conversationBackground.preset }
+          : {}),
+        ...(message.conversationBackground.objectId
+          ? { objectId: message.conversationBackground.objectId }
+          : {}),
+        ...(message.conversationBackground.url ? { url: message.conversationBackground.url } : {}),
+        ...(message.conversationBackground.fileSize === undefined
+          ? {}
+          : { fileSize: message.conversationBackground.fileSize }),
+      }, message.timestampMs || Date.now());
+      this.dispatch("iblue-conversation-background-changed", {
+        chatGuid,
+        guid: message.uuid,
+        background,
+        ...verification,
+      });
+      this.scheduleSnapshot();
+      return;
+    }
     if (message.typing) {
       this.dispatch("typing-indicator", { display: message.typing.active, guid: chatGuid, ...verification });
       return;
@@ -1362,7 +1544,8 @@ function isSharedProfileOnly(message: IncomingMessage): boolean {
     && !message.groupIconChange
     && !message.markUnread
     && !message.notifyAnyway
-    && !message.appBalloon,
+    && !message.appBalloon
+    && !message.conversationBackground,
   );
 }
 

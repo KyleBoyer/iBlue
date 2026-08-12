@@ -44,8 +44,7 @@ pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     // and the wire-format query Apple receives includes both URIs which
     // reads as a "I'm in an active conversation with this peer" signal
     // rather than a bare key lookup.
-    let mut madrid_participants: Vec<String> =
-        handles.iter().cloned().collect();
+    let mut madrid_participants: Vec<String> = handles.iter().cloned().collect();
     madrid_participants.push(sender_handle.to_string());
     // Guarded: `cache_keys` can panic upstream when a lookup narrows to a
     // single URI (ids/user.rs:984). A panic here would kill the bridge
@@ -107,12 +106,11 @@ pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     )
     .await
     .into_result("invite_keysharing: keysharing primer")?;
-    let targets = sk
-        .identity
-        .cache
-        .lock()
-        .await
-        .get_participants_targets(KEYSHARING_TOPIC, sender_handle, handles);
+    let targets = sk.identity.cache.lock().await.get_participants_targets(
+        KEYSHARING_TOPIC,
+        sender_handle,
+        handles,
+    );
     let reachable: std::collections::HashSet<&str> =
         targets.iter().map(|t| t.participant.as_str()).collect();
     let unreachable_handles: Vec<&str> = handles

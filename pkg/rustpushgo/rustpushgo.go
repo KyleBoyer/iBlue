@@ -904,6 +904,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_component(uniffiStatus)
+		})
+		if checksum != 59925 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_component: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_send_delivery_receipt(uniffiStatus)
 		})
 		if checksum != 54993 {
@@ -1077,7 +1086,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_send_set_transcript_background(uniffiStatus)
 		})
-		if checksum != 6986 {
+		if checksum != 10446 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_set_transcript_background: UniFFI API checksum mismatch")
 		}
@@ -1107,6 +1116,15 @@ func uniffiCheckChecksums() {
 		if checksum != 22079 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_sms_confirm_sent: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_sticker_tapback(uniffiStatus)
+		})
+		if checksum != 8014 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_sticker_tapback: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -3445,6 +3463,31 @@ func (_self *Client) SendChangeParticipants(conversation WrappedConversation, ne
 		})
 }
 
+func (_self *Client) SendComponent(conversation WrappedConversation, envelope WrappedComponentEnvelope, text string, subject *string, handle string, replyGuid *string, replyPart *string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_component(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterTypeWrappedComponentEnvelopeINSTANCE.Lower(envelope)), rustBufferToC(FfiConverterStringINSTANCE.Lower(text)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(subject)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyGuid)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(replyPart)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) SendDeliveryReceipt(conversation WrappedConversation, handle string) error {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -3920,14 +3963,14 @@ func (_self *Client) SendRenameGroup(conversation WrappedConversation, newName s
 		})
 }
 
-func (_self *Client) SendSetTranscriptBackground(conversation WrappedConversation, groupVersion uint64, imageData *[]byte, handle string) (string, error) {
+func (_self *Client) SendSetTranscriptBackground(conversation WrappedConversation, groupVersion uint64, imageData *[]byte, preset *string, handle string) (string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_set_transcript_background(
-				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), FfiConverterUint64INSTANCE.Lower(groupVersion), rustBufferToC(FfiConverterOptionalBytesINSTANCE.Lower(imageData)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), FfiConverterUint64INSTANCE.Lower(groupVersion), rustBufferToC(FfiConverterOptionalBytesINSTANCE.Lower(imageData)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(preset)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
 				status,
 			))
 		},
@@ -4003,6 +4046,31 @@ func (_self *Client) SendSmsConfirmSent(conversation WrappedConversation, smsSta
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_sms_confirm_sent(
 				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), FfiConverterBoolINSTANCE.Lower(smsStatus), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendStickerTapback(conversation WrappedConversation, targetUuid string, targetPart uint64, targetText string, data []byte, mime string, utiType string, filename string, source string, handle string) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_sticker_tapback(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(targetUuid)), FfiConverterUint64INSTANCE.Lower(targetPart), rustBufferToC(FfiConverterStringINSTANCE.Lower(targetText)), rustBufferToC(FfiConverterBytesINSTANCE.Lower(data)), rustBufferToC(FfiConverterStringINSTANCE.Lower(mime)), rustBufferToC(FfiConverterStringINSTANCE.Lower(utiType)), rustBufferToC(FfiConverterStringINSTANCE.Lower(filename)), rustBufferToC(FfiConverterStringINSTANCE.Lower(source)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
 				status,
 			))
 		},
@@ -7630,6 +7698,94 @@ func (_ FfiDestroyerTypeWrappedCloudSyncMessagesPage) Destroy(value WrappedCloud
 	value.Destroy()
 }
 
+type WrappedComponentEnvelope struct {
+	AppName             string
+	AppId               *uint64
+	BundleId            string
+	Url                 string
+	SessionId           *string
+	IsLive              bool
+	LdText              *string
+	ImageTitle          string
+	ImageSubtitle       string
+	Caption             string
+	Subcaption          string
+	SecondarySubcaption string
+	TertiarySubcaption  string
+	Icon                *[]byte
+}
+
+func (r *WrappedComponentEnvelope) Destroy() {
+	FfiDestroyerString{}.Destroy(r.AppName)
+	FfiDestroyerOptionalUint64{}.Destroy(r.AppId)
+	FfiDestroyerString{}.Destroy(r.BundleId)
+	FfiDestroyerString{}.Destroy(r.Url)
+	FfiDestroyerOptionalString{}.Destroy(r.SessionId)
+	FfiDestroyerBool{}.Destroy(r.IsLive)
+	FfiDestroyerOptionalString{}.Destroy(r.LdText)
+	FfiDestroyerString{}.Destroy(r.ImageTitle)
+	FfiDestroyerString{}.Destroy(r.ImageSubtitle)
+	FfiDestroyerString{}.Destroy(r.Caption)
+	FfiDestroyerString{}.Destroy(r.Subcaption)
+	FfiDestroyerString{}.Destroy(r.SecondarySubcaption)
+	FfiDestroyerString{}.Destroy(r.TertiarySubcaption)
+	FfiDestroyerOptionalBytes{}.Destroy(r.Icon)
+}
+
+type FfiConverterTypeWrappedComponentEnvelope struct{}
+
+var FfiConverterTypeWrappedComponentEnvelopeINSTANCE = FfiConverterTypeWrappedComponentEnvelope{}
+
+func (c FfiConverterTypeWrappedComponentEnvelope) Lift(rb RustBufferI) WrappedComponentEnvelope {
+	return LiftFromRustBuffer[WrappedComponentEnvelope](c, rb)
+}
+
+func (c FfiConverterTypeWrappedComponentEnvelope) Read(reader io.Reader) WrappedComponentEnvelope {
+	return WrappedComponentEnvelope{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalUint64INSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedComponentEnvelope) Lower(value WrappedComponentEnvelope) RustBuffer {
+	return LowerIntoRustBuffer[WrappedComponentEnvelope](c, value)
+}
+
+func (c FfiConverterTypeWrappedComponentEnvelope) Write(writer io.Writer, value WrappedComponentEnvelope) {
+	FfiConverterStringINSTANCE.Write(writer, value.AppName)
+	FfiConverterOptionalUint64INSTANCE.Write(writer, value.AppId)
+	FfiConverterStringINSTANCE.Write(writer, value.BundleId)
+	FfiConverterStringINSTANCE.Write(writer, value.Url)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.SessionId)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsLive)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.LdText)
+	FfiConverterStringINSTANCE.Write(writer, value.ImageTitle)
+	FfiConverterStringINSTANCE.Write(writer, value.ImageSubtitle)
+	FfiConverterStringINSTANCE.Write(writer, value.Caption)
+	FfiConverterStringINSTANCE.Write(writer, value.Subcaption)
+	FfiConverterStringINSTANCE.Write(writer, value.SecondarySubcaption)
+	FfiConverterStringINSTANCE.Write(writer, value.TertiarySubcaption)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.Icon)
+}
+
+type FfiDestroyerTypeWrappedComponentEnvelope struct{}
+
+func (_ FfiDestroyerTypeWrappedComponentEnvelope) Destroy(value WrappedComponentEnvelope) {
+	value.Destroy()
+}
+
 type WrappedConversation struct {
 	Participants []string
 	GroupName    *string
@@ -7979,107 +8135,114 @@ func (_ FfiDestroyerTypeWrappedLetMeInRequest) Destroy(value WrappedLetMeInReque
 }
 
 type WrappedMessage struct {
-	Uuid                          string
-	Sender                        *string
-	Text                          *string
-	Subject                       *string
-	Participants                  []string
-	GroupName                     *string
-	TimestampMs                   uint64
-	IsSms                         bool
-	IsTapback                     bool
-	TapbackType                   *uint32
-	TapbackTargetUuid             *string
-	TapbackTargetPart             *uint64
-	TapbackEmoji                  *string
-	TapbackRemove                 bool
-	IsEdit                        bool
-	EditTargetUuid                *string
-	EditPart                      *uint64
-	EditNewText                   *string
-	IsUnsend                      bool
-	UnsendTargetUuid              *string
-	UnsendEditPart                *uint64
-	IsRename                      bool
-	NewChatName                   *string
-	IsParticipantChange           bool
-	NewParticipants               []string
-	ParticipantGroupVersion       *uint64
-	Attachments                   []WrappedAttachment
-	ReplyGuid                     *string
-	ReplyPart                     *string
-	IsTyping                      bool
-	TypingActive                  *bool
-	TypingAppBundleId             *string
-	TypingAppIcon                 *[]byte
-	IsReadReceipt                 bool
-	IsDelivered                   bool
-	IsError                       bool
-	ErrorForUuid                  *string
-	ErrorStatus                   *uint64
-	ErrorStatusStr                *string
-	IsPeerCacheInvalidate         bool
-	SendDelivered                 bool
-	VerificationFailed            bool
-	SenderGuid                    *string
-	IsMoveToRecycleBin            bool
-	IsPermanentDelete             bool
-	IsRecoverChat                 bool
-	DeleteChatParticipants        []string
-	DeleteChatGroupId             *string
-	DeleteChatGuid                *string
-	DeleteMessageUuids            []string
-	IsStoredMessage               bool
-	IsIconChange                  bool
-	GroupPhotoCleared             bool
-	GroupIconVersion              *uint64
-	IconChangePhotoData           *[]byte
-	Html                          *string
-	IsVoice                       bool
-	Effect                        *string
-	ScheduledMs                   *uint64
-	IsSmsActivation               *bool
-	IsSmsConfirmSent              *bool
-	IsMarkUnread                  bool
-	IsMessageReadOnDevice         bool
-	IsUnschedule                  bool
-	IsUpdateExtension             bool
-	UpdateExtensionForUuid        *string
-	IsUpdateProfileSharing        bool
-	UpdateProfileSharingDismissed []string
-	UpdateProfileSharingAll       []string
-	UpdateProfileSharingVersion   *uint64
-	IsUpdateProfile               bool
-	UpdateProfileShareContacts    *bool
-	IsNotifyAnyways               bool
-	IsSetTranscriptBackground     bool
-	TranscriptBackgroundRemove    *bool
-	TranscriptBackgroundChatId    *string
-	TranscriptBackgroundObjectId  *string
-	TranscriptBackgroundUrl       *string
-	TranscriptBackgroundFileSize  *uint64
-	StickerData                   *[]byte
-	StickerMime                   *string
-	IsShareProfile                bool
-	ShareProfileRecordKey         *string
-	ShareProfileDecryptionKey     *[]byte
-	ShareProfileHasPoster         bool
-	ShareProfileDisplayName       *string
-	ShareProfileFirstName         *string
-	ShareProfileLastName          *string
-	ShareProfileAvatar            *[]byte
-	AppBalloonBundleId            *string
-	AppBalloonAppName             *string
-	AppBalloonUrl                 *string
-	AppBalloonSessionId           *string
-	AppBalloonIsLive              bool
-	AppBalloonLdText              *string
-	AppBalloonImageTitle          *string
-	AppBalloonImageSubtitle       *string
-	AppBalloonCaption             *string
-	AppBalloonSubcaption          *string
-	AppBalloonSecondarySubcaption *string
-	AppBalloonTertiarySubcaption  *string
+	Uuid                               string
+	Sender                             *string
+	Text                               *string
+	Subject                            *string
+	Participants                       []string
+	GroupName                          *string
+	TimestampMs                        uint64
+	IsSms                              bool
+	IsTapback                          bool
+	TapbackType                        *uint32
+	TapbackTargetUuid                  *string
+	TapbackTargetPart                  *uint64
+	TapbackEmoji                       *string
+	TapbackRemove                      bool
+	IsEdit                             bool
+	EditTargetUuid                     *string
+	EditPart                           *uint64
+	EditNewText                        *string
+	IsUnsend                           bool
+	UnsendTargetUuid                   *string
+	UnsendEditPart                     *uint64
+	IsRename                           bool
+	NewChatName                        *string
+	IsParticipantChange                bool
+	NewParticipants                    []string
+	ParticipantGroupVersion            *uint64
+	Attachments                        []WrappedAttachment
+	ReplyGuid                          *string
+	ReplyPart                          *string
+	IsTyping                           bool
+	TypingActive                       *bool
+	TypingAppBundleId                  *string
+	TypingAppIcon                      *[]byte
+	IsReadReceipt                      bool
+	IsDelivered                        bool
+	IsError                            bool
+	ErrorForUuid                       *string
+	ErrorStatus                        *uint64
+	ErrorStatusStr                     *string
+	IsPeerCacheInvalidate              bool
+	SendDelivered                      bool
+	VerificationFailed                 bool
+	SenderGuid                         *string
+	IsMoveToRecycleBin                 bool
+	IsPermanentDelete                  bool
+	IsRecoverChat                      bool
+	DeleteChatParticipants             []string
+	DeleteChatGroupId                  *string
+	DeleteChatGuid                     *string
+	DeleteMessageUuids                 []string
+	IsStoredMessage                    bool
+	IsIconChange                       bool
+	GroupPhotoCleared                  bool
+	GroupIconVersion                   *uint64
+	IconChangePhotoData                *[]byte
+	Html                               *string
+	IsVoice                            bool
+	Effect                             *string
+	ScheduledMs                        *uint64
+	IsSmsActivation                    *bool
+	IsSmsConfirmSent                   *bool
+	IsMarkUnread                       bool
+	IsMessageReadOnDevice              bool
+	IsUnschedule                       bool
+	IsUpdateExtension                  bool
+	UpdateExtensionForUuid             *string
+	IsUpdateProfileSharing             bool
+	UpdateProfileSharingDismissed      []string
+	UpdateProfileSharingAll            []string
+	UpdateProfileSharingVersion        *uint64
+	IsUpdateProfile                    bool
+	UpdateProfileShareContacts         *bool
+	IsNotifyAnyways                    bool
+	IsSetTranscriptBackground          bool
+	TranscriptBackgroundRemove         *bool
+	TranscriptBackgroundChatId         *string
+	TranscriptBackgroundVersion        *uint64
+	TranscriptBackgroundId             *string
+	TranscriptBackgroundPayloadVersion *uint64
+	TranscriptBackgroundObjectId       *string
+	TranscriptBackgroundUrl            *string
+	TranscriptBackgroundFileSize       *uint64
+	TranscriptBackgroundPreset         *string
+	TranscriptBackgroundPayloadData    *[]byte
+	StickerData                        *[]byte
+	StickerMime                        *string
+	IsShareProfile                     bool
+	ShareProfileRecordKey              *string
+	ShareProfileDecryptionKey          *[]byte
+	ShareProfileHasPoster              bool
+	ShareProfileDisplayName            *string
+	ShareProfileFirstName              *string
+	ShareProfileLastName               *string
+	ShareProfileAvatar                 *[]byte
+	AppBalloonBundleId                 *string
+	AppBalloonAppName                  *string
+	AppBalloonAppId                    *uint64
+	AppBalloonUrl                      *string
+	AppBalloonSessionId                *string
+	AppBalloonIsLive                   bool
+	AppBalloonLdText                   *string
+	AppBalloonImageTitle               *string
+	AppBalloonImageSubtitle            *string
+	AppBalloonCaption                  *string
+	AppBalloonSubcaption               *string
+	AppBalloonSecondarySubcaption      *string
+	AppBalloonTertiarySubcaption       *string
+	AppBalloonIcon                     *[]byte
 }
 
 func (r *WrappedMessage) Destroy() {
@@ -8159,9 +8322,14 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerBool{}.Destroy(r.IsSetTranscriptBackground)
 	FfiDestroyerOptionalBool{}.Destroy(r.TranscriptBackgroundRemove)
 	FfiDestroyerOptionalString{}.Destroy(r.TranscriptBackgroundChatId)
+	FfiDestroyerOptionalUint64{}.Destroy(r.TranscriptBackgroundVersion)
+	FfiDestroyerOptionalString{}.Destroy(r.TranscriptBackgroundId)
+	FfiDestroyerOptionalUint64{}.Destroy(r.TranscriptBackgroundPayloadVersion)
 	FfiDestroyerOptionalString{}.Destroy(r.TranscriptBackgroundObjectId)
 	FfiDestroyerOptionalString{}.Destroy(r.TranscriptBackgroundUrl)
 	FfiDestroyerOptionalUint64{}.Destroy(r.TranscriptBackgroundFileSize)
+	FfiDestroyerOptionalString{}.Destroy(r.TranscriptBackgroundPreset)
+	FfiDestroyerOptionalBytes{}.Destroy(r.TranscriptBackgroundPayloadData)
 	FfiDestroyerOptionalBytes{}.Destroy(r.StickerData)
 	FfiDestroyerOptionalString{}.Destroy(r.StickerMime)
 	FfiDestroyerBool{}.Destroy(r.IsShareProfile)
@@ -8174,6 +8342,7 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalBytes{}.Destroy(r.ShareProfileAvatar)
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonBundleId)
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonAppName)
+	FfiDestroyerOptionalUint64{}.Destroy(r.AppBalloonAppId)
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonUrl)
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonSessionId)
 	FfiDestroyerBool{}.Destroy(r.AppBalloonIsLive)
@@ -8184,6 +8353,7 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonSubcaption)
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonSecondarySubcaption)
 	FfiDestroyerOptionalString{}.Destroy(r.AppBalloonTertiarySubcaption)
+	FfiDestroyerOptionalBytes{}.Destroy(r.AppBalloonIcon)
 }
 
 type FfiConverterTypeWrappedMessage struct{}
@@ -8272,9 +8442,14 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalBoolINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalUint64INSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalUint64INSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalUint64INSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
 		FfiConverterOptionalBytesINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
@@ -8287,6 +8462,7 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalBytesINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalUint64INSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
@@ -8297,6 +8473,7 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
 	}
 }
 
@@ -8381,9 +8558,14 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterBoolINSTANCE.Write(writer, value.IsSetTranscriptBackground)
 	FfiConverterOptionalBoolINSTANCE.Write(writer, value.TranscriptBackgroundRemove)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TranscriptBackgroundChatId)
+	FfiConverterOptionalUint64INSTANCE.Write(writer, value.TranscriptBackgroundVersion)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.TranscriptBackgroundId)
+	FfiConverterOptionalUint64INSTANCE.Write(writer, value.TranscriptBackgroundPayloadVersion)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TranscriptBackgroundObjectId)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TranscriptBackgroundUrl)
 	FfiConverterOptionalUint64INSTANCE.Write(writer, value.TranscriptBackgroundFileSize)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.TranscriptBackgroundPreset)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.TranscriptBackgroundPayloadData)
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.StickerData)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.StickerMime)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsShareProfile)
@@ -8396,6 +8578,7 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.ShareProfileAvatar)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonBundleId)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonAppName)
+	FfiConverterOptionalUint64INSTANCE.Write(writer, value.AppBalloonAppId)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonUrl)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonSessionId)
 	FfiConverterBoolINSTANCE.Write(writer, value.AppBalloonIsLive)
@@ -8406,6 +8589,7 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonSubcaption)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonSecondarySubcaption)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.AppBalloonTertiarySubcaption)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.AppBalloonIcon)
 }
 
 type FfiDestroyerTypeWrappedMessage struct{}

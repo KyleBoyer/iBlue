@@ -6242,7 +6242,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
 	// fresh MessageInst and orphan delivery receipts for the first attempt.
-	uuid, err := c.client.SendMessage(conv, outbound[0], nil, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendMessage(conv, outbound[0], nil, nil, nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		// rustpush retried an unreachable iMessage as SMS and found no relay to
 		// carry it. Surface the same explanation as the pre-send guard rather than
@@ -6274,7 +6274,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	// message deleted while the tail stayed on the recipient's device.
 	var continuationUUIDs []string
 	for i, chunk := range outbound[1:] {
-		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, c.handle, nil, nil, nil)
+		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, nil, nil, c.handle, nil, nil, nil)
 		if contErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(contErr).
 				Str("uuid", uuid).
@@ -6501,7 +6501,10 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID — no Go-side retry here (would orphan delivery receipts).
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendAttachment(
+		conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle,
+		replyGuid, replyPart, nil, nil, false,
+	)
 	if err != nil {
 		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
 			return nil, errNoCarrierRoute
@@ -6523,7 +6526,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	textMXID := id.EventID("")
 	siblingUUID := ""
 	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
-		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
+		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, nil, nil, c.handle, nil, nil, nil)
 		if textErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
 		} else {
@@ -6641,17 +6644,16 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	if conv.IsSms {
 		return nil
 	}
-	var forUuid *string
-	if receipt.ExactMessage != nil {
-		uuid := string(receipt.ExactMessage.ID)
-		// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID
-		if idx := strings.Index(uuid, "_att"); idx > 0 {
-			uuid = uuid[:idx]
-		}
-		forUuid = &uuid
+	if receipt.ExactMessage == nil {
+		return nil
+	}
+	forUUID := string(receipt.ExactMessage.ID)
+	// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID.
+	if idx := strings.Index(forUUID, "_att"); idx > 0 {
+		forUUID = forUUID[:idx]
 	}
 	err := retrySendOnAPNsFlap(func() error {
-		return c.client.SendReadReceipt(conv, c.handle, forUuid)
+		return c.client.SendReadReceipt(conv, c.handle, forUUID)
 	})
 	if err != nil {
 		errStr := err.Error()
@@ -6862,7 +6864,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 			}
 		}
 		// Rust-side retry handles SendTimedOut with stable UUID.
-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, nil, nil, c.handle, &targetGUID, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
@@ -6875,8 +6877,12 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
+	targetText := ""
+	if c.cloudStore != nil {
+		targetText, _ = c.cloudStore.getMessageTextByGUID(ctx, targetUUID)
+	}
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, targetText, reaction, emoji, false, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
 	}
@@ -6912,7 +6918,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 			}
 		}
 		// Rust-side retry handles SendTimedOut with stable UUID.
-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, nil, nil, c.handle, &targetGUID, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -6921,8 +6927,12 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
+	targetText := ""
+	if c.cloudStore != nil {
+		targetText, _ = c.cloudStore.getMessageTextByGUID(ctx, targetUUID)
+	}
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, targetText, reaction, emoji, true, c.handle)
 	return err
 }
 

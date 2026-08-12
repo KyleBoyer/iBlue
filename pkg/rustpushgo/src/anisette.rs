@@ -161,14 +161,12 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                             attempt + 1,
                             MAX_RETRIES,
                         );
-                        last_err = Some(AnisetteError::InvalidArgument(
-                            format!(
-                                "Anisette provisioning timed out (attempt {}/{}). \
+                        last_err = Some(AnisetteError::InvalidArgument(format!(
+                            "Anisette provisioning timed out (attempt {}/{}). \
                                  The anisette server (ani.sidestore.io) may be down.",
-                                attempt + 1,
-                                MAX_RETRIES,
-                            ),
-                        ));
+                            attempt + 1,
+                            MAX_RETRIES,
+                        )));
                     }
                 }
             }

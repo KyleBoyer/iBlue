@@ -144,6 +144,99 @@ export interface SendMessageParams {
   scheduledMs?: number;
 }
 
+export interface SendComponentParams {
+  conversation: Conversation;
+  bundleId: string;
+  appName: string;
+  appId?: number;
+  url: string;
+  sessionId?: string;
+  isLive?: boolean;
+  ldText?: string;
+  imageTitle?: string;
+  imageSubtitle?: string;
+  caption?: string;
+  subcaption?: string;
+  secondarySubcaption?: string;
+  tertiarySubcaption?: string;
+  iconPath?: string;
+  text?: string;
+  subject?: string;
+  replyGuid?: string;
+  replyPart?: string;
+  from?: string;
+}
+
+export interface SendConversationBackgroundParams {
+  conversation: Conversation;
+  groupVersion: number;
+  path?: string;
+  /** Apple DynamicBackgroundPosterExtension preset identifier. */
+  preset?: string;
+  from?: string;
+}
+
+export interface NativeCloudSyncChat {
+  recordName: string;
+  cloudChatId: string;
+  groupId: string;
+  style: number;
+  service: string;
+  displayName?: string;
+  participants: string[];
+  deleted: boolean;
+  updatedTimestampMs: number;
+  groupPhotoGuid?: string;
+  isFiltered: number;
+}
+
+export interface NativeCloudSyncMessage {
+  recordName: string;
+  guid: string;
+  cloudChatId: string;
+  sender: string;
+  isFromMe: boolean;
+  text?: string;
+  subject?: string;
+  service: string;
+  timestampMs: number;
+  deleted: boolean;
+  tapbackType?: number;
+  tapbackTargetGuid?: string;
+  tapbackEmoji?: string;
+  attachmentGuids: string[];
+  dateReadMs: number;
+  messageType: number;
+  hasBody: boolean;
+  replyGuid?: string;
+  replyPart?: string;
+}
+
+export interface NativeCloudSyncAttachment {
+  guid: string;
+  mimeType?: string;
+  utiType?: string;
+  filename?: string;
+  fileSize: number;
+  recordName: string;
+  hideAttachment: boolean;
+  hasLivePhotoVideo: boolean;
+}
+
+export interface NativeCloudSyncPage<T> {
+  continuationToken?: string;
+  status: number;
+  done: boolean;
+  items: T[];
+}
+
+export interface NativeFocusStatus {
+  handle: string;
+  available: boolean;
+  mode?: string;
+  updatedAt: number;
+}
+
 export interface SendReactionParams {
   conversation: Conversation;
   targetUuid: string;
@@ -345,6 +438,7 @@ export interface IncomingSharedProfile {
 export interface IncomingAppBalloon {
   bundleId?: string;
   appName?: string;
+  appId?: number;
   url?: string;
   sessionId?: string;
   isLive: boolean;
@@ -355,6 +449,23 @@ export interface IncomingAppBalloon {
   subcaption?: string;
   secondarySubcaption?: string;
   tertiarySubcaption?: string;
+  iconBase64?: string;
+}
+
+export interface IncomingConversationBackground {
+  remove: boolean;
+  /** Apple DynamicBackgroundPosterExtension preset identifier, when applicable. */
+  preset?: string;
+  chatId?: string;
+  /** Apple's nanosecond revision. Kept as a string because it exceeds JS safe integers. */
+  version?: string;
+  backgroundId?: string;
+  payloadVersion?: number;
+  objectId?: string;
+  url?: string;
+  fileSize?: number;
+  /** Decrypted PosterKit ZIP exactly as received from Apple's MMCS service. */
+  payloadBase64?: string;
 }
 
 export interface NativeFindMyLocation {
@@ -430,11 +541,16 @@ export interface IncomingMessage {
   isVoice?: boolean;
   sharedProfile?: IncomingSharedProfile;
   appBalloon?: IncomingAppBalloon;
+  conversationBackground?: IncomingConversationBackground;
 }
 
 export interface EngineNotificationMap {
   "message.received": IncomingMessage;
   "account.stateChanged": { users: string; handles: string[] };
+  "focus.updated": NativeFocusStatus;
+  "focus.keysReceived": { receivedAt: number };
+  "focus.reshareReceived": { sender: string; channelId: string; receivedAt: number };
+  "focus.decryptFailed": { sender?: string; receivedAt: number };
   "engine.log": { level: string; message: string };
 }
 

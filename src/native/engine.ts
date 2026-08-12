@@ -8,6 +8,11 @@ import type {
   IdsRegistrationInspection,
   InitializeParams,
   NativeFindMyFollow,
+  NativeCloudSyncAttachment,
+  NativeCloudSyncChat,
+  NativeCloudSyncMessage,
+  SendComponentParams,
+  SendConversationBackgroundParams,
   SendAttachmentParams,
   SendEditParams,
   SendGroupIconParams,
@@ -66,6 +71,29 @@ export interface FreshICloudPhotoShare {
   itemCount: number;
 }
 
+export interface ICloudContactsSyncResult {
+  vcards: string[];
+  syncedAt: number;
+}
+
+export interface CloudSyncPage {
+  continuationToken?: string;
+  status: number;
+  done: boolean;
+}
+
+export interface CloudChatsPage extends CloudSyncPage {
+  chats: NativeCloudSyncChat[];
+}
+
+export interface CloudMessagesPage extends CloudSyncPage {
+  messages: NativeCloudSyncMessage[];
+}
+
+export interface CloudAttachmentsPage extends CloudSyncPage {
+  attachments: NativeCloudSyncAttachment[];
+}
+
 export interface IMessageEngine {
   initialize(params: InitializeParams): Promise<EngineSnapshot>;
   loginStart(appleId: string, password: string): Promise<LoginStartResult>;
@@ -91,12 +119,20 @@ export interface IMessageEngine {
     mimeType: string;
     title?: string;
   }): Promise<FreshICloudPhotoShare>;
+  syncICloudContacts?(): Promise<ICloudContactsSyncResult>;
   migrateCredentialToFile(keyPath: string): Promise<{ migrated: boolean; credentialBackend: string }>;
   startClient(): Promise<EngineSnapshot>;
   snapshot(): Promise<EngineSnapshot>;
   health(): Promise<{ clientStarted: boolean; secondsSinceLastInbound: number }>;
   refreshFindMyFollowing?(address?: string, findMyIds?: string[]): Promise<NativeFindMyFollow[]>;
   sendMessage(params: SendMessageParams): Promise<{ guid: string }>;
+  sendComponent?(params: SendComponentParams): Promise<{ guid: string }>;
+  setConversationBackground?(params: SendConversationBackgroundParams): Promise<{ guid: string }>;
+  syncCloudChats?(continuationToken?: string): Promise<CloudChatsPage>;
+  syncCloudMessages?(continuationToken?: string): Promise<CloudMessagesPage>;
+  syncCloudAttachments?(continuationToken?: string): Promise<CloudAttachmentsPage>;
+  subscribeFocus?(handles: string[]): Promise<{ subscribed: string[] }>;
+  shareFocus?(active: boolean, mode?: string): Promise<{ shared: boolean }>;
   sendReaction(params: SendReactionParams): Promise<{ guid: string }>;
   sendStickerReaction?(params: SendStickerReactionParams): Promise<{ guid: string }>;
   updateStickerReaction?(params: UpdateStickerReactionParams): Promise<{ guid: string }>;
@@ -214,6 +250,10 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
     return this.rpc.request("icloud.photos.share.create", params);
   }
 
+  syncICloudContacts(): Promise<ICloudContactsSyncResult> {
+    return this.rpc.request("icloud.contacts.sync");
+  }
+
   migrateCredentialToFile(keyPath: string): Promise<{ migrated: boolean; credentialBackend: string }> {
     return this.rpc.request("account.credentials.migrateToFile", { keyPath });
   }
@@ -248,6 +288,34 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
 
   sendMessage(params: SendMessageParams): Promise<{ guid: string }> {
     return this.rpc.request("message.send", params);
+  }
+
+  sendComponent(params: SendComponentParams): Promise<{ guid: string }> {
+    return this.rpc.request("message.component.send", params);
+  }
+
+  setConversationBackground(params: SendConversationBackgroundParams): Promise<{ guid: string }> {
+    return this.rpc.request("conversation.background.set", params);
+  }
+
+  syncCloudChats(continuationToken?: string): Promise<CloudChatsPage> {
+    return this.rpc.request("cloud.sync.chats", { continuationToken });
+  }
+
+  syncCloudMessages(continuationToken?: string): Promise<CloudMessagesPage> {
+    return this.rpc.request("cloud.sync.messages", { continuationToken });
+  }
+
+  syncCloudAttachments(continuationToken?: string): Promise<CloudAttachmentsPage> {
+    return this.rpc.request("cloud.sync.attachments", { continuationToken });
+  }
+
+  subscribeFocus(handles: string[]): Promise<{ subscribed: string[] }> {
+    return this.rpc.request("focus.subscribe", { handles });
+  }
+
+  shareFocus(active: boolean, mode?: string): Promise<{ shared: boolean }> {
+    return this.rpc.request("focus.share", { active, ...(mode ? { mode } : {}) });
   }
 
   sendReaction(params: SendReactionParams): Promise<{ guid: string }> {

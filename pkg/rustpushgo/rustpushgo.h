@@ -361,6 +361,18 @@ void* uniffi_rustpushgo_fn_method_client_send_change_participants(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_component(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer envelope,
+	RustBuffer text,
+	RustBuffer subject,
+	RustBuffer handle,
+	RustBuffer reply_guid,
+	RustBuffer reply_part,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_delivery_receipt(
 	void* ptr,
 	RustBuffer conversation,
@@ -534,6 +546,7 @@ void* uniffi_rustpushgo_fn_method_client_send_set_transcript_background(
 	RustBuffer conversation,
 	uint64_t group_version,
 	RustBuffer image_data,
+	RustBuffer preset,
 	RustBuffer handle,
 	RustCallStatus* out_status
 );
@@ -562,6 +575,21 @@ void* uniffi_rustpushgo_fn_method_client_send_sms_confirm_sent(
 	void* ptr,
 	RustBuffer conversation,
 	int8_t sms_status,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_send_sticker_tapback(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer target_uuid,
+	uint64_t target_part,
+	RustBuffer target_text,
+	RustBuffer data,
+	RustBuffer mime,
+	RustBuffer uti_type,
+	RustBuffer filename,
+	RustBuffer source,
 	RustBuffer handle,
 	RustCallStatus* out_status
 );
@@ -1856,6 +1884,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_change_participants(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_component(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_delivery_receipt(
 	RustCallStatus* out_status
 );
@@ -1945,6 +1977,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_sms_activation(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_send_sms_confirm_sent(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_sticker_tapback(
 	RustCallStatus* out_status
 );
 

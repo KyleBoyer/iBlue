@@ -121,7 +121,8 @@ previously stored `artworkAttachmentGuid`, and an `appleMusic` object containing
 
 Handles gain an optional `iBlue.contact` summary. Messages gain optional
 `iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`,
-`iBlue.audioTranscription`, `iBlue.richLink`, `iBlue.icloudShare`, `iBlue.poll`, and `iBlue.pollVote` properties; Maps extension
+`iBlue.audioTranscription`, `iBlue.richLink`, `iBlue.icloudShare`, `iBlue.poll`,
+`iBlue.pollVote`, and `iBlue.component` properties; Maps extension
 messages also expose their real bundle identifier through BlueBubbles'
 existing `balloonBundleId` field. An incoming iMessage Name & Photo Sharing
 update emits the additive `iblue-contact-updated` Socket.IO/webhook event.
@@ -196,6 +197,36 @@ location timestamp, accuracy, expiry, active/old state, and any address fields
 Apple returns. Clients may poll this additive endpoint to follow movement.
 iBlue does not read Contacts.app or geocode coordinates itself.
 
+The authenticated iCloud additions are likewise profile-scoped and never read
+the macOS user's apps or databases:
+
+- `POST /api/v1/iblue/contact/icloud/sync` performs CardDAV discovery with the
+  profile's Apple session, imports real iCloud contact cards, and gives an
+  explicitly imported profile VCF higher display-name priority.
+- `GET /api/v1/handle/:guid/focus` and the `/api/v1/iblue/focus/*` routes use
+  Apple's StatusKit key exchange and push channel. An initial response may be
+  unknown until the peer publishes or Apple replays a status update. Status,
+  key, reshare, and decrypt-failure notifications are available as additive
+  Socket.IO/webhook events.
+- `/api/v1/iblue/cloud/messages/{chats,messages,attachments}/sync` exposes the
+  existing Messages in iCloud CloudKit readers as continuation-token pages.
+  These routes are read-only: they do not reset zones or delete cloud records.
+- `POST /api/v1/iblue/message/component` sends a normalized generic Messages
+  extension envelope. Incoming balloons expose the same layout under
+  `message.iBlue.component`, including the bundle, session, URL, live-layout
+  marker, text presentation fields, and optional app icon.
+- `/api/v1/iblue/chat/:guid/background` sends and tracks Apple's transcript
+  background control. The image may reference an existing message attachment
+  or the staged path returned by `POST /api/v1/attachment/upload`. Passing
+  `preset` selects any of Apple's 12 animated built-ins: `ocean_1`, `ocean_2`,
+  `aurora_1` through `aurora_3`, `clouds_1` through `clouds_6`, or `glitter`.
+  `GET /api/v1/iblue/background/presets` returns the complete catalog with
+  family and display-name metadata.
+
+Fresh iCloud Photos shares accept JPEG, PNG, GIF, HEIC/HEIF, QuickTime MOV, and
+MP4 media. General-purpose documents are not Photos assets and continue to use
+the ordinary attachment API.
+
 Two additional exact routes deliberately report an absent optional capability:
 
 - `GET /fcm/client` returns BlueBubbles' own missing-Google-services `404`, so
@@ -215,7 +246,7 @@ plumbing.
 
 ## Structured `501` REST groups
 
-The 30 exact BlueBubbles routes not implemented natively or as honest neutral
+The 29 exact BlueBubbles routes not implemented natively or as honest neutral
 capability responses are deliberately
 grouped rather than disguised as successful operations:
 
@@ -227,7 +258,6 @@ grouped rather than disguised as successful operations:
 | FCM | 1 | iBlue supplies Socket.IO and webhooks instead of Firebase; device registration is unsupported while the config read reports the normal missing-config response. |
 | Blurhash/live-photo derivatives | 2 | The original attachment remains downloadable; no image derivative or paired live-video file is currently stored. |
 | Share contact | 1 | BlueBubbles asks Messages.app to share its signed-in user's personal card. iBlue has no equivalent main-user contact identity and does not infer one from the profile VCF. |
-| Focus status | 1 | StatusKit exists below the wrapper but is not exposed on the BlueBubbles API. |
 | FaceTime sessions | 3 | FaceTime call control is not part of the current iBlue API. |
 | Contact creation | 1 | iBlue must not mutate the main macOS user's Contacts database. |
 | Theme/settings backup | 6 | BlueBubbles client/server administration, not iMessage transport. |

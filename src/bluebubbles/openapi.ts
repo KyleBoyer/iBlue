@@ -1,6 +1,7 @@
 import type { FastifySchema, HTTPMethods } from "fastify";
 
 import { PINNED_BLUEBUBBLES_REST_ROUTES } from "./compatibility-routes.js";
+import { IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS } from "./backgrounds.js";
 
 type JsonSchema = Record<string, unknown>;
 
@@ -8,6 +9,12 @@ const stringProperty = (description: string): JsonSchema => ({ type: "string", d
 const paginationProperties = {
   offset: { type: "integer", minimum: 0, default: 0 },
   limit: { type: "integer", minimum: 1, default: 100 },
+};
+const cloudSyncBody: JsonSchema = {
+  type: "object",
+  properties: {
+    continuationToken: stringProperty("Opaque token returned by the preceding page."),
+  },
 };
 
 const routeDocumentation: Record<string, FastifySchema> = {
@@ -23,7 +30,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/iblue/contact": {
     summary: "List profile-local contacts",
-    description: "Searches contacts learned from profile VCF imports and Name & Photo Sharing.",
+    description: "Searches contacts learned from profile VCF imports, iCloud CardDAV, and Name & Photo Sharing.",
     tags: ["iBlue Contacts"],
     querystring: {
       type: "object",
@@ -44,9 +51,41 @@ const routeDocumentation: Record<string, FastifySchema> = {
         search: { type: "string" },
         sources: {
           type: "array",
-          items: { type: "string", enum: ["profile-vcf", "name-and-photo-sharing"] },
+          items: { type: "string", enum: ["profile-vcf", "icloud-carddav", "name-and-photo-sharing"] },
         },
         ...paginationProperties,
+      },
+    },
+  },
+  "POST /api/v1/iblue/contact/icloud/sync": {
+    summary: "Sync real iCloud Contacts",
+    description: "Fetches the signed-in Apple account's CardDAV address books and replaces the iCloud contact cache.",
+    tags: ["iBlue Contacts"],
+  },
+  "GET /api/v1/handle/:guid/focus": {
+    summary: "Get and subscribe to a handle's Focus status",
+    tags: ["iBlue Focus"],
+  },
+  "POST /api/v1/iblue/focus/subscribe": {
+    summary: "Subscribe to Focus status updates",
+    tags: ["iBlue Focus"],
+    body: {
+      type: "object",
+      required: ["handles"],
+      properties: {
+        handles: { type: "array", minItems: 1, maxItems: 256, items: { type: "string" } },
+      },
+    },
+  },
+  "POST /api/v1/iblue/focus/share": {
+    summary: "Publish this account's Focus status",
+    tags: ["iBlue Focus"],
+    body: {
+      type: "object",
+      required: ["active"],
+      properties: {
+        active: { type: "boolean", description: "True means available; false publishes an active Focus mode." },
+        mode: { type: "string", description: "Required when active is false." },
       },
     },
   },
@@ -200,6 +239,78 @@ const routeDocumentation: Record<string, FastifySchema> = {
       },
     },
   },
+  "POST /api/v1/iblue/message/component": {
+    summary: "Send a generic iMessage component envelope",
+    description: "Sends a normalized MSMessageTemplateLayout balloon without exposing keyed-archive internals.",
+    tags: ["iBlue Messages"],
+    body: {
+      type: "object",
+      required: ["chatGuid", "bundleId", "url"],
+      additionalProperties: false,
+      properties: {
+        chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
+        bundleId: { type: "string", maxLength: 512 },
+        appName: { type: "string" },
+        appId: { type: "integer", minimum: 0 },
+        url: { type: "string", maxLength: 16384 },
+        sessionId: { type: "string", format: "uuid" },
+        isLive: { type: "boolean" },
+        ldText: { type: "string" },
+        imageTitle: { type: "string" },
+        imageSubtitle: { type: "string" },
+        caption: { type: "string" },
+        subcaption: { type: "string" },
+        secondarySubcaption: { type: "string" },
+        tertiarySubcaption: { type: "string" },
+        iconAttachmentGuid: { type: "string" },
+        text: { type: "string" },
+        subject: { type: "string" },
+        replyGuid: { type: "string" },
+        replyPart: { type: "string" },
+      },
+    },
+  },
+  "GET /api/v1/iblue/chat/:guid/background": {
+    summary: "Get a conversation background",
+    tags: ["iBlue Messages"],
+  },
+  "GET /api/v1/iblue/background/presets": {
+    summary: "List built-in animated conversation backgrounds",
+    description: "Lists every Apple DynamicBackgroundPosterExtension preset accepted by the background endpoint.",
+    tags: ["iBlue Messages"],
+  },
+  "POST /api/v1/iblue/chat/:guid/background": {
+    summary: "Set or remove a conversation background",
+    tags: ["iBlue Messages"],
+    body: {
+      type: "object",
+      properties: {
+        attachmentGuid: { type: "string", description: "Previously uploaded image attachment." },
+        attachment: { type: "string", description: "Staged path returned by POST /api/v1/attachment/upload." },
+        preset: {
+          type: "string",
+          enum: IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS.map((background) => background.identifier),
+          description: "Built-in animated background identifier. Mutually exclusive with attachment and attachmentGuid.",
+        },
+        remove: { type: "boolean" },
+      },
+    },
+  },
+  "POST /api/v1/iblue/cloud/messages/chats/sync": {
+    summary: "Sync a Messages in iCloud chat page",
+    tags: ["iBlue Cloud Sync"],
+    body: cloudSyncBody,
+  },
+  "POST /api/v1/iblue/cloud/messages/messages/sync": {
+    summary: "Sync a Messages in iCloud message page",
+    tags: ["iBlue Cloud Sync"],
+    body: cloudSyncBody,
+  },
+  "POST /api/v1/iblue/cloud/messages/attachments/sync": {
+    summary: "Sync a Messages in iCloud attachment-metadata page",
+    tags: ["iBlue Cloud Sync"],
+    body: cloudSyncBody,
+  },
   "GET /api/v1/iblue/icloud-share/:messageGuid": {
     summary: "Resolve an iCloud Photos share",
     tags: ["iBlue iCloud Photos"],
@@ -226,15 +337,15 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/icloud-share/create": {
     summary: "Create and send a fresh iCloud Photos share",
-    description: "Uploads one JPEG to the opted-in iCloud web session, creates a fresh public share, waits for anonymous access, and sends its native Photos Messages card.",
+    description: "Uploads one Photos-compatible image or video to the opted-in iCloud web session, creates a fresh public share, waits for anonymous access, and sends its native Photos Messages card.",
     tags: ["iBlue iCloud Photos"],
     consumes: ["multipart/form-data"],
     body: {
       type: "object",
-      required: ["chatGuid", "photo"],
+      required: ["chatGuid", "media"],
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        photo: { type: "string", format: "binary", description: "JPEG image." },
+        media: { type: "string", format: "binary", description: "JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media." },
         title: { type: "string" },
         caption: { type: "string" },
         subcaption: { type: "string" },

@@ -105,6 +105,40 @@ pub struct FreshPhotoShare {
     pub item_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShareMediaKind {
+    Photo,
+    Video,
+}
+
+const VIDEO_PREVIEW_JPEG_BASE64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=";
+
+fn validate_share_media(bytes: &[u8], mime_type: &str) -> Result<ShareMediaKind, String> {
+    let photo = match mime_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/heic" | "image/heif" => {
+            bytes.get(4..8) == Some(b"ftyp")
+                && bytes.get(8..12).is_some_and(|brand| {
+                    ["heic", "heix", "hevc", "hevx", "mif1", "msf1"]
+                        .iter()
+                        .any(|candidate| brand == candidate.as_bytes())
+                })
+        }
+        _ => false,
+    };
+    if photo {
+        return Ok(ShareMediaKind::Photo);
+    }
+    let video =
+        matches!(mime_type, "video/quicktime" | "video/mp4") && bytes.get(4..8) == Some(b"ftyp");
+    if video {
+        return Ok(ShareMediaKind::Video);
+    }
+    Err("fresh iCloud Photos shares require JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media whose bytes match its MIME type".to_string())
+}
+
 #[derive(Deserialize)]
 struct SrpInitResponse {
     iteration: u32,
@@ -321,24 +355,19 @@ impl ICloudWebSession {
                 "iCloud Photos web access is not enrolled; run icloud-web-setup first".to_string(),
             );
         }
-        if mime_type != "image/jpeg" {
-            return Err("fresh iCloud Photos shares currently require a JPEG image".to_string());
-        }
         let metadata = tokio::fs::metadata(path)
             .await
             .map_err(|error| format!("failed to read photo metadata: {error}"))?;
         if !metadata.is_file() || metadata.len() == 0 {
             return Err("photo is empty or is not a regular file".to_string());
         }
-        if metadata.len() > 100 * 1024 * 1024 {
-            return Err("photo exceeds the 100 MiB fresh-share limit".to_string());
+        if metadata.len() > 1024 * 1024 * 1024 {
+            return Err("media exceeds the 1 GiB fresh-share limit".to_string());
         }
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|error| format!("failed to read photo: {error}"))?;
-        if bytes.get(..3) != Some(&[0xff, 0xd8, 0xff]) {
-            return Err("photo does not contain JPEG data".to_string());
-        }
+        let media_kind = validate_share_media(&bytes, mime_type)?;
         let modified_ms = metadata
             .modified()
             .unwrap_or_else(|_| SystemTime::now())
@@ -349,10 +378,29 @@ impl ICloudWebSession {
         self.ensure_photos_pcs(&client).await?;
 
         let asset_guid = self
-            .upload_photo(&client, dsid, &bytes, filename, modified_ms)
+            .upload_asset(&client, dsid, &bytes, filename, mime_type, modified_ms)
             .await?;
-        self.create_cmm_share(&client, dsid, &bytes, &asset_guid, modified_ms, title)
-            .await
+        let (preview, preview_mime) = if media_kind == ShareMediaKind::Video {
+            (
+                BASE64
+                    .decode(VIDEO_PREVIEW_JPEG_BASE64)
+                    .map_err(|_| "built-in video preview is invalid".to_string())?,
+                "image/jpeg",
+            )
+        } else {
+            (bytes.clone(), mime_type)
+        };
+        self.create_cmm_share(
+            &client,
+            dsid,
+            &preview,
+            preview_mime,
+            &asset_guid,
+            modified_ms,
+            title,
+            media_kind,
+        )
+        .await
     }
 
     async fn validate(&mut self, client: &Client) -> Result<(), String> {
@@ -590,12 +638,13 @@ impl ICloudWebSession {
         Err("timed out waiting for trusted-device approval of iCloud Photos web access".to_string())
     }
 
-    async fn upload_photo(
+    async fn upload_asset(
         &mut self,
         client: &Client,
         dsid: &str,
         bytes: &[u8],
         filename: &str,
+        mime_type: &str,
         modified_ms: u64,
     ) -> Result<String, String> {
         let upload_base = self.service_url("photosupload")?;
@@ -617,7 +666,7 @@ impl ICloudWebSession {
             .and_then(Value::as_str)
             .ok_or_else(|| "Apple did not return a Photos upload URL".to_string())?;
         let upload_receipt = self
-            .upload_bytes(client, signed_url, bytes, "image/jpeg")
+            .upload_bytes(client, signed_url, bytes, mime_type)
             .await?;
         let put: Value = self
             .service_json(
@@ -669,7 +718,7 @@ impl ICloudWebSession {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        Err("timed out waiting for iCloud Photos to import the uploaded photo".to_string())
+        Err("timed out waiting for iCloud Photos to import the uploaded media".to_string())
     }
 
     async fn create_cmm_share(
@@ -677,9 +726,11 @@ impl ICloudWebSession {
         client: &Client,
         dsid: &str,
         preview: &[u8],
+        preview_mime_type: &str,
         asset_guid: &str,
         asset_date_ms: u64,
         title: &str,
+        media_kind: ShareMediaKind,
     ) -> Result<FreshPhotoShare, String> {
         let cloudkit = self.service_url("ckdatabasews")?;
         let zone_name = format!("CMM-{}", new_uuid().to_uppercase());
@@ -732,7 +783,7 @@ impl ICloudWebSession {
             .and_then(Value::as_str)
             .ok_or_else(|| "Apple did not return a CMM preview upload URL".to_string())?;
         let preview_receipt = self
-            .upload_bytes(client, preview_url, preview, "image/jpeg")
+            .upload_bytes(client, preview_url, preview, preview_mime_type)
             .await?;
         let created_ms = now_ms();
         let root_response: Value = self
@@ -755,8 +806,8 @@ impl ICloudWebSession {
                                 "endDate": { "value": asset_date_ms },
                                 "startDate": { "value": asset_date_ms },
                                 "assetCount": { "value": 1 },
-                                "videosCount": { "value": 0 },
-                                "photosCount": { "value": 1 },
+                                "videosCount": { "value": if media_kind == ShareMediaKind::Video { 1 } else { 0 } },
+                                "photosCount": { "value": if media_kind == ShareMediaKind::Photo { 1 } else { 0 } },
                                 "previewData": { "value": preview_receipt },
                             },
                             "createShortGUID": true,
@@ -847,7 +898,7 @@ impl ICloudWebSession {
                     })
                 }
                 Some("FAILED") | Some("CANCELLED") => {
-                    return Err("Apple failed while copying the photo into the share".to_string())
+                    return Err("Apple failed while copying the media into the share".to_string())
                 }
                 _ => tokio::time::sleep(Duration::from_secs(1)).await,
             }
@@ -1610,9 +1661,29 @@ mod tests {
             "shortGUID": "0A1ExampleCmmShareGuid"
         }))
         .unwrap();
+        assert_eq!(cmm_share_id(&root).unwrap(), "0A1ExampleCmmShareGuid");
+    }
+
+    #[test]
+    fn share_media_validation_accepts_photos_and_videos_by_content() {
         assert_eq!(
-            cmm_share_id(&root).unwrap(),
-            "0A1ExampleCmmShareGuid"
+            validate_share_media(b"\xff\xd8\xfffixture", "image/jpeg").unwrap(),
+            ShareMediaKind::Photo
         );
+        assert_eq!(
+            validate_share_media(b"\x89PNG\r\n\x1a\nfixture", "image/png").unwrap(),
+            ShareMediaKind::Photo
+        );
+        assert_eq!(
+            validate_share_media(b"\0\0\0\x18ftypheicfixture", "image/heic").unwrap(),
+            ShareMediaKind::Photo
+        );
+        assert_eq!(
+            validate_share_media(b"\0\0\0\x18ftypqt  fixture", "video/quicktime").unwrap(),
+            ShareMediaKind::Video
+        );
+        assert!(validate_share_media(b"not a png", "image/png").is_err());
+        let preview = BASE64.decode(VIDEO_PREVIEW_JPEG_BASE64).unwrap();
+        assert!(preview.starts_with(&[0xff, 0xd8, 0xff]));
     }
 }

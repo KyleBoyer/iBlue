@@ -22,6 +22,7 @@ import type {
   IBlueContact,
   IBlueContactSource,
   IBlueContactSummary,
+  IBlueConversationBackground,
   IBlueReaction,
   IBluePoll,
   IBluePollVote,
@@ -125,6 +126,16 @@ interface SharedLocationRow {
   is_live: number;
   session_id: string | null;
   bundle_id: string | null;
+}
+
+interface ConversationBackgroundRow {
+  chat_guid: string;
+  removed: number;
+  preset: string | null;
+  object_id: string | null;
+  url: string | null;
+  file_size: number | null;
+  updated_at: number;
 }
 
 interface WebhookRow {
@@ -256,6 +267,8 @@ function incomingEventKey(message: IncomingMessage): string {
                   ? "participant-change"
                   : message.groupIconChange
                     ? "group-icon-change"
+                    : message.conversationBackground
+                      ? "conversation-background"
                     : "message";
   return `${kind}:${message.uuid.toLowerCase()}`;
 }
@@ -374,6 +387,15 @@ export class BlueBubblesStore {
         PRIMARY KEY(address_key, source)
       );
       CREATE INDEX IF NOT EXISTS contact_display_name ON contact(display_name COLLATE NOCASE);
+      CREATE TABLE IF NOT EXISTS conversation_background (
+        chat_guid TEXT PRIMARY KEY REFERENCES chat(guid) ON DELETE CASCADE,
+        removed INTEGER NOT NULL DEFAULT 0,
+        preset TEXT,
+        object_id TEXT,
+        url TEXT,
+        file_size INTEGER,
+        updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS shared_location (
         message_guid TEXT PRIMARY KEY REFERENCES message(guid) ON DELETE CASCADE,
         latitude REAL,
@@ -434,6 +456,12 @@ export class BlueBubblesStore {
     if (!chatColumns.some((column) => column.name === "icon_mime_type")) {
       this.database.exec("ALTER TABLE chat ADD COLUMN icon_mime_type TEXT");
     }
+    const conversationBackgroundColumns = this.database.prepare(
+      "PRAGMA table_info(conversation_background)",
+    ).all() as unknown as Array<{ name: string }>;
+    if (!conversationBackgroundColumns.some((column) => column.name === "preset")) {
+      this.database.exec("ALTER TABLE conversation_background ADD COLUMN preset TEXT");
+    }
     const incomingEventColumns = this.database.prepare("PRAGMA table_info(incoming_event)").all() as unknown as Array<{ name: string }>;
     if (!incomingEventColumns.some((column) => column.name === "owner")) {
       // Rows written by the brief pre-owner development schema represented
@@ -451,7 +479,8 @@ export class BlueBubblesStore {
     );
     this.#contactByAddress = this.database.prepare(`
       SELECT * FROM contact WHERE address_key = ?
-      ORDER BY CASE source WHEN 'profile-vcf' THEN 0 ELSE 1 END, updated_at DESC
+      ORDER BY CASE source WHEN 'profile-vcf' THEN 0 WHEN 'icloud-carddav' THEN 1 ELSE 2 END,
+        updated_at DESC
       LIMIT 1
     `);
     this.#locationByMessage = this.database.prepare(`
@@ -877,6 +906,25 @@ export class BlueBubblesStore {
       : undefined;
   }
 
+  async persistConversationBackgroundPayload(
+    chatGuid: string,
+    messageGuid: string,
+    payloadBase64: string,
+  ): Promise<string | undefined> {
+    const data = safeBase64(payloadBase64);
+    if (!data) return undefined;
+    const directory = join(
+      this.attachmentRoot,
+      "conversation-backgrounds",
+      createHash("sha256").update(chatGuid).digest("hex"),
+    );
+    const safeMessageGuid = messageGuid.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const path = join(directory, `${safeMessageGuid}.zip`);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await writeFile(path, data, { mode: 0o600 });
+    return path;
+  }
+
   getMessage(guid: string, includeChat = true): BlueBubblesMessage | undefined {
     const row = this.#messageByGuid.get(guid) as unknown as MessageRow | undefined;
     return row ? this.serializeMessage(row, includeChat) : undefined;
@@ -1104,10 +1152,14 @@ export class BlueBubblesStore {
   }
 
   replaceProfileVcfContacts(contacts: readonly ContactInput[]): number {
+    return this.replaceContacts("profile-vcf", contacts);
+  }
+
+  replaceContacts(source: IBlueContactSource, contacts: readonly ContactInput[]): number {
     const now = Date.now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      this.database.prepare("DELETE FROM contact WHERE source = 'profile-vcf'").run();
+      this.database.prepare("DELETE FROM contact WHERE source = ?").run(source);
       const insert = this.database.prepare(`
         INSERT INTO contact (
           address_key, address, source, display_name, first_name, last_name,
@@ -1130,7 +1182,7 @@ export class BlueBubblesStore {
           insert.run(
             key,
             stripTransport(address),
-            "profile-vcf",
+            source,
             contact.displayName,
             contact.firstName ?? null,
             contact.lastName ?? null,
@@ -1199,7 +1251,8 @@ export class BlueBubblesStore {
     if (!key) return undefined;
     const row = this.database.prepare(`
       SELECT * FROM contact WHERE address_key = ? AND avatar IS NOT NULL
-      ORDER BY CASE source WHEN 'profile-vcf' THEN 0 ELSE 1 END, updated_at DESC
+      ORDER BY CASE source WHEN 'profile-vcf' THEN 0 WHEN 'icloud-carddav' THEN 1 ELSE 2 END,
+        updated_at DESC
       LIMIT 1
     `).get(key) as unknown as ContactRow | undefined;
     if (!row?.avatar?.byteLength) return undefined;
@@ -1223,7 +1276,7 @@ export class BlueBubblesStore {
     const rows = this.database.prepare(`
       SELECT * FROM contact
       ORDER BY address_key,
-        CASE source WHEN 'profile-vcf' THEN 0 ELSE 1 END,
+        CASE source WHEN 'profile-vcf' THEN 0 WHEN 'icloud-carddav' THEN 1 ELSE 2 END,
         updated_at DESC
     `).all() as unknown as ContactRow[];
     const selected = new Map<string, IBlueContact>();
@@ -1252,6 +1305,49 @@ export class BlueBubblesStore {
   getSharedLocation(messageGuid: string): IBlueSharedLocationRecord | undefined {
     const row = this.#locationByMessage.get(messageGuid) as unknown as SharedLocationRow | undefined;
     return row ? this.serializeSharedLocation(row) : undefined;
+  }
+
+  setConversationBackground(
+    chatGuid: string,
+    background: Omit<IBlueConversationBackground, "updatedAt">,
+    updatedAt = Date.now(),
+  ): IBlueConversationBackground {
+    this.database.prepare(`
+      INSERT INTO conversation_background (
+        chat_guid, removed, preset, object_id, url, file_size, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chat_guid) DO UPDATE SET
+        removed=excluded.removed,
+        preset=excluded.preset,
+        object_id=excluded.object_id,
+        url=excluded.url,
+        file_size=excluded.file_size,
+        updated_at=excluded.updated_at
+    `).run(
+      chatGuid,
+      background.removed ? 1 : 0,
+      background.preset ?? null,
+      background.objectId ?? null,
+      background.url ?? null,
+      background.fileSize ?? null,
+      updatedAt,
+    );
+    return { ...background, updatedAt };
+  }
+
+  getConversationBackground(chatGuid: string): IBlueConversationBackground | undefined {
+    const row = this.database.prepare(`
+      SELECT * FROM conversation_background WHERE chat_guid = ?
+    `).get(chatGuid) as unknown as ConversationBackgroundRow | undefined;
+    if (!row) return undefined;
+    return {
+      removed: Boolean(row.removed),
+      ...(row.preset ? { preset: row.preset } : {}),
+      ...(row.object_id ? { objectId: row.object_id } : {}),
+      ...(row.url ? { url: row.url } : {}),
+      ...(row.file_size === null ? {} : { fileSize: row.file_size }),
+      updatedAt: row.updated_at,
+    };
   }
 
   querySharedLocations(options: {
@@ -1850,6 +1946,7 @@ export class BlueBubblesStore {
         ...(icloudShare ? { icloudShare } : {}),
         ...(poll ? { poll } : {}),
         ...(pollVote ? { pollVote } : {}),
+        ...(raw.appBalloon ? { component: { ...raw.appBalloon } } : {}),
       },
     };
     if (raw.tempGuid) output.tempGuid = raw.tempGuid;
@@ -1919,6 +2016,7 @@ export class BlueBubblesStore {
   }
 
   private serializeChat(row: ChatRow, includeParticipants: boolean): BlueBubblesChat {
+    const background = this.getConversationBackground(row.guid);
     return {
       originalROWID: row.rowid,
       guid: row.guid,
@@ -1934,6 +2032,7 @@ export class BlueBubblesStore {
           : null,
       ...(row.group_id ? { groupId: row.group_id } : {}),
       lastAddressedHandle: null,
+      ...(background ? { iBlue: { background } } : {}),
       ...(includeParticipants
         ? { participants: safeJsonArray(row.participants_json).map((address) => this.serializeHandle(address)) }
         : {}),

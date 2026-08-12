@@ -8,16 +8,17 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use keystore::keystore;
 use rand::{rngs::OsRng, RngCore};
 use rustpush::ids::user::IDSUserType;
+use rustpushgo::util::plist_from_string;
 use rustpushgo::{
     connect, create_config_from_hardware_key, create_config_from_hardware_key_with_device_id,
     create_local_macos_config, create_local_macos_config_with_device_id, deregister_account,
     init_logger, login_start, new_client, refresh_registration_once,
-    restore_token_provider_with_pet_expiration, AccountPersistData, Client,
-    LoginSession, MessageCallback, UpdateUsersCallback, WrappedAPSConnection, WrappedAPSState, WrappedAttachment,
-    WrappedConversation, WrappedIDSNGMIdentity, WrappedIDSUsers, WrappedMessage, WrappedOSConfig,
-    WrappedMultipartPart, WrappedStickerExtension, WrappedTokenProvider,
+    restore_token_provider_with_pet_expiration, AccountPersistData, Client, LoginSession,
+    MessageCallback, StatusCallback, UpdateUsersCallback, WrappedAPSConnection, WrappedAPSState,
+    WrappedAttachment, WrappedComponentEnvelope, WrappedConversation, WrappedIDSNGMIdentity,
+    WrappedIDSUsers, WrappedMessage, WrappedMultipartPart, WrappedOSConfig,
+    WrappedStickerExtension, WrappedTokenProvider,
 };
-use rustpushgo::util::plist_from_string;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -92,14 +93,18 @@ fn load_or_create_credential_service(state_dir: &Path) -> Result<String, String>
             {
                 use std::os::unix::fs::PermissionsExt;
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|error| format!("failed to protect credential service identity: {error}"))?;
+                    .map_err(|error| {
+                        format!("failed to protect credential service identity: {error}")
+                    })?;
             }
             Ok(service)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             read_credential_service(&path)
         }
-        Err(error) => Err(format!("failed to create credential service identity: {error}")),
+        Err(error) => Err(format!(
+            "failed to create credential service identity: {error}"
+        )),
     }
 }
 
@@ -111,7 +116,11 @@ fn registration_backend() -> (&'static str, bool, Option<String>) {
     #[cfg(feature = "cleanroom-registration")]
     {
         let diagnostic = open_absinthe::nac::backend_diagnostic();
-        return ("unicorn-imdappleservices-external", diagnostic.is_ok(), diagnostic.err());
+        return (
+            "unicorn-imdappleservices-external",
+            diagnostic.is_ok(),
+            diagnostic.err(),
+        );
     }
     #[allow(unreachable_code)]
     (
@@ -256,10 +265,9 @@ impl CredentialBackend {
                 let parent = path.parent().ok_or_else(|| {
                     format!("encrypted credential path {} has no parent", path.display())
                 })?;
-                let mut temporary =
-                    tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-                        format!("failed to create encrypted credential file: {error}")
-                    })?;
+                let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+                    format!("failed to create encrypted credential file: {error}")
+                })?;
                 temporary.write_all(&output).map_err(|error| {
                     format!("failed to write encrypted credential file: {error}")
                 })?;
@@ -279,7 +287,10 @@ impl CredentialBackend {
                 // therefore leaves the previous credential intact instead of
                 // deleting it before a second, fallible rename.
                 temporary.persist(path).map_err(|error| {
-                    format!("failed to install encrypted credential file: {}", error.error)
+                    format!(
+                        "failed to install encrypted credential file: {}",
+                        error.error
+                    )
                 })?;
                 Ok(())
             }
@@ -315,7 +326,9 @@ fn decode_credential_key(raw: &[u8]) -> Result<[u8; 32], String> {
         raw.to_vec()
     } else {
         let text = std::str::from_utf8(raw)
-            .map_err(|_| "credential key must be 32 raw bytes, 64 hex characters, or base64".to_string())?
+            .map_err(|_| {
+                "credential key must be 32 raw bytes, 64 hex characters, or base64".to_string()
+            })?
             .trim();
         if text.len() == 64 {
             hex::decode(text).map_err(|error| format!("invalid hex credential key: {error}"))?
@@ -326,7 +339,10 @@ fn decode_credential_key(raw: &[u8]) -> Result<[u8; 32], String> {
         }
     };
     decoded.try_into().map_err(|value: Vec<u8>| {
-        format!("credential key must decode to exactly 32 bytes, got {}", value.len())
+        format!(
+            "credential key must decode to exactly 32 bytes, got {}",
+            value.len()
+        )
     })
 }
 
@@ -550,6 +566,69 @@ struct SendMessageParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SendComponentParams {
+    conversation: ConversationParams,
+    bundle_id: String,
+    app_name: String,
+    app_id: Option<u64>,
+    url: String,
+    session_id: Option<String>,
+    #[serde(default)]
+    is_live: bool,
+    ld_text: Option<String>,
+    #[serde(default)]
+    image_title: String,
+    #[serde(default)]
+    image_subtitle: String,
+    #[serde(default)]
+    caption: String,
+    #[serde(default)]
+    subcaption: String,
+    #[serde(default)]
+    secondary_subcaption: String,
+    #[serde(default)]
+    tertiary_subcaption: String,
+    icon_path: Option<String>,
+    #[serde(default)]
+    text: String,
+    subject: Option<String>,
+    reply_guid: Option<String>,
+    reply_part: Option<String>,
+    from: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationBackgroundParams {
+    conversation: ConversationParams,
+    group_version: u64,
+    path: Option<String>,
+    preset: Option<String>,
+    from: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudSyncParams {
+    continuation_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FocusSubscribeParams {
+    #[serde(default)]
+    handles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FocusShareParams {
+    active: bool,
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SendReactionParams {
     conversation: ConversationParams,
     target_uuid: String,
@@ -759,6 +838,52 @@ impl MessageCallback for NativeMessageCallback {
     }
 }
 
+struct NativeStatusCallback {
+    emitter: Emitter,
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+impl StatusCallback for NativeStatusCallback {
+    fn on_status_update(&self, user: String, mode: Option<String>, available: bool) {
+        self.emitter.notification(
+            "focus.updated",
+            json!({
+                "handle": user,
+                "available": available,
+                "mode": mode,
+                "updatedAt": current_timestamp_ms(),
+            }),
+        );
+    }
+
+    fn on_keys_received(&self) {
+        self.emitter.notification(
+            "focus.keysReceived",
+            json!({ "receivedAt": current_timestamp_ms() }),
+        );
+    }
+
+    fn on_reshare_sender(&self, sender: String, channel_id: String) {
+        self.emitter.notification(
+            "focus.reshareReceived",
+            json!({ "sender": sender, "channelId": channel_id, "receivedAt": current_timestamp_ms() }),
+        );
+    }
+
+    fn on_status_decrypt_failed(&self, sender: Option<String>) {
+        self.emitter.notification(
+            "focus.decryptFailed",
+            json!({ "sender": sender, "receivedAt": current_timestamp_ms() }),
+        );
+    }
+}
+
 struct NativeUsersCallback {
     emitter: Emitter,
     users: Arc<RwLock<Option<Arc<WrappedIDSUsers>>>>,
@@ -821,9 +946,8 @@ fn message_to_json(message: WrappedMessage) -> Value {
             "part": message.unsend_edit_part,
         })
     });
-    let reply = (message.reply_guid.is_some() || message.reply_part.is_some()).then(|| {
-        json!({ "guid": message.reply_guid, "part": message.reply_part })
-    });
+    let reply = (message.reply_guid.is_some() || message.reply_part.is_some())
+        .then(|| json!({ "guid": message.reply_guid, "part": message.reply_part }));
     let typing = message.is_typing.then(|| {
         json!({
             "active": message.typing_active.unwrap_or(true),
@@ -846,12 +970,12 @@ fn message_to_json(message: WrappedMessage) -> Value {
             "avatarBase64": message.share_profile_avatar.map(|data| BASE64.encode(data)),
         })
     });
-    let app_balloon = (message.app_balloon_bundle_id.is_some()
-        || message.app_balloon_url.is_some())
-        .then(|| {
+    let app_balloon =
+        (message.app_balloon_bundle_id.is_some() || message.app_balloon_url.is_some()).then(|| {
             json!({
                 "bundleId": message.app_balloon_bundle_id,
                 "appName": message.app_balloon_app_name,
+                "appId": message.app_balloon_app_id,
                 "url": message.app_balloon_url,
                 "sessionId": message.app_balloon_session_id,
                 "isLive": message.app_balloon_is_live,
@@ -862,8 +986,23 @@ fn message_to_json(message: WrappedMessage) -> Value {
                 "subcaption": message.app_balloon_subcaption,
                 "secondarySubcaption": message.app_balloon_secondary_subcaption,
                 "tertiarySubcaption": message.app_balloon_tertiary_subcaption,
+                "iconBase64": message.app_balloon_icon.map(|data| BASE64.encode(data)),
             })
         });
+    let conversation_background = message.is_set_transcript_background.then(|| {
+        json!({
+            "remove": message.transcript_background_remove.unwrap_or(false),
+            "chatId": message.transcript_background_chat_id,
+            "version": message.transcript_background_version.map(|value| value.to_string()),
+            "backgroundId": message.transcript_background_id,
+            "payloadVersion": message.transcript_background_payload_version,
+            "objectId": message.transcript_background_object_id,
+            "url": message.transcript_background_url,
+            "fileSize": message.transcript_background_file_size,
+            "preset": message.transcript_background_preset,
+            "payloadBase64": message.transcript_background_payload_data.map(|data| BASE64.encode(data)),
+        })
+    });
 
     json!({
         "uuid": message.uuid,
@@ -904,7 +1043,293 @@ fn message_to_json(message: WrappedMessage) -> Value {
         "isVoice": message.is_voice,
         "sharedProfile": shared_profile,
         "appBalloon": app_balloon,
+        "conversationBackground": conversation_background,
     })
+}
+
+fn cloud_chats_page_to_json(page: rustpushgo::WrappedCloudSyncChatsPage) -> Value {
+    json!({
+        "continuationToken": page.continuation_token,
+        "status": page.status,
+        "done": page.done,
+        "chats": page.chats.into_iter().map(|chat| json!({
+            "recordName": chat.record_name,
+            "cloudChatId": chat.cloud_chat_id,
+            "groupId": chat.group_id,
+            "style": chat.style,
+            "service": chat.service,
+            "displayName": chat.display_name,
+            "participants": chat.participants,
+            "deleted": chat.deleted,
+            "updatedTimestampMs": chat.updated_timestamp_ms,
+            "groupPhotoGuid": chat.group_photo_guid,
+            "isFiltered": chat.is_filtered,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn cloud_messages_page_to_json(page: rustpushgo::WrappedCloudSyncMessagesPage) -> Value {
+    json!({
+        "continuationToken": page.continuation_token,
+        "status": page.status,
+        "done": page.done,
+        "messages": page.messages.into_iter().map(|message| json!({
+            "recordName": message.record_name,
+            "guid": message.guid,
+            "cloudChatId": message.cloud_chat_id,
+            "sender": message.sender,
+            "isFromMe": message.is_from_me,
+            "text": message.text,
+            "subject": message.subject,
+            "service": message.service,
+            "timestampMs": message.timestamp_ms,
+            "deleted": message.deleted,
+            "tapbackType": message.tapback_type,
+            "tapbackTargetGuid": message.tapback_target_guid,
+            "tapbackEmoji": message.tapback_emoji,
+            "attachmentGuids": message.attachment_guids,
+            "dateReadMs": message.date_read_ms,
+            "messageType": message.msg_type,
+            "hasBody": message.has_body,
+            "replyGuid": message.reply_guid,
+            "replyPart": message.reply_part,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn cloud_attachments_page_to_json(page: rustpushgo::WrappedCloudSyncAttachmentsPage) -> Value {
+    json!({
+        "continuationToken": page.continuation_token,
+        "status": page.status,
+        "done": page.done,
+        "attachments": page.attachments.into_iter().map(|attachment| json!({
+            "guid": attachment.guid,
+            "mimeType": attachment.mime_type,
+            "utiType": attachment.uti_type,
+            "filename": attachment.filename,
+            "fileSize": attachment.file_size,
+            "recordName": attachment.record_name,
+            "hideAttachment": attachment.hide_attachment,
+            "hasLivePhotoVideo": attachment.has_avid,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn trusted_carddav_url(value: &str) -> Result<reqwest::Url, RpcError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| RpcError::native("Apple returned an invalid CardDAV URL"))?;
+    let trusted = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && url.host_str().is_some_and(|host| {
+            let host = host.to_ascii_lowercase();
+            host == "icloud.com"
+                || host.ends_with(".icloud.com")
+                || host == "icloud.com.cn"
+                || host.ends_with(".icloud.com.cn")
+        });
+    if !trusted {
+        return Err(RpcError::native("Apple returned an untrusted CardDAV host"));
+    }
+    Ok(url)
+}
+
+fn resolve_carddav_href(base: &reqwest::Url, href: &str) -> Result<reqwest::Url, RpcError> {
+    let resolved = base
+        .join(href)
+        .map_err(|_| RpcError::native("CardDAV returned an invalid resource URL"))?;
+    trusted_carddav_url(resolved.as_str())
+}
+
+fn xml_property_href(body: &[u8], property: &str) -> Result<String, RpcError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| RpcError::native("CardDAV returned non-UTF-8 XML"))?;
+    let document = roxmltree::Document::parse(text)
+        .map_err(|error| RpcError::native(format!("CardDAV returned malformed XML: {error}")))?;
+    document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == property)
+        .and_then(|node| {
+            node.descendants()
+                .find(|child| child.is_element() && child.tag_name().name() == "href")
+        })
+        .and_then(|node| node.text())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| RpcError::native(format!("CardDAV response omitted {property}")))
+}
+
+fn xml_address_books(body: &[u8]) -> Result<Vec<String>, RpcError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| RpcError::native("CardDAV returned non-UTF-8 XML"))?;
+    let document = roxmltree::Document::parse(text)
+        .map_err(|error| RpcError::native(format!("CardDAV returned malformed XML: {error}")))?;
+    Ok(document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "response")
+        .filter(|node| {
+            node.descendants()
+                .any(|child| child.is_element() && child.tag_name().name() == "addressbook")
+        })
+        .filter_map(|node| {
+            node.children()
+                .find(|child| child.is_element() && child.tag_name().name() == "href")
+                .and_then(|href| href.text())
+                .map(str::trim)
+                .filter(|href| !href.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect())
+}
+
+fn xml_vcards(body: &[u8]) -> Result<Vec<String>, RpcError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| RpcError::native("CardDAV returned non-UTF-8 XML"))?;
+    let document = roxmltree::Document::parse(text)
+        .map_err(|error| RpcError::native(format!("CardDAV returned malformed XML: {error}")))?;
+    Ok(document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "address-data")
+        .filter_map(|node| node.text())
+        .map(str::trim)
+        .filter(|value| value.starts_with("BEGIN:VCARD") && value.len() <= 5 * 1024 * 1024)
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+async fn carddav_request(
+    http: &reqwest::Client,
+    headers: &std::collections::HashMap<String, String>,
+    method: &str,
+    url: reqwest::Url,
+    depth: &str,
+    body: &str,
+) -> Result<Vec<u8>, RpcError> {
+    trusted_carddav_url(url.as_str())?;
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|_| RpcError::native("invalid CardDAV HTTP method"))?;
+    let mut request = http
+        .request(method, url)
+        .header("content-type", "application/xml; charset=utf-8")
+        .header("depth", depth)
+        .body(body.to_string());
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let mut response = request.send().await.map_err(RpcError::native)?;
+    if response.status().as_u16() != 207 {
+        return Err(RpcError::native(format!(
+            "iCloud CardDAV returned HTTP {}",
+            response.status()
+        )));
+    }
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(RpcError::native(
+            "CardDAV response exceeded the 64 MiB limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(RpcError::native)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(RpcError::native(
+                "CardDAV response exceeded the 64 MiB limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn sync_icloud_contacts(client: &Client) -> Result<Vec<String>, RpcError> {
+    let base = client
+        .get_contacts_url()
+        .await
+        .map_err(RpcError::native)?
+        .ok_or_else(|| {
+            RpcError::invalid_state("this Apple account did not provide an iCloud Contacts URL")
+        })?;
+    let mut base = trusted_carddav_url(&base)?;
+    if !base.path().ends_with('/') {
+        let normalized = format!("{}/", base.path());
+        base.set_path(&normalized);
+    }
+    let headers = client
+        .get_icloud_auth_headers()
+        .await
+        .map_err(RpcError::native)?
+        .ok_or_else(|| RpcError::invalid_state("iCloud Contacts authentication is unavailable"))?;
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(RpcError::native)?;
+
+    let principal_xml = carddav_request(
+        &http,
+        &headers,
+        "PROPFIND",
+        base.clone(),
+        "0",
+        r#"<?xml version="1.0" encoding="UTF-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"#,
+    )
+    .await?;
+    let principal = resolve_carddav_href(
+        &base,
+        &xml_property_href(&principal_xml, "current-user-principal")?,
+    )?;
+    let home_xml = carddav_request(
+        &http,
+        &headers,
+        "PROPFIND",
+        principal.clone(),
+        "0",
+        r#"<?xml version="1.0" encoding="UTF-8"?><d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><card:addressbook-home-set/></d:prop></d:propfind>"#,
+    )
+    .await?;
+    let home = resolve_carddav_href(
+        &principal,
+        &xml_property_href(&home_xml, "addressbook-home-set")?,
+    )?;
+    let books_xml = carddav_request(
+        &http,
+        &headers,
+        "PROPFIND",
+        home.clone(),
+        "1",
+        r#"<?xml version="1.0" encoding="UTF-8"?><d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:resourcetype/><d:displayname/></d:prop></d:propfind>"#,
+    )
+    .await?;
+    let books = xml_address_books(&books_xml)?;
+    if books.is_empty() {
+        return Err(RpcError::native("iCloud CardDAV returned no address books"));
+    }
+
+    let mut vcards = Vec::new();
+    for href in books.into_iter().take(32) {
+        let book = resolve_carddav_href(&home, &href)?;
+        let report = carddav_request(
+            &http,
+            &headers,
+            "REPORT",
+            book,
+            "1",
+            r#"<?xml version="1.0" encoding="UTF-8"?><card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><card:address-data/></d:prop></card:addressbook-query>"#,
+        )
+        .await?;
+        vcards.extend(xml_vcards(&report)?);
+        if vcards.len() > 100_000 {
+            return Err(RpcError::native(
+                "iCloud Contacts exceeded the 100000-contact limit",
+            ));
+        }
+    }
+    Ok(vcards)
 }
 
 const REQUIRED_REGISTRATION_SERVICES: [&str; 4] = [
@@ -924,10 +1349,13 @@ fn key_material_available(alias: &str) -> bool {
 /// and public-certificate/state fingerprints.
 fn inspect_registration(serialized: &str) -> Result<Value, RpcError> {
     if serialized.trim().is_empty() {
-        return Err(RpcError::invalid_params("users must contain a saved IDS registration"));
+        return Err(RpcError::invalid_params(
+            "users must contain a saved IDS registration",
+        ));
     }
-    let users: Vec<rustpush::IDSUser> = plist_from_string(serialized)
-        .map_err(|error| RpcError::invalid_params(format!("saved IDS registration is invalid: {error}")))?;
+    let users: Vec<rustpush::IDSUser> = plist_from_string(serialized).map_err(|error| {
+        RpcError::invalid_params(format!("saved IDS registration is invalid: {error}"))
+    })?;
     let mut sending_handles = std::collections::BTreeSet::new();
     let mut warnings = Vec::new();
     let mut all_key_material_available = !users.is_empty();
@@ -943,7 +1371,10 @@ fn inspect_registration(serialized: &str) -> Result<Value, RpcError> {
         let auth_key_available = key_material_available(&user.auth_keypair.private.0);
         all_key_material_available &= auth_key_available;
         if !auth_key_available {
-            warnings.push(format!("user {} is missing its local IDS authentication private key", user_index + 1));
+            warnings.push(format!(
+                "user {} is missing its local IDS authentication private key",
+                user_index + 1
+            ));
         }
 
         let missing_services = REQUIRED_REGISTRATION_SERVICES
@@ -1013,7 +1444,10 @@ fn inspect_registration(serialized: &str) -> Result<Value, RpcError> {
         }
 
         if !user.registration.contains_key("com.apple.madrid") {
-            warnings.push(format!("user {} has no iMessage (com.apple.madrid) registration", user_index + 1));
+            warnings.push(format!(
+                "user {} has no iMessage (com.apple.madrid) registration",
+                user_index + 1
+            ));
         }
         user_rows.push(json!({
             "userIndex": user_index + 1,
@@ -1059,6 +1493,7 @@ struct Engine {
     account: Option<AccountState>,
     login_session: Option<Arc<LoginSession>>,
     client: Option<Arc<Client>>,
+    statuskit_initialized: bool,
     state_dir: PathBuf,
     credential_service: String,
     credential_backend: CredentialBackend,
@@ -1068,7 +1503,8 @@ impl Engine {
     fn new(emitter: Emitter, state_dir: &Path) -> Result<Self, RpcError> {
         let credential_service =
             load_or_create_credential_service(state_dir).map_err(RpcError::native)?;
-        let credential_backend = CredentialBackend::from_environment(state_dir).map_err(RpcError::native)?;
+        let credential_backend =
+            CredentialBackend::from_environment(state_dir).map_err(RpcError::native)?;
         Ok(Self {
             emitter,
             config: None,
@@ -1079,6 +1515,7 @@ impl Engine {
             account: None,
             login_session: None,
             client: None,
+            statuskit_initialized: false,
             state_dir: state_dir.to_path_buf(),
             credential_service,
             credential_backend,
@@ -1086,13 +1523,16 @@ impl Engine {
     }
 
     fn load_account_secret(&self) -> Result<Option<AccountState>, RpcError> {
-        let Some(value) = self.credential_backend
+        let Some(value) = self
+            .credential_backend
             .load(&self.credential_service)
-            .map_err(RpcError::native)? else {
-                return Ok(None);
-            };
-        let mut account: AccountState = serde_json::from_slice(&value)
-            .map_err(|error| RpcError::native(format!("invalid iBlue credential entry: {error}")))?;
+            .map_err(RpcError::native)?
+        else {
+            return Ok(None);
+        };
+        let mut account: AccountState = serde_json::from_slice(&value).map_err(|error| {
+            RpcError::native(format!("invalid iBlue credential entry: {error}"))
+        })?;
 
         // Version-0 encrypted records did not persist the PET expiry. If such
         // a record was just written by a successful interactive login, migrate
@@ -1105,8 +1545,12 @@ impl Engine {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            if let Some(modified_at_ms) = self.credential_backend.modified_at_ms()
-                .filter(|modified_at_ms| now_ms.saturating_sub(*modified_at_ms) <= RECENT_LOGIN_WINDOW_MS)
+            if let Some(modified_at_ms) =
+                self.credential_backend
+                    .modified_at_ms()
+                    .filter(|modified_at_ms| {
+                        now_ms.saturating_sub(*modified_at_ms) <= RECENT_LOGIN_WINDOW_MS
+                    })
             {
                 account.pet_expires_at_ms = modified_at_ms + MIGRATED_PET_LIFETIME_MS;
                 self.store_account_secret(&account)?;
@@ -1158,6 +1602,20 @@ impl Engine {
             .into_iter()
             .next()
             .ok_or_else(|| RpcError::invalid_state("the account has no registered sending handle"))
+    }
+
+    async fn ensure_statuskit(&mut self) -> Result<Arc<Client>, RpcError> {
+        let client = self.client()?;
+        if !self.statuskit_initialized {
+            client
+                .init_statuskit(Box::new(NativeStatusCallback {
+                    emitter: self.emitter.clone(),
+                }))
+                .await
+                .map_err(RpcError::native)?;
+            self.statuskit_initialized = true;
+        }
+        Ok(client)
     }
 
     async fn snapshot(&self) -> Result<Value, RpcError> {
@@ -1289,9 +1747,10 @@ impl Engine {
                 }))
             }
             "icloud.web.status" => {
-                let account = self.account.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("profile is not logged in")
-                })?;
+                let account = self
+                    .account
+                    .as_ref()
+                    .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                 let status = account
                     .icloud_web_session
                     .as_ref()
@@ -1300,9 +1759,10 @@ impl Engine {
                 serde_json::to_value(status).map_err(RpcError::native)
             }
             "icloud.web.login.start" => {
-                let account = self.account.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("profile is not logged in")
-                })?;
+                let account = self
+                    .account
+                    .as_ref()
+                    .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                 let username = account.username.clone();
                 let hashed_password_hex = account.hashed_password_hex.clone();
                 let mut web = account.icloud_web_session.clone().unwrap_or_default();
@@ -1311,9 +1771,10 @@ impl Engine {
                     .await
                     .map_err(RpcError::native)?;
                 let persisted = {
-                    let account = self.account.as_mut().ok_or_else(|| {
-                        RpcError::invalid_state("profile is not logged in")
-                    })?;
+                    let account = self
+                        .account
+                        .as_mut()
+                        .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                     account.icloud_web_session = Some(web);
                     account.clone()
                 };
@@ -1330,9 +1791,10 @@ impl Engine {
                     })?;
                 let phones = web.phone_options().await.map_err(RpcError::native)?;
                 let persisted = {
-                    let account = self.account.as_mut().ok_or_else(|| {
-                        RpcError::invalid_state("profile is not logged in")
-                    })?;
+                    let account = self
+                        .account
+                        .as_mut()
+                        .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                     account.icloud_web_session = Some(web);
                     account.clone()
                 };
@@ -1353,9 +1815,10 @@ impl Engine {
                     .await
                     .map_err(RpcError::native)?;
                 let persisted = {
-                    let account = self.account.as_mut().ok_or_else(|| {
-                        RpcError::invalid_state("profile is not logged in")
-                    })?;
+                    let account = self
+                        .account
+                        .as_mut()
+                        .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                     account.icloud_web_session = Some(web);
                     account.clone()
                 };
@@ -1378,9 +1841,10 @@ impl Engine {
                     .await
                     .map_err(RpcError::native)?;
                 let persisted = {
-                    let account = self.account.as_mut().ok_or_else(|| {
-                        RpcError::invalid_state("profile is not logged in")
-                    })?;
+                    let account = self
+                        .account
+                        .as_mut()
+                        .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                     account.icloud_web_session = Some(web);
                     account.clone()
                 };
@@ -1399,9 +1863,10 @@ impl Engine {
                     })?;
                 let result = web.prepare_photos().await;
                 let persisted = {
-                    let account = self.account.as_mut().ok_or_else(|| {
-                        RpcError::invalid_state("profile is not logged in")
-                    })?;
+                    let account = self
+                        .account
+                        .as_mut()
+                        .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                     account.icloud_web_session = Some(web);
                     account.clone()
                 };
@@ -1412,9 +1877,10 @@ impl Engine {
             "icloud.photos.share.create" => {
                 let params: ICloudPhotoShareCreateParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-                let account = self.account.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("profile is not logged in")
-                })?;
+                let account = self
+                    .account
+                    .as_ref()
+                    .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                 let dsid = account.dsid.clone();
                 let mut web = account.icloud_web_session.clone().ok_or_else(|| {
                     RpcError::invalid_state(
@@ -1432,19 +1898,28 @@ impl Engine {
                     .await
                     .map_err(RpcError::native)?;
                 let persisted = {
-                    let account = self.account.as_mut().ok_or_else(|| {
-                        RpcError::invalid_state("profile is not logged in")
-                    })?;
+                    let account = self
+                        .account
+                        .as_mut()
+                        .ok_or_else(|| RpcError::invalid_state("profile is not logged in"))?;
                     account.icloud_web_session = Some(web);
                     account.clone()
                 };
                 self.store_account_secret(&persisted)?;
                 serde_json::to_value(share).map_err(RpcError::native)
             }
+            "icloud.contacts.sync" => {
+                let vcards = sync_icloud_contacts(self.client()?.as_ref()).await?;
+                Ok(json!({
+                    "vcards": vcards,
+                    "syncedAt": current_timestamp_ms(),
+                }))
+            }
             "account.keychain.devices" => {
-                let token_provider = self.token_provider.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("there is no loaded Apple account")
-                })?;
+                let token_provider = self
+                    .token_provider
+                    .as_ref()
+                    .ok_or_else(|| RpcError::invalid_state("there is no loaded Apple account"))?;
                 let devices = token_provider
                     .get_escrow_devices()
                     .await
@@ -1463,13 +1938,16 @@ impl Engine {
                 if params.passcode.is_empty() {
                     return Err(RpcError::invalid_params("passcode must not be empty"));
                 }
-                let token_provider = self.token_provider.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("there is no loaded Apple account")
-                })?;
+                let token_provider = self
+                    .token_provider
+                    .as_ref()
+                    .ok_or_else(|| RpcError::invalid_state("there is no loaded Apple account"))?;
                 let result = match params.device_index {
-                    Some(device_index) => token_provider
-                        .join_keychain_clique_for_device(params.passcode, device_index)
-                        .await,
+                    Some(device_index) => {
+                        token_provider
+                            .join_keychain_clique_for_device(params.passcode, device_index)
+                            .await
+                    }
                     None => token_provider.join_keychain_clique(params.passcode).await,
                 }
                 .map_err(RpcError::native)?;
@@ -1496,9 +1974,10 @@ impl Engine {
                 Ok(json!({ "needs2fa": needs_2fa, "challenge": challenge }))
             }
             "account.login.2fa.options" => {
-                let session = self.login_session.clone().ok_or_else(|| {
-                    RpcError::invalid_state("there is no active login session")
-                })?;
+                let session = self
+                    .login_session
+                    .clone()
+                    .ok_or_else(|| RpcError::invalid_state("there is no active login session"))?;
                 let options = session
                     .two_factor_phone_options()
                     .await
@@ -1513,9 +1992,10 @@ impl Engine {
             "account.login.2fa.requestSms" => {
                 let params: TwoFactorSmsParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-                let session = self.login_session.clone().ok_or_else(|| {
-                    RpcError::invalid_state("there is no active login session")
-                })?;
+                let session = self
+                    .login_session
+                    .clone()
+                    .ok_or_else(|| RpcError::invalid_state("there is no active login session"))?;
                 let sent = session
                     .request_sms_2fa(params.phone_id)
                     .await
@@ -1525,9 +2005,10 @@ impl Engine {
             "account.login.submit2fa" => {
                 let params: TwoFactorParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-                let session = self.login_session.clone().ok_or_else(|| {
-                    RpcError::invalid_state("there is no active login session")
-                })?;
+                let session = self
+                    .login_session
+                    .clone()
+                    .ok_or_else(|| RpcError::invalid_state("there is no active login session"))?;
                 let accepted = session
                     .submit_2fa(params.code)
                     .await
@@ -1535,9 +2016,10 @@ impl Engine {
                 Ok(json!({ "accepted": accepted }))
             }
             "account.login.finish" => {
-                let session = self.login_session.clone().ok_or_else(|| {
-                    RpcError::invalid_state("there is no active login session")
-                })?;
+                let session = self
+                    .login_session
+                    .clone()
+                    .ok_or_else(|| RpcError::invalid_state("there is no active login session"))?;
                 // Generate the IDS identity once and keep it in Engine even if
                 // Apple returns a retryable registration error. Recreating it
                 // on every account.login.finish retry looks like another device
@@ -1565,9 +2047,10 @@ impl Engine {
                 self.identity = Some(result.identity);
                 self.token_provider = result.token_provider;
                 let existing_web_session = self.account.as_ref().and_then(|account| {
-                    account.icloud_web_session.clone().map(|web| {
-                        (account.username.clone(), account.dsid.clone(), web)
-                    })
+                    account
+                        .icloud_web_session
+                        .clone()
+                        .map(|web| (account.username.clone(), account.dsid.clone(), web))
                 });
                 self.account = result.account_persist.map(AccountState::from);
                 if let (Some(account), Some((username, dsid, web))) =
@@ -1593,6 +2076,7 @@ impl Engine {
                 if let Some(client) = self.client.take() {
                     client.stop().await;
                 }
+                self.statuskit_initialized = false;
                 if params.deregister {
                     deregister_account(
                         self.config()?.as_ref(),
@@ -1624,13 +2108,13 @@ impl Engine {
                 let params: CredentialMigrationParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
                 let account = self.account.as_ref().ok_or_else(|| {
-                    RpcError::invalid_state("there is no loaded Apple account credential to migrate")
+                    RpcError::invalid_state(
+                        "there is no loaded Apple account credential to migrate",
+                    )
                 })?;
-                let target = CredentialBackend::from_key_path(
-                    &self.state_dir,
-                    Path::new(&params.key_path),
-                )
-                .map_err(RpcError::native)?;
+                let target =
+                    CredentialBackend::from_key_path(&self.state_dir, Path::new(&params.key_path))
+                        .map_err(RpcError::native)?;
                 let value = serde_json::to_vec(account).map_err(RpcError::native)?;
                 target
                     .store(&self.credential_service, &value)
@@ -1721,6 +2205,148 @@ impl Engine {
                     .await
                     .map_err(RpcError::native)?;
                 Ok(json!({ "guid": guid }))
+            }
+            "message.component.send" => {
+                let params: SendComponentParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let sender = self.sender(params.from)?;
+                let icon = match params.icon_path {
+                    Some(path) => {
+                        let metadata =
+                            tokio::fs::metadata(&path).await.map_err(RpcError::native)?;
+                        if !metadata.is_file() || metadata.len() == 0 {
+                            return Err(RpcError::invalid_params(
+                                "component icon is empty or is not a regular file",
+                            ));
+                        }
+                        if metadata.len() > 2 * 1024 * 1024 {
+                            return Err(RpcError::invalid_params("component icon exceeds 2 MiB"));
+                        }
+                        Some(tokio::fs::read(path).await.map_err(RpcError::native)?)
+                    }
+                    None => None,
+                };
+                let guid = self
+                    .client()?
+                    .send_component(
+                        params.conversation.into(),
+                        WrappedComponentEnvelope {
+                            app_name: params.app_name,
+                            app_id: params.app_id,
+                            bundle_id: params.bundle_id,
+                            url: params.url,
+                            session_id: params.session_id,
+                            is_live: params.is_live,
+                            ld_text: params.ld_text,
+                            image_title: params.image_title,
+                            image_subtitle: params.image_subtitle,
+                            caption: params.caption,
+                            subcaption: params.subcaption,
+                            secondary_subcaption: params.secondary_subcaption,
+                            tertiary_subcaption: params.tertiary_subcaption,
+                            icon,
+                        },
+                        params.text,
+                        params.subject,
+                        sender,
+                        params.reply_guid,
+                        params.reply_part,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({ "guid": guid }))
+            }
+            "conversation.background.set" => {
+                let params: ConversationBackgroundParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let sender = self.sender(params.from)?;
+                let image = match params.path {
+                    Some(path) => {
+                        let metadata =
+                            tokio::fs::metadata(&path).await.map_err(RpcError::native)?;
+                        if !metadata.is_file() || metadata.len() == 0 {
+                            return Err(RpcError::invalid_params(
+                                "background image is empty or is not a regular file",
+                            ));
+                        }
+                        if metadata.len() > 50 * 1024 * 1024 {
+                            return Err(RpcError::invalid_params(
+                                "background image exceeds 50 MiB",
+                            ));
+                        }
+                        Some(tokio::fs::read(path).await.map_err(RpcError::native)?)
+                    }
+                    None => None,
+                };
+                let guid = self
+                    .client()?
+                    .send_set_transcript_background(
+                        params.conversation.into(),
+                        params.group_version,
+                        image,
+                        params.preset,
+                        sender,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({ "guid": guid }))
+            }
+            "cloud.sync.chats" => {
+                let params: CloudSyncParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let page = self
+                    .client()?
+                    .cloud_sync_chats(params.continuation_token)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(cloud_chats_page_to_json(page))
+            }
+            "cloud.sync.messages" => {
+                let params: CloudSyncParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let page = self
+                    .client()?
+                    .cloud_sync_messages(params.continuation_token)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(cloud_messages_page_to_json(page))
+            }
+            "cloud.sync.attachments" => {
+                let params: CloudSyncParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let page = self
+                    .client()?
+                    .cloud_sync_attachments(params.continuation_token)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(cloud_attachments_page_to_json(page))
+            }
+            "focus.subscribe" => {
+                let params: FocusSubscribeParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let client = self.ensure_statuskit().await?;
+                if !params.handles.is_empty() {
+                    client
+                        .get_statuskit_client()
+                        .await
+                        .map_err(RpcError::native)?
+                        .request_handles(params.handles.clone())
+                        .await;
+                }
+                Ok(json!({ "subscribed": params.handles }))
+            }
+            "focus.share" => {
+                let params: FocusShareParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let client = self.ensure_statuskit().await?;
+                client
+                    .get_statuskit_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .share_status(params.active, params.mode)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({ "shared": true }))
             }
             "message.multipart.send" => {
                 let params: SendMultipartMessageParams = serde_json::from_value(params)
@@ -1815,13 +2441,15 @@ impl Engine {
                             )
                             .await
                     }
-                    None => client
-                        .send_icon_clear(
-                            params.conversation.into(),
-                            params.group_version,
-                            sender,
-                        )
-                        .await,
+                    None => {
+                        client
+                            .send_icon_clear(
+                                params.conversation.into(),
+                                params.group_version,
+                                sender,
+                            )
+                            .await
+                    }
                 }
                 .map_err(RpcError::native)?;
                 Ok(json!({ "guid": guid }))
@@ -1864,7 +2492,9 @@ impl Engine {
                 let params: SendStickerReactionParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
                 let sender = self.sender(params.from)?;
-                let data = tokio::fs::read(&params.path).await.map_err(RpcError::native)?;
+                let data = tokio::fs::read(&params.path)
+                    .await
+                    .map_err(RpcError::native)?;
                 let filename = params.filename.unwrap_or_else(|| {
                     std::path::Path::new(&params.path)
                         .file_name()
@@ -2007,13 +2637,15 @@ impl Engine {
                 let targets = report
                     .targets
                     .iter()
-                    .map(|target| json!({
-                        "address": target.address,
-                        "cacheEntryFresh": target.cache_entry_fresh,
-                        "responseEntryReturned": target.response_entry_returned,
-                        "identityCount": target.identity_count,
-                        "correlationIdentifierPresent": target.correlation_identifier_present,
-                    }))
+                    .map(|target| {
+                        json!({
+                            "address": target.address,
+                            "cacheEntryFresh": target.cache_entry_fresh,
+                            "responseEntryReturned": target.response_entry_returned,
+                            "identityCount": target.identity_count,
+                            "correlationIdentifierPresent": target.correlation_identifier_present,
+                        })
+                    })
                     .collect::<Vec<_>>();
                 Ok(json!({
                     "available": available,
@@ -2266,6 +2898,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn carddav_urls_are_limited_to_apple_https_endpoints() {
+        assert!(trusted_carddav_url("https://p01-contacts.icloud.com/123/carddavhome/").is_ok());
+        assert!(trusted_carddav_url("https://contacts.icloud.com.cn/carddav/").is_ok());
+        assert!(trusted_carddav_url("http://contacts.icloud.com/carddav/").is_err());
+        assert!(trusted_carddav_url("https://icloud.com.evil.invalid/carddav/").is_err());
+        assert!(trusted_carddav_url("https://user@contacts.icloud.com/carddav/").is_err());
+        assert!(trusted_carddav_url("https://contacts.icloud.com:444/carddav/").is_err());
+    }
+
+    #[test]
+    fn carddav_xml_extracts_address_books_and_vcards() {
+        let response = br#"<?xml version="1.0"?>
+          <d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+            <d:response><d:href>/123/carddavhome/card/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><card:addressbook/></d:resourcetype></d:prop></d:propstat></d:response>
+            <d:response><d:href>/123/carddavhome/not-a-book/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
+          </d:multistatus>"#;
+        assert_eq!(
+            xml_address_books(response).expect("parse address books"),
+            vec!["/123/carddavhome/card/"]
+        );
+
+        let cards = br#"<?xml version="1.0"?>
+          <d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+            <d:response><d:propstat><d:prop><card:address-data>BEGIN:VCARD&#13;
+VERSION:3.0&#13;
+FN:Example Person&#13;
+END:VCARD</card:address-data></d:prop></d:propstat></d:response>
+          </d:multistatus>"#;
+        let parsed = xml_vcards(cards).expect("parse vCards");
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].contains("FN:Example Person"));
+    }
+
+    #[test]
     fn credential_service_is_stable_opaque_and_profile_scoped() {
         let first = credential_service_for_state_dir(Path::new("/profiles/first/native"));
         let first_again = credential_service_for_state_dir(Path::new("/profiles/first/native"));
@@ -2293,7 +2959,10 @@ mod tests {
 
         let original_service =
             load_or_create_credential_service(&original).expect("create credential service");
-        assert_eq!(original_service, credential_service_for_state_dir(&original));
+        assert_eq!(
+            original_service,
+            credential_service_for_state_dir(&original)
+        );
         let service_path = original.join(CREDENTIAL_SERVICE_FILE);
         assert_eq!(
             std::fs::read_to_string(&service_path)
@@ -2341,10 +3010,8 @@ mod tests {
 
     #[test]
     fn encrypted_credential_backend_round_trips_and_authenticates() {
-        let root = std::env::temp_dir().join(format!(
-            "iblue-credential-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("iblue-credential-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test directory");
         let path = root.join("credentials.enc");
         let key_path = root.join("credential.key");
@@ -2354,7 +3021,9 @@ mod tests {
         assert_eq!(backend.name(), "encrypted-file");
         let secret = br#"{"username":"secondary@example.com","pet":"not-plaintext-on-disk"}"#;
 
-        backend.store("app.iblue.test", secret).expect("store secret");
+        backend
+            .store("app.iblue.test", secret)
+            .expect("store secret");
         let encrypted = std::fs::read(&path).expect("read encrypted file");
         assert!(!encrypted
             .windows(secret.len())
@@ -2401,12 +3070,12 @@ mod tests {
 
         backend.delete("app.iblue.test").expect("delete secret");
         assert_eq!(
-            backend
-                .load("app.iblue.test")
-                .expect("load deleted secret"),
+            backend.load("app.iblue.test").expect("load deleted secret"),
             None
         );
-        backend.delete("app.iblue.test").expect("delete missing secret");
+        backend
+            .delete("app.iblue.test")
+            .expect("delete missing secret");
         std::fs::remove_dir_all(root).expect("remove test directory");
     }
 
@@ -2532,7 +3201,10 @@ mod tests {
         assert_eq!(encoded["sharedProfile"]["displayName"], "Jane Example");
         assert_eq!(encoded["sharedProfile"]["avatarBase64"], "AQID");
         assert_eq!(encoded["appBalloon"]["isLive"], true);
-        assert_eq!(encoded["appBalloon"]["bundleId"], "com.apple.Maps.MessagesExtension");
+        assert_eq!(
+            encoded["appBalloon"]["bundleId"],
+            "com.apple.Maps.MessagesExtension"
+        );
         assert!(encoded["sharedProfile"].get("recordKey").is_none());
     }
 

@@ -251,12 +251,12 @@ var cmdFaceTimeRemoveMembers = &commands.FullHandler{
 // the binding incomplete and causes peer's UI to attribute media to the
 // bridge's IDS endpoint rather than the webview pseud.
 const (
-	ftLinkUsageNext             = "next"              // pre-minted outbound
-	ftLinkUsageCurrent          = "current"           // in-flight outbound
-	ftLinkUsageCurrentOld       = "current-old"       // prior outbound
-	ftLinkUsageNextIncomingCall = "nextincomingcall"  // pre-minted inbound
-	ftLinkUsageIncomingCall     = "incomingcall"      // in-flight inbound
-	ftLinkUsageIncomingCallOld  = "incomingcall-old"  // prior inbound
+	ftLinkUsageNext             = "next"             // pre-minted outbound
+	ftLinkUsageCurrent          = "current"          // in-flight outbound
+	ftLinkUsageCurrentOld       = "current-old"      // prior outbound
+	ftLinkUsageNextIncomingCall = "nextincomingcall" // pre-minted inbound
+	ftLinkUsageIncomingCall     = "incomingcall"     // in-flight inbound
+	ftLinkUsageIncomingCallOld  = "incomingcall-old" // prior inbound
 )
 
 // armBridgeFaceTimeCall does the Rust-side dance shared by the outbound
@@ -556,7 +556,9 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 	_ = sessionID
 
 	bare := stripIdentifierPrefix(target)
-	if g, _ := ce.Bridge.GetGhostByID(ce.Ctx, networkid.UserID(target)); g != nil && g.Name != "" { bare = g.Name }
+	if g, _ := ce.Bridge.GetGhostByID(ce.Ctx, networkid.UserID(target)); g != nil && g.Name != "" {
+		bare = g.Name
+	}
 
 	// One URL for everyone. facetime.apple.com is an Apple Universal Link:
 	// iOS / macOS intercept the domain and hand the URL off to the FaceTime
@@ -630,7 +632,7 @@ func fnFaceTimeSend(ce *commands.Event) {
 	link = appendFaceTimeLinkName(link, client.resolveFaceTimeDisplayName(ce.Ctx))
 
 	conv := client.portalToConversation(ce.Portal)
-	if _, sendErr := client.client.SendMessage(conv, link, nil, client.handle, nil, nil, nil); sendErr != nil {
+	if _, sendErr := client.client.SendMessage(conv, link, nil, nil, nil, client.handle, nil, nil, nil); sendErr != nil {
 		recipient := stripIdentifierPrefix(string(ce.Portal.ID))
 		if isLikelyDeliveredSendTimeout(sendErr) {
 			ce.Reply("FaceTime link send timed out waiting for Apple ACK, but it may have already delivered to **%s**.\n\nCheck with them before retrying to avoid duplicates.", recipient)

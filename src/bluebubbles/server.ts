@@ -48,6 +48,10 @@ import {
   iCloudSharePresentation,
   publicICloudShare,
 } from "./icloud-share.js";
+import {
+  IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS,
+  isBuiltinConversationBackgroundPreset,
+} from "./backgrounds.js";
 
 const WEBHOOK_EVENTS = new Set([
   "*",
@@ -68,6 +72,12 @@ const WEBHOOK_EVENTS = new Set([
   "imessage-alias-removed",
   "imessage-aliases-removed",
   "iblue-contact-updated",
+  "iblue-contacts-synced",
+  "iblue-focus-updated",
+  "iblue-focus-keys-received",
+  "iblue-focus-reshare-received",
+  "iblue-focus-decrypt-failed",
+  "iblue-conversation-background-changed",
   "scheduled-message-created",
   "scheduled-message-updated",
   "scheduled-message-deleted",
@@ -208,7 +218,7 @@ export class BlueBubblesServer {
         info: {
           title: "iBlue API",
           version: IBLUE_VERSION,
-          description: "BlueBubbles-compatible REST API with additive iBlue endpoints for contacts, live locations, message effects, polls, rich links, and iCloud Photos shares.",
+          description: "BlueBubbles-compatible REST API with additive iBlue endpoints for iCloud sync, contacts, Focus, live locations, message components, effects, backgrounds, polls, rich links, and iCloud Photos shares.",
         },
         tags: [
           { name: "Server", description: "Server health, metadata, and statistics." },
@@ -219,6 +229,8 @@ export class BlueBubblesServer {
           { name: "Contacts", description: "Stock BlueBubbles contact compatibility routes." },
           { name: "Webhooks", description: "Webhook registration and management." },
           { name: "iBlue Contacts", description: "Profile-local contact names, VCF data, and avatars." },
+          { name: "iBlue Cloud Sync", description: "Read-only paginated Messages in iCloud synchronization." },
+          { name: "iBlue Focus", description: "StatusKit Focus subscriptions and sharing." },
           { name: "iBlue Messages", description: "Message effects and rich app content." },
           { name: "iBlue Locations", description: "Static and live shared-location data." },
           { name: "iBlue Polls", description: "Native Messages polls and votes." },
@@ -408,6 +420,17 @@ export class BlueBubblesServer {
       if (!handle) return reply.code(404).send(notFound("Handle not found!"));
       return success(handle);
     });
+    this.app.get<{ Params: { guid: string } }>("/api/v1/handle/:guid/focus", async (request) => {
+      const handle = stripTransport(request.params.guid);
+      await this.service.subscribeFocus([handle]);
+      return success(this.service.focusForHandle(handle) ?? {
+        handle,
+        available: null,
+        mode: null,
+        updatedAt: null,
+        subscribed: true,
+      }, "Successfully subscribed to Focus status!");
+    });
     this.app.get<{ Querystring: Query }>("/api/v1/handle/availability/facetime", async (request) => {
       if (!request.query.address) throw new RequestError(400, "address is required", "VALIDATION_ERROR");
       // iBlue does not currently expose FaceTime calling. Return a real
@@ -443,8 +466,8 @@ export class BlueBubblesServer {
         ? body.addresses.filter((value): value is string => typeof value === "string")
         : undefined;
       const sources = Array.isArray(body.sources)
-        ? body.sources.filter((value): value is "profile-vcf" | "name-and-photo-sharing" =>
-          value === "profile-vcf" || value === "name-and-photo-sharing")
+        ? body.sources.filter((value): value is "profile-vcf" | "icloud-carddav" | "name-and-photo-sharing" =>
+          value === "profile-vcf" || value === "icloud-carddav" || value === "name-and-photo-sharing")
         : undefined;
       const offset = numberValue(body.offset, 0);
       const limit = numberValue(body.limit, 100);
@@ -461,6 +484,27 @@ export class BlueBubblesServer {
         limit,
         count: result.contacts.length,
       });
+    });
+    this.app.post("/api/v1/iblue/contact/icloud/sync", async () =>
+      success(await this.service.syncICloudContacts(), "Successfully synced iCloud Contacts!"));
+
+    this.app.post("/api/v1/iblue/focus/subscribe", async (request) => {
+      const body = asRecord(request.body);
+      const handles = Array.isArray(body.handles)
+        ? body.handles.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        : [];
+      if (handles.length === 0 || handles.length > 256) {
+        throw new RequestError(400, "handles must contain between 1 and 256 addresses", "VALIDATION_ERROR");
+      }
+      return success(await this.service.subscribeFocus(handles), "Successfully subscribed to Focus status!");
+    });
+    this.app.post("/api/v1/iblue/focus/share", async (request) => {
+      const body = asRecord(request.body);
+      if (typeof body.active !== "boolean") {
+        throw new RequestError(400, "active must be a boolean", "VALIDATION_ERROR");
+      }
+      const mode = typeof body.mode === "string" && body.mode.trim() ? body.mode.trim() : undefined;
+      return success(await this.service.shareFocus(body.active, mode), "Successfully shared Focus status!");
     });
     this.app.get("/api/v1/iblue/contact/vcf", async () =>
       success(await this.loadContactsVcf(), "Successfully retrieved profile VCF"));
@@ -526,6 +570,146 @@ export class BlueBubblesServer {
         ...(appleMusicPlayback ? { appleMusicPlayback } : {}),
       });
       return success(message, "Rich link sent!");
+    });
+
+    this.app.post("/api/v1/iblue/message/component", async (request) => {
+      const body = asRecord(request.body);
+      const bundleId = requiredString(body, "bundleId");
+      const url = requiredString(body, "url");
+      if (bundleId.length > 512 || url.length > 16 * 1024) {
+        throw new RequestError(400, "component bundleId or url is too long", "VALIDATION_ERROR");
+      }
+      let iconPath: string | undefined;
+      if (typeof body.iconAttachmentGuid === "string") {
+        const attachment = this.service.store.getAttachment(body.iconAttachmentGuid);
+        if (!attachment?.path) throw new RequestError(404, "Component icon attachment not found!", "NOT_FOUND");
+        iconPath = attachment.path;
+      }
+      const optional = (key: string): string | undefined =>
+        typeof body[key] === "string" ? body[key] as string : undefined;
+      const appId = typeof body.appId === "number" && Number.isSafeInteger(body.appId)
+        ? body.appId
+        : undefined;
+      const sessionId = optional("sessionId");
+      const ldText = optional("ldText");
+      const imageTitle = optional("imageTitle");
+      const imageSubtitle = optional("imageSubtitle");
+      const caption = optional("caption");
+      const subcaption = optional("subcaption");
+      const secondarySubcaption = optional("secondarySubcaption");
+      const tertiarySubcaption = optional("tertiarySubcaption");
+      // Messages extension bubbles use the object-replacement character when
+      // the caller does not provide a visible fallback body.
+      const text = optional("text") ?? "\ufffc";
+      const subject = optional("subject");
+      const replyGuid = optional("replyGuid");
+      const replyPart = optional("replyPart");
+      const message = await this.service.sendComponent({
+        chatGuid: requiredString(body, "chatGuid"),
+        bundleId,
+        appName: optional("appName") ?? "iBlue",
+        url,
+        ...(appId === undefined ? {} : { appId }),
+        ...(sessionId ? { sessionId } : {}),
+        isLive: body.isLive === true,
+        ...(ldText ? { ldText } : {}),
+        ...(imageTitle ? { imageTitle } : {}),
+        ...(imageSubtitle ? { imageSubtitle } : {}),
+        ...(caption ? { caption } : {}),
+        ...(subcaption ? { subcaption } : {}),
+        ...(secondarySubcaption ? { secondarySubcaption } : {}),
+        ...(tertiarySubcaption ? { tertiarySubcaption } : {}),
+        ...(iconPath ? { iconPath } : {}),
+        text,
+        ...(subject ? { subject } : {}),
+        ...(replyGuid ? { replyGuid } : {}),
+        ...(replyPart ? { replyPart } : {}),
+      });
+      return success(message, "iMessage component sent!");
+    });
+
+    for (const kind of ["chats", "messages", "attachments"] as const) {
+      this.app.post(`/api/v1/iblue/cloud/messages/${kind}/sync`, async (request) => {
+        const body = asRecord(request.body);
+        const token = typeof body.continuationToken === "string" ? body.continuationToken : undefined;
+        const page = kind === "chats"
+          ? await this.service.syncCloudChats(token)
+          : kind === "messages"
+            ? await this.service.syncCloudMessages(token)
+            : await this.service.syncCloudAttachments(token);
+        return success(page, `Successfully synced Messages in iCloud ${kind} page!`);
+      });
+    }
+
+    this.app.get<{ Params: { guid: string } }>("/api/v1/iblue/chat/:guid/background", async (request, reply) => {
+      const background = this.service.store.getConversationBackground(request.params.guid);
+      if (!background) return reply.code(404).send(notFound("Conversation background not found!"));
+      return success(background, "Successfully fetched conversation background!");
+    });
+    this.app.get("/api/v1/iblue/background/presets", async () =>
+      success(
+        IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS,
+        "Successfully fetched built-in conversation backgrounds!",
+      ));
+    this.app.post<{ Params: { guid: string } }>("/api/v1/iblue/chat/:guid/background", async (request) => {
+      const body = asRecord(request.body);
+      const remove = body.remove === true;
+      const preset = body.preset === undefined ? undefined : requiredString(body, "preset");
+      const hasAttachment = typeof body.attachment === "string";
+      const hasAttachmentGuid = typeof body.attachmentGuid === "string";
+      if (remove && (preset || hasAttachment || hasAttachmentGuid)) {
+        throw new RequestError(
+          400,
+          "remove cannot be combined with a background image or preset",
+          "VALIDATION_ERROR",
+        );
+      }
+      if (preset && (hasAttachment || hasAttachmentGuid)) {
+        throw new RequestError(
+          400,
+          "A conversation background cannot be both a photo and a built-in preset",
+          "VALIDATION_ERROR",
+        );
+      }
+      if (preset && !isBuiltinConversationBackgroundPreset(preset)) {
+        throw new RequestError(400, `Unknown built-in conversation background preset: ${preset}`, "VALIDATION_ERROR");
+      }
+      let path: string | undefined;
+      let stagedDirectory: string | undefined;
+      if (!remove && !preset) {
+        if (typeof body.attachment === "string") {
+          const staged = this.resolveMultipartUpload(body.attachment);
+          const info = await stat(staged.path).catch(() => undefined);
+          if (!info?.isFile() || info.size === 0) {
+            throw new RequestError(404, "Staged background attachment not found!", "NOT_FOUND");
+          }
+          if (!mimeForFilename(basename(staged.path)).startsWith("image/")) {
+            throw new RequestError(400, "Conversation backgrounds require an image attachment", "VALIDATION_ERROR");
+          }
+          path = staged.path;
+          stagedDirectory = staged.directory;
+        } else {
+          const attachmentGuid = requiredString(body, "attachmentGuid");
+          const attachment = this.service.store.getAttachment(attachmentGuid);
+          if (!attachment?.path) throw new RequestError(404, "Background attachment not found!", "NOT_FOUND");
+          if (!attachment.response.mimeType.startsWith("image/")) {
+            throw new RequestError(400, "Conversation backgrounds require an image attachment", "VALIDATION_ERROR");
+          }
+          path = attachment.path;
+        }
+      }
+      try {
+        return success(
+          await this.service.setConversationBackground({
+            chatGuid: request.params.guid,
+            ...(path ? { path } : {}),
+            ...(preset ? { preset } : {}),
+          }),
+          remove ? "Conversation background removed!" : "Conversation background changed!",
+        );
+      } finally {
+        if (stagedDirectory) await rm(stagedDirectory, { recursive: true, force: true });
+      }
     });
 
     this.app.get<{ Params: { messageGuid: string } }>(
@@ -596,21 +780,25 @@ export class BlueBubblesServer {
 
     this.app.post("/api/v1/iblue/icloud-share/create", async (request) => {
       const file = await request.file();
-      if (!file || file.fieldname !== "photo") {
-        throw new RequestError(400, "JPEG photo not provided or was empty!", "VALIDATION_ERROR");
+      if (!file || !["photo", "media"].includes(file.fieldname)) {
+        throw new RequestError(400, "Photos media not provided or was empty!", "VALIDATION_ERROR");
       }
       const chatGuid = multipartField(file, "chatGuid");
       if (!chatGuid) throw new RequestError(400, "chatGuid is required", "VALIDATION_ERROR");
       const filename = safeAttachmentName(file.filename || "photo.jpg");
       const mimeType = file.mimetype || mimeForFilename(filename);
-      if (mimeType !== "image/jpeg") {
-        throw new RequestError(400, "Fresh iCloud Photos shares currently require a JPEG photo", "VALIDATION_ERROR");
+      if (!["image/jpeg", "image/png", "image/gif", "image/heic", "image/heif", "video/quicktime", "video/mp4"].includes(mimeType)) {
+        throw new RequestError(
+          400,
+          "Fresh iCloud Photos shares require JPEG, PNG, GIF, HEIC/HEIF, MOV, or MP4 media",
+          "VALIDATION_ERROR",
+        );
       }
       const directory = await mkdtemp(join(tmpdir(), "iblue-icloud-photo-share-"));
       const path = join(directory, filename);
       try {
         if (await saveMultipartFile(file, path) === 0) {
-          throw new RequestError(400, "JPEG photo not provided or was empty!", "VALIDATION_ERROR");
+          throw new RequestError(400, "Photos media not provided or was empty!", "VALIDATION_ERROR");
         }
         const created = await this.service.createICloudPhotoShare({
           chatGuid,
@@ -1851,6 +2039,9 @@ export class BlueBubblesServer {
         blueBubblesCommit: BLUEBUBBLES_COMPAT_COMMIT,
         extensions: {
           contacts: "/api/v1/iblue/contact",
+          icloudContactsSync: "/api/v1/iblue/contact/icloud/sync",
+          focus: "/api/v1/handle/:guid/focus",
+          messagesInICloud: "/api/v1/iblue/cloud/messages/messages/sync",
           sharedLocations: "/api/v1/iblue/location/query",
           liveSharedLocations: "/api/v1/iblue/location/live",
           messageFlair: "/api/v1/iblue/message/flair",
@@ -1858,6 +2049,9 @@ export class BlueBubblesServer {
           stickerReactions: "/api/v1/iblue/message/sticker",
           polls: "/api/v1/iblue/poll/:messageGuid",
           richLinks: "message.iBlue.richLink",
+          messageComponents: "/api/v1/iblue/message/component",
+          conversationBackgrounds: "/api/v1/iblue/chat/:guid/background",
+          conversationBackgroundPresets: "/api/v1/iblue/background/presets",
           icloudShares: "/api/v1/iblue/icloud-share/:messageGuid",
           icloudShareCreate: "/api/v1/iblue/icloud-share/create",
         },

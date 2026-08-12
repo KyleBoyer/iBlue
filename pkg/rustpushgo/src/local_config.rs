@@ -42,7 +42,11 @@ fn c_str_to_string(ptr: *mut std::os::raw::c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn c_data_to_vec(ptr: *mut u8, len: usize) -> Vec<u8> {
@@ -88,7 +92,8 @@ impl HardwareInfo {
         let info = HardwareInfo {
             product_name: c_str_to_string(raw.product_name).unwrap_or_else(|| "Mac".to_string()),
             serial_number: c_str_to_string(raw.serial_number).unwrap_or_default(),
-            platform_uuid: c_str_to_string(raw.platform_uuid).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            platform_uuid: c_str_to_string(raw.platform_uuid)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             board_id: c_str_to_string(raw.board_id).unwrap_or_default(),
             os_build_num: c_str_to_string(raw.os_build_num).unwrap_or_else(|| "25B78".to_string()),
             os_version: c_str_to_string(raw.os_version).unwrap_or_else(|| "26.1".to_string()),
@@ -96,7 +101,8 @@ impl HardwareInfo {
             mlb: c_str_to_string(raw.mlb).unwrap_or_default(),
             mac_address,
             root_disk_uuid: c_str_to_string(raw.root_disk_uuid).unwrap_or_default(),
-            darwin_version: c_str_to_string(raw.darwin_version).unwrap_or_else(|| "24.0.0".to_string()),
+            darwin_version: c_str_to_string(raw.darwin_version)
+                .unwrap_or_else(|| "24.0.0".to_string()),
         };
 
         unsafe { hw_info_free(&mut raw) };
@@ -147,7 +153,8 @@ impl LocalMacOSConfig {
         if id != self.device_id {
             log::warn!(
                 "Ignoring persisted device ID {} — LocalMacOSConfig must use hardware UUID {}",
-                id, self.device_id
+                id,
+                self.device_id
             );
         }
         self

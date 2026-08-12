@@ -14,8 +14,17 @@ mod tests {
         eprintln!("MLB: {}", info.mlb);
         eprintln!("MAC: {:02x?}", info.mac_address);
 
-        assert!(!info.product_name.is_empty(), "product name should not be empty");
-        assert!(!info.serial_number.is_empty(), "serial number should not be empty");
-        assert!(!info.os_version.is_empty(), "os version should not be empty");
+        assert!(
+            !info.product_name.is_empty(),
+            "product name should not be empty"
+        );
+        assert!(
+            !info.serial_number.is_empty(),
+            "serial number should not be empty"
+        );
+        assert!(
+            !info.os_version.is_empty(),
+            "os version should not be empty"
+        );
     }
 }

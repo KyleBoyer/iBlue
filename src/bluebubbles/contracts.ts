@@ -13,7 +13,7 @@ export interface BlueBubblesResponse<T = unknown> {
   error?: BlueBubblesErrorBody;
 }
 
-export type IBlueContactSource = "profile-vcf" | "name-and-photo-sharing";
+export type IBlueContactSource = "profile-vcf" | "icloud-carddav" | "name-and-photo-sharing";
 
 export interface IBlueContactSummary {
   displayName: string;
@@ -179,6 +179,39 @@ export interface IBlueICloudShare extends IBlueICloudShareSummary {
   items: IBlueICloudShareItem[];
 }
 
+export interface IBlueMessageComponent {
+  bundleId?: string;
+  appName?: string;
+  appId?: number;
+  url?: string;
+  sessionId?: string;
+  isLive: boolean;
+  ldText?: string;
+  imageTitle?: string;
+  imageSubtitle?: string;
+  caption?: string;
+  subcaption?: string;
+  secondarySubcaption?: string;
+  tertiarySubcaption?: string;
+  iconBase64?: string;
+}
+
+export interface IBlueConversationBackground {
+  removed: boolean;
+  preset?: string;
+  objectId?: string;
+  url?: string;
+  fileSize?: number;
+  updatedAt: number;
+}
+
+export interface IBlueFocusStatus {
+  handle: string;
+  available: boolean;
+  mode?: string;
+  updatedAt: number;
+}
+
 export interface IBluePollOption {
   identifier: string;
   text: string;
@@ -283,6 +316,9 @@ export interface BlueBubblesChat {
   displayName: string;
   groupId?: string;
   lastAddressedHandle?: string | null;
+  iBlue?: {
+    background?: IBlueConversationBackground;
+  };
 }
 
 export interface BlueBubblesMessage {
@@ -355,6 +391,7 @@ export interface BlueBubblesMessage {
     icloudShare?: IBlueICloudShareSummary;
     poll?: IBluePoll;
     pollVote?: IBluePollVoteUpdate;
+    component?: IBlueMessageComponent;
   };
 }
 
