@@ -251,6 +251,13 @@ export interface IBlueMessageComponent {
   secondarySubcaption?: string;
   tertiarySubcaption?: string;
   iconBase64?: string;
+  /** Rendered component artwork carried as an ordinary iMessage attachment. */
+  image?: {
+    attachmentGuid: string;
+    mimeType: string;
+    totalBytes: number;
+    downloadUrl: string;
+  };
 }
 
 export interface IBlueConversationBackground {

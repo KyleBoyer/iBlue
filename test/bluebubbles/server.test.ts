@@ -611,6 +611,7 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
       chatGuid: "iMessage;-;friend@example.com",
       bundleId: "com.example.MessagesExtension",
       appName: "Example",
+      appId: 123456,
       url: "data:,fixture",
       caption: "Component title",
       isLive: true,
@@ -618,7 +619,9 @@ test("iBlue cloud sync, components, contacts, Focus, and backgrounds use native 
   });
   assert.equal(componentResponse.status, 200, await componentResponse.text());
   assert.equal(engine.components[0]?.caption, "Component title");
+  assert.equal(engine.components[0]?.appId, 123456);
   assert.equal(store.getMessage("component-guid")?.iBlue?.component?.url, "data:,fixture");
+  assert.equal(store.getMessage("component-guid")?.iBlue?.component?.appId, 123456);
 
   const backgroundResponse = await fetch(
     `${listening.address}/api/v1/iblue/chat/${encodeURIComponent("iMessage;-;friend@example.com")}/background?password=secret`,

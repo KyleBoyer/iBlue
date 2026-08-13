@@ -1,0 +1,26 @@
+diff --git a/src/util.rs b/src/util.rs
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -1513,10 +1513,20 @@ impl KeyedArchive {
+     fn archive_obj(&mut self, item: &mut Value) -> Result<(), PushError> {
+         match item {
+             Value::Dictionary(dict) => {
+-                let Some(Value::String(class)) = dict.get("$class") else { panic!("No class?") };
++                // Property-list dictionaries can appear in an NSKeyedArchive
++                // without an explicit Objective-C class marker. Foundation
++                // treats those values as ordinary NSDictionary instances, so
++                // archive them the same way instead of panicking the process.
++                let class = match dict.get("$class") {
++                    Some(Value::String(class)) => class.clone(),
++                    Some(_) => return Err(PushError::KeyedArchiveError(
++                        "Archive object has a non-string $class".to_string()
++                    )),
++                    None => "NSDictionary".to_string(),
++                };
+                 match class.as_str() {
+                     "NSMutableDictionary" | "NSDictionary" => {
+-                        *item = self.archive_dict(dict.clone(), class)?;
++                        *item = self.archive_dict(dict.clone(), &class)?;
+                     },
+                     _class => {
+                         let (uid, class) = self.get_class_key(&_class)?;

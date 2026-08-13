@@ -10846,10 +10846,10 @@ mod reply_target_tests {
         message_inst_to_wrapped, mmcs_preflight_targets, normalize_findmy_handle,
         normalize_reply_target, parse_html_to_parts, parts_to_html, persist_gsa_tokens_in_spd,
         Attachment, AttachmentType, Balloon, ConversationData, ExtensionApp, IndexedMessagePart,
-        Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage, PartExtension,
-        PosterType, ReactMessage, ReactMessageType, Reaction, SimplifiedTranscriptPoster,
-        TextFormat, WrappedConversation, BASE64_STANDARD, TRANSCRIPT_DYNAMIC_EXTENSION,
-        TRANSCRIPT_DYNAMIC_PRESETS, TRANSCRIPT_GRADIENT_EXTENSION,
+        BalloonLayout, Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage,
+        PartExtension, PosterType, ReactMessage, ReactMessageType, Reaction,
+        SimplifiedTranscriptPoster, TextFormat, WrappedConversation, BASE64_STANDARD,
+        TRANSCRIPT_DYNAMIC_EXTENSION, TRANSCRIPT_DYNAMIC_PRESETS, TRANSCRIPT_GRADIENT_EXTENSION,
     };
 
     #[test]
@@ -11045,6 +11045,39 @@ mod reply_target_tests {
         assert_eq!(
             wrapped.app_balloon_url.as_deref(),
             Some("data:,eyJpdGVtIjp7InZvdGVzIjpbXX19"),
+        );
+    }
+
+    #[test]
+    fn generic_component_balloon_serializes_to_keyed_archives() {
+        let app = ExtensionApp {
+            name: "8 Ball Pool".to_string(),
+            app_id: Some(543_186_831),
+            bundle_id: "com.apple.messages.MSMessageExtensionBalloonPlugin:HLSX4DMBX6:com.miniclip.8ballpoolmult.PooliMessage".to_string(),
+            attribution: Default::default(),
+            balloon: Some(Balloon {
+                url: "https://8bp.co/?protomsg=CAESAWs=".to_string(),
+                session: Some("cba9de14-dd9a-45c5-bb63-989e6e32c538".to_string()),
+                layout: Some(BalloonLayout::TemplateLayout {
+                    image_subtitle: String::new(),
+                    image_title: String::new(),
+                    caption: "8 Ball Pool challenge from Jade".to_string(),
+                    secondary_subcaption: String::new(),
+                    tertiary_subcaption: String::new(),
+                    subcaption: "Tap to play".to_string(),
+                    class: rustpush::NSDictionaryClass::NSDictionary,
+                }),
+                ld_text: None,
+                is_live: false,
+                icon: None,
+            }),
+        };
+
+        let (app_info, balloon) = app.to_raw().expect("component should serialize");
+        assert!(!app_info.is_empty(), "app archive should contain data");
+        assert!(
+            balloon.is_some_and(|value| !value.is_empty()),
+            "balloon archive should contain data",
         );
     }
 

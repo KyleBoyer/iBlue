@@ -304,6 +304,7 @@ export class BlueBubblesService extends EventEmitter {
     const appBalloon = {
       bundleId: body.bundleId,
       appName: body.appName,
+      ...(body.appId === undefined ? {} : { appId: body.appId }),
       url: body.url,
       ...(body.sessionId ? { sessionId: body.sessionId } : {}),
       isLive: body.isLive ?? false,

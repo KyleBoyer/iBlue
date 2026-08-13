@@ -632,6 +632,49 @@ test("contact names enrich handles while VCF data takes precedence over shared p
   assert.deepEqual(store.getContactAvatar("friend@example.com")?.data, Buffer.from([1, 2, 3]));
 });
 
+test("generic components explicitly reference their rendered image attachment", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-component-image-test-"));
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  t.after(() => store.close());
+  const image = Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3]);
+  const message = await store.ingestIncoming({
+    uuid: "component-image-guid",
+    sender: "mailto:friend@example.com",
+    text: "\ufffc",
+    participants: ["mailto:friend@example.com"],
+    timestampMs: 1234,
+    isSms: false,
+    isStoredMessage: false,
+    attachments: [{
+      mimeType: "image/jpeg",
+      filename: "component.jpeg",
+      utiType: "public.jpeg",
+      size: image.length,
+      isInline: true,
+      dataBase64: image.toString("base64"),
+      iris: false,
+    }],
+    appBalloon: {
+      bundleId: "com.example.MessagesExtension",
+      appName: "Example",
+      appId: 123,
+      url: "example://challenge",
+      sessionId: "12345678-1234-4234-8234-123456789abc",
+      isLive: false,
+      caption: "Challenge",
+    },
+  }, []);
+
+  const attachment = message.attachments[0]!;
+  assert.deepEqual(message.iBlue?.component?.image, {
+    attachmentGuid: attachment.guid,
+    mimeType: "image/jpeg",
+    totalBytes: image.length,
+    downloadUrl: `/api/v1/attachment/${attachment.guid}/download`,
+  });
+  assert.equal(message.iBlue?.component?.appId, 123);
+});
+
 test("Maps app balloons persist as iBlue shared-location message properties", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-location-store-test-"));
   const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));

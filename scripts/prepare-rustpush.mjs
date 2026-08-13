@@ -37,6 +37,7 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "upstream-iblue.patch"),
   join(projectRoot, "rustpush", "sticker-messages.patch"),
   join(projectRoot, "rustpush", "posterkit-transcript-background.patch"),
+  join(projectRoot, "rustpush", "keyed-archive-components.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 

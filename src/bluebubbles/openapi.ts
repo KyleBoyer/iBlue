@@ -388,7 +388,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/message/component": {
     summary: "Send a generic iMessage component envelope",
-    description: "Sends a normalized MSMessageTemplateLayout balloon without exposing keyed-archive internals.",
+    description: "Sends a normalized MSMessageTemplateLayout balloon without exposing keyed-archive internals. Received components expose rendered artwork through message.iBlue.component.image with an attachment GUID and download URL.",
     tags: ["iBlue Messages"],
     body: {
       type: "object",

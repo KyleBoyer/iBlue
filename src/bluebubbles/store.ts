@@ -27,6 +27,7 @@ import type {
   IBlueFocusStatus,
   IBlueMessageReceipt,
   IBlueMessageReceiptType,
+  IBlueMessageComponent,
   IBlueReaction,
   IBluePoll,
   IBluePollVote,
@@ -2167,7 +2168,9 @@ export class BlueBubblesStore {
         ...(icloudShare ? { icloudShare } : {}),
         ...(poll ? { poll } : {}),
         ...(pollVote ? { pollVote } : {}),
-        ...(raw.appBalloon ? { component: { ...raw.appBalloon } } : {}),
+        ...(raw.appBalloon
+          ? { component: messageComponent(raw.appBalloon, visibleAttachments) }
+          : {}),
         ...(contactCards.length ? { contactCards } : {}),
       },
     };
@@ -2444,6 +2447,55 @@ function contactSummary(contact: IBlueContact): IBlueContactSummary {
     ...(contact.lastName ? { lastName: contact.lastName } : {}),
     ...(contact.nickname ? { nickname: contact.nickname } : {}),
     source: contact.source,
+  };
+}
+
+function messageComponent(
+  balloon: IncomingAppBalloon,
+  attachments: readonly BlueBubblesAttachment[],
+): IBlueMessageComponent {
+  const optionalString = (value: unknown): string | undefined =>
+    typeof value === "string" ? value : undefined;
+  const bundleId = optionalString(balloon.bundleId);
+  const appName = optionalString(balloon.appName);
+  const url = optionalString(balloon.url);
+  const sessionId = optionalString(balloon.sessionId);
+  const ldText = optionalString(balloon.ldText);
+  const imageTitle = optionalString(balloon.imageTitle);
+  const imageSubtitle = optionalString(balloon.imageSubtitle);
+  const caption = optionalString(balloon.caption);
+  const subcaption = optionalString(balloon.subcaption);
+  const secondarySubcaption = optionalString(balloon.secondarySubcaption);
+  const tertiarySubcaption = optionalString(balloon.tertiarySubcaption);
+  const iconBase64 = optionalString(balloon.iconBase64);
+  const image = attachments.find((attachment) =>
+    attachment.mimeType.startsWith("image/") && !attachment.isSticker,
+  );
+  return {
+    ...(bundleId === undefined ? {} : { bundleId }),
+    ...(appName === undefined ? {} : { appName }),
+    ...(typeof balloon.appId === "number" ? { appId: balloon.appId } : {}),
+    ...(url === undefined ? {} : { url }),
+    ...(sessionId === undefined ? {} : { sessionId }),
+    isLive: balloon.isLive === true,
+    ...(ldText === undefined ? {} : { ldText }),
+    ...(imageTitle === undefined ? {} : { imageTitle }),
+    ...(imageSubtitle === undefined ? {} : { imageSubtitle }),
+    ...(caption === undefined ? {} : { caption }),
+    ...(subcaption === undefined ? {} : { subcaption }),
+    ...(secondarySubcaption === undefined ? {} : { secondarySubcaption }),
+    ...(tertiarySubcaption === undefined ? {} : { tertiarySubcaption }),
+    ...(iconBase64 === undefined ? {} : { iconBase64 }),
+    ...(image
+      ? {
+        image: {
+          attachmentGuid: image.guid,
+          mimeType: image.mimeType,
+          totalBytes: image.totalBytes,
+          downloadUrl: `/api/v1/attachment/${encodeURIComponent(image.guid)}/download`,
+        },
+      }
+      : {}),
   };
 }
 
