@@ -45,7 +45,7 @@ import {
   IBLUE_TEXT_STYLES,
   parseOutboundTextRuns,
 } from "./attributed-text.js";
-import { completeOpenApiDocument, documentApiRoute } from "./openapi.js";
+import { documentApiRoute } from "./openapi.js";
 import {
   ICloudShareError,
   ICloudShareResolver,
@@ -233,6 +233,7 @@ export class BlueBubblesServer {
           { name: "Attachments", description: "Attachment upload and download operations." },
           { name: "Handles", description: "iMessage handle lookup and availability." },
           { name: "Contacts", description: "Stock BlueBubbles contact compatibility routes." },
+          { name: "FCM", description: "BlueBubbles Firebase compatibility status." },
           { name: "Webhooks", description: "Webhook registration and management." },
           { name: "iBlue Contacts", description: "Profile-local contact names, VCF data, and avatars." },
           { name: "iBlue Cloud Sync", description: "Read-only paginated Messages in iCloud synchronization." },
@@ -259,11 +260,6 @@ export class BlueBubblesServer {
         schema: documentApiRoute(schema, url, route.method),
         url,
       }),
-      transformObject: (document) => (
-        "openapiObject" in document
-          ? completeOpenApiDocument(document.openapiObject)
-          : document.swaggerObject
-      ),
     });
     await this.app.register(swaggerUi, {
       routePrefix: "/docs",

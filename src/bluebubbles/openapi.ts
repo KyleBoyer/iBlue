@@ -1,14 +1,25 @@
 import type { FastifySchema, HTTPMethods } from "fastify";
 
-import { PINNED_BLUEBUBBLES_REST_ROUTES } from "./compatibility-routes.js";
 import { IBLUE_BUILTIN_CONVERSATION_BACKGROUNDS } from "./backgrounds.js";
 
 type JsonSchema = Record<string, unknown>;
 
 const stringProperty = (description: string): JsonSchema => ({ type: "string", description });
+const integerProperty = (description: string, options: JsonSchema = {}): JsonSchema => ({
+  type: "integer",
+  description,
+  ...options,
+});
+const booleanProperty = (description: string): JsonSchema => ({ type: "boolean", description });
+const stringArrayProperty = (description: string, options: JsonSchema = {}): JsonSchema => ({
+  type: "array",
+  description,
+  items: { type: "string" },
+  ...options,
+});
 const paginationProperties = {
-  offset: { type: "integer", minimum: 0, default: 0 },
-  limit: { type: "integer", minimum: 1, default: 100 },
+  offset: integerProperty("Zero-based number of matching records to skip.", { minimum: 0, default: 0 }),
+  limit: integerProperty("Maximum number of matching records to return.", { minimum: 1, default: 100 }),
 };
 const cloudSyncBody: JsonSchema = {
   type: "object",
@@ -37,7 +48,447 @@ const messageReceiptSchema: JsonSchema = {
   },
 };
 
+const messageTimeQueryProperties = {
+  chatGuid: stringProperty("Limit results to this BlueBubbles chat GUID."),
+  after: integerProperty("Return messages created after this Unix timestamp in milliseconds."),
+  before: integerProperty("Return messages created before this Unix timestamp in milliseconds."),
+};
+
+const messageEffectProperties = {
+  effectId: stringProperty("Apple bubble or screen-effect identifier. Use flair instead for a friendly name."),
+  flair: stringProperty("Friendly message-effect name returned by GET /api/v1/iblue/message/flair."),
+};
+
+const replyProperties = {
+  selectedMessageGuid: stringProperty("GUID of the message being replied to."),
+  partIndex: integerProperty("Zero-based part index within the replied-to message.", { minimum: 0, default: 0 }),
+};
+
+const scheduledMessageBody: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["type", "payload", "scheduledFor", "schedule"],
+  properties: {
+    type: {
+      type: "string",
+      const: "send-message",
+      description: "Scheduled operation type. iBlue currently supports send-message only.",
+    },
+    scheduledFor: integerProperty("First execution time as a future Unix timestamp in milliseconds."),
+    payload: {
+      type: "object",
+      description: "Text-message operation to execute at the scheduled time.",
+      additionalProperties: false,
+      required: ["chatGuid", "message", "method"],
+      properties: {
+        chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
+        message: stringProperty("Plain-text message body."),
+        method: stringProperty("BlueBubbles scheduling method identifier retained with the job."),
+        subject: stringProperty("Optional iMessage subject line."),
+        attributedBody: stringProperty("Optional semantic HTML attributed body; mutually exclusive with textRuns."),
+        textRuns: {
+          type: "array",
+          description: "Optional static-style and animation ranges measured in UTF-16 code units.",
+          items: textRunSchema(),
+        },
+        ...messageEffectProperties,
+        ...replyProperties,
+      },
+    },
+    schedule: {
+      type: "object",
+      description: "One-time or recurring execution policy.",
+      additionalProperties: false,
+      required: ["type"],
+      properties: {
+        type: {
+          type: "string",
+          enum: ["once", "recurring"],
+          description: "Whether the job runs once or repeats after each successful execution.",
+        },
+        interval: integerProperty("Number of intervalType units between recurring executions.", { minimum: 1 }),
+        intervalType: {
+          type: "string",
+          enum: ["hourly", "daily", "weekly", "monthly", "yearly"],
+          description: "Unit used by interval for a recurring job.",
+        },
+      },
+    },
+  },
+};
+
+const implementedCompatibilityRouteDocumentation: Record<string, FastifySchema> = {
+  "GET /api/v1/server/update/check": {
+    summary: "Check for an iBlue server update",
+    description: "Returns a BlueBubbles-compatible no-update result. iBlue updates are managed outside the BlueBubbles Electron updater.",
+    tags: ["Server"],
+  },
+  "GET /api/v1/server/statistics/totals": {
+    summary: "Get database record totals",
+    description: "Counts handles, messages, chats, and attachments stored by the active iBlue profile.",
+    tags: ["Server"],
+    querystring: {
+      type: "object",
+      properties: {
+        only: stringProperty("Comma-separated resources to count: handles, messages, chats, and attachments. All are returned when omitted."),
+      },
+    },
+  },
+  "GET /api/v1/server/statistics/media": {
+    summary: "Get media totals",
+    description: "Counts image, video, and location attachments across the active profile.",
+    tags: ["Server"],
+    querystring: {
+      type: "object",
+      properties: {
+        only: stringProperty("Comma-separated media kinds to count: images, videos, and locations. All are returned when omitted."),
+      },
+    },
+  },
+  "GET /api/v1/server/statistics/media/chat": {
+    summary: "Get media totals by chat",
+    description: "Returns per-chat image, video, and location counts, omitting chats whose selected totals are all zero.",
+    tags: ["Server"],
+    querystring: {
+      type: "object",
+      properties: {
+        only: stringProperty("Comma-separated media kinds to count: images, videos, and locations. All are returned when omitted."),
+      },
+    },
+  },
+  "GET /api/v1/chat/count": {
+    summary: "Count chats",
+    description: "Returns the total number of chats stored by the active profile.",
+    tags: ["Chats"],
+  },
+  "GET /api/v1/attachment/count": {
+    summary: "Count attachments",
+    description: "Returns the total number of attachment records stored by the active profile.",
+    tags: ["Attachments"],
+  },
+  "POST /api/v1/attachment/upload": {
+    summary: "Stage a reusable attachment",
+    description: "Stores one multipart file temporarily and returns a profile-local path accepted by multipart messages, contact cards, and conversation backgrounds. Staged uploads expire after 24 hours.",
+    tags: ["Attachments"],
+    consumes: ["multipart/form-data"],
+    body: {
+      type: "object",
+      required: ["attachment"],
+      properties: {
+        attachment: { type: "string", format: "binary", description: "File to stage for a later API operation." },
+      },
+    },
+  },
+  "GET /api/v1/handle/count": {
+    summary: "Count message handles",
+    description: "Returns the number of known recipient handles plus the active profile's registered aliases.",
+    tags: ["Handles"],
+  },
+  "GET /api/v1/message/count": {
+    summary: "Count messages",
+    description: "Counts messages matching optional chat, timestamp, and row-ID bounds.",
+    tags: ["Messages"],
+    querystring: messageCountQuerySchema(),
+  },
+  "GET /api/v1/message/count/updated": {
+    summary: "Count updated messages",
+    description: "Counts matching messages that have edit or retraction state.",
+    tags: ["Messages"],
+    querystring: messageCountQuerySchema(),
+  },
+  "GET /api/v1/message/count/me": {
+    summary: "Count outgoing messages",
+    description: "Counts matching messages sent by the active iBlue profile.",
+    tags: ["Messages"],
+    querystring: messageCountQuerySchema(),
+  },
+  "POST /api/v1/handle/query": {
+    summary: "Query message handles",
+    description: "Lists known iMessage addresses with optional exact-address filtering and pagination.",
+    tags: ["Handles"],
+    body: {
+      type: "object",
+      properties: {
+        address: stringProperty("Return handles matching this address."),
+        ...paginationProperties,
+      },
+    },
+  },
+  "GET /api/v1/handle/availability/imessage": {
+    summary: "Check iMessage availability",
+    description: "Performs an IDS availability lookup for one phone number or email address.",
+    tags: ["Handles"],
+    querystring: {
+      type: "object",
+      required: ["address"],
+      properties: { address: stringProperty("Phone number or email address to look up in IDS.") },
+    },
+  },
+  "GET /api/v1/handle/availability/facetime": {
+    summary: "Check FaceTime availability",
+    description: "Returns available=false because iBlue does not implement FaceTime calling. FaceTime session, answer, and leave routes are intentionally absent from this API document.",
+    tags: ["Handles"],
+    querystring: {
+      type: "object",
+      required: ["address"],
+      properties: { address: stringProperty("Phone number or email address whose FaceTime capability is being queried.") },
+    },
+  },
+  "GET /api/v1/handle/:guid": {
+    summary: "Get a message handle",
+    description: "Returns one stored Messages handle by GUID or normalized address.",
+    tags: ["Handles"],
+  },
+  "GET /api/v1/contact": {
+    summary: "List macOS contacts",
+    description: "Returns an empty BlueBubbles-compatible list because Contacts.app belongs to the host macOS user. Use /api/v1/iblue/contact for profile-local contacts.",
+    tags: ["Contacts"],
+  },
+  "POST /api/v1/contact/query": {
+    summary: "Query macOS contacts",
+    description: "Returns an empty BlueBubbles-compatible list without reading the host user's Contacts.app database. Use /api/v1/iblue/contact/query instead.",
+    tags: ["Contacts"],
+  },
+  "GET /api/v1/fcm/client": {
+    summary: "Get FCM configuration status",
+    description: "Returns BlueBubbles' expected Google Services not-found response; iBlue uses Socket.IO and webhooks instead of Firebase Cloud Messaging.",
+    tags: ["FCM"],
+  },
+  "POST /api/v1/chat/query": {
+    summary: "Query chats",
+    description: "Returns paginated chats and can include each chat's latest message.",
+    tags: ["Chats"],
+    body: {
+      type: "object",
+      properties: {
+        ...paginationProperties,
+        with: stringArrayProperty("Related values to include. Use lastMessage or last-message to include the latest message."),
+      },
+    },
+  },
+  "PUT /api/v1/chat/:guid": {
+    summary: "Rename a group chat",
+    description: "Changes a group conversation's display name. A missing displayName leaves the chat unchanged.",
+    tags: ["Chats"],
+    body: {
+      type: "object",
+      properties: { displayName: stringProperty("New group-chat display name.") },
+    },
+  },
+  "GET /api/v1/chat/:guid": {
+    summary: "Get a chat",
+    description: "Returns one chat and optionally includes participant and latest-message relationships.",
+    tags: ["Chats"],
+    querystring: {
+      type: "object",
+      properties: { with: stringProperty("Comma-separated related values: participants and lastMessage.") },
+    },
+  },
+  "DELETE /api/v1/chat/:guid": {
+    summary: "Delete a local chat",
+    description: "Deletes the chat and its locally stored messages and attachment references from iBlue. It does not retract messages from recipients.",
+    tags: ["Chats"],
+  },
+  "POST /api/v1/chat/:guid/participant": participantRouteDocumentation("Add a group participant", "Adds one address to the group conversation."),
+  "DELETE /api/v1/chat/:guid/participant": participantRouteDocumentation("Remove a group participant", "Removes one address from the group conversation."),
+  "POST /api/v1/chat/:guid/participant/add": participantRouteDocumentation("Add a group participant", "BlueBubbles alias for adding one address to the group conversation."),
+  "POST /api/v1/chat/:guid/participant/remove": participantRouteDocumentation("Remove a group participant", "BlueBubbles alias for removing one address from the group conversation."),
+  "GET /api/v1/chat/:guid/icon": {
+    summary: "Download a group-chat icon",
+    description: "Returns the currently stored group image as its original media type.",
+    tags: ["Chats"],
+  },
+  "POST /api/v1/chat/:guid/icon": {
+    summary: "Set a group-chat icon",
+    description: "Uploads and publishes a new group image for the conversation.",
+    tags: ["Chats"],
+    consumes: ["multipart/form-data"],
+    body: {
+      type: "object",
+      required: ["icon"],
+      properties: { icon: { type: "string", format: "binary", description: "Image file to use as the group icon." } },
+    },
+  },
+  "DELETE /api/v1/chat/:guid/icon": {
+    summary: "Remove a group-chat icon",
+    description: "Publishes a group update that removes the conversation image.",
+    tags: ["Chats"],
+  },
+  "POST /api/v1/chat/:guid/read": {
+    summary: "Mark a chat read",
+    description: "Marks the conversation read and sends an iMessage read receipt through the selected message when supplied.",
+    tags: ["Chats"],
+    body: {
+      type: "object",
+      properties: { messageGuid: stringProperty("Optional newest message GUID to acknowledge as read.") },
+    },
+  },
+  "POST /api/v1/chat/:guid/unread": {
+    summary: "Mark a chat unread",
+    description: "Marks the conversation unread in iBlue's local store.",
+    tags: ["Chats"],
+  },
+  "POST /api/v1/chat/:guid/leave": {
+    summary: "Leave a group chat",
+    description: "Publishes an iMessage group-participant update removing the active profile from the conversation.",
+    tags: ["Chats"],
+  },
+  "GET /api/v1/chat/:guid/share/contact/status": {
+    summary: "Get contact-sharing status",
+    description: "Returns false because host Contacts.app sharing is outside iBlue's profile-isolated service.",
+    tags: ["Chats"],
+  },
+  "POST /api/v1/chat/:guid/typing": {
+    summary: "Start a typing indicator",
+    description: "Publishes an active iMessage typing indicator to the conversation.",
+    tags: ["Chats"],
+  },
+  "DELETE /api/v1/chat/:guid/typing": {
+    summary: "Stop a typing indicator",
+    description: "Publishes an inactive iMessage typing indicator to the conversation.",
+    tags: ["Chats"],
+  },
+  "GET /api/v1/chat/:guid/message": {
+    summary: "List messages in a chat",
+    description: "Returns a paginated, time-bounded page of messages from one conversation.",
+    tags: ["Chats"],
+    querystring: messageListQuerySchema(),
+  },
+  "POST /api/v1/chat/new": {
+    summary: "Create a chat",
+    description: "Creates or resolves a direct/group iMessage conversation and can send its first text message.",
+    tags: ["Chats"],
+    body: {
+      type: "object",
+      required: ["addresses"],
+      properties: {
+        addresses: stringArrayProperty("One or more participant phone numbers or email addresses.", { minItems: 1 }),
+        message: stringProperty("Optional initial plain-text message."),
+        subject: stringProperty("Optional subject for the initial message."),
+        tempGuid: stringProperty("Optional client-generated correlation GUID for the initial message."),
+        ...messageEffectProperties,
+      },
+    },
+  },
+  "DELETE /api/v1/chat/:guid/:messageGuid": {
+    summary: "Delete a locally stored message",
+    description: "Deletes one message and its unreferenced attachment files from iBlue's local store. This is not an iMessage unsend.",
+    tags: ["Chats"],
+  },
+  "POST /api/v1/message/query": {
+    summary: "Query messages",
+    description: "Returns messages using pagination, chat, time, sort, and BlueBubbles row-ID bounds.",
+    tags: ["Messages"],
+    body: messageQueryBodySchema(),
+  },
+  "GET /api/v1/message/schedule": {
+    summary: "List scheduled messages",
+    description: "Returns every pending one-time and recurring message owned by the active profile.",
+    tags: ["Messages"],
+  },
+  "POST /api/v1/message/schedule": {
+    summary: "Create a scheduled message",
+    description: "Creates a durable one-time or recurring text-message job.",
+    tags: ["Messages"],
+    body: scheduledMessageBody,
+  },
+  "GET /api/v1/message/schedule/:id": {
+    summary: "Get a scheduled message",
+    description: "Returns one scheduled-message job by numeric ID, or a successful null when it does not exist for BlueBubbles compatibility.",
+    tags: ["Messages"],
+  },
+  "PUT /api/v1/message/schedule/:id": {
+    summary: "Replace a scheduled message",
+    description: "Replaces the complete payload and timing policy of an existing scheduled-message job.",
+    tags: ["Messages"],
+    body: scheduledMessageBody,
+  },
+  "DELETE /api/v1/message/schedule/:id": {
+    summary: "Delete a scheduled message",
+    description: "Removes a pending scheduled-message job by numeric ID.",
+    tags: ["Messages"],
+  },
+  "GET /api/v1/message/:guid": {
+    summary: "Get a message",
+    description: "Returns one normalized message by its iMessage GUID.",
+    tags: ["Messages"],
+  },
+  "POST /api/v1/message/:guid/edit": editRouteDocumentation(false),
+  "POST /api/v1/message/edit": editRouteDocumentation(true),
+  "POST /api/v1/message/:guid/unsend": unsendRouteDocumentation(false),
+  "POST /api/v1/message/delete": unsendRouteDocumentation(true),
+  "POST /api/v1/message/:guid/notify": {
+    summary: "Send Notify Anyway",
+    description: "Sends Apple's urgent Focus-bypass control for a previously sent message.",
+    tags: ["Messages"],
+  },
+  "GET /api/v1/message/:guid/embedded-media": {
+    summary: "Download a message's embedded media",
+    description: "Returns the first downloaded attachment associated with the selected message.",
+    tags: ["Messages"],
+  },
+  "POST /api/v1/message/attachment": {
+    summary: "Send an attachment",
+    description: "Uploads one file through MMCS and sends it as an iMessage attachment, including audio-message and reply metadata when requested.",
+    tags: ["Messages"],
+    consumes: ["multipart/form-data"],
+    body: attachmentMessageBodySchema(),
+  },
+  "POST /api/v1/message/multipart": {
+    summary: "Send a multipart message",
+    description: "Sends an ordered mixture of text, mentions, and previously staged attachments in one iMessage.",
+    tags: ["Messages"],
+    body: multipartMessageBodySchema(),
+  },
+  "GET /api/v1/attachment/:guid/download": {
+    summary: "Download an attachment",
+    description: "Streams the locally downloaded attachment bytes with their stored MIME type and filename.",
+    tags: ["Attachments"],
+  },
+  "GET /api/v1/attachment/:guid/download/force": {
+    summary: "Download an attachment immediately",
+    description: "Alias of the normal download route. Direct IDS receive already downloads MMCS content before exposing the attachment.",
+    tags: ["Attachments"],
+  },
+  "GET /api/v1/attachment/:guid": {
+    summary: "Get attachment metadata",
+    description: "Returns normalized metadata for one stored attachment without embedding its bytes.",
+    tags: ["Attachments"],
+  },
+  "GET /api/v1/webhook": {
+    summary: "List webhooks",
+    description: "Lists registered webhook destinations with optional ID or URL filtering.",
+    tags: ["Webhooks"],
+    querystring: {
+      type: "object",
+      properties: {
+        id: integerProperty("Return only the webhook with this numeric ID.", { minimum: 1 }),
+        url: stringProperty("Return webhooks whose destination URL matches this value."),
+      },
+    },
+  },
+  "POST /api/v1/webhook": {
+    summary: "Create a webhook",
+    description: "Registers an HTTP(S) destination for one or more supported realtime event names.",
+    tags: ["Webhooks"],
+    body: {
+      type: "object",
+      required: ["url", "events"],
+      properties: {
+        url: { type: "string", format: "uri", description: "HTTP or HTTPS webhook destination." },
+        events: stringArrayProperty("Event names to deliver. Use * to subscribe to all events.", { minItems: 1 }),
+      },
+    },
+  },
+  "DELETE /api/v1/webhook/:id": {
+    summary: "Delete a webhook",
+    description: "Deletes one webhook registration by numeric ID.",
+    tags: ["Webhooks"],
+  },
+};
+
 const routeDocumentation: Record<string, FastifySchema> = {
+  ...implementedCompatibilityRouteDocumentation,
   "GET /api/v1/ping": {
     summary: "Check API availability",
     description: "Returns a BlueBubbles-compatible pong envelope.",
@@ -63,14 +514,16 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/contact/query": {
     summary: "Query profile-local contacts",
+    description: "Searches the profile-isolated contact cache by one or more addresses, free text, and source.",
     tags: ["iBlue Contacts"],
     body: {
       type: "object",
       properties: {
-        addresses: { type: "array", items: { type: "string" } },
-        search: { type: "string" },
+        addresses: stringArrayProperty("Return contacts matching any of these Messages phone numbers or email addresses."),
+        search: stringProperty("Case-insensitive display-name or address search."),
         sources: {
           type: "array",
+          description: "Restrict results to one or more contact data sources.",
           items: { type: "string", enum: ["profile-vcf", "icloud-carddav", "name-and-photo-sharing"] },
         },
         ...paginationProperties,
@@ -101,17 +554,19 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/focus/subscribe": {
     summary: "Subscribe to Focus status updates",
+    description: "Subscribes to StatusKit updates for up to 256 Messages addresses and returns their current portable availability state.",
     tags: ["iBlue Focus"],
     body: {
       type: "object",
       required: ["handles"],
       properties: {
-        handles: { type: "array", minItems: 1, maxItems: 256, items: { type: "string" } },
+        handles: stringArrayProperty("Messages phone numbers or email addresses to subscribe to.", { minItems: 1, maxItems: 256 }),
       },
     },
   },
   "POST /api/v1/iblue/focus/share": {
     summary: "Publish this account's Focus status",
+    description: "Publishes whether the active iBlue profile is available to subscribed peers; an opaque mode value may accompany a silenced state.",
     tags: ["iBlue Focus"],
     body: {
       type: "object",
@@ -124,10 +579,12 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/iblue/contact/vcf": {
     summary: "Export the profile VCF",
+    description: "Returns the complete profile-local vCard document used for imported contact names and avatars.",
     tags: ["iBlue Contacts"],
   },
   "PUT /api/v1/iblue/contact/vcf": {
     summary: "Import a profile VCF",
+    description: "Replaces the profile-local vCard document and rebuilds its normalized contact cache.",
     tags: ["iBlue Contacts"],
     body: {
       type: "object",
@@ -137,6 +594,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/iblue/contact/:address/avatar": {
     summary: "Download a contact avatar",
+    description: "Returns the cached portrait for a profile-local contact identified by phone number or email address.",
     tags: ["iBlue Contacts"],
   },
   "POST /api/v1/iblue/contact-card": {
@@ -149,51 +607,53 @@ const routeDocumentation: Record<string, FastifySchema> = {
       additionalProperties: false,
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        displayName: { type: "string", minLength: 1, maxLength: 512 },
-        firstName: { type: "string" },
-        middleName: { type: "string" },
-        lastName: { type: "string" },
-        prefix: { type: "string" },
-        suffix: { type: "string" },
-        nickname: { type: "string" },
-        organization: { type: "string" },
-        department: { type: "string" },
-        title: { type: "string" },
+        displayName: { type: "string", minLength: 1, maxLength: 512, description: "Display name shown on the contact card." },
+        firstName: stringProperty("Given name."),
+        middleName: stringProperty("Middle name."),
+        lastName: stringProperty("Family name."),
+        prefix: stringProperty("Honorific prefix such as Dr. or Ms."),
+        suffix: stringProperty("Name suffix such as Jr. or PhD."),
+        nickname: stringProperty("Contact nickname."),
+        organization: stringProperty("Company or organization name."),
+        department: stringProperty("Department within the organization."),
+        title: stringProperty("Job title."),
         birthday: { type: "string", description: "vCard birthday value, normally YYYY-MM-DD." },
-        note: { type: "string" },
+        note: stringProperty("Free-form contact note."),
         photo: stringProperty("Staged JPEG or PNG path returned by POST /api/v1/attachment/upload."),
         photoAttachmentGuid: stringProperty("GUID of an existing downloaded JPEG or PNG attachment."),
-        phones: { type: "array", maxItems: 32, items: contactCardFieldSchema() },
-        emails: { type: "array", maxItems: 32, items: contactCardFieldSchema() },
-        urls: { type: "array", maxItems: 32, items: contactCardFieldSchema() },
+        phones: { type: "array", description: "Labeled phone numbers.", maxItems: 32, items: contactCardFieldSchema() },
+        emails: { type: "array", description: "Labeled email addresses.", maxItems: 32, items: contactCardFieldSchema() },
+        urls: { type: "array", description: "Labeled website URLs.", maxItems: 32, items: contactCardFieldSchema() },
         socialProfiles: {
           type: "array",
+          description: "Labeled social-network profiles.",
           maxItems: 32,
           items: {
             ...contactCardFieldSchema(),
             properties: {
               ...((contactCardFieldSchema().properties ?? {}) as Record<string, unknown>),
-              service: { type: "string" },
-              userId: { type: "string" },
+              service: stringProperty("Social-network service name."),
+              userId: stringProperty("Account identifier on the social-network service."),
             },
           },
         },
         addresses: {
           type: "array",
+          description: "Structured postal addresses.",
           maxItems: 32,
           items: {
             type: "object",
             additionalProperties: false,
             properties: {
-              label: { type: "string" },
-              types: { type: "array", items: { type: "string" } },
-              extended: { type: "string" },
-              street: { type: "string" },
-              city: { type: "string" },
-              region: { type: "string" },
-              postalCode: { type: "string" },
-              country: { type: "string" },
-              preferred: { type: "boolean" },
+              label: stringProperty("Human-readable label such as home or work."),
+              types: stringArrayProperty("vCard type tokens such as HOME or WORK."),
+              extended: stringProperty("Apartment, suite, or other extended-address value."),
+              street: stringProperty("Street address."),
+              city: stringProperty("City or locality."),
+              region: stringProperty("State, province, or region."),
+              postalCode: stringProperty("Postal or ZIP code."),
+              country: stringProperty("Country name or code."),
+              preferred: booleanProperty("Whether this is the preferred postal address."),
             },
           },
         },
@@ -206,7 +666,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
     tags: ["iBlue Contacts"],
     querystring: {
       type: "object",
-      properties: { cardIndex: { type: "integer", minimum: 0, default: 0 } },
+      properties: { cardIndex: integerProperty("Zero-based vCard index when the attachment contains multiple contacts.", { minimum: 0, default: 0 }) },
     },
   },
   "GET /api/v1/iblue/message/flair": {
@@ -233,10 +693,10 @@ const routeDocumentation: Record<string, FastifySchema> = {
     querystring: {
       type: "object",
       properties: {
-        type: { type: "string", enum: ["delivered", "read"] },
+        type: { type: "string", enum: ["delivered", "read"], description: "Return only delivered or read receipt events." },
         handle: stringProperty("Optionally filter by recipient address."),
-        offset: { type: "integer", minimum: 0, default: 0 },
-        limit: { type: "integer", minimum: 1, maximum: 1000, default: 100 },
+        offset: integerProperty("Zero-based number of matching receipt records to skip.", { minimum: 0, default: 0 }),
+        limit: integerProperty("Maximum matching receipt records to return.", { minimum: 1, maximum: 1000, default: 100 }),
       },
     },
     response: {
@@ -273,36 +733,17 @@ const routeDocumentation: Record<string, FastifySchema> = {
       additionalProperties: true,
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        message: { type: "string" },
+        message: stringProperty("Plain-text message body."),
         attributedBody: { type: "string", description: "Advanced semantic HTML input." },
         textRuns: {
           type: "array",
           description: "Sorted, non-overlapping NSRange-compatible runs measured in UTF-16 code units.",
-          items: {
-            type: "object",
-            required: ["range"],
-            properties: {
-              range: {
-                type: "array",
-                minItems: 2,
-                maxItems: 2,
-                prefixItems: [
-                  { type: "integer", minimum: 0 },
-                  { type: "integer", minimum: 1 },
-                ],
-              },
-              styles: {
-                type: "array",
-                uniqueItems: true,
-                items: { type: "string", enum: ["bold", "italic", "underline", "strikethrough"] },
-              },
-              effect: {
-                type: "string",
-                enum: ["big", "small", "shake", "nod", "explode", "ripple", "bloom", "jitter"],
-              },
-            },
-          },
+          items: textRunSchema(),
         },
+        tempGuid: stringProperty("Optional client-generated correlation GUID."),
+        subject: stringProperty("Optional iMessage subject line."),
+        ...messageEffectProperties,
+        ...replyProperties,
       },
     },
   },
@@ -316,9 +757,10 @@ const routeDocumentation: Record<string, FastifySchema> = {
       properties: {
         chatGuid: stringProperty("Chat containing the target message."),
         selectedMessageGuid: stringProperty("GUID of the target message."),
-        partIndex: { type: "integer", minimum: 0, default: 0 },
+        partIndex: integerProperty("Zero-based part index within the target message.", { minimum: 0, default: 0 }),
         reaction: {
           type: "string",
+          description: "Tapback to add, or the same name prefixed with - to remove. emoji and -emoji require emoji.",
           enum: [
             "love", "like", "dislike", "laugh", "emphasize", "question",
             "-love", "-like", "-dislike", "-laugh", "-emphasize", "-question",
@@ -340,8 +782,8 @@ const routeDocumentation: Record<string, FastifySchema> = {
       properties: {
         chatGuid: stringProperty("Chat containing the target message."),
         selectedMessageGuid: stringProperty("GUID of the target message."),
-        partIndex: { type: "integer", minimum: 0, default: 0 },
-        source: { type: "string", enum: ["sticker", "memoji", "genmoji"], default: "sticker" },
+        partIndex: integerProperty("Zero-based part index within the target message.", { minimum: 0, default: 0 }),
+        source: { type: "string", enum: ["sticker", "memoji", "genmoji"], default: "sticker", description: "Apple sticker-family attribution to encode." },
         sticker: {
           type: "string",
           format: "binary",
@@ -360,12 +802,13 @@ const routeDocumentation: Record<string, FastifySchema> = {
       properties: {
         chatGuid: stringProperty("Chat containing the sticker."),
         messageGuid: stringProperty("GUID returned when the sticker was sent."),
-        scale: { type: "number", minimum: 0.05, maximum: 2 },
+        scale: { type: "number", minimum: 0.05, maximum: 2, description: "Rendered sticker scale relative to Apple's base sticker size." },
       },
     },
   },
   "POST /api/v1/iblue/rich-link": {
     summary: "Send a rich link or Apple Music card",
+    description: "Builds and sends an Apple rich-link balloon. Supplying complete Apple Music metadata produces the native playable Music card.",
     tags: ["iBlue Messages"],
     body: {
       type: "object",
@@ -373,15 +816,24 @@ const routeDocumentation: Record<string, FastifySchema> = {
       additionalProperties: true,
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        originalUrl: { type: "string", format: "uri" },
-        url: { type: "string", format: "uri" },
-        title: { type: "string" },
-        summary: { type: "string" },
-        artworkAttachmentGuid: { type: "string" },
+        originalUrl: { type: "string", format: "uri", description: "Original destination URL encoded in the rich-link payload." },
+        url: { type: "string", format: "uri", description: "Canonical URL opened when the recipient taps the card; defaults to originalUrl." },
+        title: stringProperty("Headline shown in a generic rich-link card."),
+        summary: stringProperty("Supporting description shown in a generic rich-link card."),
+        artworkAttachmentGuid: stringProperty("GUID of an existing downloaded image to use as card artwork."),
         appleMusic: {
           type: "object",
-          description: "Optional Apple Music playback metadata.",
-          additionalProperties: true,
+          description: "Complete Apple Music playback metadata required to render the native play button.",
+          additionalProperties: false,
+          required: ["storefrontIdentifier", "storeIdentifier", "name", "artist", "album", "previewUrl"],
+          properties: {
+            storefrontIdentifier: stringProperty("Apple Music storefront code, such as us."),
+            storeIdentifier: stringProperty("Apple Music catalog song identifier."),
+            name: stringProperty("Track title."),
+            artist: stringProperty("Artist display name."),
+            album: stringProperty("Album display name."),
+            previewUrl: { type: "string", format: "uri", description: "Public Apple Music audio-preview URL used by the inline play button." },
+          },
         },
       },
     },
@@ -396,29 +848,30 @@ const routeDocumentation: Record<string, FastifySchema> = {
       additionalProperties: false,
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        bundleId: { type: "string", maxLength: 512 },
-        appName: { type: "string" },
-        appId: { type: "integer", minimum: 0 },
-        url: { type: "string", maxLength: 16384 },
-        sessionId: { type: "string", format: "uuid" },
-        isLive: { type: "boolean" },
-        ldText: { type: "string" },
-        imageTitle: { type: "string" },
-        imageSubtitle: { type: "string" },
-        caption: { type: "string" },
-        subcaption: { type: "string" },
-        secondarySubcaption: { type: "string" },
-        tertiarySubcaption: { type: "string" },
-        iconAttachmentGuid: { type: "string" },
-        text: { type: "string" },
-        subject: { type: "string" },
-        replyGuid: { type: "string" },
-        replyPart: { type: "string" },
+        bundleId: { type: "string", maxLength: 512, description: "Messages extension bundle identifier that owns the component." },
+        appName: stringProperty("Extension display name shown by Messages."),
+        appId: integerProperty("Numeric App Store identifier when known.", { minimum: 0 }),
+        url: { type: "string", maxLength: 16384, description: "Component data URL opened by the owning Messages extension." },
+        sessionId: { type: "string", format: "uuid", description: "Stable UUID connecting updates to the same component session." },
+        isLive: booleanProperty("Whether this component represents an active live session."),
+        ldText: stringProperty("Accessibility and link-description text carried by the component."),
+        imageTitle: stringProperty("Primary text overlaid in the template image region."),
+        imageSubtitle: stringProperty("Secondary text overlaid in the template image region."),
+        caption: stringProperty("Primary caption beneath the image region."),
+        subcaption: stringProperty("Secondary caption beneath the image region."),
+        secondarySubcaption: stringProperty("Additional secondary template caption."),
+        tertiarySubcaption: stringProperty("Additional tertiary template caption."),
+        iconAttachmentGuid: stringProperty("GUID of an existing downloaded image to render as the component artwork."),
+        text: stringProperty("Optional plain text stored with the component message."),
+        subject: stringProperty("Optional iMessage subject stored with the component."),
+        replyGuid: stringProperty("GUID of a message this component replies to."),
+        replyPart: stringProperty("Part identifier within the replied-to message."),
       },
     },
   },
   "GET /api/v1/iblue/chat/:guid/background": {
     summary: "Get a conversation background",
+    description: "Returns the normalized photo, color, Sky, Water, Aurora, or none background currently stored for the conversation.",
     tags: ["iBlue Messages"],
   },
   "GET /api/v1/iblue/background/presets": {
@@ -428,6 +881,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/chat/:guid/background": {
     summary: "Set or remove a conversation background",
+    description: "Publishes a conversation background update using a staged photo, stored attachment, built-in preset, or removal flag.",
     tags: ["iBlue Messages"],
     body: {
       type: "object",
@@ -446,27 +900,31 @@ const routeDocumentation: Record<string, FastifySchema> = {
           items: { type: "string", pattern: "^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$" },
           description: "Two gradient colors. Required only when preset is color.",
         },
-        remove: { type: "boolean" },
+        remove: booleanProperty("Remove the current conversation background and return to none."),
       },
     },
   },
   "POST /api/v1/iblue/cloud/messages/chats/sync": {
     summary: "Sync a Messages in iCloud chat page",
+    description: "Fetches and persists one paginated Messages in iCloud conversation page for the active profile.",
     tags: ["iBlue Cloud Sync"],
     body: cloudSyncBody,
   },
   "POST /api/v1/iblue/cloud/messages/messages/sync": {
     summary: "Sync a Messages in iCloud message page",
+    description: "Fetches and persists one paginated Messages in iCloud message page for the active profile.",
     tags: ["iBlue Cloud Sync"],
     body: cloudSyncBody,
   },
   "POST /api/v1/iblue/cloud/messages/attachments/sync": {
     summary: "Sync a Messages in iCloud attachment-metadata page",
+    description: "Fetches and persists one paginated Messages in iCloud attachment-metadata page without downloading all media bytes.",
     tags: ["iBlue Cloud Sync"],
     body: cloudSyncBody,
   },
   "GET /api/v1/iblue/icloud-share/:messageGuid": {
     summary: "Resolve an iCloud Photos share",
+    description: "Resolves the iCloud Photos URL in a message into album metadata and downloadable original, medium, and thumbnail variants.",
     tags: ["iBlue iCloud Photos"],
   },
   "GET /api/v1/iblue/icloud-share/:messageGuid/item/:itemGuid/:variant": {
@@ -476,16 +934,17 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/icloud-share": {
     summary: "Send an existing iCloud Photos share",
+    description: "Sends an already-created public iCloud Photos URL as a native Photos Messages card.",
     tags: ["iBlue iCloud Photos"],
     body: {
       type: "object",
       required: ["chatGuid", "url"],
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        url: { type: "string", format: "uri" },
-        caption: { type: "string" },
-        subcaption: { type: "string" },
-        ldText: { type: "string" },
+        url: { type: "string", format: "uri", description: "Public share URL from share.icloud.com or www.icloud.com/photos." },
+        caption: stringProperty("Primary Photos card caption."),
+        subcaption: stringProperty("Secondary Photos card caption."),
+        ldText: stringProperty("Accessibility and link-description text for the card."),
       },
     },
   },
@@ -500,28 +959,31 @@ const routeDocumentation: Record<string, FastifySchema> = {
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
         media: { type: "string", format: "binary", description: "JPEG, PNG, HEIC/HEIF, QuickTime MOV, or MP4 media." },
-        title: { type: "string" },
-        caption: { type: "string" },
-        subcaption: { type: "string" },
-        ldText: { type: "string" },
+        title: stringProperty("Optional public iCloud album title."),
+        caption: stringProperty("Primary Photos card caption."),
+        subcaption: stringProperty("Secondary Photos card caption."),
+        ldText: stringProperty("Accessibility and link-description text for the card."),
       },
     },
   },
   "GET /api/v1/iblue/poll/:messageGuid": {
     summary: "Get a poll and its votes",
+    description: "Returns a normalized Messages poll, its stable option identifiers, and every observed participant vote.",
     tags: ["iBlue Polls"],
   },
   "POST /api/v1/iblue/poll": {
     summary: "Send a poll",
+    description: "Creates a native Messages poll with two to 32 options and returns its sent-message representation.",
     tags: ["iBlue Polls"],
     body: {
       type: "object",
       required: ["chatGuid", "options"],
       properties: {
         chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
-        title: { type: "string" },
+        title: stringProperty("Optional question or title shown above the choices."),
         options: {
           type: "array",
+          description: "Choice labels in display order.",
           minItems: 2,
           maxItems: 32,
           items: { type: "string", minLength: 1 },
@@ -531,22 +993,24 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "POST /api/v1/iblue/poll/:messageGuid/vote": {
     summary: "Vote in a poll",
+    description: "Replaces this profile's vote on an existing Messages poll with the selected option identifiers.",
     tags: ["iBlue Polls"],
     body: {
       type: "object",
       required: ["optionIdentifiers"],
       properties: {
-        optionIdentifiers: { type: "array", items: { type: "string" } },
+        optionIdentifiers: stringArrayProperty("Stable identifiers of the selected poll options.", { minItems: 1 }),
       },
     },
   },
   "POST /api/v1/iblue/location/query": {
     summary: "Query shared-location messages",
+    description: "Lists normalized static map pins and live Find My sharing records with optional chat, time, and pagination filters.",
     tags: ["iBlue Locations"],
     body: {
       type: "object",
       properties: {
-        chatGuid: { type: "string" },
+        chatGuid: stringProperty("Limit results to this BlueBubbles chat GUID."),
         after: { type: "integer", description: "Minimum Unix timestamp in milliseconds." },
         before: { type: "integer", description: "Maximum Unix timestamp in milliseconds." },
         ...paginationProperties,
@@ -555,6 +1019,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/iblue/location/live": {
     summary: "Refresh live Find My locations",
+    description: "Refreshes indefinite Find My sharing state and returns the newest available coordinates for all peers or one address.",
     tags: ["iBlue Locations"],
     querystring: {
       type: "object",
@@ -563,6 +1028,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/iblue/location/:messageGuid": {
     summary: "Get normalized shared-location data",
+    description: "Returns normalized coordinates and metadata for one static pin or live-location sharing message.",
     tags: ["iBlue Locations"],
   },
 };
@@ -570,36 +1036,222 @@ const routeDocumentation: Record<string, FastifySchema> = {
 function contactCardFieldSchema(): JsonSchema {
   return {
     type: "object",
+    description: "Labeled contact value.",
     additionalProperties: false,
     required: ["value"],
     properties: {
-      value: { type: "string", minLength: 1 },
-      label: { type: "string" },
-      types: { type: "array", items: { type: "string" } },
-      preferred: { type: "boolean" },
+      value: { type: "string", minLength: 1, description: "Phone number, email address, URL, or profile value." },
+      label: stringProperty("Human-readable label such as mobile, work, or home."),
+      types: stringArrayProperty("vCard type tokens such as CELL, WORK, or HOME."),
+      preferred: booleanProperty("Whether this is the preferred value of its kind."),
     },
   };
 }
 
-const genericJsonBody: JsonSchema = {
-  type: "object",
-  additionalProperties: true,
-  description: "See the BlueBubbles API contract for accepted fields.",
-};
-
-function routeTag(url: string): string {
-  if (url.startsWith("/api/v1/iblue/")) return "iBlue Extensions";
-  const resource = url.split("/")[3] ?? "server";
+function textRunSchema(): JsonSchema {
   return {
-    attachment: "Attachments",
-    chat: "Chats",
-    contact: "Contacts",
-    fcm: "FCM",
-    handle: "Handles",
-    message: "Messages",
-    server: "Server",
-    webhook: "Webhooks",
-  }[resource] ?? "BlueBubbles Compatibility";
+    type: "object",
+    description: "Formatting and animation applied to one UTF-16 text range.",
+    additionalProperties: false,
+    required: ["range"],
+    properties: {
+      range: {
+        type: "array",
+        description: "Two integers: UTF-16 start offset followed by UTF-16 length.",
+        minItems: 2,
+        maxItems: 2,
+        prefixItems: [
+          integerProperty("Zero-based UTF-16 start offset.", { minimum: 0 }),
+          integerProperty("Number of UTF-16 code units in the run.", { minimum: 1 }),
+        ],
+      },
+      styles: {
+        type: "array",
+        description: "Static styles to combine on this range.",
+        uniqueItems: true,
+        items: { type: "string", enum: ["bold", "italic", "underline", "strikethrough"] },
+      },
+      effect: {
+        type: "string",
+        description: "Apple inline text animation for this range.",
+        enum: ["big", "small", "shake", "nod", "explode", "ripple", "bloom", "jitter"],
+      },
+    },
+  };
+}
+
+function messageCountQuerySchema(): JsonSchema {
+  return {
+    type: "object",
+    properties: {
+      ...messageTimeQueryProperties,
+      minRowId: integerProperty("Count messages whose local database row ID is at least this value.", { minimum: 0 }),
+      maxRowId: integerProperty("Count messages whose local database row ID is at most this value.", { minimum: 0 }),
+    },
+  };
+}
+
+function messageListQuerySchema(): JsonSchema {
+  return {
+    type: "object",
+    properties: {
+      ...paginationProperties,
+      after: messageTimeQueryProperties.after,
+      before: messageTimeQueryProperties.before,
+      sort: {
+        type: "string",
+        enum: ["ASC", "DESC"],
+        default: "DESC",
+        description: "Creation-time sort direction.",
+      },
+    },
+  };
+}
+
+function participantRouteDocumentation(summary: string, description: string): FastifySchema {
+  return {
+    summary,
+    description,
+    tags: ["Chats"],
+    body: {
+      type: "object",
+      required: ["address"],
+      properties: {
+        address: stringProperty("Phone number or email address of the participant to add or remove."),
+      },
+    },
+  };
+}
+
+function messageQueryBodySchema(): JsonSchema {
+  return {
+    type: "object",
+    properties: {
+      ...paginationProperties,
+      ...messageTimeQueryProperties,
+      sort: {
+        type: "string",
+        enum: ["ASC", "DESC"],
+        default: "DESC",
+        description: "Creation-time sort direction.",
+      },
+      where: {
+        type: "array",
+        description: "BlueBubbles-compatible row-ID conditions. iBlue recognizes message.ROWID > :startRowId and message.ROWID <= :endRowId (originalRowId is also accepted).",
+        items: {
+          type: "object",
+          description: "One BlueBubbles query condition.",
+          properties: {
+            statement: stringProperty("BlueBubbles SQL-style condition using :startRowId or :endRowId."),
+            args: {
+              type: "object",
+              description: "Named row-ID values referenced by statement.",
+              additionalProperties: false,
+              properties: {
+                startRowId: integerProperty("Exclusive lower local row-ID bound.", { minimum: 0 }),
+                endRowId: integerProperty("Inclusive upper local row-ID bound.", { minimum: 0 }),
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
+function editRouteDocumentation(messageGuidInBody: boolean): FastifySchema {
+  return {
+    summary: "Edit a sent message",
+    description: messageGuidInBody
+      ? "Edits text previously sent by this iBlue profile; the target GUID is supplied in the request body."
+      : "Edits text previously sent by this iBlue profile; the target GUID is supplied in the path.",
+    tags: ["Messages"],
+    body: {
+      type: "object",
+      additionalProperties: false,
+      required: messageGuidInBody ? ["messageGuid", "editedMessage"] : ["editedMessage"],
+      properties: {
+        ...(messageGuidInBody
+          ? { messageGuid: stringProperty("GUID of the previously sent message to edit.") }
+          : {}),
+        editedMessage: stringProperty("Replacement plain-text body."),
+        partIndex: integerProperty("Zero-based part index to replace within the message.", { minimum: 0, default: 0 }),
+      },
+    },
+  };
+}
+
+function unsendRouteDocumentation(messageGuidInBody: boolean): FastifySchema {
+  return {
+    summary: "Unsend a sent message",
+    description: messageGuidInBody
+      ? "Retracts a message previously sent by this iBlue profile; the target GUID is supplied in the request body."
+      : "Retracts a message previously sent by this iBlue profile; the target GUID is supplied in the path.",
+    tags: ["Messages"],
+    body: {
+      type: "object",
+      additionalProperties: false,
+      required: messageGuidInBody ? ["messageGuid"] : [],
+      properties: {
+        ...(messageGuidInBody
+          ? { messageGuid: stringProperty("GUID of the previously sent message to retract.") }
+          : {}),
+        partIndex: integerProperty("Zero-based part index to retract within the message.", { minimum: 0, default: 0 }),
+      },
+    },
+  };
+}
+
+function attachmentMessageBodySchema(): JsonSchema {
+  return {
+    type: "object",
+    required: ["chatGuid", "attachment"],
+    properties: {
+      chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
+      attachment: { type: "string", format: "binary", description: "File bytes to upload and send." },
+      name: stringProperty("Optional recipient-visible filename; defaults to the uploaded filename."),
+      tempGuid: stringProperty("Optional client-generated correlation GUID."),
+      subject: stringProperty("Optional iMessage attachment caption/subject."),
+      ...messageEffectProperties,
+      isAudioMessage: booleanProperty("Mark the upload as an expiring iMessage audio message."),
+      selectedMessageGuid: stringProperty("GUID of the message being replied to."),
+      partIndex: integerProperty("Zero-based part index within the replied-to message.", { minimum: 0, default: 0 }),
+    },
+  };
+}
+
+function multipartMessageBodySchema(): JsonSchema {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["chatGuid", "parts"],
+    properties: {
+      chatGuid: stringProperty("Destination BlueBubbles chat GUID."),
+      parts: {
+        type: "array",
+        description: "Ordered text, mention, and staged-attachment parts.",
+        minItems: 1,
+        items: {
+          type: "object",
+          description: "One message part. Supply text or both attachment and name.",
+          additionalProperties: false,
+          required: ["partIndex"],
+          properties: {
+            partIndex: integerProperty("Zero-based output position for this part.", { minimum: 0 }),
+            text: stringProperty("Plain text for a text or mention part."),
+            mention: stringProperty("Messages address mentioned by this text part."),
+            attachment: stringProperty("Staged path returned by POST /api/v1/attachment/upload."),
+            name: stringProperty("Recipient-visible filename required for an attachment part."),
+          },
+        },
+      },
+      tempGuid: stringProperty("Optional client-generated correlation GUID."),
+      subject: stringProperty("Optional iMessage subject line."),
+      ...messageEffectProperties,
+      ...replyProperties,
+      ddScan: booleanProperty("Ask Messages to scan text for Data Detectors such as dates and addresses."),
+    },
+  };
 }
 
 function operationId(method: string, url: string): string {
@@ -611,13 +1263,45 @@ function operationId(method: string, url: string): string {
   return `${method.toLowerCase()}_${path || "root"}`;
 }
 
+function inferredPathParameter(url: string, name: string): JsonSchema {
+  if (name === "variant") {
+    return {
+      type: "string",
+      enum: ["original", "medium", "thumbnail"],
+      description: "Media rendition to download from the iCloud Photos share.",
+    };
+  }
+  if (name === "id") {
+    return integerProperty("Numeric resource ID.", { minimum: 1 });
+  }
+  if (name === "address") {
+    return stringProperty("URL-encoded Messages phone number or email address.");
+  }
+  if (name === "attachmentGuid") {
+    return stringProperty("GUID of the stored iMessage attachment.");
+  }
+  if (name === "itemGuid") {
+    return stringProperty("Identifier of one asset within the resolved iCloud Photos share.");
+  }
+  if (name === "messageGuid") {
+    return stringProperty("GUID of the target iMessage.");
+  }
+  if (name === "guid") {
+    if (url.startsWith("/api/v1/chat/")) return stringProperty("BlueBubbles chat GUID.");
+    if (url.startsWith("/api/v1/handle/")) return stringProperty("Messages handle GUID or normalized address.");
+    if (url.startsWith("/api/v1/attachment/")) return stringProperty("GUID of the stored iMessage attachment.");
+    return stringProperty("GUID of the target iMessage.");
+  }
+  return stringProperty(`Path identifier named ${name}.`);
+}
+
 function inferredParams(url: string): JsonSchema | undefined {
   const names = [...url.matchAll(/:([A-Za-z0-9_]+)/g)].map((match) => match[1]!);
   if (names.length === 0) return undefined;
   return {
     type: "object",
     required: names,
-    properties: Object.fromEntries(names.map((name) => [name, { type: "string" }])),
+    properties: Object.fromEntries(names.map((name) => [name, inferredPathParameter(url, name)])),
   };
 }
 
@@ -631,75 +1315,20 @@ export function documentApiRoute(
   if (url === "/api/v1/*") return { ...source, hide: true };
 
   const method = (Array.isArray(routeMethod) ? routeMethod[0] ?? "GET" : routeMethod).toUpperCase();
-  const documented = routeDocumentation[`${method} ${url}`] ?? {};
+  const key = `${method} ${url}`;
+  const documented = routeDocumentation[key];
+  if (!documented?.summary || !documented.description || !documented.tags) {
+    throw new Error(`OpenAPI documentation is incomplete for ${key}`);
+  }
   const params = source.params ?? documented.params ?? inferredParams(url);
-  const acceptsJsonBody = ["POST", "PUT", "PATCH"].includes(method);
 
   return {
     ...source,
     ...documented,
-    tags: source.tags ?? documented.tags ?? [routeTag(url)],
-    summary: source.summary ?? documented.summary ?? `${method} ${url}`,
+    tags: source.tags ?? documented.tags,
+    summary: source.summary ?? documented.summary,
+    description: source.description ?? documented.description,
     operationId: source.operationId ?? documented.operationId ?? operationId(method, url),
     ...(params ? { params } : {}),
-    ...(source.body || documented.body || !acceptsJsonBody
-      ? {}
-      : { body: genericJsonBody }),
   };
-}
-
-export function completeOpenApiDocument<T extends { paths?: Record<string, unknown> }>(document: T): T {
-  const paths = (document.paths ?? {}) as Record<string, Record<string, unknown>>;
-  document.paths = paths;
-
-  for (const route of PINNED_BLUEBUBBLES_REST_ROUTES) {
-    const method = route.method.toLowerCase();
-    const path = route.path.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
-    const pathItem = paths[path] ?? {};
-    paths[path] = pathItem;
-    if (pathItem[method]) continue;
-
-    const params = [...route.path.matchAll(/:([A-Za-z0-9_]+)/g)].map((match) => ({
-      name: match[1]!,
-      in: "path",
-      required: true,
-      schema: { type: "string" },
-    }));
-    const acceptsBody = ["post", "put", "patch"].includes(method);
-    pathItem[method] = {
-      operationId: operationId(route.method, route.path),
-      summary: `${route.method} ${route.path}`,
-      description: "Recognized for BlueBubbles 1.9.9 compatibility. This operation currently returns an authenticated BlueBubbles-shaped 501 response because it requires a macOS app or administration subsystem outside iBlue's isolated IDS service.",
-      tags: [routeTag(route.path)],
-      ...(params.length > 0 ? { parameters: params } : {}),
-      ...(acceptsBody
-        ? {
-          requestBody: {
-            required: false,
-            content: { "application/json": { schema: genericJsonBody } },
-          },
-        }
-        : {}),
-      responses: {
-        "501": {
-          description: "Recognized but unsupported by the isolated iBlue service.",
-          content: {
-            "application/json": {
-              schema: {
-                type: "object",
-                required: ["status", "message", "error"],
-                properties: {
-                  status: { type: "integer", const: 501 },
-                  message: { type: "string" },
-                  error: { type: "object", additionalProperties: true },
-                },
-              },
-            },
-          },
-        },
-      },
-    };
-  }
-
-  return document;
 }

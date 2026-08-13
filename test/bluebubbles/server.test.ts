@@ -1243,6 +1243,13 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     paths: Record<string, Record<string, {
       summary?: string;
       description?: string;
+      operationId?: string;
+      parameters?: Array<{
+        name?: string;
+        in?: string;
+        description?: string;
+        schema?: { description?: string };
+      }>;
       requestBody?: { content?: Record<string, { schema?: Record<string, unknown> }> };
       responses?: Record<string, {
         content?: Record<string, { schema?: Record<string, unknown> }>;
@@ -1258,10 +1265,52 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
     name: "password",
     description: "The configured iBlue server password. BlueBubbles aliases `guid` and `token` are also accepted by the API.",
   });
-  for (const route of PINNED_BLUEBUBBLES_REST_ROUTES) {
-    const path = route.path.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
-    assert.ok(openApi.paths[path]?.[route.method.toLowerCase()], `OpenAPI omitted ${route.method} ${route.path}`);
+  const documentedOperations = Object.entries(openApi.paths).flatMap(([path, pathItem]) =>
+    Object.entries(pathItem)
+      .filter(([method]) => ["get", "post", "put", "patch", "delete"].includes(method))
+      .map(([method, operation]) => ({ path, method, operation })),
+  );
+  assert.equal(documentedOperations.length, 98);
+  const missingParameterDescriptions: string[] = [];
+  const auditBodyProperties = (
+    schema: Record<string, unknown> | undefined,
+    label: string,
+    prefix = "",
+  ): void => {
+    const properties = schema?.properties as Record<string, Record<string, unknown>> | undefined;
+    for (const [name, property] of Object.entries(properties ?? {})) {
+      const path = prefix ? `${prefix}.${name}` : name;
+      if (typeof property.description !== "string" || !property.description.trim()) {
+        missingParameterDescriptions.push(`${label} body parameter ${path}`);
+      }
+      auditBodyProperties(property, label, path);
+      if (property.items && typeof property.items === "object") {
+        auditBodyProperties(property.items as Record<string, unknown>, label, `${path}[]`);
+      }
+    }
+  };
+  for (const { path, method, operation } of documentedOperations) {
+    const label = `${method.toUpperCase()} ${path}`;
+    assert.ok(operation.summary?.trim(), `${label} omitted a summary`);
+    assert.ok(operation.description?.trim(), `${label} omitted a description`);
+    assert.ok(operation.operationId?.trim(), `${label} omitted an operationId`);
+    assert.doesNotMatch(String(operation.summary), /^(GET|POST|PUT|PATCH|DELETE) \/api\//, `${label} uses a placeholder summary`);
+    for (const parameter of operation.parameters ?? []) {
+      if (!parameter.description?.trim() && !parameter.schema?.description?.trim()) {
+        missingParameterDescriptions.push(
+          `${label} ${parameter.in ?? "unknown"} parameter ${parameter.name ?? "unknown"}`,
+        );
+      }
+    }
+    for (const media of Object.values(operation.requestBody?.content ?? {})) {
+      auditBodyProperties(media.schema, label);
+    }
   }
+  assert.deepEqual(missingParameterDescriptions, [], "OpenAPI parameters omitted descriptions");
+  assert.equal(openApi.paths["/api/v1/facetime/session"], undefined);
+  assert.equal(openApi.paths["/api/v1/facetime/answer/{call_uuid}"], undefined);
+  assert.equal(openApi.paths["/api/v1/facetime/leave/{call_uuid}"], undefined);
+  assert.equal(openApi.paths["/api/v1/mac/lock"], undefined);
   const createShareDocs = openApi.paths["/api/v1/iblue/icloud-share/create"]?.post;
   assert.equal(createShareDocs?.summary, "Create and send a fresh iCloud Photos share");
   assert.match(String(createShareDocs?.description), /web importer rejects GIF/);
