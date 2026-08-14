@@ -1,0 +1,14 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,8 +39,8 @@ rcgen = "0.13"
+ ring = "0.17"
+ rustc-hash = "2"
+-rustls = { path = "../rustls/rustls", default-features = false, features = ["std"] }
++rustls = { version = "0.23.28", default-features = false, features = ["std"] }
+ rustls-pemfile = "2"
+-rustls-platform-verifier = { path = "../rustls-platform-verifier/rustls-platform-verifier" }
++rustls-platform-verifier = "0.4"
+ rustls-pki-types = "1.7"
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1"

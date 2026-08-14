@@ -28,6 +28,7 @@ import type {
   IBlueICloudShareVariantName,
   IBlueReactionRequest,
 } from "./contracts.js";
+import type { NativeFaceTimeMediaFrame } from "../types.js";
 import { failure, success, unsupported } from "./response.js";
 import type { ScheduledMessageDraft } from "./scheduler.js";
 import {
@@ -35,7 +36,7 @@ import {
   StickerUnsendUnsupportedError,
   type BlueBubblesEvent,
 } from "./service.js";
-import { stripTransport } from "./guid.js";
+import { stripTransport, toTransportAddress } from "./guid.js";
 import { buildVCardContact, parseVCardContactCards, parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
 import {
@@ -57,6 +58,10 @@ import {
   isBuiltinConversationBackgroundPreset,
   normalizeConversationBackgroundColors,
 } from "./backgrounds.js";
+import {
+  FaceTimeMediaManager,
+  type FaceTimeMediaMode,
+} from "./facetime-media.js";
 
 const WEBHOOK_EVENTS = new Set([
   "*",
@@ -147,7 +152,16 @@ export interface BlueBubblesServerOptions {
   port?: number;
   /** Test/embedding override for Apple's public iCloud Photos resolver. */
   icloudShareResolver?: ICloudShareResolver;
+  /** Test/embedding override for the deterministic FaceTime call controller. */
+  faceTimeMediaManager?: FaceTimeMediaController;
 }
+
+type FaceTimeMediaController =
+  Pick<FaceTimeMediaManager, "list" | "get" | "start" | "stop" | "close">
+  & Partial<Pick<
+    FaceTimeMediaManager,
+    "startLiveAudio" | "pushLiveAudioFrame" | "finishLiveAudio"
+  >>;
 
 type Query = Record<string, string | undefined>;
 
@@ -159,6 +173,15 @@ interface SocketUpload {
   nextOffset: number;
 }
 
+interface FaceTimeSocketSubscription {
+  callId: string;
+  sessionId: string;
+  audio: boolean;
+  video: boolean;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class BlueBubblesServer {
   readonly service: BlueBubblesService;
   readonly host: string;
@@ -167,6 +190,14 @@ export class BlueBubblesServer {
   readonly icloudShareResolver: ICloudShareResolver;
 
   #socket?: SocketIoServer;
+  #faceTimeMedia?: FaceTimeMediaController;
+  #faceTimeMediaUnavailableReason?: string;
+  readonly #faceTimeSocketSubscriptions = new Map<
+    string,
+    Map<string, FaceTimeSocketSubscription>
+  >();
+  /** A live microphone stream is controlled exclusively by the socket that created it. */
+  readonly #faceTimeLiveAudioOwners = new Map<string, string>();
 
   constructor(options: BlueBubblesServerOptions) {
     this.service = options.service;
@@ -174,6 +205,56 @@ export class BlueBubblesServer {
     this.port = options.port ?? 1234;
     this.icloudShareResolver = options.icloudShareResolver ?? new ICloudShareResolver();
     this.app = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024 });
+    if (options.faceTimeMediaManager) {
+      this.#faceTimeMedia = options.faceTimeMediaManager;
+    } else if (this.service.faceTimeAvailable) {
+      try {
+        this.#faceTimeMedia = new FaceTimeMediaManager({
+          signaling: {
+            createSession: (params) => this.service.createFaceTimeSession(params),
+            listSessions: () => this.service.listFaceTimeSessions(),
+            ringSession: (sessionId, targets) =>
+              this.service.ringFaceTimeSession(sessionId, targets),
+            confirmMediaJoined: (sessionId) =>
+              this.service.confirmFaceTimeMediaJoined(sessionId),
+            leaveSession: (sessionId) => this.service.leaveFaceTimeSession(sessionId),
+            ...(this.service.nativeFaceTimeMediaAvailable ? {
+              createNativeMediaSession: (params: {
+                targets: string[];
+                from?: string;
+                audioPath: string;
+              }) => this.service.createNativeFaceTimeMediaSession(params),
+              startNativeMediaSession: (sessionId: string) =>
+                this.service.startNativeFaceTimeMediaSession(sessionId),
+              nativeMediaStatus: (sessionId: string) =>
+                this.service.nativeFaceTimeMediaStatus(sessionId),
+            } : {}),
+            ...(this.service.nativeFaceTimeLiveAudioAvailable ? {
+              createNativeLiveAudioSession: (params: {
+                targets: string[];
+                from?: string;
+                ring?: boolean;
+              }) => this.service.createNativeFaceTimeLiveAudioSession(params),
+              startNativeLiveAudioStream: (sessionId: string) =>
+                this.service.startNativeFaceTimeLiveAudioStream(sessionId),
+              pushNativeLiveAudioFrame: (sessionId: string, frame: Buffer) =>
+                this.service.pushNativeFaceTimeLiveAudioFrame(sessionId, frame),
+              finishNativeLiveAudioStream: (sessionId: string) =>
+                this.service.finishNativeFaceTimeLiveAudioStream(sessionId),
+            } : {}),
+          },
+          onUpdate: (call) => {
+            this.service.dispatch("ft-call-status-changed", call);
+            if ((call.state === "ended" || call.state === "failed") && call.sessionId) {
+              this.#faceTimeLiveAudioOwners.delete(call.id);
+              void this.revokeFaceTimeSubscriptions(call.sessionId);
+            }
+          },
+        });
+      } catch (error) {
+        this.#faceTimeMediaUnavailableReason = error instanceof Error ? error.message : String(error);
+      }
+    }
   }
 
   async start(): Promise<{ address: string; port: number }> {
@@ -201,6 +282,8 @@ export class BlueBubblesServer {
     });
     this.configureSocket(this.#socket);
     this.service.on("event", (event: BlueBubblesEvent) => this.#socket?.emit(event.type, event.data));
+    this.service.on("facetime-media-frame", (frame: NativeFaceTimeMediaFrame) =>
+      this.routeFaceTimeMediaFrame(frame));
     this.service.on("error", (error) => this.app.log.error(error));
 
     const address = await this.app.listen({ host: this.host, port: this.port });
@@ -210,6 +293,11 @@ export class BlueBubblesServer {
   }
 
   async stop(): Promise<void> {
+    for (const subscriptions of this.#faceTimeSocketSubscriptions.values()) {
+      for (const subscription of subscriptions.values()) clearTimeout(subscription.timer);
+    }
+    this.#faceTimeSocketSubscriptions.clear();
+    await this.#faceTimeMedia?.close();
     await new Promise<void>((resolve) => {
       if (!this.#socket) return resolve();
       this.#socket.close(() => resolve());
@@ -242,6 +330,7 @@ export class BlueBubblesServer {
           { name: "iBlue Locations", description: "Static and live shared-location data." },
           { name: "iBlue Polls", description: "Native Messages polls and votes." },
           { name: "iBlue iCloud Photos", description: "Resolve, create, download, and send iCloud Photos shares." },
+          { name: "iBlue FaceTime", description: "Profile-isolated FaceTime signaling, media, lifecycle, and agent-facing realtime streams." },
           { name: "iBlue Extensions", description: "Additional iBlue API extensions." },
         ],
         components: {
@@ -436,11 +525,335 @@ export class BlueBubblesServer {
     });
     this.app.get<{ Querystring: Query }>("/api/v1/handle/availability/facetime", async (request) => {
       if (!request.query.address) throw new RequestError(400, "address is required", "VALIDATION_ERROR");
-      // iBlue does not currently expose FaceTime calling. Return a real
-      // negative capability result instead of letting setup clients mistake a
-      // missing route for a broken BlueBubbles server.
-      return success({ available: false });
+      return success({ available: this.service.faceTimeAvailable });
     });
+
+    this.app.post("/api/v1/iblue/facetime/session", async (request) => {
+      const body = asRecord(request.body);
+      const targets = Array.isArray(body.targets)
+        ? body.targets.filter((value): value is string => typeof value === "string")
+        : typeof body.address === "string"
+          ? [body.address]
+          : [];
+      if (targets.length === 0) {
+        throw new RequestError(400, "address or targets is required", "VALIDATION_ERROR");
+      }
+      const normalizedTargets = targets.map((target) => {
+        const trimmed = target.trim();
+        if (trimmed.startsWith("tel:") || trimmed.startsWith("mailto:")) return trimmed;
+        return toTransportAddress(trimmed);
+      });
+      const ttl = body.ringTtlSeconds === undefined
+        ? undefined
+        : numberValue(body.ringTtlSeconds, Number.NaN);
+      if (ttl !== undefined && (!Number.isSafeInteger(ttl) || ttl < 15 || ttl > 3_600)) {
+        throw new RequestError(
+          400,
+          "ringTtlSeconds must be an integer between 15 and 3600",
+          "VALIDATION_ERROR",
+        );
+      }
+      const result = await this.service.createFaceTimeSession({
+        targets: normalizedTargets,
+        ...(typeof body.from === "string" ? { from: toTransportAddress(body.from) } : {}),
+        ...(typeof body.displayName === "string" ? { displayName: body.displayName } : {}),
+        ...(ttl === undefined ? {} : { ringTtlSeconds: ttl }),
+      });
+      this.service.dispatch("ft-call-status-changed", {
+        callUuid: result.sessionId,
+        status: result.state,
+        targets: result.targets,
+      });
+      return success(result, "FaceTime session created; join its link to begin ringing!");
+    });
+    this.app.get("/api/v1/iblue/facetime/session", async () =>
+      success(await this.service.listFaceTimeSessions(), "Successfully fetched FaceTime sessions!"));
+    this.app.post<{ Params: { sessionId: string } }>(
+      "/api/v1/iblue/facetime/session/:sessionId/leave",
+      async (request) => {
+        const result = await this.service.leaveFaceTimeSession(request.params.sessionId);
+        this.service.dispatch("ft-call-status-changed", {
+          callUuid: result.sessionId,
+          status: "ended",
+        });
+        return success(result, "FaceTime session left!");
+      },
+    );
+    this.app.get("/api/v1/iblue/facetime/capabilities", async () => success({
+      signaling: this.service.faceTimeAvailable,
+      deterministicMedia: Boolean(this.#faceTimeMedia),
+      // These legacy scalar fields describe the preferred audio path. Use
+      // modeCapabilities when selecting audio versus video behavior.
+      deterministicMediaTransport: this.service.nativeFaceTimeMediaAvailable
+        ? "iblue-quickrelay"
+        : this.#faceTimeMedia
+          ? "apple-web-bridge"
+          : null,
+      nativeMedia: this.service.nativeFaceTimeMediaAvailable,
+      nativeMediaModes: this.service.nativeFaceTimeMediaAvailable ? ["audio"] : [],
+      nativeMediaUnavailableReason: this.service.nativeFaceTimeMediaAvailable
+        ? null
+        : this.service.nativeFaceTimeMediaUnavailableReason,
+      callTopology: this.service.nativeFaceTimeMediaAvailable
+        ? "one-to-one"
+        : this.#faceTimeMedia
+          ? "group"
+          : null,
+      outboundIdentity: this.service.nativeFaceTimeMediaAvailable
+        ? "registered-apple-handle"
+        : this.#faceTimeMedia
+          ? "apple-web-guest"
+          : null,
+      modes: this.#faceTimeMedia ? ["audio", "video"] : [],
+      outboundMedia: this.#faceTimeMedia
+        ? [
+          "uploaded-file",
+          ...(this.service.nativeFaceTimeLiveAudioAvailable
+            && this.#faceTimeMedia.startLiveAudio
+            && this.#faceTimeMedia.pushLiveAudioFrame
+            && this.#faceTimeMedia.finishLiveAudio
+            ? ["live-audio-stream"]
+            : []),
+        ]
+        : [],
+      modeCapabilities: {
+        audio: {
+          available: Boolean(this.#faceTimeMedia),
+          verification: this.service.nativeFaceTimeMediaAvailable
+            ? "verified-generated-and-phone-originated-aac-eld-playback"
+            : this.#faceTimeMedia
+              ? "web-fallback"
+              : "unavailable",
+          transport: this.service.nativeFaceTimeMediaAvailable
+            ? "iblue-quickrelay"
+            : this.#faceTimeMedia
+              ? "apple-web-bridge"
+              : null,
+          topology: this.service.nativeFaceTimeMediaAvailable
+            ? "one-to-one"
+            : this.#faceTimeMedia
+              ? "group"
+              : null,
+          outboundIdentity: this.service.nativeFaceTimeMediaAvailable
+            ? "registered-apple-handle"
+            : this.#faceTimeMedia
+              ? "apple-web-guest"
+              : null,
+          outboundCodec: this.service.nativeFaceTimeMediaAvailable ? "aac-eld-pt104" : null,
+        },
+        video: {
+          available: Boolean(this.#faceTimeMedia),
+          transport: this.#faceTimeMedia ? "apple-web-bridge" : null,
+          topology: this.#faceTimeMedia ? "group" : null,
+          outboundIdentity: this.#faceTimeMedia ? "apple-web-guest" : null,
+        },
+      },
+      webFallbackBrowserSandbox: "default",
+      inboundMediaStreaming: this.service.nativeFaceTimeStreamingAvailable,
+      inboundMediaTransport: this.service.nativeFaceTimeStreamingAvailable ? "socket.io" : null,
+      inboundMediaCodecs: this.service.nativeFaceTimeStreamingAvailable
+        ? { audio: ["evs", "aac-eld"], video: ["h265"], videoDescription: ["qtff"] }
+        : { audio: [], video: [], videoDescription: [] },
+      inboundMediaSubscription: this.service.nativeFaceTimeStreamingAvailable
+        ? { optIn: true, ttlSeconds: { minimum: 5, maximum: 3_600, default: 300 } }
+        : null,
+      outboundLiveMediaInjection: Boolean(
+        this.service.nativeFaceTimeLiveAudioAvailable
+        && this.#faceTimeMedia?.startLiveAudio
+        && this.#faceTimeMedia.pushLiveAudioFrame
+        && this.#faceTimeMedia.finishLiveAudio,
+      ),
+      realtimeProtocol: this.service.nativeFaceTimeStreamingAvailable
+        || this.service.nativeFaceTimeLiveAudioAvailable
+        ? "/api/v1/iblue/facetime/realtime"
+        : null,
+      realtimeLifecycleEvent: "ft-call-status-changed",
+      ...(this.#faceTimeMediaUnavailableReason
+        ? { unavailableReason: this.#faceTimeMediaUnavailableReason }
+        : {}),
+    }, "Successfully fetched FaceTime capabilities!"));
+    this.app.get("/api/v1/iblue/facetime/realtime", async () => success({
+      transport: "socket.io",
+      path: "/socket.io",
+      authentication: {
+        location: "handshake.query",
+        parameter: "password",
+        aliases: ["guid"],
+      },
+      controls: {
+        list: { requestEvent: "facetime-call-list", responseEvent: "facetime-call-list" },
+        get: { requestEvent: "facetime-call-get", responseEvent: "facetime-call-get", required: ["callId"] },
+        stop: { requestEvent: "facetime-call-stop", responseEvent: "facetime-call-stop", required: ["callId"] },
+      },
+      inboundMedia: {
+        available: this.service.nativeFaceTimeStreamingAvailable,
+        subscribeEvent: "facetime-media-subscribe",
+        unsubscribeEvent: "facetime-media-unsubscribe",
+        frameEvent: "ft-media-frame",
+        codecs: { audio: ["evs", "aac-eld"], video: ["h265"], videoDescription: ["qtff"] },
+        request: {
+          required: ["callId"],
+          optional: { audio: "boolean (default true)", video: "boolean (default false)", ttlSeconds: "integer 5..3600 (default 300)" },
+        },
+        frame: {
+          fields: [
+            "callId", "sessionId", "kind", "codec", "payloadType", "rtpTimestamp",
+            "durationMs", "droppedPackets", "receivedAt", "data",
+          ],
+          data: "Socket.IO binary Buffer containing one encoded codec access unit or Annex-B H.265 sample",
+        },
+        persistence: "none",
+        webhookDelivery: false,
+        explicitOptIn: true,
+      },
+      outboundLiveMediaInjection: {
+        available: Boolean(
+          this.service.nativeFaceTimeLiveAudioAvailable
+          && this.#faceTimeMedia?.startLiveAudio
+          && this.#faceTimeMedia.pushLiveAudioFrame
+          && this.#faceTimeMedia.finishLiveAudio,
+        ),
+        verification: "native-aac-eld-pt104; pending live-call listening confirmation",
+        createEvent: "facetime-live-audio-create",
+        frameEvent: "facetime-live-audio-frame",
+        finishEvent: "facetime-live-audio-finish",
+        lifecycleEvent: "ft-call-status-changed",
+        createRequest: {
+          required: ["target or address"],
+          optional: {
+            displayName: "string (default iBlue)",
+            from: "registered iBlue handle",
+            maxDurationSeconds: "integer 15..600 (default 300)",
+          },
+        },
+        frameRequest: {
+          required: ["callId", "data"],
+          data: "Socket.IO binary Buffer: exactly 1920 bytes of 24 kHz mono float32 little-endian PCM (20 ms)",
+          acknowledgement: "one acknowledgement per accepted or rejected frame",
+        },
+        ownership: "Only the authenticated socket that creates a call may inject or finish its stream",
+        disconnectBehavior: "The call is finished immediately when its owner socket disconnects",
+        concurrency: "One active deterministic FaceTime media call per server process",
+        queueCapacityFrames: 50,
+        safetyDeadlineSeconds: { minimum: 15, maximum: 600, default: 300 },
+        persistence: "none",
+        webhookDelivery: false,
+      },
+    }, "Successfully fetched FaceTime realtime protocol metadata!"));
+    this.app.get("/api/v1/iblue/facetime/call", async () =>
+      success(this.#faceTimeMedia?.list() ?? [], "Successfully fetched FaceTime media calls!"));
+    this.app.get<{ Params: { callId: string } }>(
+      "/api/v1/iblue/facetime/call/:callId",
+      async (request, reply) => {
+        const call = this.#faceTimeMedia?.get(request.params.callId);
+        if (!call) return reply.code(404).send(notFound("FaceTime media call not found!"));
+        return success(call, "Successfully fetched FaceTime media call!");
+      },
+    );
+    this.app.post("/api/v1/iblue/facetime/call", async (request) => {
+      if (!this.#faceTimeMedia) {
+        throw new RequestError(
+          500,
+          this.#faceTimeMediaUnavailableReason ?? "FaceTime media is unavailable",
+          "FACETIME_MEDIA_UNAVAILABLE",
+        );
+      }
+      const file = await request.file();
+      if (!file || file.fieldname !== "media") {
+        throw new RequestError(400, "FaceTime media file is required", "VALIDATION_ERROR");
+      }
+      const directory = await mkdtemp(join(tmpdir(), "iblue-facetime-upload-"));
+      const filename = safeAttachmentName(file.filename || "media");
+      const path = join(directory, filename);
+      try {
+        const size = await saveMultipartFile(file, path);
+        if (size === 0 || size > 95 * 1024 * 1024) {
+          throw new RequestError(
+            400,
+            "FaceTime media must be between 1 byte and 95 MiB",
+            "VALIDATION_ERROR",
+          );
+        }
+        const address = multipartField(file, "address");
+        const targetsField = multipartField(file, "targets");
+        let targets: string[] = [];
+        if (targetsField) {
+          try {
+            const parsed: unknown = JSON.parse(targetsField);
+            if (Array.isArray(parsed)) {
+              targets = parsed.filter((value): value is string => typeof value === "string");
+            }
+          } catch {
+            targets = targetsField.split(",").map((value) => value.trim()).filter(Boolean);
+          }
+        } else if (address) {
+          targets = [address];
+        }
+        if (targets.length === 0) {
+          throw new RequestError(400, "address or targets is required", "VALIDATION_ERROR");
+        }
+        targets = targets.map((target) =>
+          target.startsWith("tel:") || target.startsWith("mailto:")
+            ? target
+            : toTransportAddress(target));
+        const requestedMode = multipartField(file, "mode");
+        const mode: FaceTimeMediaMode = requestedMode === "video"
+          ? "video"
+          : requestedMode === "audio"
+            ? "audio"
+            : file.mimetype.startsWith("video/")
+              ? "video"
+              : "audio";
+        if (!file.mimetype.startsWith(`${mode}/`)) {
+          throw new RequestError(
+            400,
+            `The ${mode} call requires an ${mode} media upload`,
+            "VALIDATION_ERROR",
+          );
+        }
+        const rawDuration = multipartField(file, "maxDurationSeconds");
+        const maxDurationSeconds = rawDuration === undefined ? undefined : Number(rawDuration);
+        if (maxDurationSeconds !== undefined && (
+          !Number.isSafeInteger(maxDurationSeconds)
+          || maxDurationSeconds < 15
+          || maxDurationSeconds > 600
+        )) {
+          throw new RequestError(
+            400,
+            "maxDurationSeconds must be an integer between 15 and 600",
+            "VALIDATION_ERROR",
+          );
+        }
+        const nativeAudioPassthrough = multipartField(file, "nativeAudioPassthrough") === "true";
+        if (nativeAudioPassthrough && mode !== "audio") {
+          throw new RequestError(
+            400,
+            "nativeAudioPassthrough is available only for audio calls",
+            "VALIDATION_ERROR",
+          );
+        }
+        const call = await this.#faceTimeMedia.start({
+          mode,
+          targets,
+          displayName: multipartField(file, "displayName") ?? "iBlue",
+          sourcePath: path,
+          ...(multipartField(file, "from") ? { from: multipartField(file, "from")! } : {}),
+          ...(maxDurationSeconds === undefined ? {} : { maxDurationSeconds }),
+          ...(nativeAudioPassthrough ? { nativeAudioPassthrough: true } : {}),
+        });
+        return success(call, "FaceTime media call is starting!");
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+    this.app.delete<{ Params: { callId: string } }>(
+      "/api/v1/iblue/facetime/call/:callId",
+      async (request, reply) => {
+        const call = await this.#faceTimeMedia?.stop(request.params.callId);
+        if (!call) return reply.code(404).send(notFound("FaceTime media call not found!"));
+        return success(call, "FaceTime media call ended!");
+      },
+    );
 
     // Contacts.app belongs to the signed-in macOS user and is intentionally
     // outside the isolated iBlue profile. Keep the stock BlueBubbles contact
@@ -1663,6 +2076,74 @@ export class BlueBubblesServer {
     });
   }
 
+  private routeFaceTimeMediaFrame(frame: NativeFaceTimeMediaFrame): void {
+    const now = Date.now();
+    const data = Buffer.from(frame.dataBase64, "base64");
+    for (const [socketId, subscriptions] of this.#faceTimeSocketSubscriptions) {
+      const subscription = [...subscriptions.values()].find((candidate) =>
+        candidate.sessionId === frame.sessionId
+        && candidate.expiresAt > now
+        && (frame.kind === "audio" ? candidate.audio : candidate.video));
+      if (!subscription) continue;
+      this.#socket?.sockets.sockets.get(socketId)?.emit("ft-media-frame", {
+        callId: subscription.callId,
+        sessionId: frame.sessionId,
+        kind: frame.kind,
+        codec: frame.codec,
+        ...(frame.payloadType === undefined ? {} : { payloadType: frame.payloadType }),
+        ...(frame.rtpTimestamp === undefined ? {} : { rtpTimestamp: frame.rtpTimestamp }),
+        ...(frame.durationMs === undefined ? {} : { durationMs: frame.durationMs }),
+        ...(frame.droppedPackets === undefined ? {} : { droppedPackets: frame.droppedPackets }),
+        receivedAt: frame.receivedAt,
+        data,
+      });
+    }
+  }
+
+  private async refreshNativeFaceTimeStream(sessionId: string): Promise<void> {
+    if (!this.service.nativeFaceTimeStreamingAvailable) return;
+    const now = Date.now();
+    const active = [...this.#faceTimeSocketSubscriptions.values()]
+      .flatMap((subscriptions) => [...subscriptions.values()])
+      .filter((subscription) => subscription.sessionId === sessionId && subscription.expiresAt > now);
+    if (active.length === 0) {
+      await this.service.setNativeFaceTimeMediaStream({ sessionId, enabled: false });
+      return;
+    }
+    const expiresAt = Math.max(...active.map((subscription) => subscription.expiresAt));
+    await this.service.setNativeFaceTimeMediaStream({
+      sessionId,
+      enabled: true,
+      audio: active.some((subscription) => subscription.audio),
+      video: active.some((subscription) => subscription.video),
+      ttlSeconds: Math.min(3_600, Math.max(5, Math.ceil((expiresAt - now) / 1_000))),
+    });
+  }
+
+  private removeFaceTimeSubscription(socketId: string, callId: string): string | undefined {
+    const subscriptions = this.#faceTimeSocketSubscriptions.get(socketId);
+    const subscription = subscriptions?.get(callId);
+    if (!subscription) return undefined;
+    clearTimeout(subscription.timer);
+    subscriptions!.delete(callId);
+    if (subscriptions!.size === 0) this.#faceTimeSocketSubscriptions.delete(socketId);
+    return subscription.sessionId;
+  }
+
+  private async revokeFaceTimeSubscriptions(sessionId: string): Promise<void> {
+    for (const [socketId, subscriptions] of this.#faceTimeSocketSubscriptions) {
+      for (const subscription of [...subscriptions.values()]) {
+        if (subscription.sessionId === sessionId) {
+          this.removeFaceTimeSubscription(socketId, subscription.callId);
+        }
+      }
+    }
+    if (this.service.nativeFaceTimeStreamingAvailable) {
+      await this.service.setNativeFaceTimeMediaStream({ sessionId, enabled: false }).catch((error) =>
+        this.app.log.error(error));
+    }
+  }
+
   private configureSocketRequests(socket: Socket): void {
     const uploads = new Map<string, SocketUpload>();
     const response = (callback: unknown, channel: string, payload: BlueBubblesResponse): void => {
@@ -1670,6 +2151,261 @@ export class BlueBubblesServer {
       if (typeof callback === "function") callback(wirePayload);
       else socket.emit(channel, wirePayload);
     };
+    socket.on("facetime-call-list", (_params, callback) =>
+      response(callback, "facetime-call-list", success(this.#faceTimeMedia?.list() ?? [])));
+    socket.on("facetime-call-get", (params, callback) => {
+      const body = asRecord(params);
+      const call = typeof body.callId === "string" ? this.#faceTimeMedia?.get(body.callId) : undefined;
+      response(
+        callback,
+        call ? "facetime-call-get" : "error",
+        call ? success(call) : notFound("FaceTime media call not found!"),
+      );
+    });
+    socket.on("facetime-call-stop", (params, callback) => {
+      const body = asRecord(params);
+      const callId = typeof body.callId === "string" ? body.callId : "";
+      if (!this.#faceTimeMedia) {
+        response(callback, "error", unsupported("Socket.IO facetime-call-stop"));
+        return;
+      }
+      void this.#faceTimeMedia.stop(callId)
+        .then(async (call) => {
+          this.#faceTimeLiveAudioOwners.delete(callId);
+          if (call?.sessionId && (call.state === "ended" || call.state === "failed")) {
+            await this.revokeFaceTimeSubscriptions(call.sessionId);
+          }
+          response(
+            callback,
+            call ? "facetime-call-stop" : "error",
+            call ? success(call) : notFound("FaceTime media call not found!"),
+          );
+        })
+        .catch((error: Error) => response(
+          callback,
+          "error",
+          failure(500, "Failed to stop FaceTime call", "FaceTime Error", error.message),
+        ));
+    });
+    socket.on("facetime-live-audio-create", (params, callback) => {
+      const body = asRecord(params);
+      void (async () => {
+        if (
+          !this.service.nativeFaceTimeLiveAudioAvailable
+          || !this.#faceTimeMedia?.startLiveAudio
+          || !this.#faceTimeMedia.pushLiveAudioFrame
+          || !this.#faceTimeMedia.finishLiveAudio
+        ) {
+          throw new RequestError(501, "Native FaceTime live audio is unavailable", "UNSUPPORTED");
+        }
+        const rawTarget = typeof body.target === "string"
+          ? body.target
+          : requiredString(body, "address");
+        const target = rawTarget.trim();
+        if (!target) {
+          throw new RequestError(400, "target or address is required", "VALIDATION_ERROR");
+        }
+        const maxDurationSeconds = body.maxDurationSeconds === undefined
+          ? undefined
+          : numberValue(body.maxDurationSeconds, Number.NaN);
+        if (maxDurationSeconds !== undefined && (
+          !Number.isSafeInteger(maxDurationSeconds)
+          || maxDurationSeconds < 15
+          || maxDurationSeconds > 600
+        )) {
+          throw new RequestError(
+            400,
+            "maxDurationSeconds must be an integer between 15 and 600",
+            "VALIDATION_ERROR",
+          );
+        }
+        const call = await this.#faceTimeMedia.startLiveAudio({
+          targets: [target.startsWith("tel:") || target.startsWith("mailto:")
+            ? target
+            : toTransportAddress(target)],
+          displayName: typeof body.displayName === "string" ? body.displayName : "iBlue",
+          ...(typeof body.from === "string" ? { from: toTransportAddress(body.from) } : {}),
+          ...(maxDurationSeconds === undefined ? {} : { maxDurationSeconds }),
+        });
+        this.#faceTimeLiveAudioOwners.set(call.id, socket.id);
+        return call;
+      })()
+        .then((call) => response(
+          callback,
+          "facetime-live-audio-create",
+          success(call, "FaceTime live audio call is ringing"),
+        ))
+        .catch((error: Error) => response(
+          callback,
+          "error",
+          failure(
+            error instanceof RequestError ? error.status : 500,
+            error.message,
+            "FaceTime Live Audio Error",
+            error.message,
+          ),
+        ));
+    });
+    socket.on("facetime-live-audio-frame", (params, callback) => {
+      const body = asRecord(params);
+      void (async () => {
+        const callId = requiredString(body, "callId");
+        if (this.#faceTimeLiveAudioOwners.get(callId) !== socket.id) {
+          throw new RequestError(403, "This socket does not own the live audio call", "FORBIDDEN");
+        }
+        if (!this.#faceTimeMedia?.pushLiveAudioFrame) {
+          throw new RequestError(501, "Native FaceTime live audio is unavailable", "UNSUPPORTED");
+        }
+        const data = body.data;
+        if (!Buffer.isBuffer(data)) {
+          throw new RequestError(
+            400,
+            "data must be a Socket.IO binary Buffer",
+            "VALIDATION_ERROR",
+          );
+        }
+        if (data.length !== 1_920) {
+          throw new RequestError(
+            400,
+            "PCM frame must be exactly 1920 bytes (24 kHz mono float32 LE, 20 ms)",
+            "VALIDATION_ERROR",
+          );
+        }
+        return this.#faceTimeMedia.pushLiveAudioFrame(callId, data);
+      })()
+        .then((call) => response(
+          callback,
+          "facetime-live-audio-frame",
+          success(call, "FaceTime live audio frame accepted"),
+        ))
+        .catch((error: Error) => response(
+          callback,
+          "error",
+          failure(
+            error instanceof RequestError ? error.status : 500,
+            error.message,
+            "FaceTime Live Audio Error",
+            error.message,
+          ),
+        ));
+    });
+    socket.on("facetime-live-audio-finish", (params, callback) => {
+      const body = asRecord(params);
+      void (async () => {
+        const callId = requiredString(body, "callId");
+        if (this.#faceTimeLiveAudioOwners.get(callId) !== socket.id) {
+          throw new RequestError(403, "This socket does not own the live audio call", "FORBIDDEN");
+        }
+        if (!this.#faceTimeMedia?.finishLiveAudio) {
+          throw new RequestError(501, "Native FaceTime live audio is unavailable", "UNSUPPORTED");
+        }
+        const call = await this.#faceTimeMedia.finishLiveAudio(callId);
+        this.#faceTimeLiveAudioOwners.delete(callId);
+        if (!call) throw new RequestError(404, "FaceTime media call not found", "NOT_FOUND");
+        return call;
+      })()
+        .then((call) => response(
+          callback,
+          "facetime-live-audio-finish",
+          success(call, "FaceTime live audio call ended"),
+        ))
+        .catch((error: Error) => response(
+          callback,
+          "error",
+          failure(
+            error instanceof RequestError ? error.status : 500,
+            error.message,
+            "FaceTime Live Audio Error",
+            error.message,
+          ),
+        ));
+    });
+    socket.on("facetime-media-subscribe", (params, callback) => {
+      const body = asRecord(params);
+      void (async () => {
+        if (!this.service.nativeFaceTimeStreamingAvailable) {
+          throw new RequestError(501, "Native FaceTime media streaming is unavailable", "UNSUPPORTED");
+        }
+        const callId = requiredString(body, "callId");
+        const call = this.#faceTimeMedia?.get(callId);
+        if (!call) throw new RequestError(404, "FaceTime media call not found", "NOT_FOUND");
+        if (!call.sessionId || call.transport !== "iblue-quickrelay") {
+          throw new RequestError(409, "Call does not use native iBlue media", "INVALID_STATE");
+        }
+        if (call.state === "ended" || call.state === "failed") {
+          throw new RequestError(409, "FaceTime media call has ended", "INVALID_STATE");
+        }
+        const audio = body.audio === undefined ? true : Boolean(body.audio);
+        const video = body.video === undefined ? false : Boolean(body.video);
+        if (!audio && !video) {
+          throw new RequestError(400, "At least one of audio or video is required", "VALIDATION_ERROR");
+        }
+        const ttlSeconds = body.ttlSeconds === undefined ? 300 : numberValue(body.ttlSeconds, Number.NaN);
+        if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 5 || ttlSeconds > 3_600) {
+          throw new RequestError(
+            400,
+            "ttlSeconds must be an integer between 5 and 3600",
+            "VALIDATION_ERROR",
+          );
+        }
+        const priorSessionId = this.removeFaceTimeSubscription(socket.id, callId);
+        if (priorSessionId && priorSessionId !== call.sessionId) {
+          await this.refreshNativeFaceTimeStream(priorSessionId);
+        }
+        const expiresAt = Date.now() + ttlSeconds * 1_000;
+        const timer = setTimeout(() => {
+          const sessionId = this.removeFaceTimeSubscription(socket.id, callId);
+          if (sessionId) void this.refreshNativeFaceTimeStream(sessionId).catch((error) =>
+            this.app.log.error(error));
+        }, ttlSeconds * 1_000);
+        timer.unref?.();
+        const subscriptions = this.#faceTimeSocketSubscriptions.get(socket.id) ?? new Map();
+        subscriptions.set(callId, { callId, sessionId: call.sessionId, audio, video, expiresAt, timer });
+        this.#faceTimeSocketSubscriptions.set(socket.id, subscriptions);
+        try {
+          await this.refreshNativeFaceTimeStream(call.sessionId);
+        } catch (error) {
+          this.removeFaceTimeSubscription(socket.id, callId);
+          throw error;
+        }
+        return { callId, sessionId: call.sessionId, audio, video, expiresAt };
+      })()
+        .then((subscription) => response(
+          callback,
+          "facetime-media-subscribe",
+          success(subscription, "FaceTime media subscription enabled"),
+        ))
+        .catch((error: Error) => response(
+          callback,
+          "error",
+          failure(
+            error instanceof RequestError ? error.status : 500,
+            error.message,
+            "FaceTime Media Error",
+            error.message,
+          ),
+        ));
+    });
+    socket.on("facetime-media-unsubscribe", (params, callback) => {
+      const body = asRecord(params);
+      void (async () => {
+        const callId = requiredString(body, "callId");
+        const sessionId = this.removeFaceTimeSubscription(socket.id, callId);
+        if (!sessionId) return false;
+        await this.refreshNativeFaceTimeStream(sessionId);
+        return true;
+      })()
+        .then((removed) => response(
+          callback,
+          "facetime-media-unsubscribe",
+          success({ removed }, "FaceTime media subscription disabled"),
+        ))
+        .catch((error: Error) => response(
+          callback,
+          "error",
+          failure(500, error.message, "FaceTime Media Error", error.message),
+        ));
+    });
     socket.on("get-server-metadata", (_params, callback) =>
       response(callback, "server-metadata", success(this.serverMetadata())),
     );
@@ -2015,6 +2751,23 @@ export class BlueBubblesServer {
     socket.on("disconnect", () => {
       for (const upload of uploads.values()) void rm(upload.directory, { recursive: true, force: true });
       uploads.clear();
+      const sessionIds = new Set(
+        [...(this.#faceTimeSocketSubscriptions.get(socket.id)?.values() ?? [])]
+          .map((subscription) => subscription.sessionId),
+      );
+      for (const subscription of this.#faceTimeSocketSubscriptions.get(socket.id)?.values() ?? []) {
+        clearTimeout(subscription.timer);
+      }
+      this.#faceTimeSocketSubscriptions.delete(socket.id);
+      for (const sessionId of sessionIds) {
+        void this.refreshNativeFaceTimeStream(sessionId).catch((error) => this.app.log.error(error));
+      }
+      for (const [callId, ownerSocketId] of [...this.#faceTimeLiveAudioOwners]) {
+        if (ownerSocketId !== socket.id) continue;
+        this.#faceTimeLiveAudioOwners.delete(callId);
+        void this.#faceTimeMedia?.finishLiveAudio?.(callId).catch((error) =>
+          this.app.log.error(error));
+      }
     });
   }
 
@@ -2193,6 +2946,10 @@ export class BlueBubblesServer {
           conversationBackgroundPresets: "/api/v1/iblue/background/presets",
           icloudShares: "/api/v1/iblue/icloud-share/:messageGuid",
           icloudShareCreate: "/api/v1/iblue/icloud-share/create",
+          faceTimeSessions: "/api/v1/iblue/facetime/session",
+          faceTimeCapabilities: "/api/v1/iblue/facetime/capabilities",
+          faceTimeCalls: "/api/v1/iblue/facetime/call",
+          faceTimeCallEvent: "ft-call-status-changed",
         },
       },
     };
@@ -2272,7 +3029,7 @@ export class BlueBubblesServer {
 
 class RequestError extends Error {
   constructor(
-    readonly status: 400 | 404 | 415 | 500 | 502 | 504,
+    readonly status: 400 | 403 | 404 | 409 | 415 | 500 | 501 | 502 | 504,
     message: string,
     readonly code: string,
   ) {

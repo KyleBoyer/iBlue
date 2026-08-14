@@ -1,0 +1,95 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 8c2f929..dd18e0f 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -560,6 +560,20 @@ impl QuickRelaySkmMaterial {
+     }
+ }
+ 
++const APPLE_RTP_SHORT_MKI: [u8; 2] = [0x00, 0x10];
++
++fn apple_rtp_mki(participant_id: u64) -> [u8; 16] {
++    // Apple's 16-byte material identifier carries the two-byte short MKI,
++    // followed by the QuickRelay participant ID split around a reserved byte.
++    // Only the first two bytes travel with SRTP, but the full identifier is
++    // how the receiver associates that selector with the advertised sender.
++    let mut mki = [0u8; 16];
++    mki[..2].copy_from_slice(&APPLE_RTP_SHORT_MKI);
++    mki[2..6].copy_from_slice(&((participant_id >> 32) as u32).to_be_bytes());
++    mki[7..11].copy_from_slice(&(participant_id as u32).to_be_bytes());
++    mki
++}
++
+ #[derive(Deserialize, Serialize, Clone)]
+ pub struct QuickRelayMkmMaterial {
+     #[serde(rename = "participantID")]
+@@ -582,8 +596,7 @@ impl QuickRelayMkmMaterial {
+         Self {
+             participant_id: pid,
+             rtmpwm: 1,
+-            // TODO this isn't random, figure out what it is, 0010EB28319A00D86723B10000000000
+-            mki: rand::random::<[u8; 16]>().to_vec(),
++            mki: apple_rtp_mki(pid).to_vec(),
+             mkm: rand::random::<[u8; 32]>().to_vec(),
+             mks: rand::random::<[u8; 16]>().to_vec(),
+             smkil: 2,
+@@ -591,6 +604,11 @@ impl QuickRelayMkmMaterial {
+         }
+     }
+ 
++    fn has_apple_rtp_short_mki(&self) -> bool {
++        self.smkil as usize == APPLE_RTP_SHORT_MKI.len()
++            && self.mki.as_slice() == apple_rtp_mki(self.participant_id)
++    }
++
+     pub fn get_control(&self, my_uuid: &str, their_uuid: &str) -> ControlKeySet {
+         let hk = Hkdf::<Sha256>::new(Some(&self.mks), &self.mkm);
+ 
+@@ -1202,6 +1220,10 @@ impl GlobalLink {
+         
+         // send MKM/SKM
+         let state = self.state.lock().await;
++        if !state.my_mkm.has_apple_rtp_short_mki() {
++            warn!("FaceTime outbound media key ID does not match Apple's SRTP MKI");
++            return Err(PushError::BadMsg);
++        }
+         for (id, participant) in &state.states {
+             let Some(prekey) = &participant.prekey else { 
+                 warn!("Participant missing prekey?");
+@@ -1522,6 +1544,10 @@ impl GlobalLink {
+         let (mut header_template, peer_participant) = self.wait_for_audio_header_template().await?;
+         let (avc_pod, direct_socket, direct_peer, key) = {
+             let state = self.state.lock().await;
++            if !state.my_mkm.has_apple_rtp_short_mki() {
++                warn!("FaceTime outbound SRTP key selector no longer matches the advertised media key ID");
++                return Err(PushError::BadMsg);
++            }
+             (
+                 state.avc_pod.clone().ok_or(PushError::NotConnected)?,
+                 state.direct_socket.clone(),
+@@ -1970,3 +1996,25 @@ impl GlobalLink {
+         Ok(me)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki};
++
++    #[test]
++    fn outbound_media_key_id_matches_apple_short_mki() {
++        let participant_id = 0xeb28_319a_d867_23b1;
++        let material = QuickRelayMkmMaterial::create(participant_id);
++
++        assert_eq!(&material.mki[..2], &APPLE_RTP_SHORT_MKI);
++        assert_eq!(
++            material.mki,
++            [
++                0x00, 0x10, 0xeb, 0x28, 0x31, 0x9a, 0x00, 0xd8, 0x67, 0x23, 0xb1, 0x00,
++                0x00, 0x00, 0x00, 0x00,
++            ],
++        );
++        assert_eq!(material.mki, apple_rtp_mki(participant_id));
++        assert!(material.has_apple_rtp_short_mki());
++    }
++}

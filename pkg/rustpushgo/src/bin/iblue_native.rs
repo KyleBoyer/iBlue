@@ -1,11 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use keystore::keystore;
 use rand::{rngs::OsRng, RngCore};
 use rustpush::ids::user::IDSUserType;
@@ -835,6 +838,79 @@ struct ConversationControlParams {
     from: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeSessionCreateParams {
+    targets: Vec<String>,
+    from: Option<String>,
+    display_name: Option<String>,
+    ring_ttl_seconds: Option<u64>,
+    #[serde(default = "default_true")]
+    ring_on_media_join: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeSessionParams {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeRingParams {
+    session_id: String,
+    targets: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeMediaCreateParams {
+    targets: Vec<String>,
+    from: Option<String>,
+    audio_path: String,
+    #[serde(default = "default_true")]
+    ring: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeLiveAudioCreateParams {
+    targets: Vec<String>,
+    from: Option<String>,
+    #[serde(default = "default_true")]
+    ring: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeAudioFrameParams {
+    session_id: String,
+    data_base64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeStreamParams {
+    session_id: String,
+    enabled: bool,
+    #[serde(default = "default_true")]
+    audio: bool,
+    #[serde(default)]
+    video: bool,
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone)]
+struct FaceTimeMediaStreamPolicy {
+    audio: bool,
+    video: bool,
+    expires_at_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 struct NativeMessageCallback {
     emitter: Emitter,
 }
@@ -1519,6 +1595,7 @@ struct Engine {
     state_dir: PathBuf,
     credential_service: String,
     credential_backend: CredentialBackend,
+    facetime_media_streams: Arc<tokio::sync::RwLock<HashMap<String, FaceTimeMediaStreamPolicy>>>,
 }
 
 impl Engine {
@@ -1543,6 +1620,7 @@ impl Engine {
             state_dir: state_dir.to_path_buf(),
             credential_service,
             credential_backend,
+            facetime_media_streams: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -2116,6 +2194,7 @@ impl Engine {
                 if let Some(client) = self.client.take() {
                     client.stop().await;
                 }
+                self.facetime_media_streams.write().await.clear();
                 self.statuskit_initialized = false;
                 self.statuskit_tokens_primed = false;
                 self.statuskit_invited_handles.clear();
@@ -2190,6 +2269,109 @@ impl Engine {
                 )
                 .await
                 .map_err(RpcError::native)?;
+                if let Ok(facetime) = client.get_facetime_client().await {
+                    let mut media_events = facetime.subscribe_native_media_events();
+                    let policies = self.facetime_media_streams.clone();
+                    let emitter = self.emitter.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let event = match media_events.recv().await {
+                                Ok(event) => event,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    continue
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            };
+                            let (session_id, kind, codec, payload_type, rtp_timestamp,
+                                duration_ms, dropped_packets, data) = match event {
+                                rustpush::facetime::NativeFaceTimeMediaEvent::Audio {
+                                    session_id,
+                                    payload_type,
+                                    rtp_timestamp,
+                                    data,
+                                } => (
+                                    session_id,
+                                    "audio",
+                                    if payload_type == 108 { "evs" } else { "aac-eld" },
+                                    Some(payload_type),
+                                    Some(rtp_timestamp),
+                                    None,
+                                    None,
+                                    data,
+                                ),
+                                rustpush::facetime::NativeFaceTimeMediaEvent::VideoDescription {
+                                    session_id,
+                                    data,
+                                } => (session_id, "video-description", "qtff", None, None, None, None, data),
+                                rustpush::facetime::NativeFaceTimeMediaEvent::Video {
+                                    session_id,
+                                    rtp_timestamp,
+                                    duration_ms,
+                                    dropped_packets,
+                                    data,
+                                } => (
+                                    session_id,
+                                    "video",
+                                    "h265",
+                                    None,
+                                    Some(rtp_timestamp),
+                                    Some(duration_ms),
+                                    Some(dropped_packets),
+                                    data,
+                                ),
+                            };
+                            let now = current_timestamp_ms();
+                            let policy = {
+                                let mut policies = policies.write().await;
+                                match policies.get(&session_id).cloned() {
+                                    Some(policy) if policy.expires_at_ms > now => Some(policy),
+                                    Some(_) => {
+                                        policies.remove(&session_id);
+                                        None
+                                    }
+                                    None => None,
+                                }
+                            };
+                            let Some(policy) = policy else { continue };
+                            let allowed = if kind == "audio" {
+                                policy.audio
+                            } else {
+                                policy.video
+                            };
+                            let max_bytes = match kind {
+                                "audio" => 64 * 1024,
+                                "video-description" => 256 * 1024,
+                                _ => 4 * 1024 * 1024,
+                            };
+                            if !allowed || data.len() > max_bytes {
+                                continue;
+                            }
+                            let mut notification = json!({
+                                "sessionId": session_id,
+                                "kind": kind,
+                                "codec": codec,
+                                "dataBase64": BASE64.encode(data),
+                                "receivedAt": now,
+                            });
+                            let fields = notification
+                                .as_object_mut()
+                                .expect("FaceTime media notification must be an object");
+                            if let Some(payload_type) = payload_type {
+                                fields.insert("payloadType".to_string(), payload_type.into());
+                            }
+                            if let Some(rtp_timestamp) = rtp_timestamp {
+                                fields.insert("rtpTimestamp".to_string(), rtp_timestamp.into());
+                            }
+                            if let Some(duration_ms) = duration_ms {
+                                fields.insert("durationMs".to_string(), duration_ms.into());
+                            }
+                            if let Some(dropped_packets) = dropped_packets {
+                                fields.insert("droppedPackets".to_string(), dropped_packets.into());
+                            }
+                            emitter.notification("facetime.media.frame", notification);
+                        }
+                    });
+                }
                 self.client = Some(client);
                 self.snapshot().await
             }
@@ -2891,7 +3073,421 @@ impl Engine {
                     .map_err(RpcError::native)?;
                 Ok(json!({ "guid": guid }))
             }
+            "facetime.session.create" => {
+                let params: FaceTimeSessionCreateParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.targets.is_empty() || params.targets.len() > 32 {
+                    return Err(RpcError::invalid_params(
+                        "FaceTime requires between 1 and 32 targets",
+                    ));
+                }
+                if params
+                    .targets
+                    .iter()
+                    .any(|target| !(target.starts_with("tel:") || target.starts_with("mailto:")))
+                {
+                    return Err(RpcError::invalid_params(
+                        "FaceTime targets must use tel: or mailto: transport prefixes",
+                    ));
+                }
+
+                let sender = self.sender(params.from)?;
+                let display_name = params
+                    .display_name
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| sender.trim_start_matches("mailto:").to_string());
+                let ttl = params.ring_ttl_seconds.unwrap_or(120).clamp(15, 3_600);
+                let session_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                let client = self.client()?;
+                let facetime = client
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?;
+                facetime.set_self_display_name(display_name.clone());
+                if params.ring_on_media_join {
+                    facetime
+                        .create_session_no_ring(
+                            session_id.clone(),
+                            sender.clone(),
+                            params.targets.clone(),
+                        )
+                        .await
+                        .map_err(RpcError::native)?;
+                } else {
+                    facetime
+                        .create_session_allocated_native(
+                            session_id.clone(),
+                            sender.clone(),
+                            params.targets.clone(),
+                        )
+                        .await
+                        .map_err(RpcError::native)?;
+                }
+                if params.ring_on_media_join {
+                    facetime
+                        .register_pending_ring(
+                            session_id.clone(),
+                            sender.clone(),
+                            params.targets.clone(),
+                            ttl,
+                        )
+                        .await
+                        .map_err(RpcError::native)?;
+                }
+
+                let link = match facetime
+                    .get_link_for_usage(sender.clone(), "next".to_string())
+                    .await
+                {
+                    Ok(link) => link,
+                    Err(first_error) => {
+                        facetime.clear_links().await.map_err(RpcError::native)?;
+                        facetime
+                            .get_link_for_usage(sender.clone(), "next".to_string())
+                            .await
+                            .map_err(|second_error| {
+                                RpcError::native(format!(
+                                    "FaceTime link creation failed after recovery: {first_error}; {second_error}"
+                                ))
+                            })?
+                    }
+                };
+                facetime
+                    .bind_bridge_link_to_session(
+                        sender.clone(),
+                        "next".to_string(),
+                        session_id.clone(),
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+
+                // Move the in-use pseud to `current` and leave a propagated
+                // `next` link ready for the following call. Slot absence is
+                // normal on first use, hence the deliberately ignored moves.
+                let _ = facetime
+                    .use_link_for("current".to_string(), "current-old".to_string())
+                    .await;
+                let _ = facetime
+                    .use_link_for("next".to_string(), "current".to_string())
+                    .await;
+                let _ = facetime
+                    .get_link_for_usage(sender.clone(), "next".to_string())
+                    .await;
+
+                let separator = if link.contains('#') { '&' } else { '#' };
+                let named_link = format!(
+                    "{link}{separator}n={}",
+                    URL_SAFE_NO_PAD.encode(display_name.as_bytes())
+                );
+                Ok(json!({
+                    "sessionId": session_id,
+                    "link": named_link,
+                    "from": sender,
+                    "targets": params.targets,
+                    "displayName": display_name,
+                    "ringTtlSeconds": ttl,
+                    "ringOnMediaJoin": params.ring_on_media_join,
+                    "state": "waiting-for-media",
+                }))
+            }
+            "facetime.native.create" => {
+                let params: FaceTimeNativeMediaCreateParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.targets.len() != 1 {
+                    return Err(RpcError::invalid_params(
+                        "Native FaceTime media requires exactly one target",
+                    ));
+                }
+                if params.audio_path.trim().is_empty() {
+                    return Err(RpcError::invalid_params("audioPath is required"));
+                }
+                let sender = self.sender(params.from)?;
+                let session_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .create_native_media_session(
+                        session_id.clone(),
+                        sender.clone(),
+                        params.targets.clone(),
+                        params.audio_path,
+                        params.ring,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "sessionId": session_id,
+                    "from": sender,
+                    "targets": params.targets,
+                    "state": if params.ring { "ringing" } else { "allocated" },
+                    "transport": "iblue-quickrelay",
+                    "topology": "one-to-one",
+                }))
+            }
+            "facetime.native.start" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .start_native_media_session(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "started": true,
+                    "sessionId": params.session_id,
+                    "transport": "iblue-quickrelay",
+                }))
+            }
+            "facetime.native.audio.create" => {
+                let params: FaceTimeNativeLiveAudioCreateParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.targets.len() != 1 {
+                    return Err(RpcError::invalid_params(
+                        "Native FaceTime live audio requires exactly one target",
+                    ));
+                }
+                if params
+                    .targets
+                    .iter()
+                    .any(|target| !(target.starts_with("tel:") || target.starts_with("mailto:")))
+                {
+                    return Err(RpcError::invalid_params(
+                        "FaceTime targets must use tel: or mailto: transport prefixes",
+                    ));
+                }
+                let sender = self.sender(params.from)?;
+                let session_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .create_native_live_audio_session(
+                        session_id.clone(),
+                        sender.clone(),
+                        params.targets.clone(),
+                        params.ring,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "sessionId": session_id,
+                    "from": sender,
+                    "targets": params.targets,
+                    "state": if params.ring { "ringing" } else { "allocated" },
+                    "transport": "iblue-quickrelay",
+                    "topology": "one-to-one",
+                    "mediaSource": "live-stream",
+                    "audioFormat": {
+                        "encoding": "pcm-f32le",
+                        "sampleRate": 24_000,
+                        "channels": 1,
+                        "frameDurationMs": 20,
+                        "frameBytes": 1_920,
+                    },
+                }))
+            }
+            "facetime.native.audio.start" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .start_native_audio_stream(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "started": true,
+                    "sessionId": params.session_id,
+                    "frameBytes": 1_920,
+                    "queueCapacityFrames": 50,
+                }))
+            }
+            "facetime.native.audio.push" => {
+                let params: FaceTimeNativeAudioFrameParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                let frame = BASE64.decode(params.data_base64.as_bytes()).map_err(|_| {
+                    RpcError::invalid_params("dataBase64 must contain valid base64")
+                })?;
+                if frame.len() != 1_920 {
+                    return Err(RpcError::invalid_params(
+                        "live audio frames must be exactly 1920 bytes",
+                    ));
+                }
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .push_native_audio_frame(&params.session_id, &frame)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "queued": true,
+                    "sessionId": params.session_id,
+                    "frameBytes": frame.len(),
+                }))
+            }
+            "facetime.native.audio.stop" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .finish_native_audio_stream(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "stopped": true,
+                    "sessionId": params.session_id,
+                }))
+            }
+            "facetime.native.status" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let status = self
+                    .client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .native_media_status(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                serde_json::to_value(status).map_err(RpcError::native)
+            }
+            "facetime.native.stream.set" => {
+                let params: FaceTimeNativeStreamParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                let session_id = params.session_id.trim().to_string();
+                if session_id.is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                if !params.enabled {
+                    self.facetime_media_streams
+                        .write()
+                        .await
+                        .remove(&session_id);
+                    return Ok(json!({
+                        "sessionId": session_id,
+                        "enabled": false,
+                        "audio": false,
+                        "video": false,
+                        "expiresAt": Value::Null,
+                    }));
+                }
+                if !params.audio && !params.video {
+                    return Err(RpcError::invalid_params(
+                        "at least one of audio or video must be enabled",
+                    ));
+                }
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .native_media_status(&session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                let ttl_seconds = params.ttl_seconds.unwrap_or(300).clamp(5, 3_600);
+                let expires_at_ms = current_timestamp_ms().saturating_add(ttl_seconds * 1_000);
+                self.facetime_media_streams.write().await.insert(
+                    session_id.clone(),
+                    FaceTimeMediaStreamPolicy {
+                        audio: params.audio,
+                        video: params.video,
+                        expires_at_ms,
+                    },
+                );
+                Ok(json!({
+                    "sessionId": session_id,
+                    "enabled": true,
+                    "audio": params.audio,
+                    "video": params.video,
+                    "expiresAt": expires_at_ms,
+                }))
+            }
+            "facetime.session.list" => {
+                let facetime = self
+                    .client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?;
+                let state = facetime
+                    .export_state_json()
+                    .await
+                    .map_err(RpcError::native)?;
+                serde_json::from_str(&state).map_err(RpcError::native)
+            }
+            "facetime.session.leave" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .leave_session_native(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                self.facetime_media_streams
+                    .write()
+                    .await
+                    .remove(&params.session_id);
+                Ok(json!({ "left": true, "sessionId": params.session_id }))
+            }
+            "facetime.session.ring" => {
+                let params: FaceTimeRingParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() || params.targets.is_empty() {
+                    return Err(RpcError::invalid_params(
+                        "sessionId and at least one target are required",
+                    ));
+                }
+                let facetime = self
+                    .client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?;
+                facetime
+                    .ring_session_native(&params.session_id, params.targets.clone())
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "rang": true,
+                    "sessionId": params.session_id,
+                    "targets": params.targets,
+                }))
+            }
+            "facetime.session.mediaJoined" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .media_joined_session_native(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "confirmed": true,
+                    "sessionId": params.session_id,
+                }))
+            }
             "system.shutdown" => {
+                self.facetime_media_streams.write().await.clear();
                 if let Some(client) = self.client.take() {
                     client.stop().await;
                 }

@@ -1,0 +1,127 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 72b1d8b0..4fe417c2 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -733,6 +733,22 @@ impl ParticipantState {
+     }
+ }
+ 
++fn control_peer_session_candidates(
++    avc_uuid: Option<&str>,
++    ids_uuid_hint: Option<&str>,
++) -> Vec<String> {
++    let mut candidates = Vec::with_capacity(2);
++    if let Some(uuid) = avc_uuid {
++        candidates.push(uuid.to_string());
++    }
++    if let Some(uuid) = ids_uuid_hint {
++        if !candidates.iter().any(|candidate| candidate == uuid) {
++            candidates.push(uuid.to_string());
++        }
++    }
++    candidates
++}
++
+ // all the places where packets can come from
+ enum LinkType {
+     Pod, // QPod AVC channel
+@@ -1356,13 +1372,24 @@ impl GlobalLink {
+             if participant_hint.is_some_and(|hint| hint != *participant) {
+                 continue;
+             }
+-            let Some(peer_session_id) = participant_state.avc_uuid.clone()
+-                .or_else(|| peer_session_id_hint.map(ToOwned::to_owned)) else { continue };
+-            for mkm in &participant_state.mkm {
+-                let key = mkm.get_control(&peer_session_id, local_session_id);
+-                if let Ok(plaintext) = key.decrypt(payload) {
+-                    participant_state.avc_uuid.get_or_insert(peer_session_id);
+-                    authenticated = Some((*participant, plaintext));
++            let peer_session_ids = control_peer_session_candidates(
++                participant_state.avc_uuid.as_deref(),
++                peer_session_id_hint,
++            );
++            for peer_session_id in peer_session_ids {
++                for mkm in &participant_state.mkm {
++                    let key = mkm.get_control(&peer_session_id, local_session_id);
++                    if let Ok(plaintext) = key.decrypt(payload) {
++                        // The IDS command-207 UUID is fresher than an AVC
++                        // material cached by QuickRelay. Remember whichever
++                        // candidate actually authenticated so replies use the
++                        // same control context.
++                        participant_state.avc_uuid = Some(peer_session_id);
++                        authenticated = Some((*participant, plaintext));
++                        break;
++                    }
++                }
++                if authenticated.is_some() {
+                     break;
+                 }
+             }
+@@ -1430,11 +1457,13 @@ impl GlobalLink {
+                 .and_then(|peer| peer.avc_uuid.clone())
+                 .ok_or(PushError::BadMsg)?;
+             let counter = state.control_send_counters.entry(participant).or_default();
++            // Apple's SFrame control counter is zero-based. Advance only
++            // after taking the value used for this packet.
++            let packet_counter = *counter;
+             *counter = counter.wrapping_add(1);
+-            let counter = *counter;
+             let key = state.my_mkm.get_control(local_session_id, &peer_session_id);
+             (
+-                key.encrypt(plaintext, counter)?,
++                key.encrypt(plaintext, packet_counter)?,
+                 state.direct_socket.clone(),
+                 state.direct_peer,
+                 state.avc_pod.clone().ok_or(PushError::NotConnected)?,
+@@ -2005,7 +2034,22 @@ impl GlobalLink {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki};
++    use super::{
++        APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki,
++        control_peer_session_candidates,
++    };
++
++    #[test]
++    fn fresh_ids_control_uuid_is_tried_after_cached_avc_uuid() {
++        assert_eq!(
++            control_peer_session_candidates(Some("cached"), Some("fresh")),
++            vec!["cached".to_string(), "fresh".to_string()],
++        );
++        assert_eq!(
++            control_peer_session_candidates(Some("same"), Some("same")),
++            vec!["same".to_string()],
++        );
++    }
+ 
+     #[test]
+     fn outbound_media_key_id_matches_apple_short_mki() {
+diff --git a/src/facetime.rs b/src/facetime.rs
+index 763ea3e3..42eedf35 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1857,17 +1857,12 @@ impl FTClient {
+                         let should_send_stream_state = !sent_stream_group_state
+                             || message.topic.as_deref() == Some("VCSessionMessageTopicFetchStreamGroupsState");
+                         if should_send_stream_state {
+-                            let stream_groups: HashMap<String, u8> = HashMap::from_iter([
+-                                ("136".to_string(), 0u8), ("128".to_string(), 2),
+-                                ("10".to_string(), 0), ("132".to_string(), 0),
+-                                ("11".to_string(), 0), ("129".to_string(), 1),
+-                                ("133".to_string(), 0), ("1".to_string(), 2),
+-                                ("2".to_string(), 1), ("3".to_string(), 0),
+-                                ("134".to_string(), 0), ("4".to_string(), 0),
+-                                ("5".to_string(), 2), ("130".to_string(), 0),
+-                                ("6".to_string(), 1), ("135".to_string(), 0),
+-                                ("7".to_string(), 0), ("8".to_string(), 0),
+-                                ("131".to_string(), 0), ("9".to_string(), 0),
++                            let stream_groups: HashMap<u32, u8> = HashMap::from_iter([
++                                (136, 0u8), (128, 2), (10, 0), (132, 0),
++                                (11, 0), (129, 1), (133, 0), (1, 2),
++                                (2, 1), (3, 0), (134, 0), (4, 0),
++                                (5, 2), (130, 0), (6, 1), (135, 0),
++                                (7, 0), (8, 0), (131, 0), (9, 0),
+                             ]);
+                             let state_message = VcccMessageWrapper {
+                                 message: Some(VcccMessage {

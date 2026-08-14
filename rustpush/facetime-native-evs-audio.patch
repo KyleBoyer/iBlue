@@ -1,0 +1,95 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1922,9 +1922,12 @@ impl FTClient {
+-    /// Encrypt and pace one already-encoded AAC-ELD access unit per RTP packet
++    /// Encrypt and pace one already-encoded audio access unit per RTP packet
+     /// on the microphone SSRC advertised in this session's AVC blob.
+     pub async fn send_native_audio(
+         &self,
+         group_id: &str,
+         packets: Vec<Vec<u8>>,
++        payload_type: u8,
++        samples_per_packet: u32,
++        packet_duration_ms: u64,
+     ) -> Result<(), PushError> {
+         let (connection, audio_ssrc) = {
+             let state = self.state.read().await;
+@@ -1936,7 +1939,13 @@ impl FTClient {
+         if !connection.link.is_bootstrapped().await {
+             return Err(PushError::NotConnected);
+         }
+-        connection.link.send_audio_packets(audio_ssrc, packets, 480).await
++        connection.link.send_audio_packets(
++            audio_ssrc,
++            packets,
++            payload_type,
++            samples_per_packet,
++            packet_duration_ms,
++        ).await
+     }
+ 
+     // warning: Doesn't save the link
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1500,7 +1500,9 @@ impl GlobalLink {
+         &self,
+         ssrc: u32,
+         packets: Vec<Vec<u8>>,
++        payload_type: u8,
+         samples_per_packet: u32,
++        packet_duration_ms: u64,
+     ) -> Result<(), PushError> {
+         let (mut header_template, peer_participant) = self.wait_for_audio_header_template().await?;
+         let (avc_pod, direct_socket, direct_peer, key) = {
+@@ -1539,17 +1541,23 @@ impl GlobalLink {
+         }
+ 
+         for (index, payload) in packets.into_iter().enumerate() {
+-            if payload.len() > u8::MAX as usize {
++            if payload_type == 104 && payload.len() > u8::MAX as usize {
+                 warn!("FaceTime AAC-ELD access unit is too large for Apple audio framing: {} bytes", payload.len());
+                 return Err(PushError::BadMsg);
+             }
+ 
+-            // FaceTime audio payloads contain one or more codec frames, each
+-            // prefixed by its one-byte size. Our Core Audio CAF supplies one
+-            // 480-sample AAC-ELD access unit per packet.
+-            let mut framed_payload = Vec::with_capacity(payload.len() + 1);
+-            framed_payload.push(payload.len() as u8);
+-            framed_payload.extend_from_slice(&payload);
++            // PT104 carries one-byte-length-prefixed AAC-ELD access units.
++            // PT108 carries one complete EVS access unit without a prefix.
++            let framed_payload = if payload_type == 104 {
++                let mut framed = Vec::with_capacity(payload.len() + 1);
++                framed.push(payload.len() as u8);
++                framed.extend_from_slice(&payload);
++                framed
++            } else if payload_type == 108 {
++                payload
++            } else {
++                return Err(PushError::BadMsg);
++            };
+ 
+             // Apple attaches fresh proprietary receiver/control statistics to
+             // every U1 audio RTP packet. We have no receiver statistics yet,
+@@ -1563,7 +1570,7 @@ impl GlobalLink {
+             header_template.padding = false;
+             header_template.extension = true;
+             header_template.marker = index == 0;
+-            header_template.payload_type = 104;
++            header_template.payload_type = payload_type;
+             header_template.sequence_number = sequence_number;
+             header_template.timestamp = timestamp;
+             header_template.ssrc = ssrc;
+@@ -1593,7 +1600,8 @@ impl GlobalLink {
+ 
+             sequence_number = sequence_number.wrapping_add(1);
+             timestamp = timestamp.wrapping_add(samples_per_packet);
+-            let deadline = started + std::time::Duration::from_millis((index as u64 + 1) * 10);
++            let deadline = started
++                + std::time::Duration::from_millis((index as u64 + 1) * packet_duration_ms);
+             tokio::time::sleep_until(deadline).await;
+         }
+         Ok(())

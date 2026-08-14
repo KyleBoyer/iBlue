@@ -1,0 +1,137 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index bfcf263b..763ea3e3 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -20,7 +20,7 @@ use rtc_srtp::{context::Context, protection_profile::ProtectionProfile};
+ use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
+ use serde::{Deserialize, Serialize};
+ use sha2::Sha256;
+-use tokio::sync::Mutex;
++use tokio::sync::{broadcast, Mutex};
+ use uuid::Uuid;
+ use aes_gcm::KeyInit;
+ use rtc_shared::marshal::Unmarshal;
+@@ -1312,6 +1312,27 @@ pub struct FTWireMessage {
+     uri_to_participant_id_key: Option<HashMap<String, Vec<ParticipantID>>>,
+ }
+ 
++#[derive(Clone, Debug)]
++pub enum NativeFaceTimeMediaEvent {
++    Audio {
++        session_id: String,
++        payload_type: u8,
++        rtp_timestamp: u32,
++        data: Vec<u8>,
++    },
++    VideoDescription {
++        session_id: String,
++        data: Vec<u8>,
++    },
++    Video {
++        session_id: String,
++        rtp_timestamp: u32,
++        duration_ms: u64,
++        dropped_packets: u16,
++        data: Vec<u8>,
++    },
++}
++
+ pub struct FTClient {
+     pub conn: APSConnection,
+     pub identity: IdentityManager,
+@@ -1320,6 +1341,7 @@ pub struct FTClient {
+     pub state: DebugRwLock<FTState>,
+     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
+     pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
++    media_events: broadcast::Sender<NativeFaceTimeMediaEvent>,
+ }
+ 
+ /// Summarize FaceTime's audio bundle/RED framing without logging encoded audio.
+@@ -1438,6 +1460,7 @@ fn primary_facetime_audio_frames(payload_type: u8, payload: &[u8]) -> Option<(u8
+ impl FTClient {
+     pub async fn new(state: FTState, update_state: Box<dyn Fn(&FTState) + Send + Sync>, conn: APSConnection, identity: IdentityManager, config: Arc<dyn OSConfig>) -> Self {
+         let token = conn.request_topics(&["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video", "com.apple.private.alloy.quickrelay"]).await;
++        let (media_events, _) = broadcast::channel(512);
+ 
+         Self {
+             _interest_token: token,
+@@ -1446,10 +1469,15 @@ impl FTClient {
+             os_config: config,
+             state: DebugRwLock::new(state),
+             update_state,
+-            delegated_requests: DebugMutex::new(HashMap::new())
++            delegated_requests: DebugMutex::new(HashMap::new()),
++            media_events,
+         }
+     }
+ 
++    pub fn subscribe_native_media_events(&self) -> broadcast::Receiver<NativeFaceTimeMediaEvent> {
++        self.media_events.subscribe()
++    }
++
+     pub async fn ensure_allocations(&self, session: &mut FTSession, new_members: &[FTMember]) -> Result<(), PushError> {
+         // ensure all members have participant entries
+         let has_relay = session.members.iter().chain(new_members).all(|member| session.participants.values().any(|p| p.handle == member.handle));
+@@ -1499,6 +1527,8 @@ impl FTClient {
+ 
+         let item = session.connection.clone().unwrap();
+         let session_id = session.av_config.as_ref().expect("no av config").session.clone();
++        let media_session_id = session.group_id.clone();
++        let media_events = self.media_events.clone();
+         let inbound_capture_path = std::env::var_os("IBLUE_FACETIME_INBOUND_CAPTURE_DIR")
+             .map(std::path::PathBuf::from)
+             .map(|root| root.join(format!("{session_id}.iblueaudio")));
+@@ -1680,14 +1710,20 @@ impl FTClient {
+                         let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+                         session_handle.remember_audio_header(&unmarshalled.header, recv.participant).await;
+ 
+-                        if let Some(capture_sender) = &capture_sender {
+-                            if let Some((payload_type, frames)) = primary_facetime_audio_frames(
+-                                header.payload_type,
+-                                &unmarshalled.payload,
+-                            ) {
+-                                for frame in frames {
+-                                    let _ = capture_sender.try_send((payload_type, header.timestamp, frame));
++                        if let Some((payload_type, frames)) = primary_facetime_audio_frames(
++                            header.payload_type,
++                            &unmarshalled.payload,
++                        ) {
++                            for frame in frames {
++                                if let Some(capture_sender) = &capture_sender {
++                                    let _ = capture_sender.try_send((payload_type, header.timestamp, frame.clone()));
+                                 }
++                                let _ = media_events.send(NativeFaceTimeMediaEvent::Audio {
++                                    session_id: media_session_id.clone(),
++                                    payload_type,
++                                    rtp_timestamp: header.timestamp,
++                                    data: frame,
++                                });
+                             }
+                         }
+ 
+@@ -1726,6 +1762,10 @@ impl FTClient {
+                             if let Some(video_capture_sender) = &video_capture_sender {
+                                 let _ = video_capture_sender.try_send((true, qtff_format.to_vec()));
+                             }
++                            let _ = media_events.send(NativeFaceTimeMediaEvent::VideoDescription {
++                                session_id: media_session_id.clone(),
++                                data: qtff_format.to_vec(),
++                            });
+                             let _ = send.try_send(ChannelFrame::ImageDescription(qtff_format.to_vec()));
+                         } else if let Some(depacket) = depacket {
+                             depacket.push(unmarshalled);
+@@ -1736,6 +1776,13 @@ impl FTClient {
+                                 if let Some(video_capture_sender) = &video_capture_sender {
+                                     let _ = video_capture_sender.try_send((false, parse.to_vec()));
+                                 }
++                                let _ = media_events.send(NativeFaceTimeMediaEvent::Video {
++                                    session_id: media_session_id.clone(),
++                                    rtp_timestamp: sample.packet_timestamp,
++                                    duration_ms: sample.duration.as_millis() as u64,
++                                    dropped_packets: sample.prev_dropped_packets,
++                                    data: parse.to_vec(),
++                                });
+                                 let _ = send.try_send(ChannelFrame::Sample(parse.to_vec()));
+                             }
+                         }
+

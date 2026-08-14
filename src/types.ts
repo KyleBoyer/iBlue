@@ -553,7 +553,20 @@ export interface EngineNotificationMap {
   "focus.keysReceived": { receivedAt: number };
   "focus.reshareReceived": { sender: string; channelId: string; receivedAt: number };
   "focus.decryptFailed": { sender?: string; receivedAt: number };
+  "facetime.media.frame": NativeFaceTimeMediaFrame;
   "engine.log": { level: string; message: string };
+}
+
+export interface NativeFaceTimeMediaFrame {
+  sessionId: string;
+  kind: "audio" | "video" | "video-description";
+  codec: "evs" | "aac-eld" | "h265" | "qtff";
+  payloadType?: number;
+  rtpTimestamp?: number;
+  durationMs?: number;
+  droppedPackets?: number;
+  dataBase64: string;
+  receivedAt: number;
 }
 
 export interface ApiEvent<T = unknown> {

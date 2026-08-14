@@ -1,0 +1,116 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1643,8 +1643,6 @@ impl FTClient {
+                         let header = rtc_rtp::Header::unmarshal(&mut &recv.data[..]).unwrap();
+                         info!("Header {:?}", header);
+ 
+-                        session_handle.remember_audio_header(&header, recv.participant).await;
+-
+                         if !channel_contexts.contains_key(&header.ssrc) {
+                             let state = session_handle.state.lock().await;
+                             // find right participant and interation
+@@ -1674,6 +1672,7 @@ impl FTClient {
+                             }
+                         };
+                         let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
++                        session_handle.remember_audio_header(&unmarshalled.header, recv.participant).await;
+ 
+                         if let Some(capture_sender) = &capture_sender {
+                             if let Some((payload_type, frames)) = primary_facetime_audio_frames(
+@@ -1911,6 +1910,19 @@ impl FTClient {
+         Some(connection.link.control_status().await)
+     }
+ 
++    /// Authenticated peer RTP feedback about packets received from this
++    /// sender. Values are counters only and never expose media or key bytes.
++    pub async fn native_audio_feedback_status(
++        &self,
++        group_id: &str,
++    ) -> Option<(u64, u16, u16, u16)> {
++        let connection = {
++            let state = self.state.read().await;
++            state.sessions.get(group_id).and_then(|session| session.connection.clone())
++        }?;
++        Some(connection.link.audio_feedback_status().await)
++    }
++
+     /// Encrypt and pace one already-encoded AAC-ELD access unit per RTP packet
+     /// on the microphone SSRC advertised in this session's AVC blob.
+     pub async fn send_native_audio(
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -772,4 +772,11 @@ pub struct GlobalLinkState {
+     /// constant, so the outbound stream mirrors the live peer template.
+     pub audio_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
++    /// Authenticated feedback from the peer's proprietary audio RTP
++    /// extension. These counters prove whether the peer accepted outbound
++    /// SRTP independently from whether its decoder rendered the codec.
++    audio_feedback_updates: u64,
++    audio_feedback_sequence: u16,
++    audio_feedback_total_kb_received: u16,
++    audio_feedback_packets_received: u16,
+     /// Per-participant SFrame counter for outbound VC control messages.
+     control_send_counters: HashMap<u64, u64>,
+@@ -1433,14 +1441,49 @@ impl GlobalLink {
+         self.state.lock().await.bootstrapped
+     }
+ 
++    fn parse_audio_feedback(header: &rtc_rtp::Header) -> Option<(u16, u16, u16)> {
++        if !matches!(header.payload_type, 20 | 104 | 108 | 13) || !header.extension {
++            return None;
++        }
++        let payload = header.extensions.first()?.payload.as_ref();
++        if header.extension_profile >> 14 != 2 || payload.len() < 6 {
++            return None;
++        }
++        let feedback_sequence = u16::from_be_bytes(payload[0..2].try_into().ok()?);
++        let total_kb_received = u16::from_be_bytes(payload[2..4].try_into().ok()?);
++        let packed_audio_receive_stats = u16::from_be_bytes(payload[4..6].try_into().ok()?);
++        Some((
++            feedback_sequence,
++            total_kb_received,
++            packed_audio_receive_stats & 0x0fff,
++        ))
++    }
++
+     pub async fn remember_audio_header(&self, header: &rtc_rtp::Header, participant: Option<u64>) {
+         // Payload identifiers are negotiated independently in each direction.
+         // Modern iOS currently emits its microphone as PT20 even though this
+         // client advertises AAC-ELD PT104 for the reverse direction.
+         if matches!(header.payload_type, 20 | 104 | 108 | 13) && header.extension {
+-            self.state.lock().await.audio_header_template = Some((header.clone(), participant));
++            let mut state = self.state.lock().await;
++            state.audio_header_template = Some((header.clone(), participant));
++            if let Some((sequence, total_kb, packets)) = Self::parse_audio_feedback(header) {
++                state.audio_feedback_updates = state.audio_feedback_updates.saturating_add(1);
++                state.audio_feedback_sequence = sequence;
++                state.audio_feedback_total_kb_received = total_kb;
++                state.audio_feedback_packets_received = packets;
++            }
+         }
+     }
+ 
++    pub async fn audio_feedback_status(&self) -> (u64, u16, u16, u16) {
++        let state = self.state.lock().await;
++        (
++            state.audio_feedback_updates,
++            state.audio_feedback_sequence,
++            state.audio_feedback_total_kb_received,
++            state.audio_feedback_packets_received,
++        )
++    }
++
+     async fn wait_for_audio_header_template(&self) -> Result<(rtc_rtp::Header, Option<u64>), PushError> {
+         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+@@ -1875,5 +1913,9 @@ impl GlobalLink {
+                 local_candidate_port: None,
+                 bootstrapped: false,
+                 audio_header_template: None,
++                audio_feedback_updates: 0,
++                audio_feedback_sequence: 0,
++                audio_feedback_total_kb_received: 0,
++                audio_feedback_packets_received: 0,
+                 control_send_counters: HashMap::new(),
+                 control_messages_received: 0,

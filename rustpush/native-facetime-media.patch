@@ -1,0 +1,190 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index 6232556..faa4ac6 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -360,6 +360,8 @@ pub struct AVCData {
+ pub struct AVConfig {
+     session: String,
+     start_time: u64,
++    device_type: String,
++    os_build: String,
+ }
+ 
+ #[test]
+@@ -369,10 +371,13 @@ fn waht() {
+ }
+ 
+ impl AVConfig {
+-    fn new() -> Self {
++    fn new(config: &dyn OSConfig) -> Self {
++        let register = config.get_register_meta();
+         Self {
+             session: Uuid::new_v4().to_string().to_uppercase(),
+             start_time: duration_since_epoch().as_millis() as u64,
++            device_type: register.hardware_version,
++            os_build: register.software_version,
+         }
+     }
+ 
+@@ -937,9 +942,9 @@ impl AVConfig {
+         let call_info = VcCallInfoBlob {
+             call_id: Some(1458276328),
+             client_version: Some(1),
+-            device_type: Some("iMac19,2".to_string()),
++            device_type: Some(self.device_type.clone()),
+             framework_version: Some("2090.17.5.1".to_string()),
+-            os_version: Some("24C101".to_string()),
++            os_version: Some(self.os_build.clone()),
+             device_name: None,
+             audio_device_uid: None,
+         };
+@@ -1320,7 +1325,12 @@ impl FTClient {
+         }
+ 
+         let avc_data = my_conv_participant(session.av_config.as_ref().expect("no av config")).encode_to_vec();
+-        relay_session.alloc_bind(&avc_data).await?;
++        let register = self.os_config.get_register_meta();
++        relay_session.alloc_bind(
++            &avc_data,
++            &register.os_version,
++            &register.hardware_version,
++        ).await?;
+ 
+         
+         let wire_message = FTWireMessage {
+@@ -1601,7 +1611,10 @@ impl FTClient {
+     }
+ 
+     // group is random uuid
+-    pub async fn create_session(&self, for_group: String, handle: String, participants: &[String]) -> Result<(), PushError> {
++    /// Create and fully bind a native FaceTime media session without sending
++    /// the command-207 invitation. Callers can finish local media setup and
++    /// then invoke `prop_up_conv(..., true)` exactly once to ring.
++    pub async fn create_session_allocated(&self, for_group: String, handle: String, participants: &[String]) -> Result<(), PushError> {
+         let since_the_epoch = duration_since_epoch();
+ 
+         let session = FTSession {
+@@ -1618,7 +1631,7 @@ impl FTClient {
+             mode: Some(FTMode::Outgoing),
+             recent_member_adds: HashMap::new(),
+             connection: None,
+-            av_config: Some(AVConfig::new()),
++            av_config: Some(AVConfig::new(self.os_config.as_ref())),
+         };
+ 
+         let mut my_session = self.state.write().await;
+@@ -1629,6 +1642,15 @@ impl FTClient {
+         
+         self.ensure_allocations(session, &[]).await?;
+ 
++        Ok(())
++    }
++
++    pub async fn create_session(&self, for_group: String, handle: String, participants: &[String]) -> Result<(), PushError> {
++        self.create_session_allocated(for_group.clone(), handle, participants).await?;
++
++        let mut my_session = self.state.write().await;
++        let session = my_session.sessions.get_mut(&for_group).ok_or(PushError::BadMsg)?;
++
+         self.prop_up_conv(session, true).await?;
+ 
+         Ok(())
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 801e7c8..bc5889e 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -759,6 +759,8 @@ pub struct GlobalLinkState {
+     pub avc_pod: Option<Pod>,
+     pub ids_pod: Option<Pod>,
+     pub link_id: u32,
++    pub local_candidate_ipv4: Option<[u8; 4]>,
++    pub local_candidate_port: Option<u16>,
+ 
+     prekey: EcKey<Private>,
+     pub states: HashMap<u64, ParticipantState>,
+@@ -1090,6 +1092,13 @@ impl GlobalLink {
+     }
+ 
+     async fn bootstrap_session(&self) -> Result<(), PushError> {
++        let (candidate_ipv4, candidate_port) = {
++            let state = self.state.lock().await;
++            (
++                state.local_candidate_ipv4.ok_or(PushError::BadMsg)?,
++                state.local_candidate_port.ok_or(PushError::BadMsg)?,
++            )
++        };
+         let message = LinkMessage { 
+             command: 6, 
+             parameters: vec![
+@@ -1130,7 +1139,7 @@ impl GlobalLink {
+                             radio_access_technology: 0, 
+                             link_flags_4: false, 
+                             spacing: 0, 
+-                            ipv4_addr: Some([192, 168, 1, 170]),
++                            ipv4_addr: Some(candidate_ipv4),
+                             ipv6_addr: None 
+                         }
+                     ], candidates: vec![
+@@ -1138,7 +1147,7 @@ impl GlobalLink {
+                             r#type: 0, 
+                             transport: 1, 
+                             ip_idx: 0, 
+-                            some_addr_meta: 16393 
++                            some_addr_meta: candidate_port,
+                         }] 
+                     }
+                 ), 
+@@ -1276,10 +1285,31 @@ impl GlobalLink {
+         Ok(self.state.lock().await.prekey.public_key().to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut bignum)?)
+     }
+ 
+-    pub async fn alloc_bind(&self, avc_data: &[u8]) -> Result<(), PushError> {
++    pub async fn alloc_bind(
++        &self,
++        avc_data: &[u8],
++        client_os_version: &str,
++        client_hw_version: &str,
++    ) -> Result<(), PushError> {
+         let time_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs_f64();
+ 
+-        let connection = UdpSocket::bind("0.0.0.0:16393").await.unwrap();
++        let target_ip: [u8; 4] = self.relay_ip.clone().try_into().map_err(|_| PushError::BadMsg)?;
++        let route_probe = std::net::UdpSocket::bind("0.0.0.0:0")?;
++        route_probe.connect(SocketAddr::V4(SocketAddrV4::new(
++            std::net::Ipv4Addr::from(target_ip),
++            self.relay_port,
++        )))?;
++        let candidate_ipv4 = match route_probe.local_addr()?.ip() {
++            std::net::IpAddr::V4(ip) => ip.octets(),
++            std::net::IpAddr::V6(_) => return Err(PushError::BadMsg),
++        };
++        let connection = UdpSocket::bind("0.0.0.0:0").await?;
++        let candidate_port = connection.local_addr()?.port();
++        {
++            let mut state = self.state.lock().await;
++            state.local_candidate_ipv4 = Some(candidate_ipv4);
++            state.local_candidate_port = Some(candidate_port);
++        }
+         let integrity = MessageIntegrity(self.session_id.clone());
+         let session_id = self.session_id.clone();
+         let channel = self.inc_send.clone();
+@@ -1386,8 +1416,8 @@ impl GlobalLink {
+         let body = IdsqrProtoH3Message {
+             allocbind_request: Some(qrp::IdsqrProtoAllocBindRequest {
+                 service_id: Some(4096),
+-                client_os_version: Some("macOS,15.5,24F74".to_string()),
+-                client_hw_version: Some("iMac19,2".to_string()),
++                client_os_version: Some(client_os_version.to_string()),
++                client_hw_version: Some(client_hw_version.to_string()),
+                 capabilities: Some(9271791),
+                 subscribed_streams: vec![
+                     qrp::IdsqrProtoSubscribedStream {
+@@ -1558,6 +1588,8 @@ impl GlobalLink {
+                 avc_pod: None,
+                 ids_pod: None,
+                 link_id: 0,
++                local_candidate_ipv4: None,
++                local_candidate_port: None,
+             })),
+             inc_send,
+             ind_send,

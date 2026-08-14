@@ -2,7 +2,11 @@ import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
-import type { IMessageEngine } from "../native/engine.js";
+import type {
+  FaceTimeSessionCreateParams,
+  FaceTimeSessionStart,
+  IMessageEngine,
+} from "../native/engine.js";
 import type { SessionStore } from "../profile.js";
 import type {
   EngineSnapshot,
@@ -15,6 +19,7 @@ import type {
   SendMultipartMessageParams,
   SendStickerReactionParams,
   NativeFindMyFollow,
+  NativeFaceTimeMediaFrame,
 } from "../types.js";
 import type {
   BlueBubblesChat,
@@ -180,6 +185,8 @@ export class BlueBubblesService extends EventEmitter {
       this.dispatch("iblue-focus-reshare-received", event));
     this.engine.on("focus.decryptFailed", (event) =>
       this.dispatch("iblue-focus-decrypt-failed", event));
+    this.engine.on("facetime.media.frame", (frame: NativeFaceTimeMediaFrame) =>
+      this.emit("facetime-media-frame", frame));
     this.engine.on("engine.log", (entry) => this.emit("log", entry));
   }
 
@@ -235,6 +242,163 @@ export class BlueBubblesService extends EventEmitter {
   }> {
     const health = await this.engine.health();
     return { profile: this.profile, handles: this.handles, ...health };
+  }
+
+  get faceTimeAvailable(): boolean {
+    return Boolean(
+      this.engine.createFaceTimeSession
+      && this.engine.listFaceTimeSessions
+      && this.engine.leaveFaceTimeSession
+      && this.engine.ringFaceTimeSession
+      && this.engine.confirmFaceTimeMediaJoined,
+    );
+  }
+
+  get nativeFaceTimeMediaAvailable(): boolean {
+    // The native sender is intentionally profile-owned: the sidecar uses the
+    // selected iBlue profile's IDS identity and QuickRelay credentials, never
+    // FaceTime.app or the macOS user's system FaceTime account.
+    return process.platform === "darwin" && Boolean(
+      this.engine.createNativeFaceTimeMediaSession
+      && this.engine.startNativeFaceTimeMediaSession
+      && this.engine.nativeFaceTimeMediaStatus,
+    );
+  }
+
+  get nativeFaceTimeStreamingAvailable(): boolean {
+    return this.nativeFaceTimeMediaAvailable
+      && Boolean(this.engine.setNativeFaceTimeMediaStream);
+  }
+
+  get nativeFaceTimeLiveAudioAvailable(): boolean {
+    return process.platform === "darwin" && Boolean(
+      this.engine.createNativeFaceTimeLiveAudioSession
+      && this.engine.startNativeFaceTimeLiveAudioStream
+      && this.engine.pushNativeFaceTimeLiveAudioFrame
+      && this.engine.finishNativeFaceTimeLiveAudioStream
+      && this.engine.nativeFaceTimeMediaStatus,
+    );
+  }
+
+  get nativeFaceTimeMediaUnavailableReason(): string {
+    return process.platform !== "darwin"
+      ? "Direct one-to-one QuickRelay media currently requires macOS"
+      : "The active native engine does not expose iBlue-owned QuickRelay media";
+  }
+
+  async createFaceTimeSession(params: FaceTimeSessionCreateParams): Promise<FaceTimeSessionStart> {
+    if (!this.engine.createFaceTimeSession) {
+      throw new Error("The native engine does not support FaceTime sessions");
+    }
+    return this.engine.createFaceTimeSession(params);
+  }
+
+  async listFaceTimeSessions(): Promise<unknown> {
+    if (!this.engine.listFaceTimeSessions) {
+      throw new Error("The native engine does not support FaceTime sessions");
+    }
+    return this.engine.listFaceTimeSessions();
+  }
+
+  async leaveFaceTimeSession(sessionId: string): Promise<{ left: boolean; sessionId: string }> {
+    if (!this.engine.leaveFaceTimeSession) {
+      throw new Error("The native engine does not support FaceTime sessions");
+    }
+    return this.engine.leaveFaceTimeSession(sessionId);
+  }
+
+  async ringFaceTimeSession(sessionId: string, targets: string[]): Promise<{
+    rang: boolean;
+    sessionId: string;
+    targets: string[];
+  }> {
+    if (!this.engine.ringFaceTimeSession) {
+      throw new Error("The native engine does not support FaceTime ringing");
+    }
+    return this.engine.ringFaceTimeSession(sessionId, targets);
+  }
+
+  async confirmFaceTimeMediaJoined(sessionId: string): Promise<{
+    confirmed: boolean;
+    sessionId: string;
+  }> {
+    if (!this.engine.confirmFaceTimeMediaJoined) {
+      throw new Error("The native engine does not support FaceTime media confirmation");
+    }
+    return this.engine.confirmFaceTimeMediaJoined(sessionId);
+  }
+
+  async createNativeFaceTimeMediaSession(params: {
+    targets: string[];
+    from?: string;
+    audioPath: string;
+  }) {
+    if (!this.engine.createNativeFaceTimeMediaSession) {
+      throw new Error("Native FaceTime media is unavailable");
+    }
+    return this.engine.createNativeFaceTimeMediaSession(params);
+  }
+
+  async startNativeFaceTimeMediaSession(sessionId: string) {
+    if (!this.engine.startNativeFaceTimeMediaSession) {
+      throw new Error("Native FaceTime media is unavailable");
+    }
+    return this.engine.startNativeFaceTimeMediaSession(sessionId);
+  }
+
+  async nativeFaceTimeMediaStatus(sessionId: string) {
+    if (!this.engine.nativeFaceTimeMediaStatus) {
+      throw new Error("Native FaceTime media status is unavailable");
+    }
+    return this.engine.nativeFaceTimeMediaStatus(sessionId);
+  }
+
+  async setNativeFaceTimeMediaStream(params: {
+    sessionId: string;
+    enabled: boolean;
+    audio?: boolean;
+    video?: boolean;
+    ttlSeconds?: number;
+  }) {
+    if (!this.engine.setNativeFaceTimeMediaStream) {
+      throw new Error("Native FaceTime media streaming is unavailable");
+    }
+    return this.engine.setNativeFaceTimeMediaStream(params);
+  }
+
+  async createNativeFaceTimeLiveAudioSession(params: {
+    targets: string[];
+    from?: string;
+    ring?: boolean;
+  }) {
+    if (!this.engine.createNativeFaceTimeLiveAudioSession) {
+      throw new Error("Native FaceTime live audio is unavailable");
+    }
+    return this.engine.createNativeFaceTimeLiveAudioSession(params);
+  }
+
+  async startNativeFaceTimeLiveAudioStream(sessionId: string) {
+    if (!this.engine.startNativeFaceTimeLiveAudioStream) {
+      throw new Error("Native FaceTime live audio is unavailable");
+    }
+    return this.engine.startNativeFaceTimeLiveAudioStream(sessionId);
+  }
+
+  async pushNativeFaceTimeLiveAudioFrame(sessionId: string, frame: Buffer) {
+    if (!this.engine.pushNativeFaceTimeLiveAudioFrame) {
+      throw new Error("Native FaceTime live audio is unavailable");
+    }
+    if (frame.length !== 1_920) {
+      throw new Error("Native FaceTime live audio frames must be exactly 1920 bytes");
+    }
+    return this.engine.pushNativeFaceTimeLiveAudioFrame(sessionId, frame);
+  }
+
+  async finishNativeFaceTimeLiveAudioStream(sessionId: string) {
+    if (!this.engine.finishNativeFaceTimeLiveAudioStream) {
+      throw new Error("Native FaceTime live audio is unavailable");
+    }
+    return this.engine.finishNativeFaceTimeLiveAudioStream(sessionId);
   }
 
   async syncICloudContacts(): Promise<{ contacts: number; addresses: number; syncedAt: number }> {

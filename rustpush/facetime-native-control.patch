@@ -1,0 +1,358 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -9,7 +9,7 @@ use h3_quinn::Connection;
+ use hkdf::Hkdf;
+ use http::Request;
+ use log::{debug, info, warn};
+-use openssl::{derive::Deriver, hash::MessageDigest, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, decrypt}};
++use openssl::{derive::Deriver, hash::MessageDigest, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, decrypt, encrypt}};
+ use plist::{Data, Dictionary, Value};
+ use base64::Engine;
+ use prost::{Message, bytes::Buf};
+@@ -25,7 +25,7 @@ use uuid::Uuid;
+ use aes_gcm::KeyInit;
+ use rtc_shared::marshal::Unmarshal;
+ 
+-use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, facetime::facetimep::{VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessageWrapper}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::GlobalLink, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
++use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, facetime::facetimep::{VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessage, VcccMessageAcknowledgment, VcccMessageWrapper}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::GlobalLink, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
+ 
+ pub mod facetimep {
+     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
+@@ -353,7 +353,7 @@ fn participant_from_meta(id: ParticipantID, ids_sender: &str, avc_data: Vec<u8>,
+ #[serde(rename_all = "camelCase")]
+ pub struct AVCData {
+     #[serde(rename = "vcSessionParticipantKeyUUID")]
+-    vc_session_participant_key_uuid: String,
++    pub vc_session_participant_key_uuid: String,
+     pub b2n: Data,
+     pub vc_session_participant_key_media_blob: Data,
+     pub vc_session_participant_key_call_info_blob: Data,
+@@ -1010,8 +1010,8 @@ struct SFramePacket {
+     extended_keyid: bool,
+     #[deku(bits = 3)]
+     keyid_len: u8,
+-    #[deku(bytes = "*keyid_len as usize + 1")]
+-    key_id: u64,
+-    #[deku(bytes = "*ctr_len as usize + 1")]
++    #[deku(count = "*keyid_len as usize + 1")]
++    key_id: Vec<u8>,
++    #[deku(bytes = "*ctr_len as usize + 1", endian = "big")]
+     ctr: u64,
+ }
+@@ -1237,20 +1237,49 @@ impl ControlKeySet {
+         }
+     }
+ 
+-    pub fn decrypt(&self, payload: &[u8]) -> Vec<u8> {
+-        let ((msg, _), packet) = SFramePacket::from_bytes((payload, 0)).unwrap();
+-        
+-        let hmac = PKey::hmac(&self.authentication_key).unwrap();
+-        let signature = Signer::new(MessageDigest::sha256(), &hmac).unwrap()
+-            .sign_oneshot_to_vec(&payload[..payload.len() - 10]).unwrap();
+-
+-        assert_eq!(&payload[payload.len() - 10..], &signature[..10]);
++    pub fn decrypt(&self, payload: &[u8]) -> Result<Vec<u8>, PushError> {
++        if payload.len() < 11 {
++            return Err(PushError::BadMsg);
++        }
++        let ((msg, _), packet) = SFramePacket::from_bytes((payload, 0))?;
++        if packet.key_id != self.key_id[..packet.key_id.len()] {
++            return Err(PushError::BadMsg);
++        }
++
++        let hmac = PKey::hmac(&self.authentication_key)?;
++        let signature = Signer::new(MessageDigest::sha256(), &hmac)?
++            .sign_oneshot_to_vec(&payload[..payload.len() - 10])?;
++        if payload[payload.len() - 10..] != signature[..10] {
++            return Err(PushError::BadMsg);
++        }
+ 
+         let mut salt = self.salt_key;
+-        for (idx, i) in packet.ctr.to_le_bytes().into_iter().enumerate() {
++        for (idx, i) in packet.ctr.to_be_bytes().into_iter().enumerate() {
+             salt[idx] ^= i;
+         }
+ 
+-        decrypt(Cipher::aes_128_ctr(), &self.encryption_key, Some(&salt), &msg[..msg.len() - 10]).unwrap()
++        Ok(decrypt(Cipher::aes_128_ctr(), &self.encryption_key, Some(&salt), &msg[..msg.len() - 10])?)
++    }
++
++    pub fn encrypt(&self, payload: &[u8], ctr: u64) -> Result<Vec<u8>, PushError> {
++        let mut salt = self.salt_key;
++        for (idx, i) in ctr.to_be_bytes().into_iter().enumerate() {
++            salt[idx] ^= i;
++        }
++        let encrypted = encrypt(Cipher::aes_128_ctr(), &self.encryption_key, Some(&salt), payload)?;
++        let packet = SFramePacket {
++            sig_flag: false,
++            ctr_len: 0,
++            extended_keyid: true,
++            keyid_len: 7,
++            key_id: self.key_id[..8].to_vec(),
++            ctr,
++        };
++        let mut framed = [packet.to_bytes()?, encrypted].concat();
++        let hmac = PKey::hmac(&self.authentication_key)?;
++        let signature = Signer::new(MessageDigest::sha256(), &hmac)?
++            .sign_oneshot_to_vec(&framed)?;
++        framed.extend_from_slice(&signature[..10]);
++        Ok(framed)
+     }
+ }
+@@ -1454,5 +1483,6 @@ impl FTClient {
+             let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+             let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
+             let mut logged_audio_diagnostic = false;
++            let mut sent_stream_group_state = false;
+             let mut raw_diagnostics_remaining = 32usize;
+             while let Some(recv) = session_handle.recv().await {
+@@ -1553,34 +1583,101 @@ impl FTClient {
+                         }
+                     },
+                     0x40 => {
+-                        let lock = item.their_session_id.lock().await.values().next().cloned();
+-                        let their = if let Some(their) = lock {
+-                            their
+-                        } else {
+-                            warn!("Missing their participant ID!");
+-                            // tokio::time::sleep(Duration::from_secs(5)).await;
+-                            // let lock = item.their_session_id.lock().await.values().next().cloned();
+-                            // if let Some(their) = lock {
+-                            //     their
+-                            // } else {
+-                            //     warn!("Still Missing their participant ID!");
+-                            //     continue;
+-                            // }
++                        // Direct U1 control can arrive before command 207. Its
++                        // encrypted AVC material already carries the peer UUID,
++                        // so briefly wait for that key context instead.
++                        let mut decrypted = None;
++                        for _ in 0..40 {
++                            let peer_session_id_hint = item.their_session_id.lock().await
++                                .values().next().cloned();
++                            if let Ok(value) = session_handle
++                                .decrypt_control_message(
++                                    &recv.data[1..],
++                                    &session_id,
++                                    recv.participant,
++                                    peer_session_id_hint.as_deref(),
++                                )
++                                .await
++                            {
++                                decrypted = Some(value);
++                                break;
++                            }
++                            tokio::time::sleep(Duration::from_millis(50)).await;
++                        }
++                        let Some((participant, decrypted)) = decrypted else {
++                            let (participants, peer_uuids, mkms) = session_handle
++                                .control_context_summary().await;
++                            warn!(
++                                "Unable to authenticate FaceTime VC control message: participants={} peer_uuids={} mkms={} ids_uuid_hint={}",
++                                participants,
++                                peer_uuids,
++                                mkms,
++                                !item.their_session_id.lock().await.is_empty(),
++                            );
+                             continue;
+                         };
+-                        let state = session_handle.state.lock().await;
+-                        // find right participant and interation
+-                        let Some(mkm) = state.states.iter().find_map(|i| i.1.mkm.first()) else {
+-                            warn!("No SKM!");
+-                            continue
++                        let wrapper = match VcccMessageWrapper::decode(&decrypted[..]) {
++                            Ok(wrapper) => wrapper,
++                            Err(error) => {
++                                warn!("Unable to decode FaceTime VC control message: {error}");
++                                continue;
++                            }
+                         };
++                        let Some(message) = wrapper.message else {
++                            continue;
++                        };
+ 
+-                        let key = mkm.get_control(&their, &session_id);
+-                        let decrypted = key.decrypt(&recv.data[1..]);
++                        // iOS waits for these transaction acknowledgements
++                        // before committing the remote media stream.
++                        let transaction_id = message.transaction_id.unwrap_or_default();
++                        let acknowledgement = VcccMessageWrapper {
++                            acknowledgement: Some(VcccMessageAcknowledgment {
++                                transaction_id: Some(transaction_id),
++                                status: Some(0),
++                            }),
++                            ..Default::default()
++                        };
++                        if let Err(error) = session_handle
++                            .send_control_message(participant, &session_id, &acknowledgement.encode_to_vec())
++                            .await
++                        {
++                            warn!("Unable to acknowledge FaceTime VC control message: {error}");
++                            continue;
++                        }
+ 
+-                        // let wrapper = VcccMessageWrapper::decode(&decrypted[..]).unwrap();
+-                        
+-                        info!("Hi {:?}", encode_hex(&decrypted));
++                        let should_send_stream_state = !sent_stream_group_state
++                            || message.topic.as_deref() == Some("VCSessionMessageTopicFetchStreamGroupsState");
++                        if should_send_stream_state {
++                            let stream_groups: HashMap<String, u8> = HashMap::from_iter([
++                                ("136".to_string(), 0u8), ("128".to_string(), 2),
++                                ("10".to_string(), 0), ("132".to_string(), 0),
++                                ("11".to_string(), 0), ("129".to_string(), 1),
++                                ("133".to_string(), 0), ("1".to_string(), 2),
++                                ("2".to_string(), 1), ("3".to_string(), 0),
++                                ("134".to_string(), 0), ("4".to_string(), 0),
++                                ("5".to_string(), 2), ("130".to_string(), 0),
++                                ("6".to_string(), 1), ("135".to_string(), 0),
++                                ("7".to_string(), 0), ("8".to_string(), 0),
++                                ("131".to_string(), 0), ("9".to_string(), 0),
++                            ]);
++                            let state_message = VcccMessageWrapper {
++                                message: Some(VcccMessage {
++                                    transaction_id: Some(1),
++                                    topic: Some("VCSessionMessageTopicStreamGroupsState".to_string()),
++                                    payload: Some(plist_to_bin(&stream_groups).unwrap()),
++                                }),
++                                ..Default::default()
++                            };
++                            if let Err(error) = session_handle
++                                .send_control_message(participant, &session_id, &state_message.encode_to_vec())
++                                .await
++                            {
++                                warn!("Unable to publish FaceTime stream group state: {error}");
++                            } else {
++                                sent_stream_group_state = true;
++                                info!("Published FaceTime U1 microphone stream state");
++                            }
++                        }
+                     },
+                     _unk => {
+                         info!("Got unknown header {_unk}");
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -674,4 +674,7 @@ pub struct ParticipantState {
+     pub mkm: Vec<QuickRelayMkmMaterial>,
+     skm: Vec<QuickRelaySkmMaterial>,
+     avc_encrypted: Option<(EncryptedAvcBlobHeader, Vec<u8>)>,
++    /// The participant's VC control-channel UUID, recovered from its encrypted
++    /// AVC blob before IDS' later join notification necessarily arrives.
++    avc_uuid: Option<String>,
+ }
+@@ -698,4 +701,5 @@ impl ParticipantState {
+ 
+         let participant = ConversationParticipant::decode(&decrypted[..]).unwrap();
+         let avc: AVCData = plist::from_bytes(&participant.avc_data)?;
++        self.avc_uuid = Some(avc.vc_session_participant_key_uuid.clone());
+         info!("recievedaa {:?}", encode_hex(avc.vc_session_participant_key_media_blob.as_ref()));
+@@ -771,3 +775,5 @@ pub struct GlobalLinkState {
+     /// constant, so the outbound stream mirrors the live peer template.
+     pub audio_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
++    /// Per-participant SFrame counter for outbound VC control messages.
++    control_send_counters: HashMap<u64, u64>,
+     /// Socket and peer selected by the successful ICE/STUN path. Once media
+@@ -1304,4 +1310,81 @@ impl GlobalLink {
+         self.incoming.lock().await.recv().await
+     }
+ 
++    /// Decrypt a VC control-channel packet. Direct U1 datagrams omit the
++    /// participant identifier, so try each participant whose AVC UUID and MKM
++    /// have completed before the later IDS join notification.
++    pub async fn decrypt_control_message(
++        &self,
++        payload: &[u8],
++        local_session_id: &str,
++        participant_hint: Option<u64>,
++        peer_session_id_hint: Option<&str>,
++    ) -> Result<(u64, Vec<u8>), PushError> {
++        let mut state = self.state.lock().await;
++        for (participant, participant_state) in &mut state.states {
++            if participant_hint.is_some_and(|hint| hint != *participant) {
++                continue;
++            }
++            let Some(peer_session_id) = participant_state.avc_uuid.clone()
++                .or_else(|| peer_session_id_hint.map(ToOwned::to_owned)) else { continue };
++            for mkm in &participant_state.mkm {
++                let key = mkm.get_control(&peer_session_id, local_session_id);
++                if let Ok(plaintext) = key.decrypt(payload) {
++                    participant_state.avc_uuid.get_or_insert(peer_session_id);
++                    return Ok((*participant, plaintext));
++                }
++            }
++        }
++        Err(PushError::BadMsg)
++    }
++
++    pub async fn control_context_summary(&self) -> (usize, usize, usize) {
++        let state = self.state.lock().await;
++        (
++            state.states.len(),
++            state.states.values().filter(|peer| peer.avc_uuid.is_some()).count(),
++            state.states.values().map(|peer| peer.mkm.len()).sum(),
++        )
++    }
++
++    /// Encrypt and route one VC control-channel protobuf to a participant,
++    /// preferring the selected direct U1 path and falling back to the AVC pod.
++    pub async fn send_control_message(
++        &self,
++        participant: u64,
++        local_session_id: &str,
++        plaintext: &[u8],
++    ) -> Result<(), PushError> {
++        let (encrypted, direct_socket, direct_peer, avc_pod) = {
++            let mut state = self.state.lock().await;
++            let peer_session_id = state.states.get(&participant)
++                .and_then(|peer| peer.avc_uuid.clone())
++                .ok_or(PushError::BadMsg)?;
++            let counter = state.control_send_counters.entry(participant).or_default();
++            *counter = counter.wrapping_add(1);
++            let counter = *counter;
++            let key = state.my_mkm.get_control(local_session_id, &peer_session_id);
++            (
++                key.encrypt(plaintext, counter)?,
++                state.direct_socket.clone(),
++                state.direct_peer,
++                state.avc_pod.clone().ok_or(PushError::NotConnected)?,
++            )
++        };
++        let mut framed_control = Vec::with_capacity(encrypted.len() + 1);
++        framed_control.push(0x40);
++        framed_control.extend_from_slice(&encrypted);
++        if let (Some(socket), Some(peer)) = (direct_socket, direct_peer) {
++            socket.send_to(&framed_control, peer).await.map_err(|_| PushError::NotConnected)?;
++        } else {
++            let framed = GlobalPacket {
++                participant: Some(participant),
++                link: LinkType::Pod,
++                data: framed_control,
++            }.to_qr_raw();
++            avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
++        }
++        Ok(())
++    }
++
+     pub async fn is_bootstrapped(&self) -> bool {
+@@ -1351,6 +1426,10 @@ impl GlobalLink {
+             None,
+             None,
+         ).map_err(|_| PushError::BadMsg)?;
+-        let mut sequence_number: u16 = rand::random();
+-        let mut timestamp: u32 = rand::random();
++        // Apple's U1 audio sender starts from the same deterministic baseline:
++        // a conventional arbitrary RTP sequence and one 480-sample frame into
++        // the 48 kHz media timeline. A random timestamp can fall outside the
++        // receiver's active playout window even when SRTP authentication passes.
++        let mut sequence_number: u16 = 30342;
++        let mut timestamp: u32 = samples_per_packet;
+         let started = tokio::time::Instant::now();
+@@ -1741,4 +1820,5 @@ impl GlobalLink {
+                 local_candidate_port: None,
+                 bootstrapped: false,
+                 audio_header_template: None,
++                control_send_counters: HashMap::new(),
+                 direct_socket: None,

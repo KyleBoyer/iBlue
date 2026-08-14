@@ -13,8 +13,14 @@ import { spawnSync } from "node:child_process";
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const thirdPartyRoot = join(projectRoot, "third_party");
 const rustpushRoot = join(thirdPartyRoot, "rustpush-upstream");
+const rustlsRoot = join(thirdPartyRoot, "rustls-psk");
+const quinnRoot = join(thirdPartyRoot, "quinn-qpod");
+const rtcRoot = join(thirdPartyRoot, "rtc-openbubbles");
 const applePrivateApisRoot = join(rustpushRoot, "apple-private-apis");
 const pin = readFileSync(join(thirdPartyRoot, "rustpush-upstream.sha"), "utf8").trim();
+const rustlsPin = "829d6c4db64afac5eabbba2e6cf00443294419f7";
+const quinnPin = "bb2c42e08d2f8073cb3c377bab2ab29f5615ea3e";
+const rtcPin = "875896651675726ed2edc68a7030f1bc7e88b88e";
 
 if (!pin) throw new Error("third_party/rustpush-upstream.sha is empty");
 mkdirSync(thirdPartyRoot, { recursive: true });
@@ -38,8 +44,81 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "sticker-messages.patch"),
   join(projectRoot, "rustpush", "posterkit-transcript-background.patch"),
   join(projectRoot, "rustpush", "keyed-archive-components.patch"),
+  join(projectRoot, "rustpush", "native-facetime-media.patch"),
+  join(projectRoot, "rustpush", "headless-facetime-media.patch"),
+  join(projectRoot, "rustpush", "facetime-native-readiness.patch"),
+  join(projectRoot, "rustpush", "facetime-native-audio.patch"),
+  join(projectRoot, "rustpush", "facetime-native-rtp-extensions.patch"),
+  join(projectRoot, "rustpush", "facetime-native-rtp-routing-diagnostics.patch"),
+  join(projectRoot, "rustpush", "facetime-native-media-wire-trace.patch"),
+  join(projectRoot, "rustpush", "facetime-native-audio-negotiation-route.patch"),
+  join(projectRoot, "rustpush", "facetime-native-audio-codec-framing.patch"),
+  join(projectRoot, "rustpush", "facetime-native-control.patch"),
+  join(projectRoot, "rustpush", "facetime-native-control-status.patch"),
+  join(projectRoot, "rustpush", "facetime-native-inbound-capture.patch"),
+  join(projectRoot, "rustpush", "facetime-native-inbound-video-capture.patch"),
+  join(projectRoot, "rustpush", "facetime-native-audio-feedback-status.patch"),
+  join(projectRoot, "rustpush", "facetime-native-evs-audio.patch"),
+  join(projectRoot, "rustpush", "facetime-native-audio-observability.patch"),
+  join(projectRoot, "rustpush", "facetime-native-srtp-mki.patch"),
+  join(projectRoot, "rustpush", "facetime-native-media-events.patch"),
+  join(projectRoot, "rustpush", "facetime-native-control-interop.patch"),
+  join(projectRoot, "rustpush", "quickrelay-rustls.patch"),
+  join(projectRoot, "rustpush", "facetime-av-feature-fix.patch"),
+  join(projectRoot, "rustpush", "facetime-native-live-audio.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
+
+// QuickRelay uses TLS 1.3 external PSKs. Keep that public rustls work pinned,
+// then layer the later public selected-ALPN switch needed by Apple's APNs
+// protocol suffixes. Cargo consumes this checkout through a local path patch.
+if (!existsSync(join(rustlsRoot, ".git"))) {
+  if (existsSync(rustlsRoot) && readdirSync(rustlsRoot).length > 0) {
+    throw new Error(`${rustlsRoot} exists but is not a Git checkout; move it aside and retry`);
+  }
+  git(["clone", "https://github.com/TaeHagen/rustls.git", rustlsRoot], projectRoot);
+  git(["checkout", rustlsPin], rustlsRoot);
+} else {
+  const current = gitOutput(["rev-parse", "HEAD"], rustlsRoot);
+  if (current !== rustlsPin) {
+    throw new Error(`rustls PSK checkout is ${current}; expected pinned commit ${rustlsPin}`);
+  }
+}
+applyPatch(rustlsRoot, join(projectRoot, "rustpush", "rustls-selected-alpn.patch"));
+applyPatch(rustlsRoot, join(projectRoot, "rustpush", "rustls-psk-store.patch"));
+applyPatch(rustlsRoot, join(projectRoot, "rustpush", "rustls-external-psk-binder.patch"));
+
+// Apple's AVC and IDS channels are QUIC packet-oblivious datagram (QPod)
+// children of the authenticated relay connection. Pin OpenBubbles' public
+// Quinn implementation and only replace its developer-local dependency paths.
+if (!existsSync(join(quinnRoot, ".git"))) {
+  if (existsSync(quinnRoot) && readdirSync(quinnRoot).length > 0) {
+    throw new Error(`${quinnRoot} exists but is not a Git checkout; move it aside and retry`);
+  }
+  git(["clone", "https://github.com/OpenBubbles/quinn.git", quinnRoot], projectRoot);
+  git(["checkout", quinnPin], quinnRoot);
+} else {
+  const current = gitOutput(["rev-parse", "HEAD"], quinnRoot);
+  if (current !== quinnPin) {
+    throw new Error(`QuickRelay Quinn checkout is ${current}; expected pinned commit ${quinnPin}`);
+  }
+}
+applyPatch(quinnRoot, join(projectRoot, "rustpush", "quinn-qpod-dependencies.patch"));
+
+// Pin the public OpenBubbles WebRTC primitives used by the native FaceTime
+// transport for STUN, RTP, SRTP, and media packet assembly.
+if (!existsSync(join(rtcRoot, ".git"))) {
+  if (existsSync(rtcRoot) && readdirSync(rtcRoot).length > 0) {
+    throw new Error(`${rtcRoot} exists but is not a Git checkout; move it aside and retry`);
+  }
+  git(["clone", "https://github.com/OpenBubbles/rtc.git", rtcRoot], projectRoot);
+  git(["checkout", rtcPin], rtcRoot);
+} else {
+  const current = gitOutput(["rev-parse", "HEAD"], rtcRoot);
+  if (current !== rtcPin) {
+    throw new Error(`OpenBubbles RTC checkout is ${current}; expected pinned commit ${rtcPin}`);
+  }
+}
 
 const openAbsintheTarget = join(rustpushRoot, "open-absinthe");
 rmSync(openAbsintheTarget, { recursive: true, force: true });

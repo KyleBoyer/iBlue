@@ -1,0 +1,609 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index 42eedf3..f653525 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1685,7 +1685,7 @@ impl FTClient {
+                             channel_contexts.insert(header.ssrc, (Context::new(
+                                 &key[..16], 
+                                 &key[16..], 
+-                                if matches!(header.payload_type, 20 | 104 | 108 | 13) { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 }, 
++                                if matches!(header.payload_type, 20 | 104 | 108 | 13) { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 },
+                                 None, 
+                                 None
+                             ).unwrap(), if header.payload_type == 100 {
+@@ -1857,12 +1857,20 @@ impl FTClient {
+                         let should_send_stream_state = !sent_stream_group_state
+                             || message.topic.as_deref() == Some("VCSessionMessageTopicFetchStreamGroupsState");
+                         if should_send_stream_state {
+-                            let stream_groups: HashMap<u32, u8> = HashMap::from_iter([
+-                                (136, 0u8), (128, 2), (10, 0), (132, 0),
+-                                (11, 0), (129, 1), (133, 0), (1, 2),
+-                                (2, 1), (3, 0), (134, 0), (4, 0),
+-                                (5, 2), (130, 0), (6, 1), (135, 0),
+-                                (7, 0), (8, 0), (131, 0), (9, 0),
++                            // Binary plists require string dictionary keys.
++                            // AVConference models these identifiers as u32,
++                            // but serializes their decimal representations.
++                            let stream_groups: HashMap<String, u8> = HashMap::from_iter([
++                                ("136".to_string(), 0u8), ("128".to_string(), 2),
++                                ("10".to_string(), 0), ("132".to_string(), 0),
++                                ("11".to_string(), 0), ("129".to_string(), 1),
++                                ("133".to_string(), 0), ("1".to_string(), 2),
++                                ("2".to_string(), 1), ("3".to_string(), 0),
++                                ("134".to_string(), 0), ("4".to_string(), 0),
++                                ("5".to_string(), 2), ("130".to_string(), 0),
++                                ("6".to_string(), 1), ("135".to_string(), 0),
++                                ("7".to_string(), 0), ("8".to_string(), 0),
++                                ("131".to_string(), 0), ("9".to_string(), 0),
+                             ]);
+                             let state_message = VcccMessageWrapper {
+                                 message: Some(VcccMessage {
+@@ -1994,6 +2002,40 @@ impl FTClient {
+         ).await
+     }
+ 
++    /// Send a bounded stream of already-encoded audio access units while
++    /// retaining one SRTP context and monotonically advancing RTP state.
++    pub async fn send_native_audio_stream(
++        &self,
++        group_id: &str,
++        packets: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        progress: tokio::sync::mpsc::UnboundedSender<usize>,
++        payload_type: u8,
++        samples_per_packet: u32,
++        packet_duration_ms: u64,
++    ) -> Result<(), PushError> {
++        let (connection, audio_ssrc) = {
++            let state = self.state.read().await;
++            let session = state.sessions.get(group_id).ok_or(PushError::BadMsg)?;
++            let connection = session.connection.clone().ok_or(PushError::BadMsg)?;
++            let audio_ssrc = session.av_config.as_ref().ok_or(PushError::BadMsg)?.audio_ssrc;
++            (connection, audio_ssrc)
++        };
++        if !connection.link.is_bootstrapped().await {
++            return Err(PushError::NotConnected);
++        }
++        connection
++            .link
++            .send_audio_stream(
++                audio_ssrc,
++                packets,
++                progress,
++                payload_type,
++                samples_per_packet,
++                packet_duration_ms,
++            )
++            .await
++    }
++
+     // warning: Doesn't save the link
+     async fn new_link(&self, handle: &str, usage: Option<String>, supported_for: Duration) -> Result<FTLink, PushError> {
+         let since_the_epoch = duration_since_epoch();
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 238ed80..5b83f6d 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -562,6 +562,37 @@ impl QuickRelaySkmMaterial {
+ 
+ const APPLE_RTP_SHORT_MKI: [u8; 2] = [0x00, 0x10];
+ 
++struct MkiShortFormat {
++    roll_index: u16,
++    ratchet_index: u8,
++    participant_id: u64,
++}
++
++impl MkiShortFormat {
++    fn parse(data: &[u8]) -> Option<Self> {
++        if data.len() != 16 || data[6] != 0 || data[11..] != [0; 5] {
++            return None;
++        }
++        let initial = u16::from_be_bytes(data[..2].try_into().ok()?);
++        let top_bits = u32::from_be_bytes(data[2..6].try_into().ok()?);
++        let bottom_bits = u32::from_be_bytes(data[7..11].try_into().ok()?);
++        Some(Self {
++            roll_index: initial >> 4,
++            ratchet_index: initial as u8 & 0x0f,
++            participant_id: ((top_bits as u64) << 32) | bottom_bits as u64,
++        })
++    }
++
++    fn serialize(&self) -> [u8; 16] {
++        let mut result = [0u8; 16];
++        let initial = (self.roll_index << 4) | self.ratchet_index as u16;
++        result[..2].copy_from_slice(&initial.to_be_bytes());
++        result[2..6].copy_from_slice(&((self.participant_id >> 32) as u32).to_be_bytes());
++        result[7..11].copy_from_slice(&(self.participant_id as u32).to_be_bytes());
++        result
++    }
++}
++
+ fn apple_rtp_mki(participant_id: u64) -> [u8; 16] {
+     // Apple's 16-byte material identifier carries the two-byte short MKI,
+     // followed by the QuickRelay participant ID split around a reserved byte.
+@@ -609,6 +640,44 @@ impl QuickRelayMkmMaterial {
+             && self.mki.as_slice() == apple_rtp_mki(self.participant_id)
+     }
+ 
++    fn roll(&self, group_id: &str) -> Option<Self> {
++        let mut short = MkiShortFormat::parse(&self.mki)?;
++        short.ratchet_index = short.ratchet_index.checked_add(1)?;
++        if short.ratchet_index > 15 {
++            return None;
++        }
++
++        let mut padded_mks = self.mks.clone();
++        padded_mks.resize(32, 0);
++        let mut next_salt = vec![0u8; self.mks.len()];
++        Hkdf::<Sha256>::from_prk(&padded_mks)
++            .ok()?
++            .expand(group_id.as_bytes(), &mut next_salt)
++            .ok()?;
++        let mut next_key = vec![0u8; self.mkm.len()];
++        Hkdf::<Sha256>::new(None, &self.mkm)
++            .expand(group_id.as_bytes(), &mut next_key)
++            .ok()?;
++        Some(Self {
++            mks: next_salt,
++            mkm: next_key,
++            mki: short.serialize().to_vec(),
++            mkgc: self.mkgc.saturating_add(1),
++            ..self.clone()
++        })
++    }
++
++    fn current_and_next(&self, group_id: &str, count: usize) -> Vec<Self> {
++        let mut result = Vec::with_capacity(count);
++        let mut current = Some(self.clone());
++        while result.len() < count {
++            let Some(material) = current else { break };
++            current = material.roll(group_id);
++            result.push(material);
++        }
++        result
++    }
++
+     pub fn get_control(&self, my_uuid: &str, their_uuid: &str) -> ControlKeySet {
+         let hk = Hkdf::<Sha256>::new(Some(&self.mks), &self.mkm);
+ 
+@@ -822,6 +891,11 @@ pub struct GlobalLinkState {
+     control_messages_sent: u64,
+     control_stream_state_sent: bool,
+     control_last_error: Option<String>,
++    /// The local UUID that authenticated the peer's VC control channel. Older
++    /// QuickRelay implementations expose three plausible session UUIDs; retain
++    /// the HMAC-verified winner so replies use the reciprocal ordering.
++    control_local_uuid: Option<String>,
++    control_incoming_peer_first: bool,
+     /// Socket and peer selected by the successful ICE/STUN path. Once media
+     /// arrives directly from the peer, outbound RTP must use that same path
+     /// instead of continuing to tunnel packets through the AVC QPod.
+@@ -938,6 +1012,7 @@ impl AsyncUdpSocket for MultiplexEndpoint {
+ 
+ pub struct GlobalLink {
+     pub session_id: Vec<u8>,
++    group_id: String,
+     pub relay_ip: Vec<u8>,
+     pub relay_port: u16,
+     pub quic: quinn::Connection,
+@@ -950,6 +1025,104 @@ pub struct GlobalLink {
+     ind_send: tokio::sync::mpsc::Sender<IdsqrProtoH3Message>,
+ }
+ 
++struct NativeAudioSender {
++    context: Context,
++    header_template: rtc_rtp::Header,
++    peer_participant: Option<u64>,
++    avc_pod: Pod,
++    direct_socket: Option<Arc<UdpSocket>>,
++    direct_peer: Option<SocketAddr>,
++    ssrc: u32,
++    payload_type: u8,
++    samples_per_packet: u32,
++    packet_duration_ms: u64,
++    sequence_number: u16,
++    timestamp: u32,
++    packet_index: u64,
++    started: tokio::time::Instant,
++}
++
++impl NativeAudioSender {
++    async fn send_packet(&mut self, payload: Vec<u8>) -> Result<usize, PushError> {
++        let payload_len = payload.len();
++        if self.payload_type == 104 && payload_len > u8::MAX as usize {
++            warn!(
++                "FaceTime AAC-ELD access unit is too large for Apple audio framing: {} bytes",
++                payload_len,
++            );
++            return Err(PushError::BadMsg);
++        }
++
++        // PT104 carries one-byte-length-prefixed AAC-ELD access units. PT108
++        // carries one complete EVS payload (including Apple's three-frame
++        // bundle produced by VCAudioPayload) without an outer prefix.
++        let framed_payload = if self.payload_type == 104 {
++            let mut framed = Vec::with_capacity(payload_len + 1);
++            framed.push(payload_len as u8);
++            framed.extend_from_slice(&payload);
++            framed
++        } else if self.payload_type == 108 {
++            payload
++        } else {
++            return Err(PushError::BadMsg);
++        };
++
++        let current_send = ((self.timestamp as u64 + 52_676) * 16 / 375) as u16;
++        let mut audio_control = vec![0u8; 20];
++        audio_control[8..10].copy_from_slice(&current_send.to_be_bytes());
++        self.header_template.version = 2;
++        self.header_template.padding = false;
++        self.header_template.extension = true;
++        self.header_template.marker = self.packet_index == 0;
++        self.header_template.payload_type = self.payload_type;
++        self.header_template.sequence_number = self.sequence_number;
++        self.header_template.timestamp = self.timestamp;
++        self.header_template.ssrc = self.ssrc;
++        self.header_template.csrc.clear();
++        self.header_template.extension_profile = 0x8d00;
++        self.header_template.extensions = vec![rtc_rtp::header::Extension {
++            id: 0,
++            payload: audio_control.into(),
++        }];
++        self.header_template.extensions_padding = 0;
++        let packet = rtc_rtp::Packet {
++            header: self.header_template.clone(),
++            payload: framed_payload.into(),
++        };
++        let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
++        let encrypted = self
++            .context
++            .encrypt_rtp(&plaintext)
++            .map_err(|_| PushError::BadMsg)?;
++        if let (Some(socket), Some(peer)) = (&self.direct_socket, self.direct_peer) {
++            socket
++                .send_to(&encrypted, peer)
++                .await
++                .map_err(|_| PushError::NotConnected)?;
++        } else {
++            let framed = GlobalPacket {
++                participant: self.peer_participant,
++                link: LinkType::Pod,
++                data: encrypted.to_vec(),
++            }
++            .to_qr_raw();
++            self.avc_pod
++                .send_datagram(framed.into())
++                .map_err(|_| PushError::NotConnected)?;
++        }
++
++        self.sequence_number = self.sequence_number.wrapping_add(1);
++        self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
++        self.packet_index = self.packet_index.saturating_add(1);
++        let deadline = self.started
++            + std::time::Duration::from_millis(
++                self.packet_index.saturating_mul(self.packet_duration_ms),
++            );
++        tokio::time::sleep_until(deadline).await;
++        Ok(payload_len)
++    }
++}
++
+ impl GlobalLink {
+     async fn connect_to_relay(response: &QuickRelayAllocationsResponse, incoming: tokio::sync::mpsc::Sender<GlobalPacket>) -> Result<(quinn::Connection, SendRequest<h3_quinn::OpenStreams, rasn::prelude::OctetString>), PushError> {
+         let mut client_crypto: ClientConfig = rustls::ClientConfig::builder()
+@@ -1135,7 +1308,15 @@ impl GlobalLink {
+ 
+                             let mut state = self.state.lock().await;
+                             item.mkm = state.decode_key_material(item.mkm.as_ref()).unwrap();
+-                            state.states.entry(mat.owner_participant_id()).or_default().mkm.push(item);
++                            let participant = state
++                                .states
++                                .entry(mat.owner_participant_id())
++                                .or_default();
++                            for material in item.current_and_next(&sid, 3) {
++                                if !participant.mkm.iter().any(|known| known.mki == material.mki) {
++                                    participant.mkm.push(material);
++                                }
++                            }
+                         }
+                         14 => {
+                             let parsed: QuickRelaySignedData = plist::from_bytes(item.material_content())?;
+@@ -1368,7 +1549,21 @@ impl GlobalLink {
+     ) -> Result<(u64, Vec<u8>), PushError> {
+         let mut state = self.state.lock().await;
+         let mut authenticated = None;
+-        for (participant, participant_state) in &mut state.states {
++        let relay_session_id = Uuid::from_bytes(
++            self.session_id
++                .clone()
++                .try_into()
++                .map_err(|_| PushError::BadMsg)?,
++        )
++        .to_string()
++        .to_uppercase();
++        let mut local_session_ids = vec![local_session_id.to_string()];
++        for candidate in [&self.group_id, &relay_session_id] {
++            if !local_session_ids.iter().any(|value| value == candidate) {
++                local_session_ids.push(candidate.clone());
++            }
++        }
++        for (participant, participant_state) in &state.states {
+             if participant_hint.is_some_and(|hint| hint != *participant) {
+                 continue;
+             }
+@@ -1378,14 +1573,29 @@ impl GlobalLink {
+             );
+             for peer_session_id in peer_session_ids {
+                 for mkm in &participant_state.mkm {
+-                    let key = mkm.get_control(&peer_session_id, local_session_id);
+-                    if let Ok(plaintext) = key.decrypt(payload) {
+-                        // The IDS command-207 UUID is fresher than an AVC
+-                        // material cached by QuickRelay. Remember whichever
+-                        // candidate actually authenticated so replies use the
+-                        // same control context.
+-                        participant_state.avc_uuid = Some(peer_session_id);
+-                        authenticated = Some((*participant, plaintext));
++                    for local_session_id in &local_session_ids {
++                        for incoming_peer_first in [true, false] {
++                            let key = if incoming_peer_first {
++                                mkm.get_control(&peer_session_id, local_session_id)
++                            } else {
++                                mkm.get_control(local_session_id, &peer_session_id)
++                            };
++                            if let Ok(plaintext) = key.decrypt(payload) {
++                                authenticated = Some((
++                                    *participant,
++                                    peer_session_id.clone(),
++                                    local_session_id.clone(),
++                                    incoming_peer_first,
++                                    plaintext,
++                                ));
++                                break;
++                            }
++                        }
++                        if authenticated.is_some() {
++                            break;
++                        }
++                    }
++                    if authenticated.is_some() {
+                         break;
+                     }
+                 }
+@@ -1397,10 +1607,17 @@ impl GlobalLink {
+                 break;
+             }
+         }
+-        if let Some(authenticated) = authenticated {
++        if let Some((participant, peer_uuid, local_uuid, incoming_peer_first, plaintext)) =
++            authenticated
++        {
++            if let Some(participant_state) = state.states.get_mut(&participant) {
++                participant_state.avc_uuid = Some(peer_uuid);
++            }
++            state.control_local_uuid = Some(local_uuid);
++            state.control_incoming_peer_first = incoming_peer_first;
+             state.control_messages_authenticated = state.control_messages_authenticated.saturating_add(1);
+             state.control_last_error = None;
+-            return Ok(authenticated);
++            return Ok((participant, plaintext));
+         }
+         Err(PushError::BadMsg)
+     }
+@@ -1461,7 +1678,19 @@ impl GlobalLink {
+             // after taking the value used for this packet.
+             let packet_counter = *counter;
+             *counter = counter.wrapping_add(1);
+-            let key = state.my_mkm.get_control(local_session_id, &peer_session_id);
++            let selected_local_session_id = state
++                .control_local_uuid
++                .clone()
++                .unwrap_or_else(|| local_session_id.to_string());
++            let key = if state.control_incoming_peer_first {
++                state
++                    .my_mkm
++                    .get_control(&selected_local_session_id, &peer_session_id)
++            } else {
++                state
++                    .my_mkm
++                    .get_control(&peer_session_id, &selected_local_session_id)
++            };
+             (
+                 key.encrypt(plaintext, packet_counter)?,
+                 state.direct_socket.clone(),
+@@ -1568,15 +1797,20 @@ impl GlobalLink {
+         }
+     }
+ 
+-    pub async fn send_audio_packets(
++    async fn create_native_audio_sender(
+         &self,
+         ssrc: u32,
+-        packets: Vec<Vec<u8>>,
+         payload_type: u8,
+         samples_per_packet: u32,
+         packet_duration_ms: u64,
+-    ) -> Result<(), PushError> {
+-        let (mut header_template, peer_participant) = self.wait_for_audio_header_template().await?;
++    ) -> Result<NativeAudioSender, PushError> {
++        if !matches!(payload_type, 104 | 108)
++            || samples_per_packet == 0
++            || packet_duration_ms == 0
++        {
++            return Err(PushError::BadMsg);
++        }
++        let (header_template, peer_participant) = self.wait_for_audio_header_template().await?;
+         let (avc_pod, direct_socket, direct_peer, key) = {
+             let state = self.state.lock().await;
+             if !state.my_mkm.has_apple_rtp_short_mki() {
+@@ -1590,22 +1824,15 @@ impl GlobalLink {
+                 state.my_mkm.get_key(ssrc),
+             )
+         };
+-        let mut context = Context::new(
++        let context = Context::new(
+             &key[..16],
+             &key[16..],
+             ProtectionProfile::Aes128CmHmacSha2mki_32,
+             None,
+             None,
+-        ).map_err(|_| PushError::BadMsg)?;
+-        // Apple's U1 audio sender starts from the same deterministic baseline:
+-        // a conventional arbitrary RTP sequence and one 480-sample frame into
+-        // the 48 kHz media timeline. A random timestamp can fall outside the
+-        // receiver's active playout window even when SRTP authentication passes.
+-        let mut sequence_number: u16 = 30342;
+-        let mut timestamp: u32 = samples_per_packet;
+-        let started = tokio::time::Instant::now();
++        )
++        .map_err(|_| PushError::BadMsg)?;
+         let using_direct = direct_socket.is_some() && direct_peer.is_some();
+-
+         if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+             warn!(
+                 "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={} participant={:?} transport={}",
+@@ -1616,70 +1843,66 @@ impl GlobalLink {
+                 if using_direct { "direct" } else { "quickrelay-pod" },
+             );
+         }
++        Ok(NativeAudioSender {
++            context,
++            header_template,
++            peer_participant,
++            avc_pod,
++            direct_socket,
++            direct_peer,
++            ssrc,
++            payload_type,
++            samples_per_packet,
++            packet_duration_ms,
++            sequence_number: 30342,
++            timestamp: samples_per_packet,
++            packet_index: 0,
++            started: tokio::time::Instant::now(),
++        })
++    }
+ 
+-        for (index, payload) in packets.into_iter().enumerate() {
+-            if payload_type == 104 && payload.len() > u8::MAX as usize {
+-                warn!("FaceTime AAC-ELD access unit is too large for Apple audio framing: {} bytes", payload.len());
+-                return Err(PushError::BadMsg);
+-            }
+-
+-            // PT104 carries one-byte-length-prefixed AAC-ELD access units.
+-            // PT108 carries one complete EVS access unit without a prefix.
+-            let framed_payload = if payload_type == 104 {
+-                let mut framed = Vec::with_capacity(payload.len() + 1);
+-                framed.push(payload.len() as u8);
+-                framed.extend_from_slice(&payload);
+-                framed
+-            } else if payload_type == 108 {
+-                payload
+-            } else {
+-                return Err(PushError::BadMsg);
+-            };
+-
+-            // Apple attaches fresh proprietary receiver/control statistics to
+-            // every U1 audio RTP packet. We have no receiver statistics yet,
+-            // but still emit the valid version-2 layout and advancing send
+-            // timestamp instead of replaying the peer's stale extension.
+-            let current_send = ((timestamp as u64 + 52_676) * 16 / 375) as u16;
+-            let mut audio_control = vec![0u8; 20];
+-            audio_control[8..10].copy_from_slice(&current_send.to_be_bytes());
+-            header_template.version = 2;
+-            header_template.padding = false;
+-            header_template.extension = true;
+-            header_template.marker = index == 0;
+-            header_template.payload_type = payload_type;
+-            header_template.sequence_number = sequence_number;
+-            header_template.timestamp = timestamp;
+-            header_template.ssrc = ssrc;
+-            header_template.csrc.clear();
+-            header_template.extension_profile = 0x8d00;
+-            header_template.extensions = vec![rtc_rtp::header::Extension {
+-                id: 0,
+-                payload: audio_control.into(),
+-            }];
+-            header_template.extensions_padding = 0;
+-            let packet = rtc_rtp::Packet {
+-                header: header_template.clone(),
+-                payload: framed_payload.into(),
+-            };
+-            let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
+-            let encrypted = context.encrypt_rtp(&plaintext).map_err(|_| PushError::BadMsg)?;
+-            if let (Some(socket), Some(peer)) = (&direct_socket, direct_peer) {
+-                socket.send_to(&encrypted, peer).await.map_err(|_| PushError::NotConnected)?;
+-            } else {
+-                let framed = GlobalPacket {
+-                    participant: peer_participant,
+-                    link: LinkType::Pod,
+-                    data: encrypted.to_vec(),
+-                }.to_qr_raw();
+-                avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
+-            }
++    pub async fn send_audio_packets(
++        &self,
++        ssrc: u32,
++        packets: Vec<Vec<u8>>,
++        payload_type: u8,
++        samples_per_packet: u32,
++        packet_duration_ms: u64,
++    ) -> Result<(), PushError> {
++        let mut sender = self
++            .create_native_audio_sender(
++                ssrc,
++                payload_type,
++                samples_per_packet,
++                packet_duration_ms,
++            )
++            .await?;
++        for payload in packets {
++            sender.send_packet(payload).await?;
++        }
++        Ok(())
++    }
+ 
+-            sequence_number = sequence_number.wrapping_add(1);
+-            timestamp = timestamp.wrapping_add(samples_per_packet);
+-            let deadline = started
+-                + std::time::Duration::from_millis((index as u64 + 1) * packet_duration_ms);
+-            tokio::time::sleep_until(deadline).await;
++    pub async fn send_audio_stream(
++        &self,
++        ssrc: u32,
++        mut packets: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        progress: tokio::sync::mpsc::UnboundedSender<usize>,
++        payload_type: u8,
++        samples_per_packet: u32,
++        packet_duration_ms: u64,
++    ) -> Result<(), PushError> {
++        let mut sender = self
++            .create_native_audio_sender(
++                ssrc,
++                payload_type,
++                samples_per_packet,
++                packet_duration_ms,
++            )
++            .await?;
++        while let Some(payload) = packets.recv().await {
++            let payload_bytes = sender.send_packet(payload).await?;
++            let _ = progress.send(payload_bytes);
+         }
+         Ok(())
+     }
+@@ -1980,6 +2203,7 @@ impl GlobalLink {
+ 
+         let me = Arc::new(Self {
+             session_id: response.session_id.clone().into(),
++            group_id: group_id.to_string(),
+             relay_ip: response.relay_ip.as_ref().to_vec(),
+             relay_port: response.relay_port,
+             quic: connection,
+@@ -2010,6 +2234,8 @@ impl GlobalLink {
+                 control_messages_sent: 0,
+                 control_stream_state_sent: false,
+                 control_last_error: None,
++                control_local_uuid: None,
++                control_incoming_peer_first: true,
+                 direct_socket: None,
+                 direct_peer: None,
+             })),

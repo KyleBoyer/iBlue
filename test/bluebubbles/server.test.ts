@@ -13,7 +13,13 @@ import { BlueBubblesServer, derivePublicComputerId } from "../../src/bluebubbles
 import { BlueBubblesService } from "../../src/bluebubbles/service.js";
 import { BlueBubblesStore } from "../../src/bluebubbles/store.js";
 import { ICloudShareResolver } from "../../src/bluebubbles/icloud-share.js";
-import type { FocusPeersSyncPage, FreshICloudPhotoShare, IMessageEngine } from "../../src/native/engine.js";
+import type {
+  FaceTimeNativeMediaStreamStatus,
+  FocusPeersSyncPage,
+  FreshICloudPhotoShare,
+  IMessageEngine,
+} from "../../src/native/engine.js";
+import type { FaceTimeCall } from "../../src/bluebubbles/facetime-media.js";
 import { SessionStore } from "../../src/profile.js";
 import type {
   EngineSnapshot,
@@ -313,6 +319,45 @@ class FakeEngine extends EventEmitter implements IMessageEngine {
   }
 }
 
+class NativeStreamTestService extends BlueBubblesService {
+  readonly streamPolicies: Array<{
+    sessionId: string;
+    enabled: boolean;
+    audio?: boolean;
+    video?: boolean;
+    ttlSeconds?: number;
+  }> = [];
+
+  override get nativeFaceTimeMediaAvailable(): boolean {
+    return true;
+  }
+
+  override get nativeFaceTimeStreamingAvailable(): boolean {
+    return true;
+  }
+
+  override get nativeFaceTimeLiveAudioAvailable(): boolean {
+    return true;
+  }
+
+  override setNativeFaceTimeMediaStream(params: {
+    sessionId: string;
+    enabled: boolean;
+    audio?: boolean;
+    video?: boolean;
+    ttlSeconds?: number;
+  }): Promise<FaceTimeNativeMediaStreamStatus> {
+    this.streamPolicies.push({ ...params });
+    return Promise.resolve({
+      sessionId: params.sessionId,
+      enabled: params.enabled,
+      audio: params.audio ?? false,
+      video: params.video ?? false,
+      expiresAt: params.enabled ? Date.now() + (params.ttlSeconds ?? 300) * 1_000 : null,
+    });
+  }
+}
+
 class PassiveFakeEngine extends FakeEngine {
   readonly passiveSnapshot: EngineSnapshot = { ...snapshot, idsMode: "passive" };
 
@@ -375,6 +420,366 @@ function serviceEvent(
     service.on("event", listener);
   });
 }
+
+test("FaceTime realtime media is authenticated, opt-in, selective, and non-persistent", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-facetime-realtime-test-"));
+  const engine = new FakeEngine();
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  const service = new NativeStreamTestService({
+    profile: "test",
+    password: "secret",
+    engine,
+    store,
+    sessionStore: new SessionStore("test", join(root, "session.json")),
+  });
+  await service.start({
+    version: 1,
+    profile: "test",
+    deviceId: "device-test",
+    apsState: "aps",
+    users: "users",
+    identity: "identity",
+    accountUsername: "secondary@example.com",
+    handles: snapshot.handles,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const call: FaceTimeCall = {
+    id: "call-1",
+    sessionId: "SESSION-1",
+    mode: "audio",
+    targets: ["tel:+12025550142"],
+    displayName: "Jade",
+    state: "active",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    maxDurationSeconds: 90,
+    participantCount: 1,
+    transport: "iblue-quickrelay",
+  };
+  const mediaManager = {
+    list: (): FaceTimeCall[] => [structuredClone(call)],
+    get: (id: string): FaceTimeCall | undefined => id === call.id ? structuredClone(call) : undefined,
+    start: async (): Promise<FaceTimeCall> => structuredClone(call),
+    stop: async (id: string): Promise<FaceTimeCall | undefined> => {
+      if (id !== call.id) return undefined;
+      call.state = "ended";
+      call.endedAt = Date.now();
+      call.updatedAt = call.endedAt;
+      return structuredClone(call);
+    },
+    close: async (): Promise<void> => {},
+  };
+  const api = new BlueBubblesServer({ service, port: 0, faceTimeMediaManager: mediaManager });
+  const listening = await api.start();
+  const sockets: Socket[] = [];
+  t.after(async () => {
+    for (const socket of sockets) socket.disconnect();
+    await api.stop();
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const connect = async (): Promise<Socket> => {
+    const socket = socketClient(listening.address, {
+      query: { password: "secret" },
+      transports: ["websocket"],
+    });
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("connect_error", reject);
+    });
+    return socket;
+  };
+  const audioSocket = await connect();
+  const videoSocket = await connect();
+
+  let apiEvents = 0;
+  service.on("event", () => { apiEvents += 1; });
+  const audioSubscription = await socketAck<{ status: number; data: { audio: boolean; video: boolean } }>(
+    audioSocket,
+    "facetime-media-subscribe",
+    { callId: call.id, audio: true, video: false, ttlSeconds: 60 },
+  );
+  assert.equal(audioSubscription.status, 200);
+  assert.deepEqual(
+    { audio: audioSubscription.data.audio, video: audioSubscription.data.video },
+    { audio: true, video: false },
+  );
+  const videoSubscription = await socketAck<{ status: number }>(
+    videoSocket,
+    "facetime-media-subscribe",
+    { callId: call.id, audio: false, video: true, ttlSeconds: 60 },
+  );
+  assert.equal(videoSubscription.status, 200);
+  assert.deepEqual(
+    service.streamPolicies.at(-1),
+    { sessionId: call.sessionId, enabled: true, audio: true, video: true, ttlSeconds: 60 },
+  );
+
+  let videoSocketSawAudio = false;
+  videoSocket.once("ft-media-frame", () => { videoSocketSawAudio = true; });
+  const audioFramePromise = new Promise<Record<string, unknown>>((resolve) =>
+    audioSocket.once("ft-media-frame", resolve));
+  engine.emit("facetime.media.frame", {
+    sessionId: call.sessionId,
+    kind: "audio",
+    codec: "evs",
+    payloadType: 108,
+    rtpTimestamp: 960,
+    dataBase64: Buffer.from([1, 2, 3]).toString("base64"),
+    receivedAt: Date.now(),
+  });
+  const audioFrame = await audioFramePromise;
+  assert.deepEqual(Buffer.from(audioFrame.data as Buffer), Buffer.from([1, 2, 3]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(videoSocketSawAudio, false);
+
+  let audioSocketSawVideo = false;
+  audioSocket.once("ft-media-frame", () => { audioSocketSawVideo = true; });
+  const videoFramePromise = new Promise<Record<string, unknown>>((resolve) =>
+    videoSocket.once("ft-media-frame", resolve));
+  engine.emit("facetime.media.frame", {
+    sessionId: call.sessionId,
+    kind: "video",
+    codec: "h265",
+    rtpTimestamp: 9_000,
+    durationMs: 33,
+    droppedPackets: 0,
+    dataBase64: Buffer.from([0, 0, 0, 1, 0x26]).toString("base64"),
+    receivedAt: Date.now(),
+  });
+  const videoFrame = await videoFramePromise;
+  assert.deepEqual(Buffer.from(videoFrame.data as Buffer), Buffer.from([0, 0, 0, 1, 0x26]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(audioSocketSawVideo, false);
+  assert.equal(apiEvents, 0, "raw FaceTime frames must not enter persisted/webhook API events");
+
+  const audioUnsubscribe = await socketAck<{ status: number; data: { removed: boolean } }>(
+    audioSocket,
+    "facetime-media-unsubscribe",
+    { callId: call.id },
+  );
+  assert.equal(audioUnsubscribe.data.removed, true);
+  assert.deepEqual(
+    service.streamPolicies.at(-1),
+    { sessionId: call.sessionId, enabled: true, audio: false, video: true, ttlSeconds: 60 },
+  );
+
+  const stop = await socketAck<{ status: number; data: FaceTimeCall }>(
+    audioSocket,
+    "facetime-call-stop",
+    { callId: call.id },
+  );
+  assert.equal(stop.status, 200);
+  assert.equal(stop.data.state, "ended");
+  assert.deepEqual(
+    service.streamPolicies.at(-1),
+    { sessionId: call.sessionId, enabled: false },
+  );
+
+  call.state = "active";
+  delete call.endedAt;
+  const resubscribe = await socketAck<{ status: number }>(
+    videoSocket,
+    "facetime-media-subscribe",
+    { callId: call.id, ttlSeconds: 60 },
+  );
+  assert.equal(resubscribe.status, 200);
+  videoSocket.disconnect();
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (service.streamPolicies.at(-1)?.enabled === false) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(
+    service.streamPolicies.at(-1),
+    { sessionId: call.sessionId, enabled: false },
+  );
+});
+
+test("FaceTime outbound live audio is socket-owned, exactly framed, bounded, and ephemeral", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-facetime-live-audio-test-"));
+  const engine = new FakeEngine();
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  const service = new NativeStreamTestService({
+    profile: "test",
+    password: "secret",
+    engine,
+    store,
+    sessionStore: new SessionStore("test", join(root, "session.json")),
+  });
+  await service.start({
+    version: 1,
+    profile: "test",
+    deviceId: "device-test",
+    apsState: "aps",
+    users: "users",
+    identity: "identity",
+    accountUsername: "secondary@example.com",
+    handles: snapshot.handles,
+    updatedAt: new Date().toISOString(),
+  });
+
+  let sequence = 0;
+  const calls = new Map<string, FaceTimeCall>();
+  const frames: Array<{ callId: string; frame: Buffer }> = [];
+  const finished: string[] = [];
+  const mediaManager = {
+    list: (): FaceTimeCall[] => [...calls.values()].map((call) => structuredClone(call)),
+    get: (id: string): FaceTimeCall | undefined => {
+      const call = calls.get(id);
+      return call ? structuredClone(call) : undefined;
+    },
+    start: async (): Promise<FaceTimeCall> => { throw new Error("not used"); },
+    stop: async (id: string): Promise<FaceTimeCall | undefined> => {
+      const call = calls.get(id);
+      if (!call) return undefined;
+      call.state = "ended";
+      call.endedAt = Date.now();
+      return structuredClone(call);
+    },
+    startLiveAudio: async (input: {
+      targets: string[];
+      displayName: string;
+      maxDurationSeconds?: number;
+    }): Promise<FaceTimeCall> => {
+      const now = Date.now();
+      const call: FaceTimeCall = {
+        id: `live-${++sequence}`,
+        sessionId: `SESSION-LIVE-${sequence}`,
+        mode: "audio",
+        targets: [...input.targets],
+        displayName: input.displayName,
+        state: "ringing",
+        createdAt: now,
+        updatedAt: now,
+        maxDurationSeconds: input.maxDurationSeconds ?? 300,
+        participantCount: 0,
+        transport: "iblue-quickrelay",
+        mediaSource: "live-stream",
+        liveAudioFormat: {
+          encoding: "pcm-f32le",
+          sampleRate: 24_000,
+          channels: 1,
+          frameDurationMs: 20,
+          frameBytes: 1_920,
+        },
+      };
+      calls.set(call.id, call);
+      return structuredClone(call);
+    },
+    pushLiveAudioFrame: async (callId: string, frame: Buffer): Promise<FaceTimeCall> => {
+      const call = calls.get(callId);
+      if (!call) throw new Error("not found");
+      frames.push({ callId, frame: Buffer.from(frame) });
+      return structuredClone(call);
+    },
+    finishLiveAudio: async (callId: string): Promise<FaceTimeCall | undefined> => {
+      const call = calls.get(callId);
+      if (!call) return undefined;
+      finished.push(callId);
+      call.state = "ended";
+      call.endedAt = Date.now();
+      call.updatedAt = call.endedAt;
+      return structuredClone(call);
+    },
+    close: async (): Promise<void> => {},
+  };
+  const api = new BlueBubblesServer({ service, port: 0, faceTimeMediaManager: mediaManager });
+  const listening = await api.start();
+  const sockets: Socket[] = [];
+  t.after(async () => {
+    for (const socket of sockets) socket.disconnect();
+    await api.stop();
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const connect = async (): Promise<Socket> => {
+    const socket = socketClient(listening.address, {
+      query: { password: "secret" },
+      transports: ["websocket"],
+    });
+    sockets.push(socket);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("connect_error", reject);
+    });
+    return socket;
+  };
+  const owner = await connect();
+  const stranger = await connect();
+
+  const metadataResponse = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/realtime?password=secret`,
+  );
+  const metadata = await metadataResponse.json() as {
+    data: { outboundLiveMediaInjection: Record<string, unknown> };
+  };
+  assert.equal(metadata.data.outboundLiveMediaInjection.available, true);
+  assert.equal(metadata.data.outboundLiveMediaInjection.queueCapacityFrames, 50);
+
+  let apiEvents = 0;
+  service.on("event", () => { apiEvents += 1; });
+  const created = await socketAck<{ status: number; data: FaceTimeCall }>(
+    owner,
+    "facetime-live-audio-create",
+    { address: "2025550142", displayName: "Jade", maxDurationSeconds: 45 },
+  );
+  assert.equal(created.status, 200);
+  assert.deepEqual(created.data.targets, ["tel:+12025550142"]);
+  assert.equal(created.data.mediaSource, "live-stream");
+  assert.equal(created.data.maxDurationSeconds, 45);
+
+  const denied = await socketAck<{ status: number }>(
+    stranger,
+    "facetime-live-audio-frame",
+    { callId: created.data.id, data: Buffer.alloc(1_920) },
+  );
+  assert.equal(denied.status, 403);
+  const malformed = await socketAck<{ status: number }>(
+    owner,
+    "facetime-live-audio-frame",
+    { callId: created.data.id, data: Buffer.alloc(1_916) },
+  );
+  assert.equal(malformed.status, 400);
+
+  const frame = Buffer.alloc(1_920, 0x5a);
+  const accepted = await socketAck<{ status: number }>(
+    owner,
+    "facetime-live-audio-frame",
+    { callId: created.data.id, data: frame },
+  );
+  assert.equal(accepted.status, 200);
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0]!.callId, created.data.id);
+  assert.deepEqual(frames[0]!.frame, frame);
+  assert.equal(apiEvents, 0, "outbound raw FaceTime frames must not enter API events or webhooks");
+
+  const finishedByOwner = await socketAck<{ status: number; data: FaceTimeCall }>(
+    owner,
+    "facetime-live-audio-finish",
+    { callId: created.data.id },
+  );
+  assert.equal(finishedByOwner.status, 200);
+  assert.equal(finishedByOwner.data.state, "ended");
+
+  const disconnectCall = await socketAck<{ status: number; data: FaceTimeCall }>(
+    owner,
+    "facetime-live-audio-create",
+    { target: "mailto:kyle@example.com" },
+  );
+  assert.equal(disconnectCall.status, 200);
+  owner.disconnect();
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (finished.includes(disconnectCall.data.id)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(finished.includes(disconnectCall.data.id), "owner disconnect must finish its call");
+});
 
 function icloudShareFetchFixture(): typeof fetch {
   return async (input) => {
@@ -1270,7 +1675,8 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
       .filter(([method]) => ["get", "post", "put", "patch", "delete"].includes(method))
       .map(([method, operation]) => ({ path, method, operation })),
   );
-  assert.equal(documentedOperations.length, 98);
+  assert.equal(documentedOperations.length, 107);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/realtime"]?.get);
   const missingParameterDescriptions: string[] = [];
   const auditBodyProperties = (
     schema: Record<string, unknown> | undefined,
@@ -2643,6 +3049,23 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   assert.equal(deletedByBody.status, 200);
   assert.ok(deletedByBodyPayload.data.dateRetracted > 0);
 
+  const unauthorizedSocket = socketClient(listening.address, {
+    query: { password: "wrong" },
+    transports: ["websocket"],
+    reconnection: false,
+  });
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("unauthorized Socket.IO client was not rejected")), 1_000);
+    const rejected = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    unauthorizedSocket.once("disconnect", rejected);
+    unauthorizedSocket.once("connect_error", rejected);
+  });
+  assert.equal(unauthorizedSocket.connected, false);
+  unauthorizedSocket.close();
+
   socket = socketClient(listening.address, { query: { password: "secret" }, transports: ["websocket"] });
   await new Promise<void>((resolve, reject) => {
     socket!.once("connect", resolve);
@@ -2651,6 +3074,58 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
   const event = new Promise<{ guid: string }>((resolve) => socket!.once("new-message", resolve));
   service.dispatch("new-message", { guid: "socket-guid" });
   assert.equal((await event).guid, "socket-guid");
+
+  const realtimeResponse = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/realtime?password=secret`,
+  );
+  const realtime = await realtimeResponse.json() as {
+    data: { inboundMedia: { available: boolean; explicitOptIn: boolean; webhookDelivery: boolean } };
+  };
+  assert.equal(realtime.data.inboundMedia.available, false);
+  assert.equal(realtime.data.inboundMedia.explicitOptIn, true);
+  assert.equal(realtime.data.inboundMedia.webhookDelivery, false);
+  const calls = await socketAck<{ status: number; data: unknown[] }>(socket, "facetime-call-list", {});
+  assert.equal(calls.status, 200);
+  assert.deepEqual(calls.data, []);
+  const unavailableStream = await socketAck<{ status: number }>(
+    socket,
+    "facetime-media-subscribe",
+    { callId: "missing-call" },
+  );
+  assert.equal(unavailableStream.status, 501);
+  const unavailableStop = await socketAck<{ status: number }>(
+    socket,
+    "facetime-call-stop",
+    { callId: "missing-call" },
+  );
+  assert.equal(unavailableStop.status, 501);
+  const missingCall = await socketAck<{ status: number }>(
+    socket,
+    "facetime-call-get",
+    { callId: "missing-call" },
+  );
+  assert.equal(missingCall.status, 404);
+  const missingSubscription = await socketAck<{ status: number; data: { removed: boolean } }>(
+    socket,
+    "facetime-media-unsubscribe",
+    { callId: "missing-call" },
+  );
+  assert.equal(missingSubscription.status, 200);
+  assert.equal(missingSubscription.data.removed, false);
+
+  let rawFrameLeaked = false;
+  socket.once("ft-media-frame", () => { rawFrameLeaked = true; });
+  engine.emit("facetime.media.frame", {
+    sessionId: "SESSION",
+    kind: "audio",
+    codec: "evs",
+    payloadType: 108,
+    rtpTimestamp: 480,
+    dataBase64: Buffer.from([1, 2, 3]).toString("base64"),
+    receivedAt: Date.now(),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(rawFrameLeaked, false, "raw FaceTime media must require an explicit subscription");
 
   const metadataEvent = new Promise<{ status: number; data: { private_api: boolean } }>((resolve) =>
     socket!.once("server-metadata", resolve),

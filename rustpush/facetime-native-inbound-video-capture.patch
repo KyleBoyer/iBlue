@@ -1,0 +1,131 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1509,22 +1509,27 @@ impl FTClient {
+             let mut logged_audio_diagnostic = false;
+             let mut sent_stream_group_state = false;
+             let mut raw_diagnostics_remaining = 32usize;
+-            let capture_sender = inbound_capture_path.map(|capture_path| {
++            let capture_sender = inbound_capture_path.clone().map(|capture_path| {
+                 let (capture_send, mut capture_recv) = tokio::sync::mpsc::channel::<(u8, u32, Vec<u8>)>(2048);
+                 tokio::spawn(async move {
+                     let mut capture = b"IBLUEFT1".to_vec();
+                     let mut frame_count = 0usize;
+                     let mut payload_bytes = 0usize;
+-                    while let Some((payload_type, timestamp, frame)) = capture_recv.recv().await {
+-                        if frame_count >= 2_000 || frame.len() > u16::MAX as usize {
+-                            continue;
++                    let capture_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
++                    loop {
++                        let item = tokio::select! {
++                            item = capture_recv.recv() => item,
++                            _ = tokio::time::sleep_until(capture_deadline) => None,
++                        };
++                        let Some((payload_type, timestamp, frame)) = item else { break };
++                        if frame_count < 2_000 && frame.len() <= u16::MAX as usize {
++                            capture.push(payload_type);
++                            capture.extend_from_slice(&timestamp.to_be_bytes());
++                            capture.extend_from_slice(&(frame.len() as u16).to_be_bytes());
++                            capture.extend_from_slice(&frame);
++                            frame_count += 1;
++                            payload_bytes += frame.len();
+                         }
+-                        capture.push(payload_type);
+-                        capture.extend_from_slice(&timestamp.to_be_bytes());
+-                        capture.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+-                        capture.extend_from_slice(&frame);
+-                        frame_count += 1;
+-                        payload_bytes += frame.len();
+                     }
+                     if frame_count == 0 {
+                         return;
+@@ -1557,6 +1562,69 @@ impl FTClient {
+                 });
+                 capture_send
+             });
++            let video_capture_sender = inbound_capture_path.map(|capture_path| {
++                let (capture_send, mut capture_recv) = tokio::sync::mpsc::channel::<(bool, Vec<u8>)>(512);
++                tokio::spawn(async move {
++                    let capture_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
++                    let mut description = None;
++                    let mut annex_b = Vec::new();
++                    let mut frame_count = 0usize;
++                    loop {
++                        let item = tokio::select! {
++                            item = capture_recv.recv() => item,
++                            _ = tokio::time::sleep_until(capture_deadline) => None,
++                        };
++                        let Some((is_description, bytes)) = item else { break };
++                        if is_description {
++                            if description.is_none() && bytes.len() <= 256 * 1024 {
++                                description = Some(bytes);
++                            }
++                        } else if frame_count < 600
++                            && annex_b.len().saturating_add(bytes.len()) <= 24 * 1024 * 1024
++                        {
++                            annex_b.extend_from_slice(&bytes);
++                            frame_count += 1;
++                        }
++                    }
++                    if annex_b.is_empty() && description.is_none() {
++                        return;
++                    }
++                    let Some(parent) = capture_path.parent() else { return };
++                    if tokio::fs::create_dir_all(parent).await.is_err() {
++                        warn!("Unable to create bounded FaceTime inbound video capture directory");
++                        return;
++                    }
++                    #[cfg(unix)]
++                    {
++                        use std::os::unix::fs::PermissionsExt;
++                        let _ = tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await;
++                    }
++                    let video_path = capture_path.with_extension("h265");
++                    if !annex_b.is_empty() && tokio::fs::write(&video_path, &annex_b).await.is_ok() {
++                        #[cfg(unix)]
++                        {
++                            use std::os::unix::fs::PermissionsExt;
++                            let _ = tokio::fs::set_permissions(&video_path, std::fs::Permissions::from_mode(0o600)).await;
++                        }
++                    }
++                    if let Some(description) = description {
++                        let description_path = capture_path.with_extension("qtff");
++                        if tokio::fs::write(&description_path, description).await.is_ok() {
++                            #[cfg(unix)]
++                            {
++                                use std::os::unix::fs::PermissionsExt;
++                                let _ = tokio::fs::set_permissions(&description_path, std::fs::Permissions::from_mode(0o600)).await;
++                            }
++                        }
++                    }
++                    warn!(
++                        "Captured bounded FaceTime inbound H.265 video: frames={} payload_bytes={}",
++                        frame_count,
++                        annex_b.len(),
++                    );
++                });
++                capture_send
++            });
+             while let Some(recv) = session_handle.recv().await {
+                 if raw_diagnostics_remaining > 0
+                     && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
+@@ -1652,6 +1720,9 @@ impl FTClient {
+                         if unmarshalled.payload.starts_with(&[0x92, 0xe6, 0xc0, 0xa3]) {
+                             let qtff_format = &unmarshalled.payload[4..];
+                             info!("mediainfo {}", encode_hex(qtff_format));
++                            if let Some(video_capture_sender) = &video_capture_sender {
++                                let _ = video_capture_sender.try_send((true, qtff_format.to_vec()));
++                            }
+                             let _ = send.try_send(ChannelFrame::ImageDescription(qtff_format.to_vec()));
+                         } else if let Some(depacket) = depacket {
+                             depacket.push(unmarshalled);
+@@ -1659,6 +1730,9 @@ impl FTClient {
+                                 info!("Smaple before {}", encode_hex(&sample.data));
+                                 let parse = enabled.parse_frame(&sample.data);
+                                 info!("sample {} {}", encode_hex(&parse), sample.prev_dropped_packets);
++                                if let Some(video_capture_sender) = &video_capture_sender {
++                                    let _ = video_capture_sender.try_send((false, parse.to_vec()));
++                                }
+                                 let _ = send.try_send(ChannelFrame::Sample(parse.to_vec()));
+                             }
+                         }

@@ -1,0 +1,114 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1359,6 +1359,7 @@ impl FTClient {
+         tokio::spawn(async move {
+             let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+             let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
++            let mut logged_audio_diagnostic = false;
+             while let Some(recv) = session_handle.recv().await {
+                 match recv.data[0] {
+                     0x90 => {
+@@ -1366,7 +1367,7 @@ impl FTClient {
+                         info!("Header {:?}", header);
+ 
+                         if header.payload_type == 104 && header.extension {
+-                            session_handle.remember_audio_header(&header).await;
++                            session_handle.remember_audio_header(&header, recv.participant).await;
+                         }
+ 
+                         if !channel_contexts.contains_key(&header.ssrc) {
+@@ -1404,6 +1405,25 @@ impl FTClient {
+                             }
+                         };
+                         let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
++
++                        if !logged_audio_diagnostic
++                            && header.payload_type == 104
++                            && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                        {
++                            let payload_prefix_len = std::cmp::min(12, unmarshalled.payload.len());
++                            let extension_lengths = header.extensions.iter()
++                                .map(|extension| extension.payload.len())
++                                .collect::<Vec<_>>();
++                            warn!(
++                                "FaceTime inbound audio template: participant={:?} extension_profile=0x{:04x} extension_lengths={:?} payload_len={} payload_prefix={}",
++                                recv.participant,
++                                header.extension_profile,
++                                extension_lengths,
++                                unmarshalled.payload.len(),
++                                encode_hex(&unmarshalled.payload[..payload_prefix_len]),
++                            );
++                            logged_audio_diagnostic = true;
++                        }
+ 
+                         info!("Result {:?}", encode_hex(&unmarshalled.payload));
+ 
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -745,6 +745,7 @@ impl GlobalPacket {
+         let mut header = QRInnerMessage {
+             attr_undef: Some(0),
+             attr_unk4: Some(true),
++            participant_id: self.participant,
+             ..Default::default()
+         }.to_bytes().unwrap();
+         header.extend_from_slice(&self.data);
+@@ -766,7 +767,7 @@ pub struct GlobalLinkState {
+     /// FaceTime requires its proprietary RTP extension on every media packet;
+     /// the extension profile is negotiated dynamically and is not an RFC 8285
+     /// constant, so the outbound stream mirrors the live peer template.
+-    pub audio_header_template: Option<rtc_rtp::Header>,
++    pub audio_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
+ 
+     prekey: EcKey<Private>,
+     pub states: HashMap<u64, ParticipantState>,
+@@ -1296,13 +1297,13 @@ impl GlobalLink {
+         self.state.lock().await.bootstrapped
+     }
+ 
+-    pub async fn remember_audio_header(&self, header: &rtc_rtp::Header) {
++    pub async fn remember_audio_header(&self, header: &rtc_rtp::Header, participant: Option<u64>) {
+         if header.payload_type == 104 && header.extension {
+-            self.state.lock().await.audio_header_template = Some(header.clone());
++            self.state.lock().await.audio_header_template = Some((header.clone(), participant));
+         }
+     }
+ 
+-    async fn wait_for_audio_header_template(&self) -> Result<rtc_rtp::Header, PushError> {
++    async fn wait_for_audio_header_template(&self) -> Result<(rtc_rtp::Header, Option<u64>), PushError> {
+         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+         loop {
+             if let Some(header) = self.state.lock().await.audio_header_template.clone() {
+@@ -1321,7 +1322,7 @@ impl GlobalLink {
+         packets: Vec<Vec<u8>>,
+         samples_per_packet: u32,
+     ) -> Result<(), PushError> {
+-        let mut header_template = self.wait_for_audio_header_template().await?;
++        let (mut header_template, peer_participant) = self.wait_for_audio_header_template().await?;
+         let (avc_pod, key) = {
+             let state = self.state.lock().await;
+             (
+@@ -1342,10 +1343,11 @@ impl GlobalLink {
+ 
+         if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+             warn!(
+-                "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={}",
++                "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={} participant={:?}",
+                 header_template.extension_profile,
+                 header_template.extensions.len(),
+                 header_template.extensions_padding,
++                peer_participant,
+             );
+         }
+ 
+@@ -1368,7 +1370,7 @@ impl GlobalLink {
+             let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
+             let encrypted = context.encrypt_rtp(&plaintext).map_err(|_| PushError::BadMsg)?;
+             let framed = GlobalPacket {
+-                participant: None,
++                participant: peer_participant,
+                 link: LinkType::Pod,
+                 data: encrypted.to_vec(),
+             }.to_qr_raw();

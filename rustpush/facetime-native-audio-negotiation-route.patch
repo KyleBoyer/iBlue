@@ -1,0 +1,142 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1379,9 +1379,7 @@
+                         let header = rtc_rtp::Header::unmarshal(&mut &recv.data[..]).unwrap();
+                         info!("Header {:?}", header);
+ 
+-                        if header.payload_type == 104 && header.extension {
+-                            session_handle.remember_audio_header(&header, recv.participant).await;
+-                        }
++                        session_handle.remember_audio_header(&header, recv.participant).await;
+ 
+                         if !channel_contexts.contains_key(&header.ssrc) {
+                             let state = session_handle.state.lock().await;
+@@ -1420,7 +1418,7 @@
+                         let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+ 
+                         if !logged_audio_diagnostic
+-                            && header.payload_type == 104
++                            && matches!(header.payload_type, 20 | 104 | 108 | 13)
+                             && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
+                         {
+                             let payload_prefix_len = std::cmp::min(12, unmarshalled.payload.len());
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -768,6 +768,11 @@
+     /// the extension profile is negotiated dynamically and is not an RFC 8285
+     /// constant, so the outbound stream mirrors the live peer template.
+     pub audio_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
++    /// Socket and peer selected by the successful ICE/STUN path. Once media
++    /// arrives directly from the peer, outbound RTP must use that same path
++    /// instead of continuing to tunnel packets through the AVC QPod.
++    pub direct_socket: Option<Arc<UdpSocket>>,
++    pub direct_peer: Option<SocketAddr>,
+ 
+     prekey: EcKey<Private>,
+     pub states: HashMap<u64, ParticipantState>,
+@@ -1298,7 +1303,10 @@
+     }
+ 
+     pub async fn remember_audio_header(&self, header: &rtc_rtp::Header, participant: Option<u64>) {
+-        if header.payload_type == 104 && header.extension {
++        // Payload identifiers are negotiated independently in each direction.
++        // Modern iOS currently emits its microphone as PT20 even though this
++        // client advertises AAC-ELD PT104 for the reverse direction.
++        if matches!(header.payload_type, 20 | 104 | 108 | 13) && header.extension {
+             self.state.lock().await.audio_header_template = Some((header.clone(), participant));
+         }
+     }
+@@ -1323,10 +1331,12 @@
+         samples_per_packet: u32,
+     ) -> Result<(), PushError> {
+         let (mut header_template, peer_participant) = self.wait_for_audio_header_template().await?;
+-        let (avc_pod, key) = {
++        let (avc_pod, direct_socket, direct_peer, key) = {
+             let state = self.state.lock().await;
+             (
+                 state.avc_pod.clone().ok_or(PushError::NotConnected)?,
++                state.direct_socket.clone(),
++                state.direct_peer,
+                 state.my_mkm.get_key(ssrc),
+             )
+         };
+@@ -1340,14 +1350,16 @@
+         let mut sequence_number: u16 = rand::random();
+         let mut timestamp: u32 = rand::random();
+         let started = tokio::time::Instant::now();
++        let using_direct = direct_socket.is_some() && direct_peer.is_some();
+ 
+         if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+             warn!(
+-                "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={} participant={:?}",
++                "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={} participant={:?} transport={}",
+                 header_template.extension_profile,
+                 header_template.extensions.len(),
+                 header_template.extensions_padding,
+                 peer_participant,
++                if using_direct { "direct" } else { "quickrelay-pod" },
+             );
+         }
+ 
+@@ -1369,12 +1381,16 @@
+             };
+             let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
+             let encrypted = context.encrypt_rtp(&plaintext).map_err(|_| PushError::BadMsg)?;
+-            let framed = GlobalPacket {
+-                participant: peer_participant,
+-                link: LinkType::Pod,
+-                data: encrypted.to_vec(),
+-            }.to_qr_raw();
+-            avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
++            if let (Some(socket), Some(peer)) = (&direct_socket, direct_peer) {
++                socket.send_to(&encrypted, peer).await.map_err(|_| PushError::NotConnected)?;
++            } else {
++                let framed = GlobalPacket {
++                    participant: peer_participant,
++                    link: LinkType::Pod,
++                    data: encrypted.to_vec(),
++                }.to_qr_raw();
++                avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
++            }
+ 
+             sequence_number = sequence_number.wrapping_add(1);
+             timestamp = timestamp.wrapping_add(samples_per_packet);
+@@ -1408,16 +1424,18 @@
+             std::net::IpAddr::V4(ip) => ip.octets(),
+             std::net::IpAddr::V6(_) => return Err(PushError::BadMsg),
+         };
+-        let connection = UdpSocket::bind("0.0.0.0:0").await?;
++        let connection = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+         let candidate_port = connection.local_addr()?.port();
+         {
+             let mut state = self.state.lock().await;
+             state.local_candidate_ipv4 = Some(candidate_ipv4);
+             state.local_candidate_port = Some(candidate_port);
++            state.direct_socket = Some(connection.clone());
+         }
+         let integrity = MessageIntegrity(self.session_id.clone());
+         let session_id = self.session_id.clone();
+         let channel = self.inc_send.clone();
++        let link_state = self.state.clone();
+         
+         tokio::spawn(async move {
+             use rtc_stun::message::Message;
+@@ -1478,6 +1496,7 @@
+                     }
+                 } else {
+                     info!("Got UDP message {}", encode_hex(&buf[..len]));
++                    link_state.lock().await.direct_peer = Some(addr);
+                     let _ = channel.try_send(GlobalPacket {
+                         participant: None, // TODO
+                         link: LinkType::Direct,
+@@ -1697,6 +1716,8 @@
+                 local_candidate_port: None,
+                 bootstrapped: false,
+                 audio_header_template: None,
++                direct_socket: None,
++                direct_peer: None,
+             })),
+             inc_send,
+             ind_send,

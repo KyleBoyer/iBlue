@@ -108,6 +108,89 @@ export interface FocusPeersSyncPage {
   discoverySummary?: string;
 }
 
+export interface FaceTimeSessionCreateParams {
+  targets: string[];
+  from?: string;
+  displayName?: string;
+  ringTtlSeconds?: number;
+  ringOnMediaJoin?: boolean;
+}
+
+export interface FaceTimeSessionStart {
+  sessionId: string;
+  link: string;
+  from: string;
+  targets: string[];
+  displayName: string;
+  ringTtlSeconds: number;
+  ringOnMediaJoin: boolean;
+  state: "waiting-for-media";
+}
+
+export interface FaceTimeNativeMediaStart {
+  sessionId: string;
+  from: string;
+  targets: string[];
+  state: "allocated" | "ringing";
+  transport: "iblue-quickrelay";
+  topology: "one-to-one";
+}
+
+export interface FaceTimeNativeLiveAudioStart extends FaceTimeNativeMediaStart {
+  mediaSource: "live-stream";
+  audioFormat: {
+    encoding: "pcm-f32le";
+    sampleRate: 24_000;
+    channels: 1;
+    frameDurationMs: 20;
+    frameBytes: 1_920;
+  };
+}
+
+export interface FaceTimeNativeMediaStatus {
+  sessionId: string;
+  state:
+    | "prepared"
+    | "waiting-for-peer-template"
+    | "streaming"
+    | "draining"
+    | "stream-ended"
+    | "completed"
+    | "failed"
+    | "stopped";
+  packetsTotal: number;
+  payloadBytesTotal: number;
+  packetsSent: number;
+  payloadBytesSent: number;
+  startedAt?: number;
+  completedAt?: number;
+  error?: string;
+  controlMessagesReceived: number;
+  controlMessagesAuthenticated: number;
+  controlMessagesSent: number;
+  controlStreamStateSent: boolean;
+  controlReady: boolean;
+  controlParticipantContexts: number;
+  controlPeerUuids: number;
+  controlMediaKeys: number;
+  controlLastError?: string;
+  peerAudioFeedbackUpdates: number;
+  peerAudioFeedbackSequence: number;
+  peerAudioKbReceived: number;
+  peerAudioPacketsReceived: number;
+  peerAudioPayloadType?: number;
+  peerAudioRtpExtensionProfile?: number;
+  peerAudioRtpExtensionHex?: string;
+}
+
+export interface FaceTimeNativeMediaStreamStatus {
+  sessionId: string;
+  enabled: boolean;
+  audio: boolean;
+  video: boolean;
+  expiresAt: number | null;
+}
+
 export interface IMessageEngine {
   initialize(params: InitializeParams): Promise<EngineSnapshot>;
   loginStart(appleId: string, password: string): Promise<LoginStartResult>;
@@ -167,6 +250,57 @@ export interface IMessageEngine {
   sendReadReceipt(params: SendReadReceiptParams): Promise<{ sent: boolean }>;
   sendMarkUnread(params: SendMarkUnreadParams): Promise<{ sent: boolean }>;
   sendNotify(params: SendNotifyParams): Promise<{ guid: string }>;
+  createFaceTimeSession?(params: FaceTimeSessionCreateParams): Promise<FaceTimeSessionStart>;
+  listFaceTimeSessions?(): Promise<unknown>;
+  leaveFaceTimeSession?(sessionId: string): Promise<{ left: boolean; sessionId: string }>;
+  ringFaceTimeSession?(sessionId: string, targets: string[]): Promise<{
+    rang: boolean;
+    sessionId: string;
+    targets: string[];
+  }>;
+  confirmFaceTimeMediaJoined?(sessionId: string): Promise<{
+    confirmed: boolean;
+    sessionId: string;
+  }>;
+  createNativeFaceTimeMediaSession?(params: {
+    targets: string[];
+    from?: string;
+    audioPath: string;
+    ring?: boolean;
+  }): Promise<FaceTimeNativeMediaStart>;
+  startNativeFaceTimeMediaSession?(sessionId: string): Promise<{
+    started: boolean;
+    sessionId: string;
+    transport: "iblue-quickrelay";
+  }>;
+  nativeFaceTimeMediaStatus?(sessionId: string): Promise<FaceTimeNativeMediaStatus>;
+  createNativeFaceTimeLiveAudioSession?(params: {
+    targets: string[];
+    from?: string;
+    ring?: boolean;
+  }): Promise<FaceTimeNativeLiveAudioStart>;
+  startNativeFaceTimeLiveAudioStream?(sessionId: string): Promise<{
+    started: boolean;
+    sessionId: string;
+    frameBytes: 1_920;
+    queueCapacityFrames: number;
+  }>;
+  pushNativeFaceTimeLiveAudioFrame?(sessionId: string, frame: Buffer): Promise<{
+    queued: boolean;
+    sessionId: string;
+    frameBytes: 1_920;
+  }>;
+  finishNativeFaceTimeLiveAudioStream?(sessionId: string): Promise<{
+    stopped: boolean;
+    sessionId: string;
+  }>;
+  setNativeFaceTimeMediaStream?(params: {
+    sessionId: string;
+    enabled: boolean;
+    audio?: boolean;
+    video?: boolean;
+    ttlSeconds?: number;
+  }): Promise<FaceTimeNativeMediaStreamStatus>;
   close(): Promise<void>;
   on<K extends keyof EngineNotificationMap>(
     event: K,
@@ -411,6 +545,99 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
 
   sendNotify(params: SendNotifyParams): Promise<{ guid: string }> {
     return this.rpc.request("message.notify", params);
+  }
+
+  createFaceTimeSession(params: FaceTimeSessionCreateParams): Promise<FaceTimeSessionStart> {
+    return this.rpc.request("facetime.session.create", params);
+  }
+
+  listFaceTimeSessions(): Promise<unknown> {
+    return this.rpc.request("facetime.session.list");
+  }
+
+  leaveFaceTimeSession(sessionId: string): Promise<{ left: boolean; sessionId: string }> {
+    return this.rpc.request("facetime.session.leave", { sessionId });
+  }
+
+  ringFaceTimeSession(sessionId: string, targets: string[]): Promise<{
+    rang: boolean;
+    sessionId: string;
+    targets: string[];
+  }> {
+    return this.rpc.request("facetime.session.ring", { sessionId, targets });
+  }
+
+  confirmFaceTimeMediaJoined(sessionId: string): Promise<{
+    confirmed: boolean;
+    sessionId: string;
+  }> {
+    return this.rpc.request("facetime.session.mediaJoined", { sessionId });
+  }
+
+  createNativeFaceTimeMediaSession(params: {
+    targets: string[];
+    from?: string;
+    audioPath: string;
+    ring?: boolean;
+  }): Promise<FaceTimeNativeMediaStart> {
+    return this.rpc.request("facetime.native.create", params);
+  }
+
+  startNativeFaceTimeMediaSession(sessionId: string): Promise<{
+    started: boolean;
+    sessionId: string;
+    transport: "iblue-quickrelay";
+  }> {
+    return this.rpc.request("facetime.native.start", { sessionId });
+  }
+
+  nativeFaceTimeMediaStatus(sessionId: string): Promise<FaceTimeNativeMediaStatus> {
+    return this.rpc.request("facetime.native.status", { sessionId });
+  }
+
+  createNativeFaceTimeLiveAudioSession(params: {
+    targets: string[];
+    from?: string;
+    ring?: boolean;
+  }): Promise<FaceTimeNativeLiveAudioStart> {
+    return this.rpc.request("facetime.native.audio.create", params);
+  }
+
+  startNativeFaceTimeLiveAudioStream(sessionId: string): Promise<{
+    started: boolean;
+    sessionId: string;
+    frameBytes: 1_920;
+    queueCapacityFrames: number;
+  }> {
+    return this.rpc.request("facetime.native.audio.start", { sessionId });
+  }
+
+  pushNativeFaceTimeLiveAudioFrame(sessionId: string, frame: Buffer): Promise<{
+    queued: boolean;
+    sessionId: string;
+    frameBytes: 1_920;
+  }> {
+    return this.rpc.request("facetime.native.audio.push", {
+      sessionId,
+      dataBase64: frame.toString("base64"),
+    });
+  }
+
+  finishNativeFaceTimeLiveAudioStream(sessionId: string): Promise<{
+    stopped: boolean;
+    sessionId: string;
+  }> {
+    return this.rpc.request("facetime.native.audio.stop", { sessionId });
+  }
+
+  setNativeFaceTimeMediaStream(params: {
+    sessionId: string;
+    enabled: boolean;
+    audio?: boolean;
+    video?: boolean;
+    ttlSeconds?: number;
+  }): Promise<FaceTimeNativeMediaStreamStatus> {
+    return this.rpc.request("facetime.native.stream.set", params);
   }
 
   close(): Promise<void> {

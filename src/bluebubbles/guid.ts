@@ -5,8 +5,19 @@ export function stripTransport(address: string): string {
 }
 
 export function toTransportAddress(address: string): string {
-  if (/^(mailto:|tel:)/i.test(address)) return address;
-  return address.includes("@") ? `mailto:${address}` : `tel:${address}`;
+  const trimmed = address.trim();
+  if (/^mailto:/i.test(trimmed)) return `mailto:${stripTransport(trimmed)}`;
+  if (!/^tel:/i.test(trimmed) && trimmed.includes("@")) return `mailto:${trimmed}`;
+
+  const phone = stripTransport(trimmed);
+  const digits = phone.replace(/\D/g, "");
+  if (phone.startsWith("+")) return `tel:+${digits}`;
+  // Apple IDS expects registered NANP handles in E.164 form. A bare local
+  // 10-digit number can otherwise allocate and appear to ring while never
+  // delivering the invitation to the callee.
+  if (digits.length === 10) return `tel:+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `tel:+${digits}`;
+  return `tel:${digits || phone}`;
 }
 
 export function directChatGuid(address: string, isSms = false): string {

@@ -1,0 +1,181 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index 1693b1a..df08674 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -424,7 +424,9 @@ impl AVConfig {
+             }),
+             microphone_u1: Some(VcMediaNegotiationBlobV2MicrophoneSettingsU1 {
+                 rtp_ssrc: Some(self.audio_ssrc),
+-                payloads: None,
++                // PT104 AAC-ELD, PT108 EVS, PT13 comfort noise, and PT20 RED.
++                // Modern Apple peers advertise the same four-bit U1 mask.
++                payloads: Some(0b1111),
+                 cipher_suites: Some(5),
+             }),
+             camera_u1: Some(VcMediaNegotiationBlobV2CameraSettingsU1 {
+@@ -1291,6 +1293,70 @@ pub struct FTClient {
+     pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
+ }
+ 
++/// Summarize FaceTime's audio bundle/RED framing without logging encoded audio.
++/// Each audio block is a sequence of one-byte-length-prefixed codec frames.
++fn describe_facetime_audio_payload(payload_type: u8, payload: &[u8]) -> String {
++    fn frame_sizes(block: &[u8]) -> (Vec<usize>, bool) {
++        let mut sizes = Vec::new();
++        let mut cursor = 0usize;
++        while cursor < block.len() {
++            let size = block[cursor] as usize;
++            cursor += 1;
++            let Some(end) = cursor.checked_add(size).filter(|end| *end <= block.len()) else {
++                return (sizes, false);
++            };
++            sizes.push(size);
++            cursor = end;
++        }
++        (sizes, true)
++    }
++
++    if payload_type != 20 {
++        let (sizes, complete) = frame_sizes(payload);
++        return format!("pt={payload_type} frames={sizes:?} complete={complete}");
++    }
++
++    // RFC 2198: zero or more four-byte redundant headers followed by one
++    // one-byte primary header, then the blocks in that same order.
++    let mut cursor = 0usize;
++    let mut blocks: Vec<(u8, Option<usize>)> = Vec::new();
++    loop {
++        let Some(first) = payload.get(cursor).copied() else {
++            return "pt=20 invalid=missing-red-header".to_string();
++        };
++        cursor += 1;
++        let pt = first & 0x7f;
++        if first & 0x80 == 0 {
++            blocks.push((pt, None));
++            break;
++        }
++        if cursor + 3 > payload.len() {
++            return "pt=20 invalid=truncated-red-header".to_string();
++        }
++        let block_len = (((payload[cursor + 1] & 0x03) as usize) << 8)
++            | payload[cursor + 2] as usize;
++        cursor += 3;
++        blocks.push((pt, Some(block_len)));
++    }
++
++    let mut descriptions = Vec::with_capacity(blocks.len());
++    for (pt, declared_len) in blocks {
++        let available = payload.len().saturating_sub(cursor);
++        let block_len = declared_len.unwrap_or(available);
++        if block_len > available {
++            descriptions.push(format!("pt={pt} bytes={block_len} invalid=truncated"));
++            break;
++        }
++        let block = &payload[cursor..cursor + block_len];
++        let (sizes, complete) = frame_sizes(block);
++        descriptions.push(format!(
++            "pt={pt} bytes={block_len} frames={sizes:?} complete={complete}"
++        ));
++        cursor += block_len;
++    }
++    format!("pt=20 blocks=[{}] trailing={}", descriptions.join(", "), payload.len().saturating_sub(cursor))
++}
++
+ impl FTClient {
+     pub async fn new(state: FTState, update_state: Box<dyn Fn(&FTState) + Send + Sync>, conn: APSConnection, identity: IdentityManager, config: Arc<dyn OSConfig>) -> Self {
+         let token = conn.request_topics(&["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video", "com.apple.private.alloy.quickrelay"]).await;
+@@ -1393,7 +1459,7 @@ impl FTClient {
+                             channel_contexts.insert(header.ssrc, (Context::new(
+                                 &key[..16], 
+                                 &key[16..], 
+-                                if header.payload_type == 104 { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 }, 
++                                if matches!(header.payload_type, 20 | 104 | 108 | 13) { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 }, 
+                                 None, 
+                                 None
+                             ).unwrap(), if header.payload_type == 100 {
+@@ -1421,17 +1487,20 @@ impl FTClient {
+                             && matches!(header.payload_type, 20 | 104 | 108 | 13)
+                             && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
+                         {
+-                            let payload_prefix_len = std::cmp::min(12, unmarshalled.payload.len());
+                             let extension_lengths = header.extensions.iter()
+                                 .map(|extension| extension.payload.len())
+                                 .collect::<Vec<_>>();
++                            let audio_structure = describe_facetime_audio_payload(
++                                header.payload_type,
++                                &unmarshalled.payload,
++                            );
+                             warn!(
+-                                "FaceTime inbound audio template: participant={:?} extension_profile=0x{:04x} extension_lengths={:?} payload_len={} payload_prefix={}",
++                                "FaceTime inbound audio template: participant={:?} extension_profile=0x{:04x} extension_lengths={:?} payload_len={} structure={}",
+                                 recv.participant,
+                                 header.extension_profile,
+                                 extension_lengths,
+                                 unmarshalled.payload.len(),
+-                                encode_hex(&unmarshalled.payload[..payload_prefix_len]),
++                                audio_structure,
+                             );
+                             logged_audio_diagnostic = true;
+                         }
+@@ -1439,7 +1508,7 @@ impl FTClient {
+                         info!("Result {:?}", encode_hex(&unmarshalled.payload));
+ 
+                         // this constant is hardcoded
+-                        if &unmarshalled.payload[..4] == &[0x92, 0xe6, 0xc0, 0xa3] {
++                        if unmarshalled.payload.starts_with(&[0x92, 0xe6, 0xc0, 0xa3]) {
+                             let qtff_format = &unmarshalled.payload[4..];
+                             info!("mediainfo {}", encode_hex(qtff_format));
+                             let _ = send.try_send(ChannelFrame::ImageDescription(qtff_format.to_vec()));
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 79de2e3..ceebedd 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1364,20 +1364,43 @@ impl GlobalLink {
+         }
+ 
+         for (index, payload) in packets.into_iter().enumerate() {
+-            // Apple attaches a proprietary extension to 100% of FaceTime RTP
+-            // packets. Keep its live negotiated profile/contents while
+-            // replacing only the direction-specific RTP stream fields.
++            if payload.len() > u8::MAX as usize {
++                warn!("FaceTime AAC-ELD access unit is too large for Apple audio framing: {} bytes", payload.len());
++                return Err(PushError::BadMsg);
++            }
++
++            // FaceTime audio payloads contain one or more codec frames, each
++            // prefixed by its one-byte size. Our Core Audio CAF supplies one
++            // 480-sample AAC-ELD access unit per packet.
++            let mut framed_payload = Vec::with_capacity(payload.len() + 1);
++            framed_payload.push(payload.len() as u8);
++            framed_payload.extend_from_slice(&payload);
++
++            // Apple attaches fresh proprietary receiver/control statistics to
++            // every U1 audio RTP packet. We have no receiver statistics yet,
++            // but still emit the valid version-2 layout and advancing send
++            // timestamp instead of replaying the peer's stale extension.
++            let current_send = ((timestamp as u64 + 52_676) * 16 / 375) as u16;
++            let mut audio_control = vec![0u8; 20];
++            audio_control[8..10].copy_from_slice(&current_send.to_be_bytes());
+             header_template.version = 2;
+             header_template.padding = false;
+-            header_template.marker = false;
++            header_template.extension = true;
++            header_template.marker = index == 0;
+             header_template.payload_type = 104;
+             header_template.sequence_number = sequence_number;
+             header_template.timestamp = timestamp;
+             header_template.ssrc = ssrc;
+             header_template.csrc.clear();
++            header_template.extension_profile = 0x8d00;
++            header_template.extensions = vec![rtc_rtp::header::Extension {
++                id: 0,
++                payload: audio_control.into(),
++            }];
++            header_template.extensions_padding = 0;
+             let packet = rtc_rtp::Packet {
+                 header: header_template.clone(),
+-                payload: payload.into(),
++                payload: framed_payload.into(),
+             };
+             let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
+             let encrypted = context.encrypt_rtp(&plaintext).map_err(|_| PushError::BadMsg)?;

@@ -1,0 +1,24 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1360,7 +1360,20 @@ impl FTClient {
+             let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+             let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
+             let mut logged_audio_diagnostic = false;
++            let mut raw_diagnostics_remaining = 32usize;
+             while let Some(recv) = session_handle.recv().await {
++                if raw_diagnostics_remaining > 0
++                    && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                {
++                    let prefix_len = std::cmp::min(24, recv.data.len());
++                    warn!(
++                        "FaceTime inbound media datagram: participant={:?} length={} prefix={}",
++                        recv.participant,
++                        recv.data.len(),
++                        encode_hex(&recv.data[..prefix_len]),
++                    );
++                    raw_diagnostics_remaining -= 1;
++                }
+                 match recv.data[0] {
+                     0x90 => {
+                         let header = rtc_rtp::Header::unmarshal(&mut &recv.data[..]).unwrap();

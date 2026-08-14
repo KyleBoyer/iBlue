@@ -1,0 +1,12 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1112,7 +1112,7 @@ impl EnabledAVFeatures {
+ 
+     fn to_bits(&self) -> [bool; FEATURES.len()] {
+         self.0.iter().fold([false; FEATURES.len()], |mut acc, i| {
+-            let pos = FEATURES.iter().position(|f| std::ptr::eq(f, *i)).expect("no feature???");
++            let pos = FEATURES.iter().position(|f| f.feature == i.feature).expect("no feature???");
+             acc[pos] = true;
+             acc
+         })

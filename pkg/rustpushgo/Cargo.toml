@@ -119,7 +119,7 @@ reqwest = { version = "0.11", features = ["stream", "rustls-tls", "rustls-tls-we
 # packed-APS-encoding refactor) but no provider is auto-installed in 0.23 —
 # someone has to call install_default() before the first TLS connection or
 # the process panics inside hyper/reqwest. See connect()/new_client().
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23.28", default-features = false, features = ["aws-lc-rs", "std"] }
 once_cell = "1"
 rand = { version = "0.8.5", features = ["min_const_gen"] }
 keyring = "4.1.6"
@@ -128,6 +128,10 @@ imagesize = { version = "0.15", default-features = false, features = ["png", "gi
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 roxmltree = "0.20"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[patch.crates-io]
+rustls = { path = "../../third_party/rustls-psk/rustls" }
+quinn = { path = "../../third_party/quinn-qpod/quinn" }
 
 [build-dependencies]
 uniffi = { version = "0.25.0", features = ["build"] }

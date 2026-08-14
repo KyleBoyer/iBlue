@@ -1,0 +1,168 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1553,6 +1553,7 @@ impl FTClient {
+                         }
+                     },
+                     0x40 => {
++                        session_handle.note_control_message_received().await;
+                         // Direct U1 control can arrive before command 207. Its
+                         // encrypted AVC material already carries the peer UUID,
+                         // so briefly wait for that key context instead.
+@@ -1584,12 +1585,14 @@ impl FTClient {
+                                 mkms,
+                                 !item.their_session_id.lock().await.is_empty(),
+                             );
++                            session_handle.note_control_error("authentication-failed").await;
+                             continue;
+                         };
+                         let wrapper = match VcccMessageWrapper::decode(&decrypted[..]) {
+                             Ok(wrapper) => wrapper,
+                             Err(error) => {
+                                 warn!("Unable to decode FaceTime VC control message: {error}");
++                                session_handle.note_control_error("decode-failed").await;
+                                 continue;
+                             }
+                         };
+@@ -1612,6 +1615,7 @@ impl FTClient {
+                             .await
+                         {
+                             warn!("Unable to acknowledge FaceTime VC control message: {error}");
++                            session_handle.note_control_error("acknowledgement-failed").await;
+                             continue;
+                         }
+ 
+@@ -1643,8 +1647,10 @@ impl FTClient {
+                                 .await
+                             {
+                                 warn!("Unable to publish FaceTime stream group state: {error}");
++                                session_handle.note_control_error("stream-state-failed").await;
+                             } else {
+                                 sent_stream_group_state = true;
++                                session_handle.note_control_stream_state_sent().await;
+                                 info!("Published FaceTime U1 microphone stream state");
+                             }
+                         }
+@@ -1702,6 +1708,20 @@ impl FTClient {
+         }
+     }
+ 
++    /// Privacy-safe VC-control handshake state for API diagnostics. The tuple
++    /// contains receive/auth/send counts, stream publication, key-context
++    /// counts, and a stable error code; it never exposes key or payload data.
++    pub async fn native_control_status(
++        &self,
++        group_id: &str,
++    ) -> Option<(u64, u64, u64, bool, usize, usize, usize, Option<String>)> {
++        let connection = {
++            let state = self.state.read().await;
++            state.sessions.get(group_id).and_then(|session| session.connection.clone())
++        }?;
++        Some(connection.link.control_status().await)
++    }
++
+     /// Encrypt and pace one already-encoded AAC-ELD access unit per RTP packet
+     /// on the microphone SSRC advertised in this session's AVC blob.
+     pub async fn send_native_audio(
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -774,6 +774,13 @@ pub struct GlobalLinkState {
+     pub audio_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
+     /// Per-participant SFrame counter for outbound VC control messages.
+     control_send_counters: HashMap<u64, u64>,
++    /// Privacy-safe native VC-control diagnostics surfaced through iBlue's
++    /// call-status API. These counters never contain keys or payload bytes.
++    control_messages_received: u64,
++    control_messages_authenticated: u64,
++    control_messages_sent: u64,
++    control_stream_state_sent: bool,
++    control_last_error: Option<String>,
+     /// Socket and peer selected by the successful ICE/STUN path. Once media
+     /// arrives directly from the peer, outbound RTP must use that same path
+     /// instead of continuing to tunnel packets through the AVC QPod.
+@@ -1315,6 +1322,7 @@ impl GlobalLink {
+         peer_session_id_hint: Option<&str>,
+     ) -> Result<(u64, Vec<u8>), PushError> {
+         let mut state = self.state.lock().await;
++        let mut authenticated = None;
+         for (participant, participant_state) in &mut state.states {
+             if participant_hint.is_some_and(|hint| hint != *participant) {
+                 continue;
+@@ -1325,9 +1333,18 @@ impl GlobalLink {
+                 let key = mkm.get_control(&peer_session_id, local_session_id);
+                 if let Ok(plaintext) = key.decrypt(payload) {
+                     participant_state.avc_uuid.get_or_insert(peer_session_id);
+-                    return Ok((*participant, plaintext));
++                    authenticated = Some((*participant, plaintext));
++                    break;
+                 }
+             }
++            if authenticated.is_some() {
++                break;
++            }
++        }
++        if let Some(authenticated) = authenticated {
++            state.control_messages_authenticated = state.control_messages_authenticated.saturating_add(1);
++            state.control_last_error = None;
++            return Ok(authenticated);
+         }
+         Err(PushError::BadMsg)
+     }
+@@ -1341,6 +1358,35 @@ impl GlobalLink {
+         )
+     }
+ 
++    pub async fn note_control_message_received(&self) {
++        let mut state = self.state.lock().await;
++        state.control_messages_received = state.control_messages_received.saturating_add(1);
++    }
++
++    pub async fn note_control_error(&self, detail: &'static str) {
++        self.state.lock().await.control_last_error = Some(detail.to_string());
++    }
++
++    pub async fn note_control_stream_state_sent(&self) {
++        let mut state = self.state.lock().await;
++        state.control_stream_state_sent = true;
++        state.control_last_error = None;
++    }
++
++    pub async fn control_status(&self) -> (u64, u64, u64, bool, usize, usize, usize, Option<String>) {
++        let state = self.state.lock().await;
++        (
++            state.control_messages_received,
++            state.control_messages_authenticated,
++            state.control_messages_sent,
++            state.control_stream_state_sent,
++            state.states.len(),
++            state.states.values().filter(|peer| peer.avc_uuid.is_some()).count(),
++            state.states.values().map(|peer| peer.mkm.len()).sum(),
++            state.control_last_error.clone(),
++        )
++    }
++
+     /// Encrypt and route one VC control-channel protobuf to a participant,
+     /// preferring the selected direct U1 path and falling back to the AVC pod.
+     pub async fn send_control_message(
+@@ -1378,6 +1424,8 @@ impl GlobalLink {
+             }.to_qr_raw();
+             avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
+         }
++        let mut state = self.state.lock().await;
++        state.control_messages_sent = state.control_messages_sent.saturating_add(1);
+         Ok(())
+     }
+ 
+@@ -1827,6 +1875,11 @@ impl GlobalLink {
+                 bootstrapped: false,
+                 audio_header_template: None,
+                 control_send_counters: HashMap::new(),
++                control_messages_received: 0,
++                control_messages_authenticated: 0,
++                control_messages_sent: 0,
++                control_stream_state_sent: false,
++                control_last_error: None,
+                 direct_socket: None,
+                 direct_peer: None,
+             })),

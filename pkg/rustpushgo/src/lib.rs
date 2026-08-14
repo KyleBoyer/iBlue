@@ -3982,6 +3982,18 @@ fn pending_ft_rings() -> &'static tokio::sync::Mutex<HashMap<String, PendingFTRi
     PENDING_FT_RINGS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
+// Routes a reusable bridge-owned FaceTime link to the outgoing native session
+// that is waiting for its web media participant. This deliberately lives
+// outside FTLink.session_link: setting that Apple-facing field makes
+// handle_letmein delegate the request through the native session, whereas the
+// known-working OpenBubbles outgoing flow approves the web request directly.
+static BRIDGE_FT_LINK_ROUTES: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn bridge_ft_link_routes() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
+    BRIDGE_FT_LINK_ROUTES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
 async fn maybe_fire_pending_ring(
     ft: &rustpush::facetime::FTClient,
     guid: &str,
@@ -4001,45 +4013,53 @@ async fn maybe_fire_pending_ring(
             // entry pending and wait for a real remote/web joiner.
             return;
         }
-        let targets = entry.targets.clone();
-        map.remove(guid);
-        targets
+        entry.targets.clone()
     };
-    let session = {
-        let state = ft.state.read().await;
-        match state.sessions.get(guid).cloned() {
-            Some(s) => s,
-            None => {
+    let mut ring_error = None;
+    let mut rang = false;
+    for attempt in 1..=3 {
+        let result = {
+            let mut state = ft.state.write().await;
+            let Some(session) = state.sessions.get_mut(guid) else {
                 warn!("pending ring: session {} not found", guid);
                 return;
+            };
+            session.is_ringing_inaccurate = true;
+            // The NiceData-only Invitation creates a recent/missed call row,
+            // but may not present live CallKit UI. Real outgoing calls start
+            // with this richer command-207 callservicesd join envelope.
+            ft.prop_up_conv(session, true).await
+        };
+        match result {
+            Ok(_) => {
+                info!(
+                    "pending ring: rang {} target(s) in session {} (triggered by join from {})",
+                    targets.len(),
+                    guid,
+                    joiner_handle
+                );
+                rang = true;
+                pending_ft_rings().lock().await.remove(guid);
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "pending ring: ft.ring attempt {}/3 failed for session {}: {:?}",
+                    attempt, guid, e
+                );
+                ring_error = Some(e);
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
+                }
             }
         }
-    };
-    let rang = match ft.ring(&session, &targets, false).await {
-        Ok(_) => {
-            info!(
-                "pending ring: rang {} target(s) in session {} (triggered by join from {})",
-                targets.len(),
-                guid,
-                joiner_handle
-            );
-            // Flip is_ringing_inaccurate=true now that the Invitation is on
-            // the wire. create_session_no_ring starts it false to suppress
-            // prop_up_conv's RespondedElsewhere diversion; we need it true
-            // here so the missed-call detection (facetime.rs:1411)
-            // trips if the callee declines / times out — otherwise a
-            // no-answer call silently drops instead of surfacing as Missed.
-            let mut state = ft.state.write().await;
-            if let Some(session) = state.sessions.get_mut(guid) {
-                session.is_ringing_inaccurate = true;
-            }
-            true
-        }
-        Err(e) => {
-            warn!("pending ring: ft.ring failed for session {}: {:?}", guid, e);
-            false
-        }
-    };
+    }
+    if !rang {
+        warn!(
+            "pending ring: retaining session {} after retries failed: {:?}",
+            guid, ring_error
+        );
+    }
     if rang {
         suppress_own_device_ring(ft, guid).await;
 
@@ -4684,7 +4704,7 @@ async fn ft_handle_with_join_recovery(
             },
         );
 
-        if session.is_propped && sender.starts_with("temp:") {
+        if session.is_propped && sender.starts_with("temp:") && !session.hold_bridge_for_web {
             // Matches the behavior at facetime.rs:1315 — once someone
             // has joined via link tap, the call is live and the propped-up
             // invitation can retire.
@@ -4738,6 +4758,11 @@ async fn auto_approve_bridge_letmein(
     // "incomingcall-old" for inbound). Session-specific links (from
     // get_session_link) have usage=None but session_link=Some. All are
     // bridge-created and safe to auto-approve.
+    let routed_group = bridge_ft_link_routes()
+        .lock()
+        .await
+        .get(&request.pseud)
+        .cloned();
     let (link_handle, linked_group, member_group, ringing_group, inbound_session) = {
         let state = facetime.state.read().await;
         let Some(link) = state.links.get(&request.pseud) else {
@@ -4757,10 +4782,13 @@ async fn auto_approve_bridge_letmein(
             return Ok(());
         }
 
-        let linked_group = link
-            .session_link
-            .clone()
-            .filter(|group| state.sessions.contains_key(group));
+        let linked_group = routed_group
+            .filter(|group| state.sessions.contains_key(group))
+            .or_else(|| {
+                link.session_link
+                    .clone()
+                    .filter(|group| state.sessions.contains_key(group))
+            });
 
         let member_group = state.sessions.iter().find_map(|(group, session)| {
             if !session.my_handles.iter().any(|h| h == &link.handle) {
@@ -4854,8 +4882,42 @@ async fn auto_approve_bridge_letmein(
     {
         let mut state = facetime.state.write().await;
         if let Some(link) = state.links.get_mut(&request.pseud) {
-            if link.session_link.as_deref() != Some(approved_group.as_str()) {
+            // Session-specific links already use this field. Reusable rotation
+            // slots must remain unbound so a subsequent LetMeIn request takes
+            // the direct approval path instead of Apple device delegation.
+            if link.usage.is_none() && link.session_link.as_deref() != Some(approved_group.as_str())
+            {
                 link.session_link = Some(approved_group.clone());
+            }
+        }
+    }
+
+    // FaceTime on the web cannot join Apple's native one-to-one media mode.
+    // Upstream respond_letmein normally performs this conversion only while
+    // `is_ringing_inaccurate` remains true. Some current iOS answer envelopes
+    // clear that heuristic before the web LetMeIn arrives, so the conversion
+    // is skipped: the guest joins this group, then the phone drops as soon as
+    // the temporary native participant leaves. For bridge-originated outgoing
+    // calls, force the same non-ringing command-207 stand-up while the answered
+    // peer is the sole active participant. This is the condition described by
+    // rustpush's own respond_letmein implementation, without its fragile
+    // ringing-state gate.
+    if !inbound_session {
+        let mut state = facetime.state.write().await;
+        if let Some(session) = state.sessions.get_mut(&approved_group) {
+            let active_count = session
+                .participants
+                .values()
+                .filter(|participant| participant.active.is_some())
+                .count();
+            if active_count == 1 {
+                facetime.ensure_allocations(session, &[]).await?;
+                session.is_ringing_inaccurate = false;
+                facetime.prop_up_conv(session, false).await?;
+                info!(
+                    "FaceTime outbound letmein: forced one-to-one to group transition for session {}",
+                    approved_group,
+                );
             }
         }
     }
@@ -4924,6 +4986,7 @@ async fn auto_approve_bridge_letmein(
                 guest_mode_enabled: None,
                 association: None,
                 is_u_plus_n_downgrade_available: Some(false),
+                ..Default::default()
             }
         }
 
@@ -7671,6 +7734,594 @@ async fn download_transcript_background_payload(
 #[derive(uniffi::Object)]
 pub struct WrappedFaceTimeClient {
     inner: Arc<rustpush::facetime::FTClient>,
+    // Source media remains process-local and is never serialized into the
+    // FaceTime signaling state. The corresponding native GlobalLink is owned
+    // by rustpush's FTSession under Jade's isolated profile.
+    native_media_sources: tokio::sync::Mutex<HashMap<String, NativeFaceTimeMedia>>,
+}
+
+struct NativeFaceTimeMedia {
+    source_path: Option<String>,
+    send_task: Option<tokio::task::JoinHandle<()>>,
+    live_audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    #[cfg(target_os = "macos")]
+    live_audio_encoder: Option<macos_aac_eld::Encoder>,
+    status: Arc<tokio::sync::Mutex<NativeFaceTimeMediaStatus>>,
+}
+
+#[cfg(target_os = "macos")]
+mod macos_aac_eld {
+    use super::WrappedError;
+    use std::ffi::CStr;
+
+    unsafe extern "C" {
+        fn iblue_aac_eld_encoder_create(
+            error: *mut libc::c_char,
+            error_capacity: usize,
+        ) -> *mut libc::c_void;
+        fn iblue_aac_eld_encoder_encode(
+            context: *mut libc::c_void,
+            samples: *const f32,
+            sample_count: u32,
+            output: *mut u8,
+            output_capacity: u32,
+            output_size: *mut u32,
+            error: *mut libc::c_char,
+            error_capacity: usize,
+        ) -> libc::c_int;
+        fn iblue_aac_eld_encoder_finish(
+            context: *mut libc::c_void,
+            output: *mut u8,
+            output_capacity: u32,
+            output_size: *mut u32,
+            finished: *mut libc::c_int,
+            error: *mut libc::c_char,
+            error_capacity: usize,
+        ) -> libc::c_int;
+        fn iblue_aac_eld_encoder_destroy(context: *mut libc::c_void);
+    }
+
+    pub struct Encoder(*mut libc::c_void);
+
+    // AudioConverter state is owned by one NativeFaceTimeMedia entry and used
+    // only while that entry's async mutex is held.
+    unsafe impl Send for Encoder {}
+
+    impl Drop for Encoder {
+        fn drop(&mut self) {
+            unsafe { iblue_aac_eld_encoder_destroy(self.0) };
+        }
+    }
+
+    impl Encoder {
+        pub fn new() -> Result<Self, WrappedError> {
+            let mut error = [0 as libc::c_char; 512];
+            let context = unsafe {
+                iblue_aac_eld_encoder_create(error.as_mut_ptr(), error.len())
+            };
+            if context.is_null() {
+                return Err(WrappedError::GenericError {
+                    msg: format!(
+                        "Could not initialize Apple's AAC-ELD encoder: {}",
+                        error_text(&error),
+                    ),
+                });
+            }
+            Ok(Self(context))
+        }
+
+        pub fn encode_frame(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, WrappedError> {
+            if bytes.len() != 480 * std::mem::size_of::<f32>() {
+                return Err(WrappedError::GenericError {
+                    msg: "Native FaceTime live audio requires exactly 480 mono float32 samples (1920 bytes) per frame".to_string(),
+                });
+            }
+            let mut samples = [0f32; 480];
+            for (index, value) in samples.iter_mut().enumerate() {
+                let offset = index * std::mem::size_of::<f32>();
+                *value = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            }
+            let mut output = [0u8; 1024];
+            let mut output_size = 0u32;
+            let mut error = [0 as libc::c_char; 512];
+            let result = unsafe {
+                iblue_aac_eld_encoder_encode(
+                    self.0,
+                    samples.as_ptr(),
+                    samples.len() as u32,
+                    output.as_mut_ptr(),
+                    output.len() as u32,
+                    &mut output_size,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            checked_packet(result, output_size, &output, &error)
+        }
+
+        pub fn finish(&mut self) -> Result<Vec<Vec<u8>>, WrappedError> {
+            let mut packets = Vec::new();
+            for _ in 0..32 {
+                let mut output = [0u8; 1024];
+                let mut output_size = 0u32;
+                let mut finished = 0;
+                let mut error = [0 as libc::c_char; 512];
+                let result = unsafe {
+                    iblue_aac_eld_encoder_finish(
+                        self.0,
+                        output.as_mut_ptr(),
+                        output.len() as u32,
+                        &mut output_size,
+                        &mut finished,
+                        error.as_mut_ptr(),
+                        error.len(),
+                    )
+                };
+                if let Some(packet) = checked_packet(result, output_size, &output, &error)? {
+                    packets.push(packet);
+                }
+                if finished != 0 {
+                    return Ok(packets);
+                }
+            }
+            Err(WrappedError::GenericError {
+                msg: "Apple's AAC-ELD encoder did not finish draining".to_string(),
+            })
+        }
+    }
+
+    fn checked_packet(
+        result: libc::c_int,
+        output_size: u32,
+        output: &[u8],
+        error: &[libc::c_char],
+    ) -> Result<Option<Vec<u8>>, WrappedError> {
+        if result != 0 || output_size as usize > output.len() {
+            return Err(WrappedError::GenericError {
+                msg: format!("Apple's AAC-ELD encoder failed: {}", error_text(error)),
+            });
+        }
+        if output_size == 0 {
+            return Ok(None);
+        }
+        if output_size > u8::MAX as u32 {
+            return Err(WrappedError::GenericError {
+                msg: format!(
+                    "Apple's AAC-ELD encoder produced an oversized PT104 access unit ({output_size} bytes)",
+                ),
+            });
+        }
+        Ok(Some(output[..output_size as usize].to_vec()))
+    }
+
+    fn error_text(buffer: &[libc::c_char]) -> String {
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Encoder;
+
+        #[test]
+        fn audio_toolbox_aac_eld_encoder_emits_pt104_sized_access_units() {
+            let mut encoder = Encoder::new().expect("AAC-ELD encoder should be available");
+            let mut packets = Vec::new();
+            for frame_index in 0..100 {
+                let mut pcm = Vec::with_capacity(480 * std::mem::size_of::<f32>());
+                for sample_in_frame in 0..480 {
+                    let sample_index = frame_index * 480 + sample_in_frame;
+                    let time = sample_index as f32 / 24_000.0;
+                    let sample = (time * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+                    pcm.extend_from_slice(&sample.to_le_bytes());
+                }
+                if let Some(packet) = encoder.encode_frame(&pcm).expect("AAC-ELD encode") {
+                    packets.push(packet);
+                }
+            }
+            packets.extend(encoder.finish().expect("AAC-ELD drain"));
+            assert!((100..=101).contains(&packets.len()), "packets={}", packets.len());
+            assert!(packets.iter().all(|packet| !packet.is_empty() && packet.len() <= 255));
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeFaceTimeMediaStatus {
+    session_id: String,
+    state: String,
+    packets_total: u64,
+    payload_bytes_total: u64,
+    packets_sent: u64,
+    payload_bytes_sent: u64,
+    started_at: Option<u64>,
+    completed_at: Option<u64>,
+    error: Option<String>,
+    control_messages_received: u64,
+    control_messages_authenticated: u64,
+    control_messages_sent: u64,
+    control_stream_state_sent: bool,
+    control_ready: bool,
+    control_participant_contexts: u64,
+    control_peer_uuids: u64,
+    control_media_keys: u64,
+    control_last_error: Option<String>,
+    peer_audio_feedback_updates: u64,
+    peer_audio_feedback_sequence: u64,
+    peer_audio_kb_received: u64,
+    peer_audio_packets_received: u64,
+    peer_audio_payload_type: Option<u8>,
+    peer_audio_rtp_extension_profile: Option<u16>,
+    peer_audio_rtp_extension_hex: Option<String>,
+}
+
+fn native_facetime_media_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn new_native_facetime_media_status(
+    session_id: String,
+) -> Arc<tokio::sync::Mutex<NativeFaceTimeMediaStatus>> {
+    Arc::new(tokio::sync::Mutex::new(NativeFaceTimeMediaStatus {
+        session_id,
+        state: "prepared".to_string(),
+        packets_total: 0,
+        payload_bytes_total: 0,
+        packets_sent: 0,
+        payload_bytes_sent: 0,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        control_messages_received: 0,
+        control_messages_authenticated: 0,
+        control_messages_sent: 0,
+        control_stream_state_sent: false,
+        control_ready: false,
+        control_participant_contexts: 0,
+        control_peer_uuids: 0,
+        control_media_keys: 0,
+        control_last_error: None,
+        peer_audio_feedback_updates: 0,
+        peer_audio_feedback_sequence: 0,
+        peer_audio_kb_received: 0,
+        peer_audio_packets_received: 0,
+        peer_audio_payload_type: None,
+        peer_audio_rtp_extension_profile: None,
+        peer_audio_rtp_extension_hex: None,
+    }))
+}
+
+async fn read_aac_eld_caf_packets(path: &str) -> Result<Vec<Vec<u8>>, WrappedError> {
+    let caf = tokio::fs::read(path)
+        .await
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Could not read encoded FaceTime audio: {error}"),
+        })?;
+    if caf.len() < 8 || &caf[..4] != b"caff" {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime audio must be an Apple CAF file".to_string(),
+        });
+    }
+
+    let mut packet_sizes: Option<Vec<usize>> = None;
+    let mut audio_data: Option<&[u8]> = None;
+    let mut valid_description = false;
+    let mut offset = 8usize;
+    while offset.checked_add(12).is_some_and(|end| end <= caf.len()) {
+        let tag = &caf[offset..offset + 4];
+        let size = i64::from_be_bytes(caf[offset + 4..offset + 12].try_into().unwrap());
+        if size < 0 {
+            return Err(WrappedError::GenericError {
+                msg: "Indefinite CAF chunks are not supported for FaceTime audio".to_string(),
+            });
+        }
+        let start = offset + 12;
+        let end = start
+            .checked_add(size as usize)
+            .filter(|end| *end <= caf.len())
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: "FaceTime CAF contains a truncated chunk".to_string(),
+            })?;
+        let chunk = &caf[start..end];
+
+        match tag {
+            b"desc" if chunk.len() >= 32 => {
+                let sample_rate =
+                    f64::from_bits(u64::from_be_bytes(chunk[..8].try_into().unwrap()));
+                let frames_per_packet = u32::from_be_bytes(chunk[20..24].try_into().unwrap());
+                valid_description =
+                    &chunk[8..12] == b"aace" && sample_rate == 24_000.0 && frames_per_packet == 480;
+            }
+            b"pakt" if chunk.len() >= 24 => {
+                let packet_count = u64::from_be_bytes(chunk[..8].try_into().unwrap()) as usize;
+                if packet_count == 0 || packet_count > 1_000_000 {
+                    return Err(WrappedError::GenericError {
+                        msg: "FaceTime CAF has an invalid packet count".to_string(),
+                    });
+                }
+                let mut cursor = 24usize;
+                let mut sizes = Vec::with_capacity(packet_count);
+                for _ in 0..packet_count {
+                    let mut value = 0usize;
+                    loop {
+                        let byte =
+                            *chunk
+                                .get(cursor)
+                                .ok_or_else(|| WrappedError::GenericError {
+                                    msg: "FaceTime CAF packet table is truncated".to_string(),
+                                })?;
+                        cursor += 1;
+                        value = value
+                            .checked_mul(128)
+                            .and_then(|value| value.checked_add((byte & 0x7f) as usize))
+                            .ok_or_else(|| WrappedError::GenericError {
+                                msg: "FaceTime CAF packet size overflowed".to_string(),
+                            })?;
+                        if byte & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    if value == 0 || value > 64 * 1024 {
+                        return Err(WrappedError::GenericError {
+                            msg: "FaceTime CAF contains an invalid AAC-ELD packet size".to_string(),
+                        });
+                    }
+                    sizes.push(value);
+                }
+                packet_sizes = Some(sizes);
+            }
+            b"data" if chunk.len() >= 4 => audio_data = Some(&chunk[4..]),
+            _ => {}
+        }
+        offset = end;
+    }
+
+    if !valid_description {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime CAF must contain mono 24 kHz AAC-ELD with 480 frames per packet"
+                .to_string(),
+        });
+    }
+    let packet_sizes = packet_sizes.ok_or_else(|| WrappedError::GenericError {
+        msg: "FaceTime CAF is missing its packet table".to_string(),
+    })?;
+    let audio_data = audio_data.ok_or_else(|| WrappedError::GenericError {
+        msg: "FaceTime CAF is missing encoded audio data".to_string(),
+    })?;
+    let mut packets = Vec::with_capacity(packet_sizes.len());
+    let mut cursor = 0usize;
+    for size in packet_sizes {
+        let end = cursor
+            .checked_add(size)
+            .filter(|end| *end <= audio_data.len())
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: "FaceTime CAF audio packet is truncated".to_string(),
+            })?;
+        packets.push(audio_data[cursor..end].to_vec());
+        cursor = end;
+    }
+    if cursor != audio_data.len() {
+        return Err(WrappedError::GenericError {
+            msg: "FaceTime CAF packet table does not match its audio data".to_string(),
+        });
+    }
+    Ok(packets)
+}
+
+struct NativeFaceTimeAudioPackets {
+    packets: Vec<Vec<u8>>,
+    payload_type: u8,
+    samples_per_packet: u32,
+    packet_duration_ms: u64,
+}
+
+#[cfg(target_os = "macos")]
+mod macos_evs {
+    use super::WrappedError;
+    use std::ffi::CStr;
+
+    unsafe extern "C" {
+        fn iblue_evs_encoder_create(
+            error: *mut libc::c_char,
+            error_capacity: usize,
+        ) -> *mut libc::c_void;
+        fn iblue_evs_encoder_encode(
+            context: *mut libc::c_void,
+            samples: *const f32,
+            sample_count: u32,
+            output: *mut u8,
+            output_capacity: u32,
+            output_size: *mut u32,
+            error: *mut libc::c_char,
+            error_capacity: usize,
+        ) -> libc::c_int;
+        fn iblue_evs_encoder_destroy(context: *mut libc::c_void);
+    }
+
+    pub struct Encoder(*mut libc::c_void);
+
+    // AudioToolbox encoder state is exclusively owned by one
+    // NativeFaceTimeMedia entry and accessed only while that entry's async
+    // mutex is held. It is never used concurrently across tasks.
+    unsafe impl Send for Encoder {}
+
+    impl Drop for Encoder {
+        fn drop(&mut self) {
+            unsafe { iblue_evs_encoder_destroy(self.0) };
+        }
+    }
+
+    impl Encoder {
+        pub fn new() -> Result<Self, WrappedError> {
+            let mut error = [0 as libc::c_char; 512];
+            let context = unsafe { iblue_evs_encoder_create(error.as_mut_ptr(), error.len()) };
+            if context.is_null() {
+                return Err(WrappedError::GenericError {
+                    msg: format!(
+                        "Could not initialize Apple's FaceTime EVS encoder: {}",
+                        error_text(&error)
+                    ),
+                });
+            }
+            Ok(Self(context))
+        }
+
+        pub fn encode_frame(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, WrappedError> {
+            if bytes.len() != 480 * std::mem::size_of::<f32>() {
+                return Err(WrappedError::GenericError {
+                    msg: "Native FaceTime live audio requires exactly 480 mono float32 samples (1920 bytes) per frame".to_string(),
+                });
+            }
+            let mut samples = [0f32; 480];
+            for (index, value) in samples.iter_mut().enumerate() {
+                let byte_offset = index * 4;
+                *value =
+                    f32::from_le_bytes(bytes[byte_offset..byte_offset + 4].try_into().unwrap());
+            }
+
+            let mut output = [0u8; 1024];
+            let mut output_size = 0u32;
+            let mut error = [0 as libc::c_char; 512];
+            let result = unsafe {
+                iblue_evs_encoder_encode(
+                    self.0,
+                    samples.as_ptr(),
+                    samples.len() as u32,
+                    output.as_mut_ptr(),
+                    output.len() as u32,
+                    &mut output_size,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            if result != 0 || output_size as usize > output.len() {
+                return Err(WrappedError::GenericError {
+                    msg: format!(
+                        "Apple's FaceTime EVS encoder failed: {}",
+                        error_text(&error),
+                    ),
+                });
+            }
+            if output_size == 0 {
+                return Ok(None);
+            }
+            Ok(Some(output[..output_size as usize].to_vec()))
+        }
+    }
+
+    fn error_text(buffer: &[libc::c_char]) -> String {
+        unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn encode_f32le(bytes: &[u8]) -> Result<Vec<Vec<u8>>, WrappedError> {
+        if bytes.is_empty() || bytes.len() % std::mem::size_of::<f32>() != 0 {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime EVS input must contain little-endian float32 PCM".to_string(),
+            });
+        }
+        let sample_count = bytes.len() / std::mem::size_of::<f32>();
+        let frame_count = sample_count.div_ceil(480);
+        if frame_count == 0 || frame_count > 30_000 {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime EVS input duration is invalid".to_string(),
+            });
+        }
+
+        let mut encoder = Encoder::new()?;
+        // Apple's negotiated EVS profile bundles three 20 ms frames. Pad the
+        // final bundle with silence so the encoder always flushes it.
+        let encoded_frame_count = frame_count.div_ceil(3) * 3;
+        let mut packets = Vec::with_capacity(encoded_frame_count / 3);
+        for frame_index in 0..encoded_frame_count {
+            let first_sample = frame_index * 480;
+            let samples_this_frame = sample_count.saturating_sub(first_sample).min(480);
+            let mut frame = vec![0u8; 480 * std::mem::size_of::<f32>()];
+            let byte_count = samples_this_frame * std::mem::size_of::<f32>();
+            let source_offset = first_sample * std::mem::size_of::<f32>();
+            if byte_count > 0 {
+                frame[..byte_count]
+                    .copy_from_slice(&bytes[source_offset..source_offset + byte_count]);
+            }
+            if let Some(packet) =
+                encoder
+                    .encode_frame(&frame)
+                    .map_err(|error| WrappedError::GenericError {
+                        msg: format!(
+                            "Apple's FaceTime EVS encoder failed on frame {frame_index}: {error}"
+                        ),
+                    })?
+            {
+                packets.push(packet);
+            }
+        }
+        Ok(packets)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::encode_f32le;
+
+        #[test]
+        fn apple_evs_encoder_produces_one_three_frame_bundle_per_sixty_ms() {
+            let mut pcm = Vec::with_capacity(480 * 3 * std::mem::size_of::<f32>());
+            for sample_index in 0..(480 * 3) {
+                let time = sample_index as f32 / 24_000.0;
+                let sample = (time * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+                pcm.extend_from_slice(&sample.to_le_bytes());
+            }
+
+            let packets = encode_f32le(&pcm).expect("Apple's EVS encoder should be available");
+
+            assert_eq!(packets.len(), 1);
+            assert!(packets
+                .iter()
+                .all(|packet| (60..=384).contains(&packet.len())));
+        }
+
+        #[test]
+        fn apple_evs_encoder_rejects_non_float_pcm() {
+            assert!(encode_f32le(&[0, 1, 2]).is_err());
+        }
+    }
+}
+
+async fn read_native_facetime_audio(
+    path: &str,
+) -> Result<NativeFaceTimeAudioPackets, WrappedError> {
+    if path.ends_with(".f32le") {
+        let pcm = tokio::fs::read(path)
+            .await
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("Could not read native FaceTime PCM: {error}"),
+            })?;
+        #[cfg(target_os = "macos")]
+        let packets = macos_evs::encode_f32le(&pcm)?;
+        #[cfg(not(target_os = "macos"))]
+        let packets: Vec<Vec<u8>> = return Err(WrappedError::GenericError {
+            msg: "Apple FaceTime EVS encoding is available only on macOS".to_string(),
+        });
+        return Ok(NativeFaceTimeAudioPackets {
+            packets,
+            payload_type: 108,
+            // RFC 8724 fixes EVS RTP's clock at 48 kHz. Apple's U1 profile
+            // bundles three 20 ms frames into each PT108 RTP payload.
+            samples_per_packet: 2_880,
+            packet_duration_ms: 60,
+        });
+    }
+    Ok(NativeFaceTimeAudioPackets {
+        packets: read_aac_eld_caf_packets(path).await?,
+        payload_type: 104,
+        samples_per_packet: 480,
+        packet_duration_ms: 20,
+    })
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -7721,21 +8372,20 @@ impl WrappedFaceTimeClient {
         Ok(self.inner.get_session_link(&guid).await?)
     }
 
-    // Deterministically binds the FTLink (matched by handle + usage) to a
-    // session group_id by setting link.session_link. Without this, the
-    // rotation-slot links (e.g. "next", "nextincomingcall") have
-    // session_link=None until the first letmein-tap, and
-    // auto_approve_bridge_letmein falls through to member/ringing heuristics.
-    // Under cold-start or stale-state conditions those heuristics miss and
-    // the approver creates a fresh empty session, producing the "0 people"
-    // symptom.
+    // Deterministically routes the reusable FTLink (matched by handle + usage)
+    // to a session group_id without writing FTLink.session_link. The latter is
+    // an Apple wire-semantic field: populating it makes handle_letmein delegate
+    // the guest request through the native conversation. OpenBubbles' working
+    // outgoing flow instead approves the request directly, while this private
+    // routing table still prevents cold-start matching from choosing an empty
+    // session.
     pub async fn bind_bridge_link_to_session(
         &self,
         handle: String,
         usage: String,
         group_id: String,
     ) -> Result<(), WrappedError> {
-        let mut state = self.inner.state.write().await;
+        let state = self.inner.state.read().await;
         let pseud = state
             .links
             .iter()
@@ -7747,9 +8397,8 @@ impl WrappedFaceTimeClient {
                     handle, usage
                 ),
             })?;
-        if let Some(link) = state.links.get_mut(&pseud) {
-            link.session_link = Some(group_id);
-        }
+        drop(state);
+        bridge_ft_link_routes().lock().await.insert(pseud, group_id);
         Ok(())
     }
 
@@ -7810,41 +8459,15 @@ impl WrappedFaceTimeClient {
         handle: String,
         participants: Vec<String>,
     ) -> Result<(), WrappedError> {
-        use rustpush::facetime::{FTMember, FTMode, FTSession};
-        use std::collections::HashMap;
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let members = participants
-            .iter()
-            .chain(std::iter::once(&handle))
-            .map(|p| FTMember {
-                nickname: None,
-                handle: p.clone(),
-            })
-            .collect();
-
-        let session = FTSession {
-            group_id: group_id.clone(),
-            my_handles: vec![handle.clone()],
-            participants: HashMap::new(),
-            link: None,
-            members,
-            report_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
-            start_time: Some(now_ms),
-            last_rekey: None,
-            is_propped: false,
-            is_ringing_inaccurate: false,
-            mode: Some(FTMode::Outgoing),
-            recent_member_adds: HashMap::new(),
-        };
-
+        self.inner
+            .create_session_allocated(group_id.clone(), handle, &participants)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("create_session_allocated failed: {:?}", e),
+            })?;
         let mut state = self.inner.state.write().await;
-        state.sessions.insert(group_id.clone(), session);
         let session = state.sessions.get_mut(&group_id).expect("just inserted");
+        session.is_ringing_inaccurate = false;
 
         self.inner
             .ensure_allocations(session, &[])
@@ -8004,6 +8627,580 @@ impl WrappedFaceTimeClient {
         self.inner
             .respond_letmein(request, approved_group.as_deref())
             .await?;
+        Ok(())
+    }
+}
+
+// Native-only helpers used by the JSON-RPC sidecar. Keep these outside the
+// UniFFI export block: the Go bridge does not consume them, so adding the
+// headless iBlue call-control surface must not churn generated Go bindings.
+impl WrappedFaceTimeClient {
+    pub fn subscribe_native_media_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<rustpush::facetime::NativeFaceTimeMediaEvent> {
+        self.inner.subscribe_native_media_events()
+    }
+
+    pub async fn create_native_media_session(
+        &self,
+        group_id: String,
+        handle: String,
+        participants: Vec<String>,
+        audio_file: String,
+        ring: bool,
+    ) -> Result<(), WrappedError> {
+        if participants.len() != 1 {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime media currently requires exactly one remote participant"
+                    .to_string(),
+            });
+        }
+        self.inner
+            .create_session_allocated(group_id.clone(), handle, &participants)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("native FaceTime allocation failed: {:?}", e),
+            })?;
+
+        self.native_media_sources.lock().await.insert(
+            group_id.clone(),
+            NativeFaceTimeMedia {
+                source_path: Some(audio_file),
+                send_task: None,
+                live_audio_sender: None,
+                #[cfg(target_os = "macos")]
+                live_audio_encoder: None,
+                status: new_native_facetime_media_status(group_id.clone()),
+            },
+        );
+
+        if ring {
+            let mut state = self.inner.state.write().await;
+            let session =
+                state
+                    .sessions
+                    .get_mut(&group_id)
+                    .ok_or_else(|| WrappedError::GenericError {
+                        msg: format!("FaceTime session not found after allocation: {group_id}"),
+                    })?;
+            self.inner.prop_up_conv(session, true).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn create_native_live_audio_session(
+        &self,
+        group_id: String,
+        handle: String,
+        participants: Vec<String>,
+        ring: bool,
+    ) -> Result<(), WrappedError> {
+        if participants.len() != 1 {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime live audio currently requires exactly one remote participant"
+                    .to_string(),
+            });
+        }
+        self.inner
+            .create_session_allocated(group_id.clone(), handle, &participants)
+            .await
+            .map_err(|error| WrappedError::GenericError {
+                msg: format!("native FaceTime allocation failed: {error:?}"),
+            })?;
+
+        self.native_media_sources.lock().await.insert(
+            group_id.clone(),
+            NativeFaceTimeMedia {
+                source_path: None,
+                send_task: None,
+                live_audio_sender: None,
+                #[cfg(target_os = "macos")]
+                live_audio_encoder: None,
+                status: new_native_facetime_media_status(group_id.clone()),
+            },
+        );
+
+        if ring {
+            let mut state = self.inner.state.write().await;
+            let session =
+                state
+                    .sessions
+                    .get_mut(&group_id)
+                    .ok_or_else(|| WrappedError::GenericError {
+                        msg: format!("FaceTime session not found after allocation: {group_id}"),
+                    })?;
+            self.inner.prop_up_conv(session, true).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn start_native_media_session(&self, session_id: &str) -> Result<(), WrappedError> {
+        if !self.inner.native_media_ready(session_id).await {
+            return Err(WrappedError::GenericError {
+                msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
+            });
+        }
+        let (source_path, status) = {
+            let media = self.native_media_sources.lock().await;
+            let source = media
+                .get(session_id)
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: format!(
+                        "iBlue-owned QuickRelay transport is not active for session {session_id}"
+                    ),
+                })?;
+            if source.send_task.is_some() {
+                return Ok(());
+            }
+            let source_path = source.source_path.clone().ok_or_else(|| {
+                WrappedError::GenericError {
+                    msg: "Native FaceTime live audio sessions must be started with the live audio stream method".to_string(),
+                }
+            })?;
+            (source_path, source.status.clone())
+        };
+        let audio = read_native_facetime_audio(&source_path).await?;
+        let packets_total = audio.packets.len() as u64;
+        let payload_bytes_total = audio.packets.iter().map(Vec::len).sum::<usize>() as u64;
+        {
+            let mut current = status.lock().await;
+            current.state = "waiting-for-peer-template".to_string();
+            current.packets_total = packets_total;
+            current.payload_bytes_total = payload_bytes_total;
+            current.started_at = Some(native_facetime_media_now_ms());
+            current.completed_at = None;
+            current.error = None;
+        }
+        let inner = self.inner.clone();
+        let group_id = session_id.to_string();
+        let task = tokio::spawn(async move {
+            let result = inner
+                .send_native_audio(
+                    &group_id,
+                    audio.packets,
+                    audio.payload_type,
+                    audio.samples_per_packet,
+                    audio.packet_duration_ms,
+                )
+                .await;
+            let mut current = status.lock().await;
+            current.completed_at = Some(native_facetime_media_now_ms());
+            match result {
+                Ok(()) => {
+                    current.state = "completed".to_string();
+                    current.packets_sent = packets_total;
+                    current.payload_bytes_sent = payload_bytes_total;
+                }
+                Err(error) => {
+                    let detail = format!("{error:?}");
+                    current.state = "failed".to_string();
+                    current.error = Some(detail.clone());
+                    error!(
+                        "Native FaceTime audio sender failed for session {}: {}",
+                        group_id, detail
+                    );
+                }
+            }
+        });
+        let mut media = self.native_media_sources.lock().await;
+        let source = media
+            .get_mut(session_id)
+            .ok_or_else(|| WrappedError::GenericError {
+                msg: format!(
+                    "iBlue-owned QuickRelay transport disappeared for session {session_id}"
+                ),
+            })?;
+        source.send_task = Some(task);
+        Ok(())
+    }
+
+    pub async fn start_native_audio_stream(&self, session_id: &str) -> Result<(), WrappedError> {
+        if !self.inner.native_media_ready(session_id).await {
+            return Err(WrappedError::GenericError {
+                msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(WrappedError::GenericError {
+            msg: "Apple FaceTime AAC-ELD encoding is available only on macOS".to_string(),
+        });
+
+        #[cfg(target_os = "macos")]
+        {
+            let (packet_sender, packet_receiver) = tokio::sync::mpsc::channel(50);
+            let encoder = macos_aac_eld::Encoder::new()?;
+            let mut media = self.native_media_sources.lock().await;
+            let source = media
+                .get_mut(session_id)
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: format!(
+                        "iBlue-owned QuickRelay transport is not active for session {session_id}"
+                    ),
+                })?;
+            if source.source_path.is_some() {
+                return Err(WrappedError::GenericError {
+                    msg: "Uploaded-file FaceTime sessions cannot accept live audio frames"
+                        .to_string(),
+                });
+            }
+            if source.live_audio_sender.is_some() || source.send_task.is_some() {
+                return Ok(());
+            }
+
+            let status = source.status.clone();
+            {
+                let mut current = status.lock().await;
+                current.state = "streaming".to_string();
+                current.started_at = Some(native_facetime_media_now_ms());
+                current.completed_at = None;
+                current.error = None;
+            }
+            let inner = self.inner.clone();
+            let group_id = session_id.to_string();
+            let task_status = status.clone();
+            let task = tokio::spawn(async move {
+                let (progress_sender, mut progress_receiver) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let send = inner.send_native_audio_stream(
+                    &group_id,
+                    packet_receiver,
+                    progress_sender,
+                    104,
+                    480,
+                    20,
+                );
+                tokio::pin!(send);
+                let result = loop {
+                    tokio::select! {
+                        result = &mut send => break result,
+                        Some(payload_bytes) = progress_receiver.recv() => {
+                            let mut current = task_status.lock().await;
+                            current.packets_sent = current.packets_sent.saturating_add(1);
+                            current.payload_bytes_sent = current
+                                .payload_bytes_sent
+                                .saturating_add(payload_bytes as u64);
+                        }
+                    }
+                };
+                while let Ok(payload_bytes) = progress_receiver.try_recv() {
+                    let mut current = task_status.lock().await;
+                    current.packets_sent = current.packets_sent.saturating_add(1);
+                    current.payload_bytes_sent = current
+                        .payload_bytes_sent
+                        .saturating_add(payload_bytes as u64);
+                }
+                let mut current = task_status.lock().await;
+                current.completed_at = Some(native_facetime_media_now_ms());
+                match result {
+                    Ok(()) => current.state = "stream-ended".to_string(),
+                    Err(error) => {
+                        let detail = format!("{error:?}");
+                        current.state = "failed".to_string();
+                        current.error = Some(detail.clone());
+                        error!(
+                            "Native FaceTime live audio sender failed for session {}: {}",
+                            group_id, detail
+                        );
+                    }
+                }
+            });
+            source.live_audio_sender = Some(packet_sender);
+            source.live_audio_encoder = Some(encoder);
+            source.send_task = Some(task);
+            Ok(())
+        }
+    }
+
+    pub async fn push_native_audio_frame(
+        &self,
+        session_id: &str,
+        pcm_f32le: &[u8],
+    ) -> Result<(), WrappedError> {
+        if pcm_f32le.len() != 480 * std::mem::size_of::<f32>() {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime live audio requires exactly 1920 bytes of mono 24 kHz float32 PCM per 20 ms frame".to_string(),
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(WrappedError::GenericError {
+            msg: "Apple FaceTime AAC-ELD encoding is available only on macOS".to_string(),
+        });
+
+        #[cfg(target_os = "macos")]
+        {
+            let (encoded_size, status) = {
+                let mut media = self.native_media_sources.lock().await;
+                let source = media.get_mut(session_id).ok_or_else(|| {
+                    WrappedError::GenericError {
+                        msg: format!(
+                            "iBlue-owned QuickRelay transport is not active for session {session_id}"
+                        ),
+                    }
+                })?;
+                let encoder = source.live_audio_encoder.as_mut().ok_or_else(|| {
+                    WrappedError::GenericError {
+                        msg: "Native FaceTime live audio stream has not been started".to_string(),
+                    }
+                })?;
+                let packet = encoder.encode_frame(pcm_f32le)?;
+                let encoded_size = packet.as_ref().map_or(0, Vec::len);
+                let sender = source.live_audio_sender.as_ref().ok_or_else(|| {
+                    WrappedError::GenericError {
+                        msg: "Native FaceTime live audio stream is closed".to_string(),
+                    }
+                })?;
+                if let Some(packet) = packet {
+                    sender.try_send(packet).map_err(|error| {
+                        let detail = match error {
+                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                "Native FaceTime live audio queue is full; producer must apply backpressure"
+                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                "Native FaceTime live audio stream is closed"
+                            }
+                        };
+                        WrappedError::GenericError {
+                            msg: detail.to_string(),
+                        }
+                    })?;
+                }
+                (encoded_size, source.status.clone())
+            };
+            let mut current = status.lock().await;
+            if encoded_size > 0 {
+                current.packets_total = current.packets_total.saturating_add(1);
+                current.payload_bytes_total = current
+                    .payload_bytes_total
+                    .saturating_add(encoded_size as u64);
+            }
+            Ok(())
+        }
+    }
+
+    pub async fn finish_native_audio_stream(&self, session_id: &str) -> Result<(), WrappedError> {
+        let (sender, status, flushed_packets) = {
+            let mut media = self.native_media_sources.lock().await;
+            let source = media
+                .get_mut(session_id)
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: format!(
+                        "iBlue-owned QuickRelay transport is not active for session {session_id}"
+                    ),
+                })?;
+            #[cfg(target_os = "macos")]
+            let flushed_packets = match source.live_audio_encoder.take() {
+                Some(mut encoder) => encoder.finish()?,
+                None => Vec::new(),
+            };
+            #[cfg(not(target_os = "macos"))]
+            let flushed_packets: Vec<Vec<u8>> = Vec::new();
+            (
+                source.live_audio_sender.take(),
+                source.status.clone(),
+                flushed_packets,
+            )
+        };
+        if let Some(sender) = sender {
+            let mut packets = 0u64;
+            let mut bytes = 0u64;
+            for packet in flushed_packets {
+                bytes = bytes.saturating_add(packet.len() as u64);
+                sender.send(packet).await.map_err(|_| WrappedError::GenericError {
+                    msg: "Native FaceTime live audio stream closed while draining".to_string(),
+                })?;
+                packets = packets.saturating_add(1);
+            }
+            if packets > 0 {
+                let mut current = status.lock().await;
+                current.packets_total = current.packets_total.saturating_add(packets);
+                current.payload_bytes_total = current.payload_bytes_total.saturating_add(bytes);
+            }
+            drop(sender);
+        }
+        let mut current = status.lock().await;
+        if current.state == "streaming" {
+            current.state = "draining".to_string();
+        }
+        Ok(())
+    }
+
+    pub async fn native_media_status(
+        &self,
+        session_id: &str,
+    ) -> Result<NativeFaceTimeMediaStatus, WrappedError> {
+        let status = {
+            let media = self.native_media_sources.lock().await;
+            media
+                .get(session_id)
+                .map(|source| source.status.clone())
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: format!(
+                        "iBlue-owned QuickRelay transport is not active for session {session_id}"
+                    ),
+                })?
+        };
+        let mut result = status.lock().await.clone();
+        if let Some((
+            received,
+            authenticated,
+            sent,
+            stream_state_sent,
+            participants,
+            peer_uuids,
+            media_keys,
+            last_error,
+        )) = self.inner.native_control_status(session_id).await
+        {
+            result.control_messages_received = received;
+            result.control_messages_authenticated = authenticated;
+            result.control_messages_sent = sent;
+            result.control_stream_state_sent = stream_state_sent;
+            result.control_ready = authenticated > 0 && stream_state_sent;
+            result.control_participant_contexts = participants as u64;
+            result.control_peer_uuids = peer_uuids as u64;
+            result.control_media_keys = media_keys as u64;
+            result.control_last_error = last_error;
+        }
+        if let Some((
+            updates,
+            sequence,
+            total_kb,
+            packets,
+            payload_type,
+            extension_profile,
+            extension_hex,
+        )) = self.inner.native_audio_feedback_status(session_id).await
+        {
+            result.peer_audio_feedback_updates = updates;
+            result.peer_audio_feedback_sequence = sequence as u64;
+            result.peer_audio_kb_received = total_kb as u64;
+            result.peer_audio_packets_received = packets as u64;
+            result.peer_audio_payload_type = payload_type;
+            result.peer_audio_rtp_extension_profile = extension_profile;
+            result.peer_audio_rtp_extension_hex = extension_hex;
+        }
+        Ok(result)
+    }
+
+    pub async fn stop_native_media_session(&self, session_id: &str) {
+        if let Some(mut media) = self.native_media_sources.lock().await.remove(session_id) {
+            media.live_audio_sender.take();
+            #[cfg(target_os = "macos")]
+            media.live_audio_encoder.take();
+            {
+                let mut status = media.status.lock().await;
+                if status.state != "completed" && status.state != "failed" {
+                    status.state = "stopped".to_string();
+                    status.completed_at = Some(native_facetime_media_now_ms());
+                }
+            }
+            if let Some(task) = media.send_task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    /// Allocate an outgoing session and QuickRelay participant without
+    /// advertising a command-207 join. The deterministic media path uses this
+    /// while it preloads Apple's web preview, then advertises exactly once when
+    /// `ring_session_native` is called.
+    pub async fn create_session_allocated_native(
+        &self,
+        group_id: String,
+        handle: String,
+        _participants: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        // Start with only the bridge identity. The web media guest joins this
+        // empty group first; ring_session_native then adds the phone targets.
+        self.inner
+            .create_session_allocated(group_id.clone(), handle, &[])
+            .await?;
+        if let Some(session) = self.inner.state.write().await.sessions.get_mut(&group_id) {
+            session.is_ringing_inaccurate = false;
+        }
+        Ok(())
+    }
+
+    /// Leave the bridge's signaling participant in a FaceTime session and
+    /// cancel any ring that was waiting for a web participant to join.
+    ///
+    /// The Apple web client remains the media participant. Its own leave
+    /// control is what ends that leg of the call; this method makes the IDS
+    /// control plane converge even if media startup fails before the join.
+    pub async fn leave_session_native(&self, session_id: &str) -> Result<(), WrappedError> {
+        self.stop_native_media_session(session_id).await;
+        pending_ft_rings().lock().await.remove(session_id);
+
+        let mut state = self.inner.state.write().await;
+        let session =
+            state
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| WrappedError::GenericError {
+                    msg: format!("FaceTime session not found: {session_id}"),
+                })?;
+        if session.is_propped {
+            self.inner.unprop_conv(session).await?;
+        }
+        Ok(())
+    }
+
+    /// Add targets to a session after its Apple web media participant is
+    /// active. add_members carries that web participant in active_participants,
+    /// so iOS enters group mode directly instead of starting a one-to-one call
+    /// and attempting a lossy conversion after answer.
+    pub async fn ring_session_native(
+        &self,
+        session_id: &str,
+        targets: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        use rustpush::facetime::FTMember;
+
+        {
+            let mut state = self.inner.state.write().await;
+            let session =
+                state
+                    .sessions
+                    .get_mut(session_id)
+                    .ok_or_else(|| WrappedError::GenericError {
+                        msg: format!("FaceTime session not found: {session_id}"),
+                    })?;
+            let new_members = targets
+                .iter()
+                .filter(|target| {
+                    !session
+                        .members
+                        .iter()
+                        .any(|member| &member.handle == *target)
+                })
+                .map(|target| FTMember {
+                    nickname: None,
+                    handle: target.clone(),
+                })
+                .collect::<Vec<_>>();
+            if !new_members.is_empty() {
+                self.inner
+                    .add_members(session, new_members, true, None)
+                    .await?;
+            }
+            // AddMember establishes the group roster and carries the live web
+            // guest. Advertise the resulting conversation with command 207:
+            // unlike the lightweight NiceData Invitation sent by `ring`, this
+            // includes the participant map and AVC metadata CallKit needs to
+            // construct and answer the call.
+            self.inner.prop_up_conv(session, true).await?;
+        }
+        pending_ft_rings().lock().await.remove(session_id);
+        Ok(())
+    }
+
+    /// Confirm that Apple's web participant joined the media plane. The
+    /// upstream FaceTime handler unprops the native bridge when the temporary
+    /// web participant's join event arrives. Do not also send
+    /// RespondedElsewhere here: although targeted at sibling devices, Apple can
+    /// treat it as conversation-wide and disconnect the remote participant.
+    pub async fn media_joined_session_native(&self, session_id: &str) -> Result<(), WrappedError> {
+        pending_ft_rings().lock().await.remove(session_id);
         Ok(())
     }
 }
@@ -8618,6 +9815,7 @@ pub async fn new_client(
             )
             .await,
         ),
+        native_media_sources: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     // Shared StatusKit state: init_statuskit() populates these Arc<RwLock>s,
@@ -10413,6 +11611,7 @@ impl Client {
                 )
                 .await,
             ),
+            native_media_sources: tokio::sync::Mutex::new(HashMap::new()),
         });
         *locked = Some(wrapped.clone());
         Ok(wrapped)
@@ -10845,9 +12044,9 @@ mod reply_target_tests {
         current_transcript_background_version, inline_relay_attachment, leave_group_participants,
         message_inst_to_wrapped, mmcs_preflight_targets, normalize_findmy_handle,
         normalize_reply_target, parse_html_to_parts, parts_to_html, persist_gsa_tokens_in_spd,
-        Attachment, AttachmentType, Balloon, ConversationData, ExtensionApp, IndexedMessagePart,
-        BalloonLayout, Message, MessageInst, MessagePart, MessageParts, MessageType, NormalMessage,
-        PartExtension, PosterType, ReactMessage, ReactMessageType, Reaction,
+        Attachment, AttachmentType, Balloon, BalloonLayout, ConversationData, ExtensionApp,
+        IndexedMessagePart, Message, MessageInst, MessagePart, MessageParts, MessageType,
+        NormalMessage, PartExtension, PosterType, ReactMessage, ReactMessageType, Reaction,
         SimplifiedTranscriptPoster, TextFormat, WrappedConversation, BASE64_STANDARD,
         TRANSCRIPT_DYNAMIC_EXTENSION, TRANSCRIPT_DYNAMIC_PRESETS, TRANSCRIPT_GRADIENT_EXTENSION,
     };
@@ -10901,8 +12100,8 @@ mod reply_target_tests {
     fn findmy_handles_normalize_nanp_national_numbers() {
         assert_eq!(normalize_findmy_handle("5555550101"), "+15555550101");
         assert_eq!(
-            normalize_findmy_handle("tel:+1 (651) 319-6252"),
-            "+16513196252"
+            normalize_findmy_handle("tel:+1 (202) 555-0142"),
+            "+12025550142"
         );
         assert_eq!(
             normalize_findmy_handle("MAILTO:Friend@Example.com"),

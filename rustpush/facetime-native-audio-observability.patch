@@ -1,0 +1,73 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index 2f93dc6..bfcf263 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1698,15 +1698,19 @@ impl FTClient {
+                             let extension_lengths = header.extensions.iter()
+                                 .map(|extension| extension.payload.len())
+                                 .collect::<Vec<_>>();
++                            let extension_hex = header.extensions.first()
++                                .map(|extension| encode_hex(extension.payload.as_ref()))
++                                .unwrap_or_default();
+                             let audio_structure = describe_facetime_audio_payload(
+                                 header.payload_type,
+                                 &unmarshalled.payload,
+                             );
+                             warn!(
+-                                "FaceTime inbound audio template: participant={:?} extension_profile=0x{:04x} extension_lengths={:?} payload_len={} structure={}",
++                                "FaceTime inbound audio template: participant={:?} extension_profile=0x{:04x} extension_lengths={:?} extension_hex={} payload_len={} structure={}",
+                                 recv.participant,
+                                 header.extension_profile,
+                                 extension_lengths,
++                                extension_hex,
+                                 unmarshalled.payload.len(),
+                                 audio_structure,
+                             );
+@@ -1911,7 +1915,7 @@ impl FTClient {
+     pub async fn native_audio_feedback_status(
+         &self,
+         group_id: &str,
+-    ) -> Option<(u64, u16, u16, u16)> {
++    ) -> Option<(u64, u16, u16, u16, Option<u8>, Option<u16>, Option<String>)> {
+         let connection = {
+             let state = self.state.read().await;
+             state.sessions.get(group_id).and_then(|session| session.connection.clone())
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 916e78f..eb09072 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1474,13 +1474,33 @@ impl GlobalLink {
+         }
+     }
+ 
+-    pub async fn audio_feedback_status(&self) -> (u64, u16, u16, u16) {
++    pub async fn audio_feedback_status(
++        &self,
++    ) -> (u64, u16, u16, u16, Option<u8>, Option<u16>, Option<String>) {
+         let state = self.state.lock().await;
++        let peer_payload_type = state
++            .audio_header_template
++            .as_ref()
++            .map(|(header, _)| header.payload_type);
++        let peer_extension_profile = state
++            .audio_header_template
++            .as_ref()
++            .filter(|(header, _)| header.extension)
++            .map(|(header, _)| header.extension_profile);
++        let peer_extension_hex = state
++            .audio_header_template
++            .as_ref()
++            .filter(|(header, _)| header.extension)
++            .and_then(|(header, _)| header.extensions.first())
++            .map(|extension| encode_hex(extension.payload.as_ref()));
+         (
+             state.audio_feedback_updates,
+             state.audio_feedback_sequence,
+             state.audio_feedback_total_kb_received,
+             state.audio_feedback_packets_received,
++            peer_payload_type,
++            peer_extension_profile,
++            peer_extension_hex,
+         )
+     }
+ 

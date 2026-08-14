@@ -1,0 +1,48 @@
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -383,7 +383,7 @@ pub(super) fn fill_in_psk_binder(
+ 
+                 let ks = KeyScheduleEarly::new(suite, &key.secret);
+                 real_binders
+-                    .push(ks.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash));
++                    .push(ks.external_psk_binder_key_and_sign_verify_data(&handshake_hash));
+ 
+                 if suite_and_schedule.is_none() {
+                     suite_and_schedule = Some((suite, ks));
+diff --git a/rustls/src/tls13/key_schedule.rs b/rustls/src/tls13/key_schedule.rs
+--- a/rustls/src/tls13/key_schedule.rs
++++ b/rustls/src/tls13/key_schedule.rs
+@@ -15,6 +15,7 @@ use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
+ /// The kinds of secret we can extract from `KeySchedule`.
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ enum SecretKind {
++    ExternalPskBinderKey,
+     ResumptionPskBinderKey,
+     ClientEarlyTrafficSecret,
+     ClientHandshakeTrafficSecret,
+@@ -32,6 +33,7 @@ impl SecretKind {
+     fn to_bytes(self) -> &'static [u8] {
+         use self::SecretKind::*;
+         match self {
++            ExternalPskBinderKey => b"ext binder",
+             ResumptionPskBinderKey => b"res binder",
+             ClientEarlyTrafficSecret => b"c e traffic",
+             ClientHandshakeTrafficSecret => b"c hs traffic",
+@@ -145,6 +147,16 @@ impl KeyScheduleEarly {
+         self.ks
+             .sign_verify_data(&resumption_psk_binder_key, hs_hash)
+     }
++
++    pub(crate) fn external_psk_binder_key_and_sign_verify_data(
++        &self,
++        hs_hash: &hash::Output,
++    ) -> hmac::Tag {
++        let external_psk_binder_key = self
++            .ks
++            .derive_for_empty_hash(SecretKind::ExternalPskBinderKey);
++        self.ks
++            .sign_verify_data(&external_psk_binder_key, hs_hash)
+     }
+ }
+ 

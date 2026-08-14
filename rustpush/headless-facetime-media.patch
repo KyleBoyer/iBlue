@@ -1,0 +1,31 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index faa4ac6..ae9d4bf 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -194,6 +194,9 @@ pub struct FTSession {
+     pub connection: Option<Arc<FTSessionConnection>>,
+     #[serde(skip)]
+     pub av_config: Option<AVConfig>,
++    // A headless web caller must remain propped until its media leg ends.
++    #[serde(skip)]
++    pub hold_bridge_for_web: bool,
+ }
+ 
+ pub struct FTSessionConnection {
+@@ -1632,6 +1635,7 @@ impl FTClient {
+             recent_member_adds: HashMap::new(),
+             connection: None,
+             av_config: Some(AVConfig::new(self.os_config.as_ref())),
++            hold_bridge_for_web: false,
+         };
+ 
+         let mut my_session = self.state.write().await;
+@@ -2367,7 +2371,7 @@ impl FTClient {
+                     // if we propped it up for a join, someone else (or us) have joined
+                     // so we don't need to prop it anymore
+                     // make sure web client to not hang up on people who are picking up for us
+-                    if session.is_propped && sender.starts_with("temp:") {
++                    if session.is_propped && sender.starts_with("temp:") && !session.hold_bridge_for_web {
+                         self.unprop_conv(session).await?;
+                     }
+ 

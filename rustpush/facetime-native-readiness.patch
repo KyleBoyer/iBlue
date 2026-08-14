@@ -1,0 +1,63 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index faa4ac6..af951c0 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1483,6 +1483,19 @@ impl FTClient {
+         Ok(())
+     }
+ 
++    /// True only after the profile-owned relay has accepted AllocBind and the
++    /// IDS QPod has completed candidate and key-material bootstrap.
++    pub async fn native_media_ready(&self, group_id: &str) -> bool {
++        let connection = {
++            let state = self.state.read().await;
++            state.sessions.get(group_id).and_then(|session| session.connection.clone())
++        };
++        match connection {
++            Some(connection) => connection.link.is_bootstrapped().await,
++            None => false,
++        }
++    }
++
+     // warning: Doesn't save the link
+     async fn new_link(&self, handle: &str, usage: Option<String>, supported_for: Duration) -> Result<FTLink, PushError> {
+         let since_the_epoch = duration_since_epoch();
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index bc5889e..4dc956e 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -761,6 +761,7 @@ pub struct GlobalLinkState {
+     pub link_id: u32,
+     pub local_candidate_ipv4: Option<[u8; 4]>,
+     pub local_candidate_port: Option<u16>,
++    pub bootstrapped: bool,
+ 
+     prekey: EcKey<Private>,
+     pub states: HashMap<u64, ParticipantState>,
+@@ -1227,6 +1228,7 @@ impl GlobalLink {
+             ..Default::default()
+         }).await?;
+ 
++        self.state.lock().await.bootstrapped = true;
+         info!("Finished bootstrap");
+         
+         Ok(())
+@@ -1279,6 +1281,10 @@ impl GlobalLink {
+         self.incoming.lock().await.recv().await
+     }
+ 
++    pub async fn is_bootstrapped(&self) -> bool {
++        self.state.lock().await.bootstrapped
++    }
++
+     pub async fn get_public_key(&self) -> Result<Vec<u8>, PushError> {
+         let mut bignum = BigNumContext::new()?;
+         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+@@ -1590,6 +1596,7 @@ impl GlobalLink {
+                 link_id: 0,
+                 local_candidate_ipv4: None,
+                 local_candidate_port: None,
++                bootstrapped: false,
+             })),
+             inc_send,
+             ind_send,

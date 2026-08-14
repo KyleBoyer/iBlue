@@ -46,6 +46,10 @@ docker-compose.override.yml
 # overlays our PRIVATE clean-room (open-absinthe + apple-private-apis) — never
 # commit it or the private APIs would leak into the public bridge repo.
 /third_party/rustpush-upstream/
+/third_party/rustls-psk/
+/third_party/quinn-qpod/
+/third_party/rtc-openbubbles/
+/tmp/
 /openbubbles-app-rustpush/
 /rustpush-master/
 

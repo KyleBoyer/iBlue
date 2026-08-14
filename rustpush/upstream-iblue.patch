@@ -1,10 +1,10 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 4a1966f..c5c81f2 100644
+index 5fa6be8..4d47f25 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -57,6 +57,10 @@ chrono = "0.4.41"
- bitflags = "2.9.1"
- x509-cert = "0.2.5"
+@@ -70,6 +70,10 @@ rtc-media = { path = "../../rtc/rtc-media" }
+ [patch.crates-io]
+ quinn = { path = "../../quinn/quinn" }
  
 +[target.'cfg(target_os = "macos")'.dependencies]
 +core-foundation = "0.9.4"
@@ -14,7 +14,7 @@ index 4a1966f..c5c81f2 100644
  prost-build = { version = "0.12.0" }
  
 diff --git a/src/aps.rs b/src/aps.rs
-index 6301922..8204f8d 100644
+index 6301922..5c2fd05 100644
 --- a/src/aps.rs
 +++ b/src/aps.rs
 @@ -1,5 +1,5 @@
@@ -214,7 +214,7 @@ index 454eff9..f52ba36 100644
  }
 -
 diff --git a/src/findmy.rs b/src/findmy.rs
-index 1be0a65..fa8b7aa 100644
+index 0e14a89..b6163c4 100644
 --- a/src/findmy.rs
 +++ b/src/findmy.rs
 @@ -1,4 +1,4 @@
@@ -224,7 +224,7 @@ index 1be0a65..fa8b7aa 100644
  use aes::{cipher::consts::U16, Aes128, Aes256};
  use aes_gcm::{Aes256Gcm, AesGcm, Nonce, Tag, aead::{Aead, AeadMutInPlace}};
 @@ -7,7 +7,7 @@ use cloudkit_derive::CloudKitRecord;
- use deku::{DekuContainerRead, DekuRead};
+ use deku::prelude::*;
  use hkdf::Hkdf;
  use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
 -use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
@@ -1248,7 +1248,7 @@ index 1be0a65..fa8b7aa 100644
 +    }
 +}
 diff --git a/src/icloud/keychain.rs b/src/icloud/keychain.rs
-index c8afb85..6594220 100644
+index 26159b3..fc61502 100644
 --- a/src/icloud/keychain.rs
 +++ b/src/icloud/keychain.rs
 @@ -1107,7 +1107,7 @@ pub const KEYCHAIN_ZONES: &[&str] = &[
@@ -1278,7 +1278,7 @@ index c8afb85..6594220 100644
                  if current_state.includeds.contains(excluded) {
                      current_state.includeds.retain(|a| a != excluded);
 diff --git a/src/ids/identity_manager.rs b/src/ids/identity_manager.rs
-index 56c840e..8884a63 100644
+index c67b359..bc4ea9e 100644
 --- a/src/ids/identity_manager.rs
 +++ b/src/ids/identity_manager.rs
 @@ -1,4 +1,4 @@
@@ -1287,7 +1287,7 @@ index 56c840e..8884a63 100644
  
  use backon::{ConstantBuilder, ExponentialBuilder};
  use deku::{DekuContainerRead, DekuRead, DekuWrite};
-@@ -27,6 +27,28 @@ const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
+@@ -28,6 +28,28 @@ const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
  const REFRESH_MIN: Duration = Duration::from_secs(60);
  use deku::{DekuContainerWrite, DekuUpdate};
  
@@ -1316,7 +1316,7 @@ index 56c840e..8884a63 100644
  #[repr(C)]
  #[derive(Clone)]
  pub enum MessageTarget {
-@@ -41,11 +63,18 @@ struct CachedKeys {
+@@ -42,11 +64,18 @@ struct CachedKeys {
      at_ms: u64
  }
  
@@ -1338,7 +1338,7 @@ index 56c840e..8884a63 100644
      }
  
      fn is_valid(&self) -> bool {
-@@ -70,6 +99,25 @@ impl CachedKeys {
+@@ -71,6 +100,25 @@ impl CachedKeys {
      }
  }
  
@@ -1364,7 +1364,7 @@ index 56c840e..8884a63 100644
  #[derive(Serialize, Deserialize, Debug, Default)]
  pub struct CachedHandle {
      keys: HashMap<String, CachedKeys>,
-@@ -182,6 +230,9 @@ pub struct KeyCache {
+@@ -183,6 +231,9 @@ pub struct KeyCache {
  impl KeyCache {
      pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) -> KeyCache {
          let mut message_counter = HashMap::new();
@@ -1374,7 +1374,7 @@ index 56c840e..8884a63 100644
          if let Ok(data) = fs::read(&path) {
              if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                  loaded.cache_location = path;
-@@ -240,7 +291,7 @@ impl KeyCache {
+@@ -241,7 +292,7 @@ impl KeyCache {
  
      pub fn save(&self) {
          let saved = plist_to_string(self).unwrap();
@@ -1383,7 +1383,7 @@ index 56c840e..8884a63 100644
      }
  
      pub fn invalidate(&mut self, handle: &str, keys_for: &str) {
-@@ -320,6 +371,14 @@ impl KeyCache {
+@@ -321,6 +372,14 @@ impl KeyCache {
          cached.keys.sender_correlation_identifier.clone()
      }
  
@@ -1398,7 +1398,7 @@ index 56c840e..8884a63 100644
      pub fn does_not_need_refresh(&self, service: &str, handle: &str, keys_for: &str, refresh: bool) -> bool {
          let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
              return false
-@@ -783,13 +842,25 @@ impl IdentityResource {
+@@ -819,13 +878,25 @@ impl IdentityResource {
              verification_failed,
              ..
          } = &mut payload {
@@ -1431,7 +1431,7 @@ index 56c840e..8884a63 100644
                  }
              };
  
-@@ -824,6 +895,16 @@ impl IdentityResource {
+@@ -860,6 +931,16 @@ impl IdentityResource {
      }
  
      pub async fn cache_keys(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
@@ -1448,7 +1448,7 @@ index 56c840e..8884a63 100644
          (|| async { self.cache_keys_once(topic, participants, handle, refresh, meta).await })
              .retry(&ConstantBuilder::default().with_delay(Duration::ZERO).with_max_times(1))
              .when(|e| !matches!(e, PushError::DoNotRetry(_))).await
-@@ -869,6 +950,31 @@ impl IdentityResource {
+@@ -905,6 +986,31 @@ impl IdentityResource {
          Ok(targets.iter().filter(|target| !key_cache.get_keys(&topic, handle, *target).is_empty()).map(|i| i.clone()).collect())
      }
  
@@ -1481,19 +1481,19 @@ index 56c840e..8884a63 100644
          if handles.is_empty() {
              return Ok(vec![])
 diff --git a/src/ids/mod.rs b/src/ids/mod.rs
-index 17e6aa0..f6c32a2 100644
+index 0969831..636be48 100644
 --- a/src/ids/mod.rs
 +++ b/src/ids/mod.rs
-@@ -10,7 +10,7 @@ use num_bigint::{BigInt, Sign};
- pub mod user;
+@@ -11,7 +11,7 @@ pub mod user;
  pub mod identity_manager;
+ pub mod link;
  
 -#[derive(Deserialize, Debug)]
 +#[derive(Deserialize, Debug, Clone)]
  #[serde(untagged)]
  pub enum MessageBody {
      Plist(Value),
-@@ -102,4 +102,4 @@ pub struct CertifiedContext {
+@@ -103,4 +103,4 @@ pub struct CertifiedContext {
  
  pub mod idsp {
      include!(concat!(env!("OUT_DIR"), "/idsp.rs"));
@@ -1501,14 +1501,14 @@ index 17e6aa0..f6c32a2 100644
 \ No newline at end of file
 +}
 diff --git a/src/ids/user.rs b/src/ids/user.rs
-index df97ecc..e3070a8 100644
+index 4add5d0..7450bf1 100644
 --- a/src/ids/user.rs
 +++ b/src/ids/user.rs
 @@ -1,4 +1,4 @@
 -use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
 +use std::{collections::{BTreeSet, HashMap}, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
  
- use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
+ use deku::prelude::*;
  use hkdf::Hkdf;
 @@ -19,7 +19,7 @@ use crate::util::DebugMutex;
  
@@ -1876,7 +1876,7 @@ index c71234a..cd85a7a 100644
  pub use ids::CertifiedContext;
  pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
 diff --git a/src/statuskit.rs b/src/statuskit.rs
-index a8fe25d..c9d3e90 100644
+index a8fe25d..4857ded 100644
 --- a/src/statuskit.rs
 +++ b/src/statuskit.rs
 @@ -116,7 +116,7 @@ pub struct StatusKitState {
@@ -1911,10 +1911,10 @@ index a8fe25d..c9d3e90 100644
                  let key = referenced_channel.get_key(inner.ratchet)?;
  
 diff --git a/src/util.rs b/src/util.rs
-index 3c7f312..45c0f87 100644
+index df9ff70..13d8b46 100644
 --- a/src/util.rs
 +++ b/src/util.rs
-@@ -1188,12 +1188,13 @@ const CLASS_SPECS: &[ClassData] = &[
+@@ -1204,12 +1204,13 @@ const CLASS_SPECS: &[ClassData] = &[
              "originalURL",
              "URL",
              "title",
@@ -1929,7 +1929,7 @@ index 3c7f312..45c0f87 100644
          ]
      },
      ClassData {
-@@ -1204,6 +1205,20 @@ const CLASS_SPECS: &[ClassData] = &[
+@@ -1220,6 +1221,20 @@ const CLASS_SPECS: &[ClassData] = &[
              "urlParameters"
          ]
      },

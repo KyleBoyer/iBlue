@@ -1,0 +1,142 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1386,6 +1386,55 @@ fn describe_facetime_audio_payload(payload_type: u8, payload: &[u8]) -> String {
+     format!("pt=20 blocks=[{}] trailing={}", descriptions.join(", "), payload.len().saturating_sub(cursor))
+ }
+ 
++/// Return only the current (non-redundant) codec frames from an Apple audio
++/// RTP payload. PT20 is RFC 2198 RED; PT104 then wraps each AAC-ELD access unit
++/// with a one-byte length. EVS PT108 is one complete frame without that prefix.
++fn primary_facetime_audio_frames(payload_type: u8, payload: &[u8]) -> Option<(u8, Vec<Vec<u8>>)> {
++    let (primary_type, primary) = if payload_type == 20 {
++        let mut cursor = 0usize;
++        let mut blocks: Vec<(u8, Option<usize>)> = Vec::new();
++        loop {
++            let first = *payload.get(cursor)?;
++            cursor += 1;
++            let pt = first & 0x7f;
++            if first & 0x80 == 0 {
++                blocks.push((pt, None));
++                break;
++            }
++            let timestamp_and_length = payload.get(cursor..cursor + 3)?;
++            let block_len = (((timestamp_and_length[1] & 0x03) as usize) << 8)
++                | timestamp_and_length[2] as usize;
++            cursor += 3;
++            blocks.push((pt, Some(block_len)));
++        }
++        let mut block_cursor = cursor;
++        for (_, block_len) in blocks.iter().take(blocks.len().saturating_sub(1)) {
++            block_cursor = block_cursor.checked_add((*block_len)?)?;
++        }
++        let (primary_type, _) = *blocks.last()?;
++        (primary_type, payload.get(block_cursor..)?.to_vec())
++    } else {
++        (payload_type, payload.to_vec())
++    };
++
++    match primary_type {
++        104 => {
++            let mut frames = Vec::new();
++            let mut cursor = 0usize;
++            while cursor < primary.len() {
++                let size = *primary.get(cursor)? as usize;
++                cursor += 1;
++                let end = cursor.checked_add(size)?;
++                frames.push(primary.get(cursor..end)?.to_vec());
++                cursor = end;
++            }
++            (!frames.is_empty()).then_some((primary_type, frames))
++        }
++        108 if !primary.is_empty() => Some((primary_type, vec![primary])),
++        _ => None,
++    }
++}
++
+ impl FTClient {
+     pub async fn new(state: FTState, update_state: Box<dyn Fn(&FTState) + Send + Sync>, conn: APSConnection, identity: IdentityManager, config: Arc<dyn OSConfig>) -> Self {
+         let token = conn.request_topics(&["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video", "com.apple.private.alloy.quickrelay"]).await;
+@@ -1450,6 +1499,9 @@ impl FTClient {
+ 
+         let item = session.connection.clone().unwrap();
+         let session_id = session.av_config.as_ref().expect("no av config").session.clone();
++        let inbound_capture_path = std::env::var_os("IBLUE_FACETIME_INBOUND_CAPTURE_DIR")
++            .map(std::path::PathBuf::from)
++            .map(|root| root.join(format!("{session_id}.iblueaudio")));
+         let session_handle = relay_session.clone();
+         tokio::spawn(async move {
+             let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+@@ -1457,6 +1509,54 @@ impl FTClient {
+             let mut logged_audio_diagnostic = false;
+             let mut sent_stream_group_state = false;
+             let mut raw_diagnostics_remaining = 32usize;
++            let capture_sender = inbound_capture_path.map(|capture_path| {
++                let (capture_send, mut capture_recv) = tokio::sync::mpsc::channel::<(u8, u32, Vec<u8>)>(2048);
++                tokio::spawn(async move {
++                    let mut capture = b"IBLUEFT1".to_vec();
++                    let mut frame_count = 0usize;
++                    let mut payload_bytes = 0usize;
++                    while let Some((payload_type, timestamp, frame)) = capture_recv.recv().await {
++                        if frame_count >= 2_000 || frame.len() > u16::MAX as usize {
++                            continue;
++                        }
++                        capture.push(payload_type);
++                        capture.extend_from_slice(&timestamp.to_be_bytes());
++                        capture.extend_from_slice(&(frame.len() as u16).to_be_bytes());
++                        capture.extend_from_slice(&frame);
++                        frame_count += 1;
++                        payload_bytes += frame.len();
++                    }
++                    if frame_count == 0 {
++                        return;
++                    }
++                    if let Some(parent) = capture_path.parent() {
++                        if tokio::fs::create_dir_all(parent).await.is_err() {
++                            warn!("Unable to create bounded FaceTime inbound capture directory");
++                            return;
++                        }
++                        #[cfg(unix)]
++                        {
++                            use std::os::unix::fs::PermissionsExt;
++                            let _ = tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await;
++                        }
++                    }
++                    if tokio::fs::write(&capture_path, capture).await.is_err() {
++                        warn!("Unable to write bounded FaceTime inbound audio capture");
++                        return;
++                    }
++                    #[cfg(unix)]
++                    {
++                        use std::os::unix::fs::PermissionsExt;
++                        let _ = tokio::fs::set_permissions(&capture_path, std::fs::Permissions::from_mode(0o600)).await;
++                    }
++                    warn!(
++                        "Captured bounded FaceTime inbound codec audio: frames={} payload_bytes={}",
++                        frame_count,
++                        payload_bytes,
++                    );
++                });
++                capture_send
++            });
+             while let Some(recv) = session_handle.recv().await {
+                 if raw_diagnostics_remaining > 0
+                     && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
+@@ -1513,6 +1613,17 @@ impl FTClient {
+                         };
+                         let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+ 
++                        if let Some(capture_sender) = &capture_sender {
++                            if let Some((payload_type, frames)) = primary_facetime_audio_frames(
++                                header.payload_type,
++                                &unmarshalled.payload,
++                            ) {
++                                for frame in frames {
++                                    let _ = capture_sender.try_send((payload_type, header.timestamp, frame));
++                                }
++                            }
++                        }
++
+                         if !logged_audio_diagnostic
+                             && matches!(header.payload_type, 20 | 104 | 108 | 13)
+                             && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")

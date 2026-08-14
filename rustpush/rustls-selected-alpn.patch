@@ -1,0 +1,66 @@
+diff --git a/rustls/src/client/builder.rs b/rustls/src/client/builder.rs
+index f41c2ce0..d8a71f99 100644
+--- a/rustls/src/client/builder.rs
++++ b/rustls/src/client/builder.rs
+@@ -166,6 +166,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+         ClientConfig {
+             provider: self.provider,
+             alpn_protocols: Vec::new(),
++            check_selected_alpn: true,
+             resumption: Resumption::default(),
+             preshared_keys: Arc::new(NoPresharedKeys::default()),
+             max_fragment_size: None,
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index ee82ad4a..26a470a4 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -166,6 +166,11 @@ pub struct ClientConfig {
+     /// If empty, no ALPN extension is sent.
+     pub alpn_protocols: Vec<Vec<u8>>,
+ 
++    /// Whether to check the selected ALPN was offered.
++    ///
++    /// The default is true.
++    pub check_selected_alpn: bool,
++
+     /// How and when the client can resume a previous session.
+     ///
+     /// # Sharing `resumption` between `ClientConfig`s
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 9f0f8dcb..cf1816da 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -620,11 +620,12 @@ pub(super) fn process_alpn_protocol(
+     common: &mut CommonState,
+     offered_protocols: &[ProtocolName],
+     selected: Option<&ProtocolName>,
++    check_selected_offered: bool,
+ ) -> Result<(), Error> {
+     common.alpn_protocol = selected.map(ToOwned::to_owned);
+ 
+     if let Some(alpn_protocol) = &common.alpn_protocol {
+-        if !offered_protocols.contains(alpn_protocol) {
++        if check_selected_offered && !offered_protocols.contains(alpn_protocol) {
+             return Err(common.send_fatal_alert(
+                 AlertDescription::IllegalParameter,
+                 PeerMisbehaved::SelectedUnofferedApplicationProtocol,
+@@ -773,6 +774,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
+                     .selected_protocol
+                     .as_ref()
+                     .map(|s| s.as_ref()),
++                self.input.config.check_selected_alpn,
+             )?;
+         }
+ 
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index f8625e27..3ffe1968 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -566,6 +566,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
+             exts.selected_protocol
+                 .as_ref()
+                 .map(|protocol| protocol.as_ref()),
++            self.config.check_selected_alpn,
+         )?;
+         hs::process_client_cert_type_extension(
+             cx.common,

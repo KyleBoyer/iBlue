@@ -1,0 +1,110 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1367,6 +1367,10 @@ impl FTClient {
+                         let header = rtc_rtp::Header::unmarshal(&mut &recv.data[..]).unwrap();
+                         info!("Header {:?}", header);
+ 
++                        if header.payload_type == 104 && header.extension {
++                            session_handle.remember_audio_header(&header).await;
++                        }
++
+                         if !channel_contexts.contains_key(&header.ssrc) {
+                             let state = session_handle.state.lock().await;
+                             // find right participant and interation
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -765,6 +765,11 @@ pub struct GlobalLinkState {
+     pub local_candidate_ipv4: Option<[u8; 4]>,
+     pub local_candidate_port: Option<u16>,
+     pub bootstrapped: bool,
++    /// Most recently observed clear RTP header for the peer's AAC-ELD stream.
++    /// FaceTime requires its proprietary RTP extension on every media packet;
++    /// the extension profile is negotiated dynamically and is not an RFC 8285
++    /// constant, so the outbound stream mirrors the live peer template.
++    pub audio_header_template: Option<rtc_rtp::Header>,
+ 
+     prekey: EcKey<Private>,
+     pub states: HashMap<u64, ParticipantState>,
+@@ -1285,6 +1290,25 @@ impl GlobalLink {
+         self.state.lock().await.bootstrapped
+     }
+ 
++    pub async fn remember_audio_header(&self, header: &rtc_rtp::Header) {
++        if header.payload_type == 104 && header.extension {
++            self.state.lock().await.audio_header_template = Some(header.clone());
++        }
++    }
++
++    async fn wait_for_audio_header_template(&self) -> Result<rtc_rtp::Header, PushError> {
++        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
++        loop {
++            if let Some(header) = self.state.lock().await.audio_header_template.clone() {
++                return Ok(header);
++            }
++            if tokio::time::Instant::now() >= deadline {
++                return Err(PushError::NotConnected);
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        }
++    }
++
+     pub async fn send_audio_packets(
+         &self,
+         ssrc: u32,
+@@ -1292,6 +1317,7 @@ impl GlobalLink {
+         packets: Vec<Vec<u8>>,
+         samples_per_packet: u32,
+     ) -> Result<(), PushError> {
++        let mut header_template = self.wait_for_audio_header_template().await?;
+         let (avc_pod, key) = {
+             let state = self.state.lock().await;
+             (
+@@ -1314,17 +1339,30 @@ impl GlobalLink {
+         let mut sequence_number: u16 = rand::random();
+         let mut timestamp: u32 = rand::random();
+         let started = tokio::time::Instant::now();
++
++        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            warn!(
++                "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={}",
++                header_template.extension_profile,
++                header_template.extensions.len(),
++                header_template.extensions_padding,
++            );
++        }
+ 
+         for (index, payload) in packets.into_iter().enumerate() {
++            // Apple attaches a proprietary extension to 100% of FaceTime RTP
++            // packets. Keep its live negotiated profile/contents while
++            // replacing only the direction-specific RTP stream fields.
++            header_template.version = 2;
++            header_template.padding = false;
++            header_template.marker = false;
++            header_template.payload_type = 104;
++            header_template.sequence_number = sequence_number;
++            header_template.timestamp = timestamp;
++            header_template.ssrc = ssrc;
++            header_template.csrc.clear();
+             let packet = rtc_rtp::Packet {
+-                header: rtc_rtp::Header {
+-                    version: 2,
+-                    payload_type: 104,
+-                    sequence_number,
+-                    timestamp,
+-                    ssrc,
+-                    ..Default::default()
+-                },
++                header: header_template.clone(),
+                 payload: payload.into(),
+             };
+             let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
+@@ -1597,6 +1638,7 @@ impl GlobalLink {
+                 local_candidate_ipv4: None,
+                 local_candidate_port: None,
+                 bootstrapped: false,
++                audio_header_template: None,
+             })),
+             inc_send,
+             ind_send,

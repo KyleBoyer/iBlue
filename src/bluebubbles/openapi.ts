@@ -226,7 +226,7 @@ const implementedCompatibilityRouteDocumentation: Record<string, FastifySchema> 
   },
   "GET /api/v1/handle/availability/facetime": {
     summary: "Check FaceTime availability",
-    description: "Returns available=false because iBlue does not implement FaceTime calling. FaceTime session, answer, and leave routes are intentionally absent from this API document.",
+    description: "Reports whether this iBlue runtime has the native FaceTime signaling surface required to create and control sessions. It does not assert that a particular address is registered for FaceTime.",
     tags: ["Handles"],
     querystring: {
       type: "object",
@@ -498,6 +498,94 @@ const routeDocumentation: Record<string, FastifySchema> = {
     summary: "Get server information",
     description: "Returns BlueBubbles compatibility metadata and additive iBlue capabilities.",
     tags: ["Server"],
+  },
+  "POST /api/v1/iblue/facetime/session": {
+    summary: "Create an outbound FaceTime session",
+    description: "Creates a profile-isolated Apple FaceTime signaling session without ringing immediately. Opening the returned Apple web-join URL admits the media participant and then rings the target. This separation prevents phantom calls when media startup fails.",
+    tags: ["iBlue FaceTime"],
+    body: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        address: stringProperty("One phone number or email address to call. Use targets for a group call."),
+        targets: stringArrayProperty("Phone numbers or email addresses to call.", { minItems: 1, maxItems: 32 }),
+        from: stringProperty("Optional registered Jade/iBlue sending handle. The profile's first handle is used by default."),
+        displayName: stringProperty("Display name shown for the isolated web participant."),
+        ringTtlSeconds: integerProperty("How long the pending ring may wait for media to join.", { minimum: 15, maximum: 3600, default: 120 }),
+      },
+      anyOf: [{ required: ["address"] }, { required: ["targets"] }],
+    },
+  },
+  "GET /api/v1/iblue/facetime/session": {
+    summary: "List FaceTime signaling sessions",
+    description: "Returns the native rustpush FaceTime session state, including participants, members, direction, and timestamps. Cryptographic link secrets remain confined to the profile state and are not added to message records.",
+    tags: ["iBlue FaceTime"],
+  },
+  "POST /api/v1/iblue/facetime/session/:sessionId/leave": {
+    summary: "Leave a FaceTime signaling session",
+    description: "Cancels a not-yet-fired pending ring and removes the iBlue IDS signaling participant when it is still present. A running web media leg must also be stopped by the call endpoint that owns it.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["sessionId"],
+      properties: { sessionId: stringProperty("Uppercase FaceTime session UUID returned at creation time.") },
+    },
+  },
+  "GET /api/v1/iblue/facetime/capabilities": {
+    summary: "Get FaceTime runtime capabilities",
+    description: "Reports signaling, deterministic media transport, identity/topology, supported mode, lifecycle event, codec, verification state, inbound streaming, and outbound live-injection availability separately so agent harnesses can feature-detect each layer without attempting a call. On macOS, uploaded audio uses a one-to-one iBlue-owned QuickRelay session authenticated as the selected profile (for example Jade); it does not use FaceTime.app, the macOS user's FaceTime account, or an Apple web guest. Both ordinary generated-source transcoding and byte-for-byte replay of phone-originated AAC-ELD/PT104 have been verified with clear playback and automatic hangup on an answered iPhone call. Live injection is reported separately until its listening test is complete. Uploaded video remains on the reported Apple web-guest group-call fallback until native AVC video sending is available.",
+    tags: ["iBlue FaceTime"],
+  },
+  "GET /api/v1/iblue/facetime/realtime": {
+    summary: "Get FaceTime realtime protocol metadata",
+    description: "Authoritative machine-readable event map for authenticated Socket.IO call controls, explicit time-limited inbound-media subscriptions, and outbound live audio injection. Raw microphone/camera frames are delivered only to opted-in authenticated sockets and are never persisted, placed in API events, or forwarded to webhooks. A live outbound stream is exclusively owned by its creating socket; 20 ms 24 kHz mono float32 frames are individually acknowledged, encoded persistently as FaceTime AAC-ELD/PT104, bounded by a 50-frame queue and a 15–600 second safety deadline, and the call is ended if the owner disconnects. OpenAPI cannot model Socket.IO events directly, so clients must feature-detect and consume the event definitions returned here.",
+    tags: ["iBlue FaceTime"],
+  },
+  "GET /api/v1/iblue/facetime/call": {
+    summary: "List FaceTime media calls",
+    description: "Returns public lifecycle state for deterministic FaceTime media calls made since this server process started. Local source paths, browser handles, and Apple join credentials are never returned.",
+    tags: ["iBlue FaceTime"],
+  },
+  "GET /api/v1/iblue/facetime/call/:callId": {
+    summary: "Get a FaceTime media call",
+    description: "Returns mode, target, lifecycle state, timestamps, converted-media/capture timing, native and web participant counts, native sender state and packet/byte totals, WebRTC connection state, audio byte/energy counters, video byte/frame counters, and any startup or transport failure for one call. Native calls also expose privacy-safe VC-control diagnostics: messages received, authenticated and sent; whether microphone stream state was published; whether the control handshake is ready; participant, peer-UUID and media-key context counts; and a stable last-error code. Peer-audio diagnostics include the observed inbound payload type, exact RTP extension profile, and the peer's complete proprietary extension as hexadecimal control metadata. The older feedback sequence/kilobyte/packet fields remain best-effort interpretations while Apple's private extension layout is being verified and must not alone be treated as delivery proof. No key, control payload, or media bytes are exposed.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["callId"],
+      properties: { callId: stringProperty("iBlue media-call UUID returned by POST /api/v1/iblue/facetime/call.") },
+    },
+  },
+  "POST /api/v1/iblue/facetime/call": {
+    summary: "Call with deterministic uploaded audio or video",
+    description: "Accepts one audio or video upload, rings the target, plays the media once, and hangs up after native sender completion or at the safety deadline. On macOS, ordinary audio is converted with Apple's AudioToolbox pipeline to mono 24 kHz AAC-ELD as one 480-sample (20 ms) PT104 access unit per RTP packet, matching the payload-to-codec clock mapping in Apple's AVConference runtime and the timing observed from current iPhone peers. For codec diagnostics, nativeAudioPassthrough=true accepts an already encoded AAC-ELD CAF and preserves every PT104 access unit byte-for-byte after strict preflight validation. Audio is sent by the selected iBlue profile over its native one-to-one IDS/QuickRelay session after the callee answers, media keys are ready, and the peer's authenticated Apple RTP extension/routing template is observed. The call lifecycle identifies AAC-ELD transcoding versus passthrough, exposes native packet, payload-byte, control-handshake, and peer-feedback totals, and fails rather than reporting active when that sender cannot start. It does not involve FaceTime.app or a web guest. Video currently uses an isolated Apple web participant and therefore appears as a group call; that fallback browser is destroyed at call end. Only one deterministic media call may run at a time.",
+    tags: ["iBlue FaceTime"],
+    consumes: ["multipart/form-data"],
+    body: {
+      type: "object",
+      required: ["media"],
+      properties: {
+        media: { type: "string", format: "binary", description: "Audio or video source, up to 95 MiB. Video sources must contain an audio track." },
+        address: stringProperty("One phone number or email address to call."),
+        targets: stringProperty("JSON array or comma-separated list of phone numbers and email addresses."),
+        mode: { type: "string", enum: ["audio", "video"], description: "Call mode. Defaults from the upload MIME type." },
+        displayName: stringProperty("Participant name shown by Apple. Defaults to iBlue."),
+        from: stringProperty("Optional registered iBlue FaceTime handle."),
+        maxDurationSeconds: integerProperty("Hard safety deadline after media handoff. iBlue hangs up earlier when the converted media reaches its play-once deadline.", { minimum: 15, maximum: 600, default: 90 }),
+        nativeAudioPassthrough: { type: "boolean", default: false, description: "Audio-only diagnostic mode that bypasses iBlue's ordinary source conversion. The upload must be an Apple CAF containing 24 kHz AAC-ELD with exactly 480 frames per packet; iBlue validates it before ringing and sends the access units as PT104 without transcoding." },
+      },
+      anyOf: [{ required: ["address"] }, { required: ["targets"] }],
+    },
+  },
+  "DELETE /api/v1/iblue/facetime/call/:callId": {
+    summary: "End a FaceTime media call",
+    description: "Aborts native QuickRelay media when present, clicks Apple's web leave control for fallback calls, removes iBlue's signaling participant, closes any isolated browser, and deletes converted temporary media.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["callId"],
+      properties: { callId: stringProperty("iBlue media-call UUID to stop.") },
+    },
   },
   "GET /api/v1/iblue/contact": {
     summary: "List profile-local contacts",

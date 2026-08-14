@@ -1,0 +1,147 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index af951c0..9edd94a 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -362,6 +362,7 @@ pub struct AVConfig {
+     start_time: u64,
+     device_type: String,
+     os_build: String,
++    audio_ssrc: u32,
+ }
+ 
+ #[test]
+@@ -378,6 +379,7 @@ impl AVConfig {
+             start_time: duration_since_epoch().as_millis() as u64,
+             device_type: register.hardware_version,
+             os_build: register.software_version,
++            audio_ssrc: rand::random(),
+         }
+     }
+ 
+@@ -418,7 +420,7 @@ impl AVConfig {
+                 video_features: Some(video_features.clone()),
+             }),
+             microphone_u1: Some(VcMediaNegotiationBlobV2MicrophoneSettingsU1 {
+-                rtp_ssrc: Some(3695227082),
++                rtp_ssrc: Some(self.audio_ssrc),
+                 payloads: None,
+                 cipher_suites: Some(5),
+             }),
+@@ -555,7 +557,7 @@ impl AVConfig {
+                         },
+                     ],
+                     settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+-                        rtp_ssrc: Some(3695227082),
++                        rtp_ssrc: Some(self.audio_ssrc),
+                         encode_decode_features: vec![],
+                     }),
+                 },
+@@ -687,7 +689,7 @@ impl AVConfig {
+             allow_dynamic_max_bitrate: Some(true),
+             allows_contents_change_with_aspect_preservation: Some(true),
+             audio_settings: Some(VcMediaNegotiationBlobAudioSettings {
+-                rtp_ssrc: Some(3695227082),
++                rtp_ssrc: Some(self.audio_ssrc),
+                 audio_unit_model: Some(67072),
+                 support_flags: Some(1),
+                 payload_flags: Some(3711),
+@@ -1496,6 +1498,26 @@ impl FTClient {
+         }
+     }
+ 
++    /// Encrypt and pace one already-encoded AAC-ELD access unit per RTP packet
++    /// on the microphone SSRC advertised in this session's AVC blob.
++    pub async fn send_native_audio(
++        &self,
++        group_id: &str,
++        packets: Vec<Vec<u8>>,
++    ) -> Result<(), PushError> {
++        let (connection, audio_ssrc) = {
++            let state = self.state.read().await;
++            let session = state.sessions.get(group_id).ok_or(PushError::BadMsg)?;
++            let connection = session.connection.clone().ok_or(PushError::BadMsg)?;
++            let audio_ssrc = session.av_config.as_ref().ok_or(PushError::BadMsg)?.audio_ssrc;
++            (connection, audio_ssrc)
++        };
++        if !connection.link.is_bootstrapped().await {
++            return Err(PushError::NotConnected);
++        }
++        connection.link.send_audio_packets(audio_ssrc, packets, 480).await
++    }
++
+     // warning: Doesn't save the link
+     async fn new_link(&self, handle: &str, usage: Option<String>, supported_for: Duration) -> Result<FTLink, PushError> {
+         let since_the_epoch = duration_since_epoch();
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 4dc956e..bbcf765 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -14,7 +14,7 @@ use plist::Data;
+ use quinn::{AsyncUdpSocket, EndpointConfig, Pod, crypto::rustls::QuicClientConfig, default_runtime};
+ use rtc_media::io::sample_builder::SampleBuilder;
+ use rtc_rtp::codec::h265::H265Packet;
+-use rtc_shared::marshal::Unmarshal;
++use rtc_shared::marshal::{Marshal, Unmarshal};
+ use rtc_srtp::{context::Context, protection_profile::ProtectionProfile};
+ use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
+ use serde::{Deserialize, Serialize};
+@@ -1285,6 +1285,59 @@ impl GlobalLink {
+         self.state.lock().await.bootstrapped
+     }
+ 
++    pub async fn send_audio_packets(
++        &self,
++        ssrc: u32,
++        packets: Vec<Vec<u8>>,
++        samples_per_packet: u32,
++    ) -> Result<(), PushError> {
++        let (avc_pod, key) = {
++            let state = self.state.lock().await;
++            (
++                state.avc_pod.clone().ok_or(PushError::NotConnected)?,
++                state.my_mkm.get_key(ssrc),
++            )
++        };
++        let mut context = Context::new(
++            &key[..16],
++            &key[16..],
++            ProtectionProfile::Aes128CmHmacSha2mki_32,
++            None,
++            None,
++        ).map_err(|_| PushError::BadMsg)?;
++        let mut sequence_number: u16 = rand::random();
++        let mut timestamp: u32 = rand::random();
++        let started = tokio::time::Instant::now();
++
++        for (index, payload) in packets.into_iter().enumerate() {
++            let packet = rtc_rtp::Packet {
++                header: rtc_rtp::Header {
++                    version: 2,
++                    payload_type: 104,
++                    sequence_number,
++                    timestamp,
++                    ssrc,
++                    ..Default::default()
++                },
++                payload: payload.into(),
++            };
++            let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
++            let encrypted = context.encrypt_rtp(&plaintext).map_err(|_| PushError::BadMsg)?;
++            let framed = GlobalPacket {
++                participant: None,
++                link: LinkType::Pod,
++                data: encrypted.to_vec(),
++            }.to_qr_raw();
++            avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
++
++            sequence_number = sequence_number.wrapping_add(1);
++            timestamp = timestamp.wrapping_add(samples_per_packet);
++            let deadline = started + std::time::Duration::from_millis((index as u64 + 1) * 10);
++            tokio::time::sleep_until(deadline).await;
++        }
++        Ok(())
++    }
++
+     pub async fn get_public_key(&self) -> Result<Vec<u8>, PushError> {
+         let mut bignum = BigNumContext::new()?;
+         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
