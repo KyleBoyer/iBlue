@@ -769,9 +769,20 @@ test("incoming FaceTime controls are authenticated, session-scoped, and media-aw
   const capabilities = await fetch(
     `${listening.address}/api/v1/iblue/facetime/capabilities?password=secret`,
   ).then((response) => response.json()) as {
-    data: { incomingCalls: { available: boolean; topology: string; autoAnswer: string } };
+    data: {
+      incomingCalls: {
+        available: boolean;
+        verification: string;
+        topology: string;
+        autoAnswer: string;
+      };
+    };
   };
   assert.equal(capabilities.data.incomingCalls.available, true);
+  assert.equal(
+    capabilities.data.incomingCalls.verification,
+    "verified-audio-and-video-auto-answer-playback",
+  );
   assert.equal(capabilities.data.incomingCalls.topology, "one-to-one");
   assert.equal(
     capabilities.data.incomingCalls.autoAnswer,

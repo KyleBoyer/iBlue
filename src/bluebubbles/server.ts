@@ -1000,6 +1000,10 @@ export class BlueBubblesServer {
       realtimeLifecycleEvent: "ft-call-status-changed",
       incomingCalls: {
         available: this.service.nativeFaceTimeIncomingAvailable,
+        verification: this.service.nativeFaceTimeIncomingAvailable
+          && this.service.nativeFaceTimeMediaAvailable
+          ? "verified-audio-and-video-auto-answer-playback"
+          : "unavailable",
         list: "/api/v1/iblue/facetime/incoming",
         answer: "/api/v1/iblue/facetime/incoming/{sessionId}/answer",
         answerWithMedia: "/api/v1/iblue/facetime/incoming/{sessionId}/answer-with-media",
