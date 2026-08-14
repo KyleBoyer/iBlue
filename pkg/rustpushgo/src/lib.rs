@@ -7746,12 +7746,74 @@ struct NativeFaceTimeMedia {
     video_description_path: Option<String>,
     video_frame_duration_ms: u64,
     send_task: Option<tokio::task::JoinHandle<()>>,
-    live_audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    live_video_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    live_audio_sender: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
+    live_video_sender: Option<tokio::sync::mpsc::Sender<(Vec<u8>, u64)>>,
     live_video_send_task: Option<tokio::task::JoinHandle<()>>,
+    live_media_clock: Option<rustpush::ids::link::NativeMediaClock>,
+    live_media_epoch_unix_ms: Option<u64>,
+    live_rtp_timestamp_base: Option<u32>,
+    live_audio_next_pts_us: u64,
+    live_video_next_pts_us: u64,
+    live_audio_pending_pts: std::collections::VecDeque<u64>,
     #[cfg(target_os = "macos")]
     live_audio_encoder: Option<macos_aac_eld::Encoder>,
     status: Arc<tokio::sync::Mutex<NativeFaceTimeMediaStatus>>,
+}
+
+fn configure_native_live_media_clock(
+    source: &mut NativeFaceTimeMedia,
+    requested_epoch_unix_ms: Option<u64>,
+    requested_rtp_timestamp_base: Option<u32>,
+    video_session: bool,
+) -> Result<(rustpush::ids::link::NativeMediaClock, u64, u32), WrappedError> {
+    if let (Some(clock), Some(epoch), Some(timestamp_base)) = (
+        &source.live_media_clock,
+        source.live_media_epoch_unix_ms,
+        source.live_rtp_timestamp_base,
+    ) {
+        if requested_epoch_unix_ms.is_some_and(|value| value != epoch)
+            || requested_rtp_timestamp_base.is_some_and(|value| value != timestamp_base)
+        {
+            return Err(WrappedError::GenericError {
+                msg: "Live FaceTime audio and video must use the same media epoch and RTP timestamp base"
+                    .to_string(),
+            });
+        }
+        return Ok((clock.clone(), epoch, timestamp_base));
+    }
+
+    let now_ms = native_facetime_media_now_ms();
+    let default_lead_ms = if video_session { 4_000 } else { 250 };
+    let epoch = requested_epoch_unix_ms.unwrap_or_else(|| now_ms.saturating_add(default_lead_ms));
+    if epoch.saturating_add(10_000) < now_ms || epoch > now_ms.saturating_add(60_000) {
+        return Err(WrappedError::GenericError {
+            msg: "Live FaceTime mediaEpochUnixMs must be within 10 seconds in the past and 60 seconds in the future"
+                .to_string(),
+        });
+    }
+    let timestamp_base = requested_rtp_timestamp_base.unwrap_or_else(rand::random);
+    let instant = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(epoch.saturating_sub(now_ms));
+    let clock = rustpush::ids::link::NativeMediaClock::new(instant, timestamp_base);
+    source.live_media_clock = Some(clock.clone());
+    source.live_media_epoch_unix_ms = Some(epoch);
+    source.live_rtp_timestamp_base = Some(timestamp_base);
+    Ok((clock, epoch, timestamp_base))
+}
+
+fn next_native_live_pts(
+    next: &mut u64,
+    requested: Option<u64>,
+    duration_us: u64,
+) -> Result<u64, WrappedError> {
+    let presentation_time_us = requested.unwrap_or(*next);
+    if presentation_time_us < *next && requested.is_some() {
+        return Err(WrappedError::GenericError {
+            msg: "Live FaceTime presentationTimeUs must be monotonic for each track".to_string(),
+        });
+    }
+    *next = presentation_time_us.saturating_add(duration_us);
+    Ok(presentation_time_us)
 }
 
 #[cfg(target_os = "macos")]
@@ -7971,6 +8033,17 @@ pub struct NativeFaceTimeMediaStatus {
     peer_audio_feedback_sequence: u64,
     peer_audio_kb_received: u64,
     peer_audio_packets_received: u64,
+    peer_audio_burst_loss: u8,
+    peer_audio_queuing_delay: Option<u16>,
+    peer_audio_current_send_timestamp: Option<u16>,
+    peer_audio_q13_one_way_delay: Option<u16>,
+    peer_audio_one_way_delay_ms: Option<u32>,
+    peer_video_burst_loss: Option<u8>,
+    peer_video_frame_size: Option<u8>,
+    peer_video_packet_loss: Option<u8>,
+    peer_bandwidth_estimate: Option<u16>,
+    peer_ect: Option<u16>,
+    peer_ce: Option<u16>,
     peer_audio_payload_type: Option<u8>,
     peer_audio_rtp_extension_profile: Option<u16>,
     peer_audio_rtp_extension_hex: Option<String>,
@@ -7978,6 +8051,10 @@ pub struct NativeFaceTimeMediaStatus {
     peer_video_ssrc: Option<u32>,
     peer_video_rtp_extension_profile: Option<u16>,
     peer_video_rtp_extension_hex: Option<String>,
+    media_epoch_unix_ms: Option<u64>,
+    rtp_timestamp_base: Option<u32>,
+    audio_last_presentation_time_us: Option<u64>,
+    video_last_presentation_time_us: Option<u64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -8036,6 +8113,17 @@ fn new_native_facetime_media_status(
         peer_audio_feedback_sequence: 0,
         peer_audio_kb_received: 0,
         peer_audio_packets_received: 0,
+        peer_audio_burst_loss: 0,
+        peer_audio_queuing_delay: None,
+        peer_audio_current_send_timestamp: None,
+        peer_audio_q13_one_way_delay: None,
+        peer_audio_one_way_delay_ms: None,
+        peer_video_burst_loss: None,
+        peer_video_frame_size: None,
+        peer_video_packet_loss: None,
+        peer_bandwidth_estimate: None,
+        peer_ect: None,
+        peer_ce: None,
         peer_audio_payload_type: None,
         peer_audio_rtp_extension_profile: None,
         peer_audio_rtp_extension_hex: None,
@@ -8043,6 +8131,10 @@ fn new_native_facetime_media_status(
         peer_video_ssrc: None,
         peer_video_rtp_extension_profile: None,
         peer_video_rtp_extension_hex: None,
+        media_epoch_unix_ms: None,
+        rtp_timestamp_base: None,
+        audio_last_presentation_time_us: None,
+        video_last_presentation_time_us: None,
     }))
 }
 
@@ -9035,6 +9127,12 @@ impl WrappedFaceTimeClient {
                 live_audio_sender: None,
                 live_video_sender: None,
                 live_video_send_task: None,
+                live_media_clock: None,
+                live_media_epoch_unix_ms: None,
+                live_rtp_timestamp_base: None,
+                live_audio_next_pts_us: 0,
+                live_video_next_pts_us: 0,
+                live_audio_pending_pts: std::collections::VecDeque::new(),
                 #[cfg(target_os = "macos")]
                 live_audio_encoder: None,
                 status: new_native_facetime_media_status(session_id.to_string()),
@@ -9125,6 +9223,12 @@ impl WrappedFaceTimeClient {
                 live_audio_sender: None,
                 live_video_sender: None,
                 live_video_send_task: None,
+                live_media_clock: None,
+                live_media_epoch_unix_ms: None,
+                live_rtp_timestamp_base: None,
+                live_audio_next_pts_us: 0,
+                live_video_next_pts_us: 0,
+                live_audio_pending_pts: std::collections::VecDeque::new(),
                 #[cfg(target_os = "macos")]
                 live_audio_encoder: None,
                 status: new_native_facetime_media_status(group_id.clone()),
@@ -9176,6 +9280,12 @@ impl WrappedFaceTimeClient {
                 live_audio_sender: None,
                 live_video_sender: None,
                 live_video_send_task: None,
+                live_media_clock: None,
+                live_media_epoch_unix_ms: None,
+                live_rtp_timestamp_base: None,
+                live_audio_next_pts_us: 0,
+                live_video_next_pts_us: 0,
+                live_audio_pending_pts: std::collections::VecDeque::new(),
                 #[cfg(target_os = "macos")]
                 live_audio_encoder: None,
                 status: new_native_facetime_media_status(group_id.clone()),
@@ -9336,7 +9446,12 @@ impl WrappedFaceTimeClient {
         Ok(())
     }
 
-    pub async fn start_native_audio_stream(&self, session_id: &str) -> Result<(), WrappedError> {
+    pub async fn start_native_audio_stream(
+        &self,
+        session_id: &str,
+        media_epoch_unix_ms: Option<u64>,
+        rtp_timestamp_base: Option<u32>,
+    ) -> Result<(u64, u32), WrappedError> {
         if !self.inner.native_media_ready(session_id).await {
             return Err(WrappedError::GenericError {
                 msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
@@ -9349,6 +9464,16 @@ impl WrappedFaceTimeClient {
 
         #[cfg(target_os = "macos")]
         {
+            let video_session = {
+                let state = self.inner.state.read().await;
+                state
+                    .sessions
+                    .get(session_id)
+                    .map(|session| session.is_video)
+                    .ok_or_else(|| WrappedError::GenericError {
+                        msg: format!("FaceTime session not found: {session_id}"),
+                    })?
+            };
             let (packet_sender, packet_receiver) = tokio::sync::mpsc::channel(50);
             let encoder = macos_aac_eld::Encoder::new()?;
             let mut media = self.native_media_sources.lock().await;
@@ -9366,8 +9491,17 @@ impl WrappedFaceTimeClient {
                 });
             }
             if source.live_audio_sender.is_some() || source.send_task.is_some() {
-                return Ok(());
+                return Ok((
+                    source.live_media_epoch_unix_ms.unwrap_or_default(),
+                    source.live_rtp_timestamp_base.unwrap_or_default(),
+                ));
             }
+            let (media_clock, epoch, timestamp_base) = configure_native_live_media_clock(
+                source,
+                media_epoch_unix_ms,
+                rtp_timestamp_base,
+                video_session,
+            )?;
 
             let status = source.status.clone();
             {
@@ -9376,6 +9510,8 @@ impl WrappedFaceTimeClient {
                 current.started_at = Some(native_facetime_media_now_ms());
                 current.completed_at = None;
                 current.error = None;
+                current.media_epoch_unix_ms = Some(epoch);
+                current.rtp_timestamp_base = Some(timestamp_base);
             }
             let inner = self.inner.clone();
             let group_id = session_id.to_string();
@@ -9390,6 +9526,7 @@ impl WrappedFaceTimeClient {
                     104,
                     480,
                     20,
+                    media_clock,
                 );
                 tokio::pin!(send);
                 let result = loop {
@@ -9437,7 +9574,7 @@ impl WrappedFaceTimeClient {
             source.live_audio_sender = Some(packet_sender);
             source.live_audio_encoder = Some(encoder);
             source.send_task = Some(task);
-            Ok(())
+            Ok((epoch, timestamp_base))
         }
     }
 
@@ -9445,7 +9582,8 @@ impl WrappedFaceTimeClient {
         &self,
         session_id: &str,
         pcm_f32le: &[u8],
-    ) -> Result<(), WrappedError> {
+        presentation_time_us: Option<u64>,
+    ) -> Result<u64, WrappedError> {
         if pcm_f32le.len() != 480 * std::mem::size_of::<f32>() {
             return Err(WrappedError::GenericError {
                 msg: "Native FaceTime live audio requires exactly 1920 bytes of mono 24 kHz float32 PCM per 20 ms frame".to_string(),
@@ -9458,7 +9596,7 @@ impl WrappedFaceTimeClient {
 
         #[cfg(target_os = "macos")]
         {
-            let (packet, status, sender) = {
+            let (packet, packet_pts, accepted_pts, status, sender) = {
                 let mut media = self.native_media_sources.lock().await;
                 let source = media.get_mut(session_id).ok_or_else(|| {
                     WrappedError::GenericError {
@@ -9472,7 +9610,18 @@ impl WrappedFaceTimeClient {
                         msg: "Native FaceTime live audio stream has not been started".to_string(),
                     }
                 })?;
+                let accepted_pts = next_native_live_pts(
+                    &mut source.live_audio_next_pts_us,
+                    presentation_time_us,
+                    20_000,
+                )?;
+                source.live_audio_pending_pts.push_back(accepted_pts);
                 let packet = encoder.encode_frame(pcm_f32le)?;
+                let packet_pts = if packet.is_some() {
+                    source.live_audio_pending_pts.pop_front()
+                } else {
+                    None
+                };
                 let sender =
                     source
                         .live_audio_sender
@@ -9480,12 +9629,12 @@ impl WrappedFaceTimeClient {
                         .ok_or_else(|| WrappedError::GenericError {
                             msg: "Native FaceTime live audio stream is closed".to_string(),
                         })?;
-                (packet, source.status.clone(), sender)
+                (packet, packet_pts, accepted_pts, source.status.clone(), sender)
             };
             let encoded_size = packet.as_ref().map_or(0, Vec::len);
             if let Some(packet) = packet {
                 sender
-                    .send(packet)
+                    .send((packet, packet_pts.unwrap_or(accepted_pts)))
                     .await
                     .map_err(|_| WrappedError::GenericError {
                         msg: "Native FaceTime live audio stream is closed".to_string(),
@@ -9502,7 +9651,8 @@ impl WrappedFaceTimeClient {
                     .audio_payload_bytes_total
                     .saturating_add(encoded_size as u64);
             }
-            Ok(())
+            current.audio_last_presentation_time_us = Some(accepted_pts);
+            Ok(accepted_pts)
         }
     }
 
@@ -9517,12 +9667,24 @@ impl WrappedFaceTimeClient {
                     ),
                 })?;
             #[cfg(target_os = "macos")]
-            let flushed_packets = match source.live_audio_encoder.take() {
+            let raw_flushed_packets = match source.live_audio_encoder.take() {
                 Some(mut encoder) => encoder.finish()?,
                 None => Vec::new(),
             };
             #[cfg(not(target_os = "macos"))]
-            let flushed_packets: Vec<Vec<u8>> = Vec::new();
+            let raw_flushed_packets: Vec<Vec<u8>> = Vec::new();
+            let mut flushed_packets = Vec::with_capacity(raw_flushed_packets.len());
+            for packet in raw_flushed_packets {
+                let presentation_time_us = source
+                    .live_audio_pending_pts
+                    .pop_front()
+                    .unwrap_or_else(|| {
+                        let value = source.live_audio_next_pts_us;
+                        source.live_audio_next_pts_us = value.saturating_add(20_000);
+                        value
+                    });
+                flushed_packets.push((packet, presentation_time_us));
+            }
             (
                 source.live_audio_sender.take(),
                 source.status.clone(),
@@ -9533,10 +9695,10 @@ impl WrappedFaceTimeClient {
         if let Some(sender) = sender {
             let mut packets = 0u64;
             let mut bytes = 0u64;
-            for packet in flushed_packets {
+            for (packet, presentation_time_us) in flushed_packets {
                 bytes = bytes.saturating_add(packet.len() as u64);
                 sender
-                    .send(packet)
+                    .send((packet, presentation_time_us))
                     .await
                     .map_err(|_| WrappedError::GenericError {
                         msg: "Native FaceTime live audio stream closed while draining".to_string(),
@@ -9572,7 +9734,9 @@ impl WrappedFaceTimeClient {
         session_id: &str,
         image_description: &[u8],
         frame_duration_ms: u64,
-    ) -> Result<(), WrappedError> {
+        media_epoch_unix_ms: Option<u64>,
+        rtp_timestamp_base: Option<u32>,
+    ) -> Result<(u64, u32), WrappedError> {
         if !self.inner.native_media_ready(session_id).await {
             return Err(WrappedError::GenericError {
                 msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
@@ -9616,8 +9780,17 @@ impl WrappedFaceTimeClient {
             });
         }
         if source.live_video_sender.is_some() {
-            return Ok(());
+            return Ok((
+                source.live_media_epoch_unix_ms.unwrap_or_default(),
+                source.live_rtp_timestamp_base.unwrap_or_default(),
+            ));
         }
+        let (media_clock, epoch, timestamp_base) = configure_native_live_media_clock(
+            source,
+            media_epoch_unix_ms,
+            rtp_timestamp_base,
+            true,
+        )?;
         if source.live_video_send_task.is_some() {
             return Err(WrappedError::GenericError {
                 msg: "Native FaceTime live video stream has already ended".to_string(),
@@ -9633,6 +9806,8 @@ impl WrappedFaceTimeClient {
                 .get_or_insert_with(native_facetime_media_now_ms);
             current.completed_at = None;
             current.error = None;
+            current.media_epoch_unix_ms = Some(epoch);
+            current.rtp_timestamp_base = Some(timestamp_base);
         }
         let inner = self.inner.clone();
         let group_id = session_id.to_string();
@@ -9646,6 +9821,7 @@ impl WrappedFaceTimeClient {
                 description,
                 progress_sender,
                 frame_duration_ms,
+                media_clock,
             );
             tokio::pin!(send);
             let result = loop {
@@ -9694,19 +9870,20 @@ impl WrappedFaceTimeClient {
         source.video_frame_duration_ms = frame_duration_ms;
         source.live_video_sender = Some(frame_sender);
         source.live_video_send_task = Some(task);
-        Ok(())
+        Ok((epoch, timestamp_base))
     }
 
     pub async fn push_native_video_frame(
         &self,
         session_id: &str,
         annex_b_hevc: &[u8],
-    ) -> Result<(), WrappedError> {
+        presentation_time_us: Option<u64>,
+    ) -> Result<u64, WrappedError> {
         let frame = normalize_native_facetime_live_video_frame(annex_b_hevc)?;
-        let (sender, status) = {
-            let media = self.native_media_sources.lock().await;
+        let (sender, status, accepted_pts) = {
+            let mut media = self.native_media_sources.lock().await;
             let source = media
-                .get(session_id)
+                .get_mut(session_id)
                 .ok_or_else(|| WrappedError::GenericError {
                     msg: format!(
                         "iBlue-owned QuickRelay transport is not active for session {session_id}"
@@ -9719,20 +9896,25 @@ impl WrappedFaceTimeClient {
                     .ok_or_else(|| WrappedError::GenericError {
                         msg: "Native FaceTime live video stream has not been started".to_string(),
                     })?;
-            (sender, source.status.clone())
+            let accepted_pts = next_native_live_pts(
+                &mut source.live_video_next_pts_us,
+                presentation_time_us,
+                source.video_frame_duration_ms.saturating_mul(1_000),
+            )?;
+            (sender, source.status.clone(), accepted_pts)
         };
         let frame_size = frame.len() as u64;
+        // Backpressure belongs at the async RPC boundary. Rejecting a frame
+        // just because the bounded queue is temporarily full makes a normal
+        // startup lead (or a short encoder burst) fatal to the whole call.
+        // Waiting here keeps memory bounded while allowing Socket.IO/FFmpeg to
+        // slow down until the RTP sender reaches this frame's presentation
+        // time and frees capacity.
         sender
-            .try_send(frame)
-            .map_err(|error| WrappedError::GenericError {
-                msg: match error {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                        "Native FaceTime live video queue is full; frame was rejected".to_string()
-                    }
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                        "Native FaceTime live video stream is closed".to_string()
-                    }
-                },
+            .send((frame, accepted_pts))
+            .await
+            .map_err(|_| WrappedError::GenericError {
+                msg: "Native FaceTime live video stream is closed".to_string(),
             })?;
         let mut current = status.lock().await;
         current.packets_total = current.packets_total.saturating_add(1);
@@ -9740,7 +9922,8 @@ impl WrappedFaceTimeClient {
         current.video_frames_total = current.video_frames_total.saturating_add(1);
         current.video_source_bytes_total =
             current.video_source_bytes_total.saturating_add(frame_size);
-        Ok(())
+        current.video_last_presentation_time_us = Some(accepted_pts);
+        Ok(accepted_pts)
     }
 
     pub async fn finish_native_video_stream(&self, session_id: &str) -> Result<(), WrappedError> {
@@ -9812,23 +9995,25 @@ impl WrappedFaceTimeClient {
             result.control_media_keys = media_keys as u64;
             result.control_last_error = last_error;
         }
-        if let Some((
-            updates,
-            sequence,
-            total_kb,
-            packets,
-            payload_type,
-            extension_profile,
-            extension_hex,
-        )) = self.inner.native_audio_feedback_status(session_id).await
-        {
-            result.peer_audio_feedback_updates = updates;
-            result.peer_audio_feedback_sequence = sequence as u64;
-            result.peer_audio_kb_received = total_kb as u64;
-            result.peer_audio_packets_received = packets as u64;
-            result.peer_audio_payload_type = payload_type;
-            result.peer_audio_rtp_extension_profile = extension_profile;
-            result.peer_audio_rtp_extension_hex = extension_hex;
+        if let Some(feedback) = self.inner.native_audio_feedback_status(session_id).await {
+            result.peer_audio_feedback_updates = feedback.updates;
+            result.peer_audio_feedback_sequence = feedback.feedback_sequence as u64;
+            result.peer_audio_kb_received = feedback.total_kb_received as u64;
+            result.peer_audio_packets_received = feedback.audio_packets_received as u64;
+            result.peer_audio_burst_loss = feedback.audio_burst_loss;
+            result.peer_audio_queuing_delay = feedback.queuing_delay;
+            result.peer_audio_current_send_timestamp = feedback.current_send_timestamp;
+            result.peer_audio_q13_one_way_delay = feedback.q13_one_way_delay;
+            result.peer_audio_one_way_delay_ms = feedback.one_way_delay_ms;
+            result.peer_video_burst_loss = feedback.video_burst_loss;
+            result.peer_video_frame_size = feedback.video_frame_size;
+            result.peer_video_packet_loss = feedback.video_packet_loss;
+            result.peer_bandwidth_estimate = feedback.bandwidth_estimate;
+            result.peer_ect = feedback.ect;
+            result.peer_ce = feedback.ce;
+            result.peer_audio_payload_type = feedback.peer_payload_type;
+            result.peer_audio_rtp_extension_profile = feedback.peer_extension_profile;
+            result.peer_audio_rtp_extension_hex = feedback.peer_extension_hex;
         }
         if let Some((packets, ssrc, extension_profile, extension_hex)) =
             self.inner.native_video_receive_status(session_id).await

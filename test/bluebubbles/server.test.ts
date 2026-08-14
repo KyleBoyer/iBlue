@@ -20,7 +20,11 @@ import type {
   FreshICloudPhotoShare,
   IMessageEngine,
 } from "../../src/native/engine.js";
-import type { FaceTimeCall } from "../../src/bluebubbles/facetime-media.js";
+import type {
+  FaceTimeCall,
+  FaceTimeLiveVideoTranscoderController,
+  FaceTimeLiveVideoTranscoderOptions,
+} from "../../src/bluebubbles/facetime-media.js";
 import { SessionStore } from "../../src/profile.js";
 import type {
   EngineSnapshot,
@@ -361,11 +365,15 @@ class NativeStreamTestService extends BlueBubblesService {
 
 class IncomingFaceTimeTestService extends NativeStreamTestService {
   readonly liveAudioFrames: Buffer[] = [];
+  readonly liveAudioPresentationTimes: Array<number | undefined> = [];
   readonly liveVideoFrames: Buffer[] = [];
+  readonly liveVideoPresentationTimes: Array<number | undefined> = [];
   readonly liveVideoStarts: Array<{
     sessionId: string;
     imageDescription: Buffer;
     frameDurationMs?: number;
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
   }> = [];
   readonly incoming: FaceTimeIncomingSession[] = [{
     sessionId: "INCOMING-SESSION-1",
@@ -407,18 +415,33 @@ class IncomingFaceTimeTestService extends NativeStreamTestService {
     return Promise.resolve(structuredClone(session));
   }
 
-  override startNativeFaceTimeLiveAudioStream(sessionId: string) {
+  override startNativeFaceTimeLiveAudioStream(sessionId: string, timing?: {
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
+  }) {
     return Promise.resolve({
       started: true,
       sessionId,
       frameBytes: 1_920 as const,
       queueCapacityFrames: 50,
+      mediaEpochUnixMs: timing?.mediaEpochUnixMs ?? 1_000,
+      rtpTimestampBase: timing?.rtpTimestampBase ?? 123,
     });
   }
 
-  override pushNativeFaceTimeLiveAudioFrame(sessionId: string, frame: Buffer) {
+  override pushNativeFaceTimeLiveAudioFrame(
+    sessionId: string,
+    frame: Buffer,
+    presentationTimeUs?: number,
+  ) {
     this.liveAudioFrames.push(Buffer.from(frame));
-    return Promise.resolve({ queued: true, sessionId, frameBytes: 1_920 as const });
+    this.liveAudioPresentationTimes.push(presentationTimeUs);
+    return Promise.resolve({
+      queued: true,
+      sessionId,
+      frameBytes: 1_920 as const,
+      presentationTimeUs: presentationTimeUs ?? 0,
+    });
   }
 
   override finishNativeFaceTimeLiveAudioStream(sessionId: string) {
@@ -429,6 +452,8 @@ class IncomingFaceTimeTestService extends NativeStreamTestService {
     sessionId: string;
     imageDescription: Buffer;
     frameDurationMs?: number;
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
   }) {
     this.liveVideoStarts.push({
       ...params,
@@ -440,12 +465,24 @@ class IncomingFaceTimeTestService extends NativeStreamTestService {
       encoding: "hevc-annex-b" as const,
       frameDurationMs: params.frameDurationMs ?? 40,
       queueCapacityFrames: 8,
+      mediaEpochUnixMs: params.mediaEpochUnixMs ?? 1_000,
+      rtpTimestampBase: params.rtpTimestampBase ?? 123,
     });
   }
 
-  override pushNativeFaceTimeLiveVideoFrame(sessionId: string, frame: Buffer) {
+  override pushNativeFaceTimeLiveVideoFrame(
+    sessionId: string,
+    frame: Buffer,
+    presentationTimeUs?: number,
+  ) {
     this.liveVideoFrames.push(Buffer.from(frame));
-    return Promise.resolve({ queued: true, sessionId, frameBytes: frame.length });
+    this.liveVideoPresentationTimes.push(presentationTimeUs);
+    return Promise.resolve({
+      queued: true,
+      sessionId,
+      frameBytes: frame.length,
+      presentationTimeUs: presentationTimeUs ?? 0,
+    });
   }
 
   override finishNativeFaceTimeLiveVideoStream(sessionId: string) {
@@ -573,18 +610,55 @@ test("incoming FaceTime controls are authenticated, session-scoped, and media-aw
     },
     close: async (): Promise<void> => {},
   };
-  const api = new BlueBubblesServer({ service, port: 0, faceTimeMediaManager: mediaManager });
+  const transcoderInputs: Buffer[] = [];
+  const transcoderFactory = (
+    options: FaceTimeLiveVideoTranscoderOptions,
+  ): FaceTimeLiveVideoTranscoderController => {
+    let started = false;
+    let nativeStarted = false;
+    return {
+      inputFormat: options.inputFormat,
+      get nativeStarted(): boolean { return nativeStarted; },
+      start: async (): Promise<void> => { started = true; },
+      push: async (data: Buffer, presentationTimeUs?: number): Promise<void> => {
+        assert.equal(started, true);
+        transcoderInputs.push(Buffer.from(data));
+        if (!nativeStarted) {
+          await options.onStart(Buffer.from("generated-hvc1-description"));
+          nativeStarted = true;
+        }
+        await options.onFrame(
+          Buffer.concat([Buffer.from("hevc:"), data]),
+          presentationTimeUs ?? 0,
+        );
+      },
+      finish: async (): Promise<void> => {},
+      abort: async (): Promise<void> => {},
+    };
+  };
+  const api = new BlueBubblesServer({
+    service,
+    port: 0,
+    faceTimeMediaManager: mediaManager,
+    faceTimeLiveVideoTranscoderFactory: transcoderFactory,
+  });
   const listening = await api.start();
   const socket = socketClient(listening.address, {
     query: { password: "secret" },
     transports: ["websocket"],
   });
-  await new Promise<void>((resolve, reject) => {
-    socket.once("connect", resolve);
-    socket.once("connect_error", reject);
+  const videoSocket = socketClient(listening.address, {
+    query: { password: "secret" },
+    transports: ["websocket"],
   });
+  await Promise.all([socket, videoSocket].map((candidate) =>
+    new Promise<void>((resolve, reject) => {
+      candidate.once("connect", resolve);
+      candidate.once("connect_error", reject);
+    })));
   t.after(async () => {
     socket.disconnect();
+    videoSocket.disconnect();
     await api.stop();
     await service.stop();
     store.close();
@@ -610,25 +684,45 @@ test("incoming FaceTime controls are authenticated, session-scoped, and media-aw
   const liveAudioStarted = await socketAck<{ status: number }>(
     socket,
     "facetime-live-audio-start",
-    { sessionId: "INCOMING-SESSION-1" },
+    {
+      sessionId: "INCOMING-SESSION-1",
+      mediaEpochUnixMs: 5_000,
+      rtpTimestampBase: 456,
+    },
   );
   assert.equal(liveAudioStarted.status, 200);
   const liveAudioFrame = await socketAck<{ status: number }>(
     socket,
     "facetime-live-audio-session-frame",
-    { sessionId: "INCOMING-SESSION-1", data: Buffer.alloc(1_920, 1) },
+    {
+      sessionId: "INCOMING-SESSION-1",
+      data: Buffer.alloc(1_920, 1),
+      presentationTimeUs: 1_000_000,
+    },
   );
   assert.equal(liveAudioFrame.status, 200);
   assert.deepEqual(service.liveAudioFrames, [Buffer.alloc(1_920, 1)]);
+  assert.deepEqual(service.liveAudioPresentationTimes, [1_000_000]);
+  assert.equal((await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-audio-session-frame",
+    {
+      sessionId: "INCOMING-SESSION-1",
+      data: Buffer.alloc(1_920),
+      presentationTimeUs: -1,
+    },
+  )).status, 400);
 
   const imageDescription = Buffer.from("hvc1-description");
   const liveVideoStarted = await socketAck<{ status: number }>(
-    socket,
+    videoSocket,
     "facetime-live-video-start",
     {
       sessionId: "INCOMING-SESSION-1",
       imageDescription,
       frameDurationMs: 40,
+      mediaEpochUnixMs: 5_000,
+      rtpTimestampBase: 456,
     },
   );
   assert.equal(liveVideoStarted.status, 200);
@@ -636,22 +730,77 @@ test("incoming FaceTime controls are authenticated, session-scoped, and media-aw
     sessionId: "INCOMING-SESSION-1",
     imageDescription,
     frameDurationMs: 40,
+    mediaEpochUnixMs: 5_000,
+    rtpTimestampBase: 456,
   }]);
   const videoAccessUnit = Buffer.from([0, 0, 0, 1, 0x26, 1, 2, 3]);
   const liveVideoFrame = await socketAck<{ status: number }>(
-    socket,
+    videoSocket,
     "facetime-live-video-frame",
-    { sessionId: "INCOMING-SESSION-1", data: videoAccessUnit },
+    {
+      sessionId: "INCOMING-SESSION-1",
+      data: videoAccessUnit,
+      presentationTimeUs: 1_000_000,
+    },
   );
   assert.equal(liveVideoFrame.status, 200);
   assert.deepEqual(service.liveVideoFrames, [videoAccessUnit]);
+  assert.deepEqual(service.liveVideoPresentationTimes, [1_000_000]);
   assert.equal((await socketAck<{ status: number }>(
     socket,
     "facetime-live-audio-session-finish",
     { sessionId: "INCOMING-SESSION-1" },
   )).status, 200);
   assert.equal((await socketAck<{ status: number }>(
-    socket,
+    videoSocket,
+    "facetime-live-video-finish",
+    { sessionId: "INCOMING-SESSION-1" },
+  )).status, 200);
+
+  const transcodedVideoStarted = await socketAck<{
+    status: number;
+    data: { inputFormat: string; outputFormat: string; nativeStarted: boolean };
+  }>(videoSocket, "facetime-live-video-start", {
+    sessionId: "INCOMING-SESSION-1",
+    inputFormat: "h264-annex-b",
+    frameDurationMs: 40,
+  });
+  assert.equal(transcodedVideoStarted.status, 200);
+  assert.deepEqual(transcodedVideoStarted.data, {
+    sessionId: "INCOMING-SESSION-1",
+    state: "encoder-ready",
+    inputFormat: "h264-annex-b",
+    outputFormat: "hevc-annex-b",
+    outputWidth: 1_280,
+    outputHeight: 720,
+    resizeMode: "contain-black",
+    nativeStarted: false,
+  });
+  const h264AccessUnit = Buffer.from([0, 0, 0, 1, 0x65, 4, 5, 6]);
+  const transcodedFrame = await socketAck<{
+    status: number;
+    data: { nativeStarted: boolean };
+  }>(videoSocket, "facetime-live-video-frame", {
+    sessionId: "INCOMING-SESSION-1",
+    data: h264AccessUnit,
+    presentationTimeUs: 2_000_000,
+  });
+  assert.equal(transcodedFrame.status, 200);
+  assert.equal(transcodedFrame.data.nativeStarted, true);
+  assert.equal((transcodedFrame.data as { presentationTimeUs?: number }).presentationTimeUs, 2_000_000);
+  assert.deepEqual(transcoderInputs, [h264AccessUnit]);
+  assert.deepEqual(service.liveVideoStarts.at(-1), {
+    sessionId: "INCOMING-SESSION-1",
+    imageDescription: Buffer.from("generated-hvc1-description"),
+    frameDurationMs: 40,
+  });
+  assert.deepEqual(service.liveVideoFrames.at(-1), Buffer.concat([
+    Buffer.from("hevc:"),
+    h264AccessUnit,
+  ]));
+  assert.equal(service.liveVideoPresentationTimes.at(-1), 2_000_000);
+  assert.equal((await socketAck<{ status: number }>(
+    videoSocket,
     "facetime-live-video-finish",
     { sessionId: "INCOMING-SESSION-1" },
   )).status, 200);

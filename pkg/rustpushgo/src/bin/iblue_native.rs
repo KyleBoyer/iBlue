@@ -899,6 +899,15 @@ struct FaceTimeNativeLiveAudioCreateParams {
 struct FaceTimeNativeAudioFrameParams {
     session_id: String,
     data_base64: String,
+    presentation_time_us: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeLiveStartParams {
+    session_id: String,
+    media_epoch_unix_ms: Option<u64>,
+    rtp_timestamp_base: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -907,6 +916,8 @@ struct FaceTimeNativeVideoStartParams {
     session_id: String,
     image_description_base64: String,
     frame_duration_ms: Option<u64>,
+    media_epoch_unix_ms: Option<u64>,
+    rtp_timestamp_base: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -914,6 +925,7 @@ struct FaceTimeNativeVideoStartParams {
 struct FaceTimeNativeVideoFrameParams {
     session_id: String,
     data_base64: String,
+    presentation_time_us: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -3392,16 +3404,20 @@ impl Engine {
                 }))
             }
             "facetime.native.audio.start" => {
-                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                let params: FaceTimeNativeLiveStartParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
                 if params.session_id.trim().is_empty() {
                     return Err(RpcError::invalid_params("sessionId is required"));
                 }
-                self.client()?
+                let (media_epoch_unix_ms, rtp_timestamp_base) = self.client()?
                     .get_facetime_client()
                     .await
                     .map_err(RpcError::native)?
-                    .start_native_audio_stream(&params.session_id)
+                    .start_native_audio_stream(
+                        &params.session_id,
+                        params.media_epoch_unix_ms,
+                        params.rtp_timestamp_base,
+                    )
                     .await
                     .map_err(RpcError::native)?;
                 Ok(json!({
@@ -3409,6 +3425,8 @@ impl Engine {
                     "sessionId": params.session_id,
                     "frameBytes": 1_920,
                     "queueCapacityFrames": 50,
+                    "mediaEpochUnixMs": media_epoch_unix_ms,
+                    "rtpTimestampBase": rtp_timestamp_base,
                 }))
             }
             "facetime.native.audio.push" => {
@@ -3425,17 +3443,22 @@ impl Engine {
                         "live audio frames must be exactly 1920 bytes",
                     ));
                 }
-                self.client()?
+                let presentation_time_us = self.client()?
                     .get_facetime_client()
                     .await
                     .map_err(RpcError::native)?
-                    .push_native_audio_frame(&params.session_id, &frame)
+                    .push_native_audio_frame(
+                        &params.session_id,
+                        &frame,
+                        params.presentation_time_us,
+                    )
                     .await
                     .map_err(RpcError::native)?;
                 Ok(json!({
                     "queued": true,
                     "sessionId": params.session_id,
                     "frameBytes": frame.len(),
+                    "presentationTimeUs": presentation_time_us,
                 }))
             }
             "facetime.native.audio.stop" => {
@@ -3473,7 +3496,7 @@ impl Engine {
                     RpcError::invalid_params("imageDescriptionBase64 must contain valid base64")
                 })?;
                 let frame_duration_ms = params.frame_duration_ms.unwrap_or(40);
-                self.client()?
+                let (media_epoch_unix_ms, rtp_timestamp_base) = self.client()?
                     .get_facetime_client()
                     .await
                     .map_err(RpcError::native)?
@@ -3481,6 +3504,8 @@ impl Engine {
                         &params.session_id,
                         &image_description,
                         frame_duration_ms,
+                        params.media_epoch_unix_ms,
+                        params.rtp_timestamp_base,
                     )
                     .await
                     .map_err(RpcError::native)?;
@@ -3490,6 +3515,8 @@ impl Engine {
                     "encoding": "hevc-annex-b",
                     "frameDurationMs": frame_duration_ms,
                     "queueCapacityFrames": 8,
+                    "mediaEpochUnixMs": media_epoch_unix_ms,
+                    "rtpTimestampBase": rtp_timestamp_base,
                 }))
             }
             "facetime.native.video.push" => {
@@ -3506,17 +3533,22 @@ impl Engine {
                 let frame = BASE64.decode(params.data_base64.as_bytes()).map_err(|_| {
                     RpcError::invalid_params("dataBase64 must contain valid base64")
                 })?;
-                self.client()?
+                let presentation_time_us = self.client()?
                     .get_facetime_client()
                     .await
                     .map_err(RpcError::native)?
-                    .push_native_video_frame(&params.session_id, &frame)
+                    .push_native_video_frame(
+                        &params.session_id,
+                        &frame,
+                        params.presentation_time_us,
+                    )
                     .await
                     .map_err(RpcError::native)?;
                 Ok(json!({
                     "queued": true,
                     "sessionId": params.session_id,
                     "frameBytes": frame.len(),
+                    "presentationTimeUs": presentation_time_us,
                 }))
             }
             "facetime.native.video.stop" => {
@@ -3711,6 +3743,90 @@ fn prepare_state_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Realtime media frames must not pass through the sidecar's sequential
+/// control RPC loop. A video push can legitimately wait for its bounded native
+/// queue; if that wait blocks stdin, 20 ms audio pushes arrive at 40 ms cadence
+/// and the two tracks can never stay synchronized. Track clients already wait
+/// for each acknowledgement in order, so dispatching one in-flight push per
+/// track concurrently preserves per-track ordering without weakening
+/// backpressure.
+async fn handle_facetime_realtime_push(
+    client: Arc<Client>,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcError> {
+    match method {
+        "facetime.native.audio.push" => {
+            let params: FaceTimeNativeAudioFrameParams = serde_json::from_value(params)
+                .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+            if params.session_id.trim().is_empty() {
+                return Err(RpcError::invalid_params("sessionId is required"));
+            }
+            let frame = BASE64.decode(params.data_base64.as_bytes()).map_err(|_| {
+                RpcError::invalid_params("dataBase64 must contain valid base64")
+            })?;
+            if frame.len() != 1_920 {
+                return Err(RpcError::invalid_params(
+                    "live audio frames must be exactly 1920 bytes",
+                ));
+            }
+            let presentation_time_us = client
+                .get_facetime_client()
+                .await
+                .map_err(RpcError::native)?
+                .push_native_audio_frame(
+                    &params.session_id,
+                    &frame,
+                    params.presentation_time_us,
+                )
+                .await
+                .map_err(RpcError::native)?;
+            Ok(json!({
+                "queued": true,
+                "sessionId": params.session_id,
+                "frameBytes": frame.len(),
+                "presentationTimeUs": presentation_time_us,
+            }))
+        }
+        "facetime.native.video.push" => {
+            let params: FaceTimeNativeVideoFrameParams = serde_json::from_value(params)
+                .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+            if params.session_id.trim().is_empty() {
+                return Err(RpcError::invalid_params("sessionId is required"));
+            }
+            if params.data_base64.len() > 6 * 1024 * 1024 {
+                return Err(RpcError::invalid_params(
+                    "live video frame exceeds the supported size",
+                ));
+            }
+            let frame = BASE64.decode(params.data_base64.as_bytes()).map_err(|_| {
+                RpcError::invalid_params("dataBase64 must contain valid base64")
+            })?;
+            let presentation_time_us = client
+                .get_facetime_client()
+                .await
+                .map_err(RpcError::native)?
+                .push_native_video_frame(
+                    &params.session_id,
+                    &frame,
+                    params.presentation_time_us,
+                )
+                .await
+                .map_err(RpcError::native)?;
+            Ok(json!({
+                "queued": true,
+                "sessionId": params.session_id,
+                "frameBytes": frame.len(),
+                "presentationTimeUs": presentation_time_us,
+            }))
+        }
+        _ => Err(RpcError {
+            code: -32601,
+            message: format!("method not found: {method}"),
+        }),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let state_dir = match parse_state_dir().and_then(|path| {
@@ -3772,6 +3888,35 @@ async fn main() {
                 continue;
             }
         };
+        if matches!(
+            request.method.as_str(),
+            "facetime.native.audio.push" | "facetime.native.video.push"
+        ) {
+            let id = request.id;
+            let method = request.method;
+            let params = request.params;
+            let emitter = emitter.clone();
+            let client = engine.client();
+            tokio::spawn(async move {
+                let result = match client {
+                    Ok(client) => handle_facetime_realtime_push(client, &method, params).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(result) => emitter.write(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                    })),
+                    Err(error) => emitter.write(&json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": error.code, "message": error.message },
+                    })),
+                }
+            });
+            continue;
+        }
         let id = request.id.clone();
         match engine.handle(&request.method, request.params).await {
             Ok(result) => emitter.write(&json!({

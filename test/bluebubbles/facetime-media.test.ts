@@ -4,12 +4,19 @@ import test from "node:test";
 import {
   applyNativeFaceTimeMediaStatus,
   buildFaceTimeHvc1SampleEntry,
+  buildFaceTimeHvc1SampleEntryFromAnnexB,
   extractHvc1SampleEntry,
+  FaceTimeLiveVideoTranscoder,
   faceTimeMediaStopDeadline,
   inspectAacEldCaf,
   inspectEvsPcmF32Le,
+  splitFaceTimeHevcAccessUnits,
   type FaceTimeCall,
 } from "../../src/bluebubbles/facetime-media.js";
+
+function annexBNal(type: number, payload: number[]): Buffer {
+  return Buffer.from([0, 0, 0, 1, type << 1, 1, ...payload]);
+}
 
 test("FaceTime native video extracts the complete hvc1 image description", () => {
   const entry = Buffer.alloc(96);
@@ -74,6 +81,64 @@ test("FaceTime native video emits Apple's canonical hvc1 ImageDescription with e
   assert.equal(result[result.length - 1], 0);
   assert.equal(result.includes(Buffer.from("FFMP", "ascii")), false);
   for (const nal of parameterSets.values()) assert.equal(result.includes(nal), true);
+});
+
+test("FaceTime live video derives Apple's hvc1 ImageDescription from Annex-B parameter sets", () => {
+  const accessUnit = Buffer.concat([
+    annexBNal(35, []),
+    annexBNal(32, [0x0c]),
+    annexBNal(33, [0x01, 0x60]),
+    annexBNal(34, [0xc0]),
+    annexBNal(19, [1, 2, 3]),
+  ]);
+
+  const result = buildFaceTimeHvc1SampleEntryFromAnnexB(accessUnit, 1_920, 1_080);
+
+  assert.equal(result.toString("ascii", 4, 8), "hvc1");
+  assert.equal(result.readUInt16BE(32), 1_920);
+  assert.equal(result.readUInt16BE(34), 1_080);
+  assert.equal(result.toString("ascii", 90, 94), "hvcC");
+  assert.equal(result.includes(Buffer.from([0x40, 1, 0x0c])), true);
+  assert.equal(result.includes(Buffer.from([0x42, 1, 0x01, 0x60])), true);
+  assert.equal(result.includes(Buffer.from([0x44, 1, 0xc0])), true);
+});
+
+test("FaceTime live video splits HEVC access units across arbitrary stream chunks", () => {
+  const first = Buffer.concat([annexBNal(35, []), annexBNal(19, [1, 2, 3])]);
+  const second = Buffer.concat([annexBNal(35, []), annexBNal(1, [4, 5, 6])]);
+  const stream = Buffer.concat([first, second]);
+  const chunkOne = stream.subarray(0, first.length + 2);
+  const initial = splitFaceTimeHevcAccessUnits(chunkOne);
+  assert.deepEqual(initial.frames, []);
+
+  const next = splitFaceTimeHevcAccessUnits(Buffer.concat([
+    initial.remainder,
+    stream.subarray(first.length + 2),
+  ]));
+  assert.deepEqual(next.frames, [first]);
+  const final = splitFaceTimeHevcAccessUnits(next.remainder, true);
+  assert.deepEqual(final.frames, [second]);
+  assert.equal(final.remainder.length, 0);
+});
+
+test("FaceTime live raw video requires bounded dimensions and exact frame geometry", () => {
+  assert.throws(() => new FaceTimeLiveVideoTranscoder({
+    inputFormat: "raw-rgba",
+    frameDurationMs: 40,
+    onStart: async () => {},
+    onFrame: async () => {},
+  }), /width and height/i);
+
+  const transcoder = new FaceTimeLiveVideoTranscoder({
+    inputFormat: "raw-bgra",
+    width: 320,
+    height: 180,
+    frameDurationMs: 40,
+    onStart: async () => {},
+    onFrame: async () => {},
+  });
+  assert.equal(transcoder.inputFrameBytes, 320 * 180 * 4);
+  assert.equal(transcoder.nativeStarted, false);
 });
 
 function cafChunk(tag: string, payload: Buffer): Buffer {
@@ -162,7 +227,7 @@ test("FaceTime live calls publish the final post-drain native status", () => {
     sessionId: "session-1",
     direction: "outgoing",
     mode: "audio",
-    targets: ["tel:+16513196252"],
+    targets: ["tel:+15551234567"],
     displayName: "Jade",
     state: "ending",
     createdAt: 1,
@@ -207,6 +272,7 @@ test("FaceTime live calls publish the final post-drain native status", () => {
     peerAudioFeedbackSequence: 8,
     peerAudioKbReceived: 9,
     peerAudioPacketsReceived: 10,
+    peerAudioBurstLoss: 0,
     peerAudioPayloadType: 20,
     peerAudioRtpExtensionProfile: 0x8d00,
     peerAudioRtpExtensionHex: "01020304",

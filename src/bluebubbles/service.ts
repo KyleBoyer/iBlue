@@ -449,21 +449,28 @@ export class BlueBubblesService extends EventEmitter {
     return this.engine.createNativeFaceTimeLiveAudioSession(params);
   }
 
-  async startNativeFaceTimeLiveAudioStream(sessionId: string) {
+  async startNativeFaceTimeLiveAudioStream(sessionId: string, timing?: {
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
+  }) {
     if (!this.engine.startNativeFaceTimeLiveAudioStream) {
       throw new Error("Native FaceTime live audio is unavailable");
     }
-    return this.engine.startNativeFaceTimeLiveAudioStream(sessionId);
+    return this.engine.startNativeFaceTimeLiveAudioStream(sessionId, timing);
   }
 
-  async pushNativeFaceTimeLiveAudioFrame(sessionId: string, frame: Buffer) {
+  async pushNativeFaceTimeLiveAudioFrame(
+    sessionId: string,
+    frame: Buffer,
+    presentationTimeUs?: number,
+  ) {
     if (!this.engine.pushNativeFaceTimeLiveAudioFrame) {
       throw new Error("Native FaceTime live audio is unavailable");
     }
     if (frame.length !== 1_920) {
       throw new Error("Native FaceTime live audio frames must be exactly 1920 bytes");
     }
-    return this.engine.pushNativeFaceTimeLiveAudioFrame(sessionId, frame);
+    return this.engine.pushNativeFaceTimeLiveAudioFrame(sessionId, frame, presentationTimeUs);
   }
 
   async finishNativeFaceTimeLiveAudioStream(sessionId: string) {
@@ -477,6 +484,8 @@ export class BlueBubblesService extends EventEmitter {
     sessionId: string;
     imageDescription: Buffer;
     frameDurationMs?: number;
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
   }) {
     if (!this.engine.startNativeFaceTimeLiveVideoStream) {
       throw new Error("Native FaceTime live video is unavailable");
@@ -484,14 +493,18 @@ export class BlueBubblesService extends EventEmitter {
     return this.engine.startNativeFaceTimeLiveVideoStream(params);
   }
 
-  async pushNativeFaceTimeLiveVideoFrame(sessionId: string, frame: Buffer) {
+  async pushNativeFaceTimeLiveVideoFrame(
+    sessionId: string,
+    frame: Buffer,
+    presentationTimeUs?: number,
+  ) {
     if (!this.engine.pushNativeFaceTimeLiveVideoFrame) {
       throw new Error("Native FaceTime live video is unavailable");
     }
     if (frame.length === 0 || frame.length > 4 * 1024 * 1024) {
       throw new Error("Native FaceTime live video frames must be between 1 byte and 4 MiB");
     }
-    return this.engine.pushNativeFaceTimeLiveVideoFrame(sessionId, frame);
+    return this.engine.pushNativeFaceTimeLiveVideoFrame(sessionId, frame, presentationTimeUs);
   }
 
   async finishNativeFaceTimeLiveVideoStream(sessionId: string) {

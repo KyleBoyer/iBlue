@@ -200,6 +200,17 @@ export interface FaceTimeNativeMediaStatus {
   peerAudioFeedbackSequence: number;
   peerAudioKbReceived: number;
   peerAudioPacketsReceived: number;
+  peerAudioBurstLoss: number;
+  peerAudioQueuingDelay?: number;
+  peerAudioCurrentSendTimestamp?: number;
+  peerAudioQ13OneWayDelay?: number;
+  peerAudioOneWayDelayMs?: number;
+  peerVideoBurstLoss?: number;
+  peerVideoFrameSize?: number;
+  peerVideoPacketLoss?: number;
+  peerBandwidthEstimate?: number;
+  peerEct?: number;
+  peerCe?: number;
   peerAudioPayloadType?: number;
   peerAudioRtpExtensionProfile?: number;
   peerAudioRtpExtensionHex?: string;
@@ -207,6 +218,10 @@ export interface FaceTimeNativeMediaStatus {
   peerVideoSsrc?: number;
   peerVideoRtpExtensionProfile?: number;
   peerVideoRtpExtensionHex?: string;
+  mediaEpochUnixMs?: number;
+  rtpTimestampBase?: number;
+  audioLastPresentationTimeUs?: number;
+  videoLastPresentationTimeUs?: number;
 }
 
 export interface FaceTimeNativeMediaStreamStatus {
@@ -317,16 +332,22 @@ export interface IMessageEngine {
     from?: string;
     ring?: boolean;
   }): Promise<FaceTimeNativeLiveAudioStart>;
-  startNativeFaceTimeLiveAudioStream?(sessionId: string): Promise<{
+  startNativeFaceTimeLiveAudioStream?(sessionId: string, timing?: {
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
+  }): Promise<{
     started: boolean;
     sessionId: string;
     frameBytes: 1_920;
     queueCapacityFrames: number;
+    mediaEpochUnixMs: number;
+    rtpTimestampBase: number;
   }>;
-  pushNativeFaceTimeLiveAudioFrame?(sessionId: string, frame: Buffer): Promise<{
+  pushNativeFaceTimeLiveAudioFrame?(sessionId: string, frame: Buffer, presentationTimeUs?: number): Promise<{
     queued: boolean;
     sessionId: string;
     frameBytes: 1_920;
+    presentationTimeUs: number;
   }>;
   finishNativeFaceTimeLiveAudioStream?(sessionId: string): Promise<{
     stopped: boolean;
@@ -336,17 +357,22 @@ export interface IMessageEngine {
     sessionId: string;
     imageDescription: Buffer;
     frameDurationMs?: number;
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
   }): Promise<{
     started: boolean;
     sessionId: string;
     encoding: "hevc-annex-b";
     frameDurationMs: number;
     queueCapacityFrames: number;
+    mediaEpochUnixMs: number;
+    rtpTimestampBase: number;
   }>;
-  pushNativeFaceTimeLiveVideoFrame?(sessionId: string, frame: Buffer): Promise<{
+  pushNativeFaceTimeLiveVideoFrame?(sessionId: string, frame: Buffer, presentationTimeUs?: number): Promise<{
     queued: boolean;
     sessionId: string;
     frameBytes: number;
+    presentationTimeUs: number;
   }>;
   finishNativeFaceTimeLiveVideoStream?(sessionId: string): Promise<{
     stopped: boolean;
@@ -682,23 +708,34 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
     return this.rpc.request("facetime.native.audio.create", params);
   }
 
-  startNativeFaceTimeLiveAudioStream(sessionId: string): Promise<{
+  startNativeFaceTimeLiveAudioStream(sessionId: string, timing?: {
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
+  }): Promise<{
     started: boolean;
     sessionId: string;
     frameBytes: 1_920;
     queueCapacityFrames: number;
+    mediaEpochUnixMs: number;
+    rtpTimestampBase: number;
   }> {
-    return this.rpc.request("facetime.native.audio.start", { sessionId });
+    return this.rpc.request("facetime.native.audio.start", { sessionId, ...timing });
   }
 
-  pushNativeFaceTimeLiveAudioFrame(sessionId: string, frame: Buffer): Promise<{
+  pushNativeFaceTimeLiveAudioFrame(
+    sessionId: string,
+    frame: Buffer,
+    presentationTimeUs?: number,
+  ): Promise<{
     queued: boolean;
     sessionId: string;
     frameBytes: 1_920;
+    presentationTimeUs: number;
   }> {
     return this.rpc.request("facetime.native.audio.push", {
       sessionId,
       dataBase64: frame.toString("base64"),
+      ...(presentationTimeUs === undefined ? {} : { presentationTimeUs }),
     });
   }
 
@@ -713,12 +750,16 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
     sessionId: string;
     imageDescription: Buffer;
     frameDurationMs?: number;
+    mediaEpochUnixMs?: number;
+    rtpTimestampBase?: number;
   }): Promise<{
     started: boolean;
     sessionId: string;
     encoding: "hevc-annex-b";
     frameDurationMs: number;
     queueCapacityFrames: number;
+    mediaEpochUnixMs: number;
+    rtpTimestampBase: number;
   }> {
     return this.rpc.request("facetime.native.video.start", {
       sessionId: params.sessionId,
@@ -726,17 +767,29 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
       ...(params.frameDurationMs === undefined
         ? {}
         : { frameDurationMs: params.frameDurationMs }),
+      ...(params.mediaEpochUnixMs === undefined
+        ? {}
+        : { mediaEpochUnixMs: params.mediaEpochUnixMs }),
+      ...(params.rtpTimestampBase === undefined
+        ? {}
+        : { rtpTimestampBase: params.rtpTimestampBase }),
     });
   }
 
-  pushNativeFaceTimeLiveVideoFrame(sessionId: string, frame: Buffer): Promise<{
+  pushNativeFaceTimeLiveVideoFrame(
+    sessionId: string,
+    frame: Buffer,
+    presentationTimeUs?: number,
+  ): Promise<{
     queued: boolean;
     sessionId: string;
     frameBytes: number;
+    presentationTimeUs: number;
   }> {
     return this.rpc.request("facetime.native.video.push", {
       sessionId,
       dataBase64: frame.toString("base64"),
+      ...(presentationTimeUs === undefined ? {} : { presentationTimeUs }),
     });
   }
 

@@ -60,7 +60,11 @@ import {
   normalizeConversationBackgroundColors,
 } from "./backgrounds.js";
 import {
+  FaceTimeLiveVideoTranscoder,
   FaceTimeMediaManager,
+  type FaceTimeLiveVideoInputFormat,
+  type FaceTimeLiveVideoTranscoderController,
+  type FaceTimeLiveVideoTranscoderOptions,
   type FaceTimeMediaMode,
 } from "./facetime-media.js";
 
@@ -155,6 +159,10 @@ export interface BlueBubblesServerOptions {
   icloudShareResolver?: ICloudShareResolver;
   /** Test/embedding override for the deterministic FaceTime call controller. */
   faceTimeMediaManager?: FaceTimeMediaController;
+  /** Test/embedding override for persistent live camera transcoding. */
+  faceTimeLiveVideoTranscoderFactory?: (
+    options: FaceTimeLiveVideoTranscoderOptions,
+  ) => FaceTimeLiveVideoTranscoderController;
 }
 
 type FaceTimeMediaController =
@@ -222,11 +230,22 @@ export class BlueBubblesServer {
   >();
   /** A live microphone stream is controlled exclusively by the socket that created it. */
   readonly #faceTimeLiveAudioOwners = new Map<string, string>();
-  /** Live media on an answered incoming call is controlled by one socket. */
+  /**
+   * Live tracks on an answered incoming call are owned independently. Keeping
+   * audio and video on separate WebSockets avoids head-of-line blocking when
+   * a large video access unit (or raw frame) is being uploaded.
+   */
   readonly #faceTimeIncomingLiveOwners = new Map<
     string,
-    { socketId: string; audio: boolean; video: boolean }
+    { audioSocketId?: string; videoSocketId?: string }
   >();
+  readonly #faceTimeLiveVideoTranscoders = new Map<
+    string,
+    FaceTimeLiveVideoTranscoderController
+  >();
+  readonly #faceTimeLiveVideoTranscoderFactory: (
+    options: FaceTimeLiveVideoTranscoderOptions,
+  ) => FaceTimeLiveVideoTranscoderController;
   #faceTimeAutoAnswer: FaceTimeAutoAnswerArm | undefined;
 
   constructor(options: BlueBubblesServerOptions) {
@@ -234,6 +253,8 @@ export class BlueBubblesServer {
     this.host = options.host ?? "127.0.0.1";
     this.port = options.port ?? 1234;
     this.icloudShareResolver = options.icloudShareResolver ?? new ICloudShareResolver();
+    this.#faceTimeLiveVideoTranscoderFactory = options.faceTimeLiveVideoTranscoderFactory
+      ?? ((transcoderOptions) => new FaceTimeLiveVideoTranscoder(transcoderOptions));
     this.app = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024 });
     if (options.faceTimeMediaManager) {
       this.#faceTimeMedia = options.faceTimeMediaManager;
@@ -348,6 +369,9 @@ export class BlueBubblesServer {
       for (const subscription of subscriptions.values()) clearTimeout(subscription.timer);
     }
     this.#faceTimeSocketSubscriptions.clear();
+    await Promise.all([...this.#faceTimeLiveVideoTranscoders.keys()]
+      .map((sessionId) => this.abortFaceTimeLiveVideo(sessionId)));
+    this.#faceTimeIncomingLiveOwners.clear();
     await this.clearFaceTimeAutoAnswer();
     await this.#faceTimeMedia?.close();
     await new Promise<void>((resolve) => {
@@ -1014,6 +1038,13 @@ export class BlueBubblesServer {
         liveMediaInjection: {
           audio: this.service.nativeFaceTimeLiveAudioAvailable,
           video: this.service.nativeFaceTimeLiveVideoAvailable,
+          videoInputFormats: ["hevc-annex-b", "h264-annex-b", "raw-rgba", "raw-bgra"],
+          videoTranscodedOutput: {
+            codec: "hevc-annex-b",
+            width: 1_280,
+            height: 720,
+            resizeMode: "contain-black",
+          },
           transport: "socket.io",
         },
       },
@@ -1040,7 +1071,7 @@ export class BlueBubblesServer {
         incomingLiveAudioStart: { requestEvent: "facetime-live-audio-start", responseEvent: "facetime-live-audio-start", required: ["sessionId"] },
         incomingLiveAudioFrame: { requestEvent: "facetime-live-audio-session-frame", responseEvent: "facetime-live-audio-session-frame", required: ["sessionId", "data"] },
         incomingLiveAudioFinish: { requestEvent: "facetime-live-audio-session-finish", responseEvent: "facetime-live-audio-session-finish", required: ["sessionId"] },
-        incomingLiveVideoStart: { requestEvent: "facetime-live-video-start", responseEvent: "facetime-live-video-start", required: ["sessionId", "imageDescription"] },
+        incomingLiveVideoStart: { requestEvent: "facetime-live-video-start", responseEvent: "facetime-live-video-start", required: ["sessionId"] },
         incomingLiveVideoFrame: { requestEvent: "facetime-live-video-frame", responseEvent: "facetime-live-video-frame", required: ["sessionId", "data"] },
         incomingLiveVideoFinish: { requestEvent: "facetime-live-video-finish", responseEvent: "facetime-live-video-finish", required: ["sessionId"] },
       },
@@ -1100,6 +1131,27 @@ export class BlueBubblesServer {
       },
       incomingLiveMediaInjection: {
         available: this.service.nativeFaceTimeLiveAudioAvailable,
+        synchronization: {
+          clockRateHz: 24_000,
+          epoch: "One mediaEpochUnixMs and rtpTimestampBase are shared by audio and video for the native session",
+          startOptional: {
+            mediaEpochUnixMs: "Unix milliseconds, from 10 seconds past through 60 seconds future",
+            rtpTimestampBase: "unsigned 32-bit RTP timestamp origin; must match across tracks",
+          },
+          frameOptional: {
+            presentationTimeUs: "non-negative monotonic source PTS in microseconds, independently monotonic per track",
+          },
+          defaults: "Video calls start on a shared epoch four seconds after the first track starts; omitted frame PTS begins at zero and advances by frame duration",
+          feedback: [
+            "queuingDelay",
+            "q13OneWayDelay",
+            "oneWayDelayMs",
+            "audioBurstLoss",
+            "videoPacketLoss",
+            "bandwidthEstimate",
+            "ECN ect/ce",
+          ],
+        },
         audio: {
           available: this.service.nativeFaceTimeLiveAudioAvailable,
           startEvent: "facetime-live-audio-start",
@@ -1107,20 +1159,51 @@ export class BlueBubblesServer {
           finishEvent: "facetime-live-audio-session-finish",
           format: "24 kHz mono float32 little-endian PCM; exactly 1920 bytes per 20 ms frame",
           queueCapacityFrames: 50,
+          frameOptional: ["presentationTimeUs"],
         },
         video: {
           available: this.service.nativeFaceTimeLiveVideoAvailable,
           startEvent: "facetime-live-video-start",
           frameEvent: "facetime-live-video-frame",
           finishEvent: "facetime-live-video-finish",
-          format: "one Annex-B H.265 access unit per binary Socket.IO frame",
-          imageDescription: "one complete hvc1 sample entry containing hvcC",
+          inputFormats: {
+            "hevc-annex-b": {
+              description: "FaceTime-ready passthrough; one Annex-B H.265 access unit per frame event",
+              startRequired: ["imageDescription"],
+              imageDescription: "one complete hvc1 sample entry containing hvcC",
+              maxFrameBytes: 4 * 1024 * 1024,
+            },
+            "h264-annex-b": {
+              description: "persistent realtime conversion; send one Annex-B H.264 access unit per frame event, beginning with SPS/PPS and an IDR",
+            },
+            "raw-rgba": {
+              description: "persistent realtime conversion; one packed RGBA frame per event",
+              startRequired: ["width", "height"],
+              frameBytes: "width * height * 4",
+            },
+            "raw-bgra": {
+              description: "persistent realtime conversion; one packed BGRA frame per event",
+              startRequired: ["width", "height"],
+              frameBytes: "width * height * 4",
+            },
+          },
+          startDefaults: { inputFormat: "hevc-annex-b", frameDurationMs: 40 },
+          transcodedOutput: {
+            codec: "Annex-B H.265/HEVC",
+            width: 1_280,
+            height: 720,
+            resizeMode: "contain",
+            borderFill: "black",
+            hardwareEncoder: "VideoToolbox",
+            lifecycle: "one persistent FFmpeg process per live stream",
+          },
           frameDurationMs: { minimum: 20, maximum: 100, default: 40 },
-          queueCapacityFrames: 8,
-          maxFrameBytes: 4 * 1024 * 1024,
+          frameOptional: ["presentationTimeUs"],
+          acknowledgement: "accepted into the bounded encoder/native sender pipeline; not remote-render proof",
+          backpressure: "Socket acknowledgements wait for FFmpeg stdin drain when its bounded pipe is full",
         },
-        ownership: "One authenticated socket owns live injection for each answered incoming call",
-        disconnectBehavior: "Injected streams and the incoming call end when the owner socket disconnects",
+        ownership: "Audio and video tracks may be owned by independent authenticated sockets for each answered incoming call",
+        disconnectBehavior: "A disconnected owner ends only its track; the incoming call ends after neither track has an owner",
       },
     }, "Successfully fetched FaceTime realtime protocol metadata!"));
     this.app.get("/api/v1/iblue/facetime/call", async () =>
@@ -2537,6 +2620,58 @@ export class BlueBubblesServer {
     }
   }
 
+  private async finishFaceTimeLiveVideo(sessionId: string): Promise<unknown> {
+    const transcoder = this.#faceTimeLiveVideoTranscoders.get(sessionId);
+    if (!transcoder) return this.service.finishNativeFaceTimeLiveVideoStream(sessionId);
+    this.#faceTimeLiveVideoTranscoders.delete(sessionId);
+    await transcoder.finish();
+    if (!transcoder.nativeStarted) {
+      return {
+        sessionId,
+        state: "stream-ended",
+        inputFormat: transcoder.inputFormat,
+        nativeStarted: false,
+        framesSent: 0,
+      };
+    }
+    return this.service.finishNativeFaceTimeLiveVideoStream(sessionId);
+  }
+
+  private async pushFaceTimeLiveVideoWithBackpressure(
+    sessionId: string,
+    accessUnit: Buffer,
+    presentationTimeUs?: number,
+  ): Promise<unknown> {
+    const deadline = Date.now() + 5_000;
+    while (true) {
+      try {
+        return await this.service.pushNativeFaceTimeLiveVideoFrame(
+          sessionId,
+          accessUnit,
+          presentationTimeUs,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("live video queue is full") || Date.now() >= deadline) throw error;
+        // Native drains one video AU at frameDurationMs cadence. Retrying here
+        // turns its deliberately bounded queue into Socket.IO/FFmpeg
+        // backpressure instead of dropping a burst from VideoToolbox.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+  }
+
+  private async abortFaceTimeLiveVideo(sessionId: string): Promise<void> {
+    const transcoder = this.#faceTimeLiveVideoTranscoders.get(sessionId);
+    if (!transcoder) return;
+    this.#faceTimeLiveVideoTranscoders.delete(sessionId);
+    await transcoder.abort().catch((error) => this.app.log.error(error));
+    if (transcoder.nativeStarted) {
+      await this.service.finishNativeFaceTimeLiveVideoStream(sessionId).catch((error) =>
+        this.app.log.error(error));
+    }
+  }
+
   private configureSocketRequests(socket: Socket): void {
     const uploads = new Map<string, SocketUpload>();
     const response = (callback: unknown, channel: string, payload: BlueBubblesResponse): void => {
@@ -2641,21 +2776,22 @@ export class BlueBubblesServer {
           );
         }
         const owner = this.#faceTimeIncomingLiveOwners.get(sessionId);
-        if (owner && owner.socketId !== socket.id) {
-          throw new RequestError(403, "Another socket owns this incoming call", "FORBIDDEN");
+        if (owner?.audioSocketId && owner.audioSocketId !== socket.id) {
+          throw new RequestError(403, "Another socket owns this incoming audio stream", "FORBIDDEN");
         }
         this.#faceTimeIncomingLiveOwners.set(sessionId, {
-          socketId: socket.id,
-          audio: true,
-          video: owner?.video ?? false,
+          ...owner,
+          audioSocketId: socket.id,
         });
         try {
-          return await this.service.startNativeFaceTimeLiveAudioStream(sessionId);
+          return await this.service.startNativeFaceTimeLiveAudioStream(sessionId, {
+            ...optionalLiveMediaClock(body),
+          });
         } catch (error) {
           const current = this.#faceTimeIncomingLiveOwners.get(sessionId);
-          if (current?.socketId === socket.id) {
-            if (current.video) current.audio = false;
-            else this.#faceTimeIncomingLiveOwners.delete(sessionId);
+          if (current?.audioSocketId === socket.id) {
+            delete current.audioSocketId;
+            if (!current.videoSocketId) this.#faceTimeIncomingLiveOwners.delete(sessionId);
           }
           throw error;
         }
@@ -2681,7 +2817,7 @@ export class BlueBubblesServer {
       void (async () => {
         const sessionId = requiredString(body, "sessionId");
         const owner = this.#faceTimeIncomingLiveOwners.get(sessionId);
-        if (owner?.socketId !== socket.id || !owner.audio) {
+        if (owner?.audioSocketId !== socket.id) {
           throw new RequestError(403, "This socket does not own the live audio stream", "FORBIDDEN");
         }
         const data = body.data;
@@ -2692,7 +2828,11 @@ export class BlueBubblesServer {
             "VALIDATION_ERROR",
           );
         }
-        return this.service.pushNativeFaceTimeLiveAudioFrame(sessionId, data);
+        return this.service.pushNativeFaceTimeLiveAudioFrame(
+          sessionId,
+          data,
+          optionalPresentationTimeUs(body),
+        );
       })()
         .then((result) => response(
           callback,
@@ -2715,12 +2855,12 @@ export class BlueBubblesServer {
       void (async () => {
         const sessionId = requiredString(body, "sessionId");
         const owner = this.#faceTimeIncomingLiveOwners.get(sessionId);
-        if (owner?.socketId !== socket.id || !owner.audio) {
+        if (owner?.audioSocketId !== socket.id) {
           throw new RequestError(403, "This socket does not own the live audio stream", "FORBIDDEN");
         }
         const result = await this.service.finishNativeFaceTimeLiveAudioStream(sessionId);
-        owner.audio = false;
-        if (!owner.video) this.#faceTimeIncomingLiveOwners.delete(sessionId);
+        delete owner.audioSocketId;
+        if (!owner.videoSocketId) this.#faceTimeIncomingLiveOwners.delete(sessionId);
         return result;
       })()
         .then((result) => response(
@@ -2761,11 +2901,15 @@ export class BlueBubblesServer {
         if (incoming.mode !== "video") {
           throw new RequestError(409, "Live video requires an incoming FaceTime Video call", "INVALID_STATE");
         }
-        const imageDescription = body.imageDescription;
-        if (!Buffer.isBuffer(imageDescription)) {
+        const inputFormatValue = body.inputFormat ?? "hevc-annex-b";
+        if (typeof inputFormatValue !== "string") {
+          throw new RequestError(400, "inputFormat must be a string", "VALIDATION_ERROR");
+        }
+        const inputFormat = inputFormatValue.toLowerCase();
+        if (!["hevc-annex-b", "h264-annex-b", "raw-rgba", "raw-bgra"].includes(inputFormat)) {
           throw new RequestError(
             400,
-            "imageDescription must be a Socket.IO binary Buffer containing one hvc1 sample entry",
+            "inputFormat must be hevc-annex-b, h264-annex-b, raw-rgba, or raw-bgra",
             "VALIDATION_ERROR",
           );
         }
@@ -2780,25 +2924,92 @@ export class BlueBubblesServer {
           );
         }
         const owner = this.#faceTimeIncomingLiveOwners.get(sessionId);
-        if (owner && owner.socketId !== socket.id) {
-          throw new RequestError(403, "Another socket owns this incoming call", "FORBIDDEN");
+        if (owner?.videoSocketId && owner.videoSocketId !== socket.id) {
+          throw new RequestError(403, "Another socket owns this incoming video stream", "FORBIDDEN");
+        }
+        if (owner?.videoSocketId) {
+          throw new RequestError(409, "This incoming call already has a live video stream", "INVALID_STATE");
         }
         this.#faceTimeIncomingLiveOwners.set(sessionId, {
-          socketId: socket.id,
-          audio: owner?.audio ?? false,
-          video: true,
+          ...owner,
+          videoSocketId: socket.id,
         });
         try {
-          return await this.service.startNativeFaceTimeLiveVideoStream({
+          if (inputFormat === "hevc-annex-b") {
+            const imageDescription = body.imageDescription;
+            if (!Buffer.isBuffer(imageDescription)) {
+              throw new RequestError(
+                400,
+                "imageDescription must be a Socket.IO binary Buffer containing one hvc1 sample entry for hevc-annex-b passthrough",
+                "VALIDATION_ERROR",
+              );
+            }
+            return await this.service.startNativeFaceTimeLiveVideoStream({
+              sessionId,
+              imageDescription,
+              frameDurationMs,
+              ...optionalLiveMediaClock(body),
+            });
+          }
+
+          const width = inputFormat.startsWith("raw-")
+            ? numberValue(body.width, Number.NaN)
+            : undefined;
+          const height = inputFormat.startsWith("raw-")
+            ? numberValue(body.height, Number.NaN)
+            : undefined;
+          let transcoder: FaceTimeLiveVideoTranscoderController;
+          try {
+            transcoder = this.#faceTimeLiveVideoTranscoderFactory({
+              inputFormat: inputFormat as FaceTimeLiveVideoInputFormat,
+              ...(width === undefined ? {} : { width }),
+              ...(height === undefined ? {} : { height }),
+              frameDurationMs,
+              onStart: (generatedDescription) =>
+                this.service.startNativeFaceTimeLiveVideoStream({
+                  sessionId,
+                  imageDescription: generatedDescription,
+                  frameDurationMs,
+                  ...optionalLiveMediaClock(body),
+                }).then(() => undefined),
+              onFrame: (accessUnit, presentationTimeUs) =>
+                this.pushFaceTimeLiveVideoWithBackpressure(
+                  sessionId,
+                  accessUnit,
+                  presentationTimeUs,
+                )
+                  .then(() => undefined),
+            });
+          } catch (error) {
+            throw new RequestError(
+              400,
+              error instanceof Error ? error.message : String(error),
+              "VALIDATION_ERROR",
+            );
+          }
+          await transcoder.start();
+          this.#faceTimeLiveVideoTranscoders.set(sessionId, transcoder);
+          return {
             sessionId,
-            imageDescription,
-            frameDurationMs,
-          });
+            state: "encoder-ready",
+            inputFormat,
+            ...(transcoder.inputFrameBytes === undefined
+              ? {}
+              : { inputFrameBytes: transcoder.inputFrameBytes }),
+            outputFormat: "hevc-annex-b",
+            outputWidth: 1_280,
+            outputHeight: 720,
+            resizeMode: "contain-black",
+            nativeStarted: false,
+          };
         } catch (error) {
+          const transcoder = this.#faceTimeLiveVideoTranscoders.get(sessionId);
+          this.#faceTimeLiveVideoTranscoders.delete(sessionId);
+          await transcoder?.abort().catch(() => undefined);
           const current = this.#faceTimeIncomingLiveOwners.get(sessionId);
-          if (current?.socketId === socket.id) {
-            if (current.audio) current.video = false;
-            else this.#faceTimeIncomingLiveOwners.delete(sessionId);
+          if (current?.videoSocketId === socket.id) {
+            delete current.videoSocketId;
+            if (!current.audioSocketId) this.#faceTimeIncomingLiveOwners.delete(sessionId);
           }
           throw error;
         }
@@ -2824,18 +3035,67 @@ export class BlueBubblesServer {
       void (async () => {
         const sessionId = requiredString(body, "sessionId");
         const owner = this.#faceTimeIncomingLiveOwners.get(sessionId);
-        if (owner?.socketId !== socket.id || !owner.video) {
+        if (owner?.videoSocketId !== socket.id) {
           throw new RequestError(403, "This socket does not own the live video stream", "FORBIDDEN");
         }
         const data = body.data;
-        if (!Buffer.isBuffer(data) || data.length === 0 || data.length > 4 * 1024 * 1024) {
+        if (!Buffer.isBuffer(data) || data.length === 0) {
           throw new RequestError(
             400,
-            "data must be a Socket.IO binary Buffer containing one Annex-B H.265 access unit (maximum 4 MiB)",
+            "data must be a non-empty Socket.IO binary Buffer",
             "VALIDATION_ERROR",
           );
         }
-        return this.service.pushNativeFaceTimeLiveVideoFrame(sessionId, data);
+        const transcoder = this.#faceTimeLiveVideoTranscoders.get(sessionId);
+        if (transcoder) {
+          if (
+            transcoder.inputFrameBytes !== undefined
+            && data.length !== transcoder.inputFrameBytes
+          ) {
+            throw new RequestError(
+              400,
+              `Raw video frame must contain exactly ${transcoder.inputFrameBytes} bytes`,
+              "VALIDATION_ERROR",
+            );
+          }
+          if (transcoder.inputFrameBytes === undefined && data.length > 4 * 1024 * 1024) {
+            throw new RequestError(
+              400,
+              "Annex-B H.264 access unit exceeds 4 MiB",
+              "VALIDATION_ERROR",
+            );
+          }
+          try {
+            const presentationTimeUs = optionalPresentationTimeUs(body);
+            await transcoder.push(data, presentationTimeUs);
+            return {
+              sessionId,
+              state: "accepted",
+              inputFormat: transcoder.inputFormat,
+              inputBytes: data.length,
+              nativeStarted: transcoder.nativeStarted,
+              ...(presentationTimeUs === undefined ? {} : { presentationTimeUs }),
+            };
+          } catch (error) {
+            throw new RequestError(
+              500,
+              error instanceof Error ? error.message : String(error),
+              "VIDEO_TRANSCODE_ERROR",
+            );
+          }
+        }
+        if (data.length > 4 * 1024 * 1024) {
+          throw new RequestError(
+            400,
+            "Annex-B H.265 access unit exceeds 4 MiB",
+            "VALIDATION_ERROR",
+          );
+        }
+        return this.pushFaceTimeLiveVideoWithBackpressure(
+          sessionId,
+          data,
+          optionalPresentationTimeUs(body),
+        );
       })()
         .then((result) => response(
           callback,
@@ -2858,13 +3118,15 @@ export class BlueBubblesServer {
       void (async () => {
         const sessionId = requiredString(body, "sessionId");
         const owner = this.#faceTimeIncomingLiveOwners.get(sessionId);
-        if (owner?.socketId !== socket.id || !owner.video) {
+        if (owner?.videoSocketId !== socket.id) {
           throw new RequestError(403, "This socket does not own the live video stream", "FORBIDDEN");
         }
-        const result = await this.service.finishNativeFaceTimeLiveVideoStream(sessionId);
-        owner.video = false;
-        if (!owner.audio) this.#faceTimeIncomingLiveOwners.delete(sessionId);
-        return result;
+        try {
+          return await this.finishFaceTimeLiveVideo(sessionId);
+        } finally {
+          delete owner.videoSocketId;
+          if (!owner.audioSocketId) this.#faceTimeIncomingLiveOwners.delete(sessionId);
+        }
       })()
         .then((result) => response(
           callback,
@@ -2914,6 +3176,7 @@ export class BlueBubblesServer {
       const body = asRecord(params);
       void (async () => {
         const sessionId = requiredString(body, "sessionId");
+        await this.abortFaceTimeLiveVideo(sessionId);
         const result = await this.service.leaveFaceTimeSession(sessionId);
         await this.revokeFaceTimeSubscriptions(sessionId);
         this.#faceTimeIncomingLiveOwners.delete(sessionId);
@@ -3577,20 +3840,31 @@ export class BlueBubblesServer {
           this.app.log.error(error));
       }
       for (const [sessionId, owner] of [...this.#faceTimeIncomingLiveOwners]) {
-        if (owner.socketId !== socket.id) continue;
-        this.#faceTimeIncomingLiveOwners.delete(sessionId);
+        const ownsAudio = owner.audioSocketId === socket.id;
+        const ownsVideo = owner.videoSocketId === socket.id;
+        if (!ownsAudio && !ownsVideo) continue;
+        if (ownsAudio) delete owner.audioSocketId;
+        if (ownsVideo) delete owner.videoSocketId;
+        const noTrackOwner = !owner.audioSocketId && !owner.videoSocketId;
+        if (noTrackOwner) this.#faceTimeIncomingLiveOwners.delete(sessionId);
         void (async () => {
-          if (owner.audio) {
+          if (ownsAudio) {
             await this.service.finishNativeFaceTimeLiveAudioStream(sessionId).catch((error) =>
               this.app.log.error(error));
           }
-          if (owner.video) {
-            await this.service.finishNativeFaceTimeLiveVideoStream(sessionId).catch((error) =>
-              this.app.log.error(error));
+          if (ownsVideo) {
+            if (this.#faceTimeLiveVideoTranscoders.has(sessionId)) {
+              await this.abortFaceTimeLiveVideo(sessionId);
+            } else {
+              await this.service.finishNativeFaceTimeLiveVideoStream(sessionId).catch((error) =>
+                this.app.log.error(error));
+            }
           }
-          await this.service.leaveFaceTimeSession(sessionId).catch((error) =>
-            this.app.log.error(error));
-          await this.revokeFaceTimeSubscriptions(sessionId);
+          if (noTrackOwner) {
+            await this.service.leaveFaceTimeSession(sessionId).catch((error) =>
+              this.app.log.error(error));
+            await this.revokeFaceTimeSubscriptions(sessionId);
+          }
         })();
       }
     });
@@ -4137,6 +4411,55 @@ function numberValue(value: unknown, fallback: number): number {
 function positiveInteger(value: unknown): number | undefined {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function optionalPresentationTimeUs(body: Record<string, unknown>): number | undefined {
+  if (body.presentationTimeUs === undefined) return undefined;
+  const value = numberValue(body.presentationTimeUs, Number.NaN);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RequestError(
+      400,
+      "presentationTimeUs must be a non-negative safe integer",
+      "VALIDATION_ERROR",
+    );
+  }
+  return value;
+}
+
+function optionalLiveMediaClock(body: Record<string, unknown>): {
+  mediaEpochUnixMs?: number;
+  rtpTimestampBase?: number;
+} {
+  const mediaEpochUnixMs = body.mediaEpochUnixMs === undefined
+    ? undefined
+    : numberValue(body.mediaEpochUnixMs, Number.NaN);
+  if (
+    mediaEpochUnixMs !== undefined
+    && (!Number.isSafeInteger(mediaEpochUnixMs) || mediaEpochUnixMs < 0)
+  ) {
+    throw new RequestError(
+      400,
+      "mediaEpochUnixMs must be a non-negative safe integer",
+      "VALIDATION_ERROR",
+    );
+  }
+  const rtpTimestampBase = body.rtpTimestampBase === undefined
+    ? undefined
+    : numberValue(body.rtpTimestampBase, Number.NaN);
+  if (
+    rtpTimestampBase !== undefined
+    && (!Number.isSafeInteger(rtpTimestampBase) || rtpTimestampBase < 0 || rtpTimestampBase > 0xffff_ffff)
+  ) {
+    throw new RequestError(
+      400,
+      "rtpTimestampBase must be an unsigned 32-bit integer",
+      "VALIDATION_ERROR",
+    );
+  }
+  return {
+    ...(mediaEpochUnixMs === undefined ? {} : { mediaEpochUnixMs }),
+    ...(rtpTimestampBase === undefined ? {} : { rtpTimestampBase }),
+  };
 }
 
 function outboundEffectId(effectIdValue: unknown, flairValue: unknown): string | undefined {

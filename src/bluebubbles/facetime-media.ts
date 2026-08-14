@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -91,6 +91,17 @@ export interface FaceTimeCall {
   nativePeerAudioFeedbackSequence?: number;
   nativePeerAudioKbReceived?: number;
   nativePeerAudioPacketsReceived?: number;
+  nativePeerAudioBurstLoss?: number;
+  nativePeerAudioQueuingDelay?: number;
+  nativePeerAudioCurrentSendTimestamp?: number;
+  nativePeerAudioQ13OneWayDelay?: number;
+  nativePeerAudioOneWayDelayMs?: number;
+  nativePeerVideoBurstLoss?: number;
+  nativePeerVideoFrameSize?: number;
+  nativePeerVideoPacketLoss?: number;
+  nativePeerBandwidthEstimate?: number;
+  nativePeerEct?: number;
+  nativePeerCe?: number;
   nativePeerAudioPayloadType?: number;
   nativePeerAudioRtpExtensionProfile?: number;
   nativePeerAudioRtpExtensionHex?: string;
@@ -98,6 +109,10 @@ export interface FaceTimeCall {
   nativePeerVideoSsrc?: number;
   nativePeerVideoRtpExtensionProfile?: number;
   nativePeerVideoRtpExtensionHex?: string;
+  nativeMediaEpochUnixMs?: number;
+  nativeRtpTimestampBase?: number;
+  nativeAudioLastPresentationTimeUs?: number;
+  nativeVideoLastPresentationTimeUs?: number;
   error?: string;
   transport: "iblue-quickrelay" | "apple-web-bridge";
 }
@@ -267,21 +282,68 @@ function extractHevcParameterSets(sampleEntry: Buffer): Map<number, Buffer> {
   return parameterSets;
 }
 
-/**
- * Convert FFmpeg's hvc1 sample entry into the exact ImageDescription shape
- * emitted by Apple's AVConference stack. The decoder parameter sets remain
- * those of the encoded source; container-only fields use Apple's canonical
- * values instead of FFmpeg's data reference, vendor, compressor name, and
- * optional fiel/pasp child boxes.
- */
-export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
-  const sourceEntry = extractHvc1SampleEntry(movie);
-  const width = sourceEntry.readUInt16BE(32);
-  const height = sourceEntry.readUInt16BE(34);
-  if (width === 0 || height === 0) {
+interface AnnexBNalUnit {
+  offset: number;
+  startCodeLength: 3 | 4;
+  type: number;
+  data: Buffer;
+}
+
+function annexBNalUnits(data: Buffer, codec: "h264" | "h265"): AnnexBNalUnit[] {
+  const starts: Array<{ offset: number; length: 3 | 4 }> = [];
+  for (let offset = 0; offset + 3 <= data.length;) {
+    if (
+      offset + 4 <= data.length
+      && data[offset] === 0
+      && data[offset + 1] === 0
+      && data[offset + 2] === 0
+      && data[offset + 3] === 1
+    ) {
+      starts.push({ offset, length: 4 });
+      offset += 4;
+      continue;
+    }
+    if (data[offset] === 0 && data[offset + 1] === 0 && data[offset + 2] === 1) {
+      starts.push({ offset, length: 3 });
+      offset += 3;
+      continue;
+    }
+    offset += 1;
+  }
+  return starts.flatMap((start, index) => {
+    const payloadOffset = start.offset + start.length;
+    const end = starts[index + 1]?.offset ?? data.length;
+    if (payloadOffset >= end) return [];
+    const first = data[payloadOffset]!;
+    return [{
+      offset: start.offset,
+      startCodeLength: start.length,
+      type: codec === "h265" ? (first >> 1) & 0x3f : first & 0x1f,
+      data: Buffer.from(data.subarray(payloadOffset, end)),
+    }];
+  });
+}
+
+function buildFaceTimeHvc1SampleEntryFromParameterSets(
+  parameterSets: ReadonlyMap<number, Buffer>,
+  width: number,
+  height: number,
+): Buffer {
+  if (
+    !Number.isSafeInteger(width)
+    || !Number.isSafeInteger(height)
+    || width < 1
+    || width > 0xffff
+    || height < 1
+    || height > 0xffff
+  ) {
     throw new Error("Encoded FaceTime hvc1 sample entry has invalid dimensions");
   }
-  const parameterSets = extractHevcParameterSets(sourceEntry);
+  for (const nalType of [32, 33, 34]) {
+    if (!parameterSets.has(nalType)) {
+      throw new Error(`Encoded FaceTime stream is missing HEVC NAL type ${nalType}`);
+    }
+  }
   const arrays: Buffer[] = [];
   for (const nalType of [32, 33, 34]) {
     const nal = parameterSets.get(nalType)!;
@@ -324,10 +386,6 @@ export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
   entry.writeUInt16BE(0xffff, 14);
   entry.writeUInt32BE(512, 24);
   entry.writeUInt32BE(512, 28);
-  // The VisualSampleEntry dimensions must match the HEVC SPS. This remains
-  // important for diagnostic passthrough and any future non-1080p encoder:
-  // mismatched dimensions make VideoToolbox allocate the wrong surface,
-  // causing rotation-like tiling and stretched edge columns on the receiver.
   entry.writeUInt16BE(width, 32);
   entry.writeUInt16BE(height, 34);
   entry.writeUInt32BE(0x0048_0000, 36);
@@ -339,6 +397,358 @@ export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
   entry.writeInt16BE(-1, 84);
   hvcC.copy(entry, 86);
   return entry;
+}
+
+/**
+ * Convert FFmpeg's hvc1 sample entry into the exact ImageDescription shape
+ * emitted by Apple's AVConference stack. The decoder parameter sets remain
+ * those of the encoded source; container-only fields use Apple's canonical
+ * values instead of FFmpeg's data reference, vendor, compressor name, and
+ * optional fiel/pasp child boxes.
+ */
+export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
+  const sourceEntry = extractHvc1SampleEntry(movie);
+  const width = sourceEntry.readUInt16BE(32);
+  const height = sourceEntry.readUInt16BE(34);
+  if (width === 0 || height === 0) {
+    throw new Error("Encoded FaceTime hvc1 sample entry has invalid dimensions");
+  }
+  // The VisualSampleEntry dimensions must match the HEVC SPS. This remains
+  // important for diagnostic passthrough and any future non-1080p encoder:
+  // mismatched dimensions make VideoToolbox allocate the wrong surface,
+  // causing rotation-like tiling and stretched edge columns on the receiver.
+  return buildFaceTimeHvc1SampleEntryFromParameterSets(
+    extractHevcParameterSets(sourceEntry),
+    width,
+    height,
+  );
+}
+
+/** Build Apple's hvc1 ImageDescription directly from an Annex-B HEVC keyframe. */
+export function buildFaceTimeHvc1SampleEntryFromAnnexB(
+  accessUnit: Buffer,
+  width: number,
+  height: number,
+): Buffer {
+  const parameterSets = new Map<number, Buffer>();
+  for (const nal of annexBNalUnits(accessUnit, "h265")) {
+    if ([32, 33, 34].includes(nal.type) && !parameterSets.has(nal.type)) {
+      parameterSets.set(nal.type, nal.data);
+    }
+  }
+  return buildFaceTimeHvc1SampleEntryFromParameterSets(parameterSets, width, height);
+}
+
+export interface FaceTimeHevcAccessUnitSplit {
+  frames: Buffer[];
+  remainder: Buffer;
+}
+
+/**
+ * Split a streaming Annex-B HEVC byte sequence at Access Unit Delimiters.
+ * The final AU stays buffered until another AUD arrives, unless `flush` is set.
+ */
+export function splitFaceTimeHevcAccessUnits(
+  data: Buffer,
+  flush = false,
+): FaceTimeHevcAccessUnitSplit {
+  const audOffsets = annexBNalUnits(data, "h265")
+    .filter((nal) => nal.type === 35)
+    .map((nal) => nal.offset);
+  if (audOffsets.length === 0) {
+    if (flush && data.length > 0) return { frames: [Buffer.from(data)], remainder: Buffer.alloc(0) };
+    return { frames: [], remainder: Buffer.from(data) };
+  }
+
+  const frames: Buffer[] = [];
+  // Preserve a possible VPS/SPS/PPS preamble before the first AUD by attaching
+  // it to the first frame. VideoToolbox normally emits the AUD first, but both
+  // legal orderings contain the decoder configuration we need.
+  for (let index = 0; index + 1 < audOffsets.length; index += 1) {
+    frames.push(Buffer.from(data.subarray(
+      index === 0 ? 0 : audOffsets[index],
+      audOffsets[index + 1],
+    )));
+  }
+  const finalOffset = audOffsets[audOffsets.length - 1]!;
+  if (flush) {
+    frames.push(Buffer.from(data.subarray(audOffsets.length === 1 ? 0 : finalOffset)));
+    return { frames, remainder: Buffer.alloc(0) };
+  }
+  return { frames, remainder: Buffer.from(data.subarray(finalOffset)) };
+}
+
+export type FaceTimeLiveVideoInputFormat =
+  | "h264-annex-b"
+  | "raw-rgba"
+  | "raw-bgra";
+
+export interface FaceTimeLiveVideoTranscoderOptions {
+  inputFormat: FaceTimeLiveVideoInputFormat;
+  width?: number;
+  height?: number;
+  frameDurationMs: number;
+  ffmpegPath?: string;
+  onStart(imageDescription: Buffer): Promise<void>;
+  onFrame(accessUnit: Buffer, presentationTimeUs: number): Promise<void>;
+}
+
+export interface FaceTimeLiveVideoTranscoderController {
+  readonly inputFormat: FaceTimeLiveVideoInputFormat;
+  readonly nativeStarted: boolean;
+  readonly inputFrameBytes?: number;
+  start(): Promise<void>;
+  push(data: Buffer, presentationTimeUs?: number): Promise<void>;
+  finish(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+const LIVE_VIDEO_OUTPUT_WIDTH = 1_280;
+const LIVE_VIDEO_OUTPUT_HEIGHT = 720;
+const LIVE_VIDEO_MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const LIVE_VIDEO_MAX_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024;
+const LIVE_VIDEO_OUTPUT_QUEUE_FRAMES = 8;
+
+/**
+ * Persistent, bounded-latency converter for live camera sources. It accepts
+ * H.264 access units or packed 32-bit raw frames, then emits FaceTime-ready
+ * Annex-B HEVC while preserving aspect ratio and padding unused space black.
+ */
+export class FaceTimeLiveVideoTranscoder implements FaceTimeLiveVideoTranscoderController {
+  readonly inputFormat: FaceTimeLiveVideoInputFormat;
+  readonly inputFrameBytes?: number;
+  readonly #options: FaceTimeLiveVideoTranscoderOptions;
+  #process?: ChildProcessWithoutNullStreams;
+  #outputBuffer: Buffer = Buffer.alloc(0);
+  #outputWork: Promise<void> = Promise.resolve();
+  #processClosed?: Promise<number | null>;
+  #fatalError?: Error;
+  #started = false;
+  #finishing = false;
+  #aborted = false;
+  #nativeStarted = false;
+  #pendingOutputFrames = 0;
+  #pendingPresentationTimes: number[] = [];
+  #nextInputPresentationTimeUs = 0;
+  #nextOutputPresentationTimeUs = 0;
+  #stderr = "";
+
+  constructor(options: FaceTimeLiveVideoTranscoderOptions) {
+    this.#options = options;
+    this.inputFormat = options.inputFormat;
+    if (!Number.isSafeInteger(options.frameDurationMs)
+      || options.frameDurationMs < 20
+      || options.frameDurationMs > 100) {
+      throw new Error("frameDurationMs must be an integer between 20 and 100");
+    }
+    if (options.inputFormat.startsWith("raw-")) {
+      const width = options.width ?? 0;
+      const height = options.height ?? 0;
+      if (
+        !Number.isSafeInteger(width)
+        || !Number.isSafeInteger(height)
+        || width < 16
+        || height < 16
+        || width > 4_096
+        || height > 4_096
+        || width * height > 16_777_216
+      ) {
+        throw new Error("Raw video width and height must be integers from 16 to 4096");
+      }
+      this.inputFrameBytes = width * height * 4;
+    }
+  }
+
+  get nativeStarted(): boolean {
+    return this.#nativeStarted;
+  }
+
+  async start(): Promise<void> {
+    if (this.#started) throw new Error("Live video transcoder has already started");
+    this.#started = true;
+    const ffmpegPath = resolveExecutable(this.#options.ffmpegPath, [
+      "/opt/homebrew/bin/ffmpeg",
+      "/usr/local/bin/ffmpeg",
+      "/usr/bin/ffmpeg",
+    ]);
+    const frameRate = `1000/${this.#options.frameDurationMs}`;
+    const inputArgs = this.inputFormat === "h264-annex-b"
+      ? ["-fflags", "+genpts", "-r", frameRate, "-f", "h264", "-i", "pipe:0"]
+      : [
+        "-f", "rawvideo",
+        "-pixel_format", this.inputFormat === "raw-rgba" ? "rgba" : "bgra",
+        "-video_size", `${this.#options.width}x${this.#options.height}`,
+        "-framerate", frameRate,
+        "-i", "pipe:0",
+      ];
+    const outputFrameRate = Math.max(1, Math.round(1_000 / this.#options.frameDurationMs));
+    const args = [
+      "-hide_banner", "-loglevel", "warning", "-nostdin",
+      ...inputArgs,
+      "-map", "0:v:0", "-an",
+      "-vf", `scale=${LIVE_VIDEO_OUTPUT_WIDTH}:${LIVE_VIDEO_OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,pad=${LIVE_VIDEO_OUTPUT_WIDTH}:${LIVE_VIDEO_OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,format=nv12`,
+      "-c:v", "hevc_videotoolbox", "-realtime", "1", "-prio_speed", "1",
+      "-tag:v", "hvc1", "-b:v", "600k", "-maxrate", "700k", "-bufsize", "1200k",
+      "-g", String(outputFrameRate), "-bf", "0",
+      "-r", frameRate,
+      "-bsf:v", "hevc_metadata=aud=insert",
+      "-f", "hevc", "-flush_packets", "1", "pipe:1",
+    ];
+    const child = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+    this.#process = child;
+    child.stdout.on("data", (chunk: Buffer) => this.#acceptOutput(chunk));
+    child.stdout.on("end", () => this.#flushOutput());
+    child.stderr.on("data", (chunk: Buffer) => {
+      this.#stderr = (this.#stderr + chunk.toString("utf8")).slice(-8_192);
+    });
+    this.#processClosed = new Promise((resolve) => {
+      child.once("error", (error) => {
+        const wrapped = new Error(`Live video FFmpeg failed to start: ${error.message}`);
+        this.#recordFatal(wrapped);
+        // `start()` has its own error listener so callers receive the failure;
+        // keep the lifecycle promise fulfilled to avoid an orphan rejection
+        // when process creation itself fails and there is nothing to finish.
+        resolve(null);
+      });
+      child.once("close", (code) => resolve(code));
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+  }
+
+  async push(data: Buffer, presentationTimeUs?: number): Promise<void> {
+    this.#throwIfUnusable();
+    if (!Buffer.isBuffer(data) || data.length === 0) {
+      throw new Error("Live video data must be a non-empty Buffer");
+    }
+    if (this.inputFrameBytes !== undefined && data.length !== this.inputFrameBytes) {
+      throw new Error(`Raw video frame must contain exactly ${this.inputFrameBytes} bytes`);
+    }
+    if (this.inputFrameBytes === undefined && data.length > LIVE_VIDEO_MAX_FRAME_BYTES) {
+      throw new Error("Live H.264 access unit exceeds 4 MiB");
+    }
+    const acceptedPresentationTimeUs = presentationTimeUs ?? this.#nextInputPresentationTimeUs;
+    if (
+      !Number.isSafeInteger(acceptedPresentationTimeUs)
+      || acceptedPresentationTimeUs < this.#nextInputPresentationTimeUs
+    ) {
+      throw new Error("presentationTimeUs must be a monotonic non-negative safe integer");
+    }
+    this.#nextInputPresentationTimeUs = acceptedPresentationTimeUs
+      + this.#options.frameDurationMs * 1_000;
+    this.#pendingPresentationTimes.push(acceptedPresentationTimeUs);
+    const input = this.#process!.stdin;
+    if (!input.write(data)) {
+      await new Promise<void>((resolve, reject) => {
+        const onDrain = (): void => { cleanup(); resolve(); };
+        const onError = (error: Error): void => { cleanup(); reject(error); };
+        const cleanup = (): void => {
+          input.off("drain", onDrain);
+          input.off("error", onError);
+        };
+        input.once("drain", onDrain);
+        input.once("error", onError);
+      });
+    }
+    if (this.#fatalError) throw this.#fatalError;
+  }
+
+  async finish(): Promise<void> {
+    if (!this.#started || this.#finishing) return;
+    this.#finishing = true;
+    const child = this.#process!;
+    if (!child.stdin.destroyed) child.stdin.end();
+    const code = await this.#processClosed;
+    await this.#outputWork;
+    if (this.#fatalError) throw this.#fatalError;
+    if (code !== 0) {
+      throw new Error(`Live video FFmpeg exited with code ${code}: ${this.#stderr.trim() || "no diagnostics"}`);
+    }
+  }
+
+  async abort(): Promise<void> {
+    if (!this.#started || this.#finishing) return;
+    this.#finishing = true;
+    this.#aborted = true;
+    const child = this.#process!;
+    if (!child.stdin.destroyed) child.stdin.destroy();
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    await this.#processClosed?.catch(() => undefined);
+    await this.#outputWork.catch(() => undefined);
+  }
+
+  #throwIfUnusable(): void {
+    if (!this.#started) throw new Error("Live video transcoder has not started");
+    if (this.#finishing) throw new Error("Live video transcoder is finishing");
+    if (this.#fatalError) throw this.#fatalError;
+    if (!this.#process || this.#process.exitCode !== null) {
+      throw new Error("Live video FFmpeg is no longer running");
+    }
+  }
+
+  #acceptOutput(chunk: Buffer): void {
+    if (this.#fatalError || this.#aborted) return;
+    this.#outputBuffer = Buffer.concat([this.#outputBuffer, chunk]);
+    if (this.#outputBuffer.length > LIVE_VIDEO_MAX_OUTPUT_BUFFER_BYTES) {
+      this.#recordFatal(new Error("Live video FFmpeg output exceeded the 16 MiB buffer limit"));
+      this.#process?.kill("SIGTERM");
+      return;
+    }
+    const split = splitFaceTimeHevcAccessUnits(this.#outputBuffer);
+    this.#outputBuffer = split.remainder;
+    for (const frame of split.frames) this.#queueOutput(frame);
+  }
+
+  #flushOutput(): void {
+    if (this.#fatalError || this.#aborted) return;
+    const split = splitFaceTimeHevcAccessUnits(this.#outputBuffer, true);
+    this.#outputBuffer = split.remainder;
+    for (const frame of split.frames) this.#queueOutput(frame);
+  }
+
+  #queueOutput(frame: Buffer): void {
+    if (frame.length > LIVE_VIDEO_MAX_FRAME_BYTES) {
+      this.#recordFatal(new Error("Encoded FaceTime HEVC access unit exceeds 4 MiB"));
+      this.#process?.kill("SIGTERM");
+      return;
+    }
+    this.#pendingOutputFrames += 1;
+    const presentationTimeUs = this.#pendingPresentationTimes.shift()
+      ?? this.#nextOutputPresentationTimeUs;
+    this.#nextOutputPresentationTimeUs = presentationTimeUs
+      + this.#options.frameDurationMs * 1_000;
+    if (this.#pendingOutputFrames >= LIVE_VIDEO_OUTPUT_QUEUE_FRAMES) {
+      this.#process?.stdout.pause();
+    }
+    this.#outputWork = this.#outputWork.then(async () => {
+      if (this.#aborted) return;
+      if (!this.#nativeStarted) {
+        const imageDescription = buildFaceTimeHvc1SampleEntryFromAnnexB(
+          frame,
+          LIVE_VIDEO_OUTPUT_WIDTH,
+          LIVE_VIDEO_OUTPUT_HEIGHT,
+        );
+        await this.#options.onStart(imageDescription);
+        this.#nativeStarted = true;
+      }
+      if (this.#aborted) return;
+      await this.#options.onFrame(frame, presentationTimeUs);
+    }).catch((error: unknown) => {
+      this.#recordFatal(error instanceof Error ? error : new Error(String(error)));
+      this.#process?.kill("SIGTERM");
+    }).finally(() => {
+      this.#pendingOutputFrames -= 1;
+      if (this.#pendingOutputFrames < LIVE_VIDEO_OUTPUT_QUEUE_FRAMES) {
+        this.#process?.stdout.resume();
+      }
+    });
+  }
+
+  #recordFatal(error: Error): void {
+    this.#fatalError ??= error;
+  }
 }
 
 function publicCall(call: InternalFaceTimeCall): FaceTimeCall {
@@ -389,6 +799,27 @@ export function applyNativeFaceTimeMediaStatus(
   call.nativePeerAudioFeedbackSequence = native.peerAudioFeedbackSequence;
   call.nativePeerAudioKbReceived = native.peerAudioKbReceived;
   call.nativePeerAudioPacketsReceived = native.peerAudioPacketsReceived;
+  call.nativePeerAudioBurstLoss = native.peerAudioBurstLoss;
+  if (native.peerAudioQueuingDelay !== undefined) {
+    call.nativePeerAudioQueuingDelay = native.peerAudioQueuingDelay;
+  }
+  if (native.peerAudioCurrentSendTimestamp !== undefined) {
+    call.nativePeerAudioCurrentSendTimestamp = native.peerAudioCurrentSendTimestamp;
+  }
+  if (native.peerAudioQ13OneWayDelay !== undefined) {
+    call.nativePeerAudioQ13OneWayDelay = native.peerAudioQ13OneWayDelay;
+  }
+  if (native.peerAudioOneWayDelayMs !== undefined) {
+    call.nativePeerAudioOneWayDelayMs = native.peerAudioOneWayDelayMs;
+  }
+  if (native.peerVideoBurstLoss !== undefined) call.nativePeerVideoBurstLoss = native.peerVideoBurstLoss;
+  if (native.peerVideoFrameSize !== undefined) call.nativePeerVideoFrameSize = native.peerVideoFrameSize;
+  if (native.peerVideoPacketLoss !== undefined) call.nativePeerVideoPacketLoss = native.peerVideoPacketLoss;
+  if (native.peerBandwidthEstimate !== undefined) {
+    call.nativePeerBandwidthEstimate = native.peerBandwidthEstimate;
+  }
+  if (native.peerEct !== undefined) call.nativePeerEct = native.peerEct;
+  if (native.peerCe !== undefined) call.nativePeerCe = native.peerCe;
   if (native.peerAudioPayloadType !== undefined) {
     call.nativePeerAudioPayloadType = native.peerAudioPayloadType;
   }
@@ -407,6 +838,18 @@ export function applyNativeFaceTimeMediaStatus(
   }
   if (native.peerVideoRtpExtensionHex !== undefined) {
     call.nativePeerVideoRtpExtensionHex = native.peerVideoRtpExtensionHex;
+  }
+  if (native.mediaEpochUnixMs !== undefined) {
+    call.nativeMediaEpochUnixMs = native.mediaEpochUnixMs;
+  }
+  if (native.rtpTimestampBase !== undefined) {
+    call.nativeRtpTimestampBase = native.rtpTimestampBase;
+  }
+  if (native.audioLastPresentationTimeUs !== undefined) {
+    call.nativeAudioLastPresentationTimeUs = native.audioLastPresentationTimeUs;
+  }
+  if (native.videoLastPresentationTimeUs !== undefined) {
+    call.nativeVideoLastPresentationTimeUs = native.videoLastPresentationTimeUs;
   }
   if (native.controlLastError) call.nativeControlLastError = native.controlLastError;
   else delete call.nativeControlLastError;

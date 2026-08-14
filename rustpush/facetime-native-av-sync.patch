@@ -1,0 +1,695 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index 1f696a0..e047dde 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2206,7 +2206,7 @@ impl FTClient {
+     pub async fn native_audio_feedback_status(
+         &self,
+         group_id: &str,
+-    ) -> Option<(u64, u16, u16, u16, Option<u8>, Option<u16>, Option<String>)> {
++    ) -> Option<crate::ids::link::NativeAudioFeedbackStatus> {
+         let connection = {
+             let state = self.state.read().await;
+             state.sessions.get(group_id).and_then(|session| session.connection.clone())
+@@ -2261,11 +2261,12 @@ impl FTClient {
+     pub async fn send_native_audio_stream(
+         &self,
+         group_id: &str,
+-        packets: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        packets: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>,
+         progress: tokio::sync::mpsc::UnboundedSender<usize>,
+         payload_type: u8,
+         samples_per_packet: u32,
+         packet_duration_ms: u64,
++        media_clock: crate::ids::link::NativeMediaClock,
+     ) -> Result<(), PushError> {
+         let (connection, audio_ssrc) = {
+             let state = self.state.read().await;
+@@ -2286,6 +2287,7 @@ impl FTClient {
+                 payload_type,
+                 samples_per_packet,
+                 packet_duration_ms,
++                media_clock,
+             )
+             .await
+     }
+@@ -2325,10 +2327,11 @@ impl FTClient {
+     pub async fn send_native_video_stream(
+         &self,
+         group_id: &str,
+-        frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        frames: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>,
+         image_description: Vec<u8>,
+         progress: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+         frame_duration_ms: u64,
++        media_clock: crate::ids::link::NativeMediaClock,
+     ) -> Result<(), PushError> {
+         let (connection, video_ssrc) = {
+             let state = self.state.read().await;
+@@ -2348,6 +2351,7 @@ impl FTClient {
+                 image_description,
+                 progress,
+                 frame_duration_ms,
++                media_clock,
+             )
+             .await
+     }
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 2c2781c..f952b75 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -917,10 +917,7 @@ pub struct GlobalLinkState {
+     /// Authenticated feedback from the peer's proprietary audio RTP
+     /// extension. These counters prove whether the peer accepted outbound
+     /// SRTP independently from whether its decoder rendered the codec.
+-    audio_feedback_updates: u64,
+-    audio_feedback_sequence: u16,
+-    audio_feedback_total_kb_received: u16,
+-    audio_feedback_packets_received: u16,
++    audio_feedback: NativeAudioFeedbackStatus,
+     /// Per-participant SFrame counter for outbound VC control messages.
+     control_send_counters: HashMap<u64, u64>,
+     /// Privacy-safe native VC-control diagnostics surfaced through iBlue's
+@@ -950,6 +947,29 @@ pub struct GlobalLinkState {
+     my_skm: QuickRelaySkmMaterial,
+ }
+ 
++#[derive(Clone, Debug, Default)]
++pub struct NativeAudioFeedbackStatus {
++    pub updates: u64,
++    pub feedback_sequence: u16,
++    pub total_kb_received: u16,
++    pub audio_burst_loss: u8,
++    pub audio_packets_received: u16,
++    pub queuing_delay: Option<u16>,
++    pub current_send_timestamp: Option<u16>,
++    pub q13_one_way_delay: Option<u16>,
++    pub one_way_delay_ms: Option<u32>,
++    pub video_burst_loss: Option<u8>,
++    pub video_frame_size: Option<u8>,
++    pub video_packet_loss: Option<u8>,
++    pub bandwidth_estimate: Option<u16>,
++    pub ect: Option<u16>,
++    pub ce: Option<u16>,
++    pub connection_stats_blob: Option<[u8; 4]>,
++    pub peer_payload_type: Option<u8>,
++    pub peer_extension_profile: Option<u16>,
++    pub peer_extension_hex: Option<String>,
++}
++
+ impl GlobalLinkState {
+     fn decode_key_material(&self, material: &[u8]) -> Result<Vec<u8>, PushError> {
+         let mut ctx = BigNumContext::new()?;
+@@ -1085,6 +1105,42 @@ struct NativeAudioSender {
+     timestamp: u32,
+     packet_index: u64,
+     started: tokio::time::Instant,
++    media_clock: Option<NativeMediaClock>,
++}
++
++/// A call-level clock shared by every live media sender. Apple U1 audio and
++/// video both use a 24 kHz RTP clock, so one epoch and timestamp origin let the
++/// receiver align the two SSRCs without relying on process startup order.
++#[derive(Clone)]
++pub struct NativeMediaClock {
++    epoch: tokio::time::Instant,
++    rtp_timestamp_base: u32,
++}
++
++impl NativeMediaClock {
++    pub fn new(epoch: tokio::time::Instant, rtp_timestamp_base: u32) -> Self {
++        Self {
++            epoch,
++            rtp_timestamp_base,
++        }
++    }
++
++    fn timestamp(&self, presentation_time_us: u64) -> u32 {
++        let ticks = ((presentation_time_us as u128 * 24_000) / 1_000_000) as u32;
++        self.rtp_timestamp_base.wrapping_add(ticks)
++    }
++
++    fn deadline(&self, presentation_time_us: u64) -> tokio::time::Instant {
++        self.epoch + std::time::Duration::from_micros(presentation_time_us)
++    }
++
++    fn lateness(&self, presentation_time_us: u64) -> std::time::Duration {
++        tokio::time::Instant::now().saturating_duration_since(self.deadline(presentation_time_us))
++    }
++
++    async fn wait(&self, presentation_time_us: u64) {
++        tokio::time::sleep_until(self.deadline(presentation_time_us)).await;
++    }
+ }
+ 
+ #[derive(Debug, Default, PartialEq, Eq)]
+@@ -1176,6 +1232,7 @@ struct NativeVideoSender {
+     frame_index: u64,
+     frame_duration_ms: u64,
+     started: tokio::time::Instant,
++    media_clock: Option<NativeMediaClock>,
+ }
+ 
+ impl NativeVideoSender {
+@@ -1183,7 +1240,14 @@ impl NativeVideoSender {
+         &mut self,
+         mut frame: Vec<u8>,
+         description: Option<&[u8]>,
++        presentation_time_us: Option<u64>,
+     ) -> Result<(u64, u64), PushError> {
++        if let (Some(clock), Some(presentation_time_us)) =
++            (&self.media_clock, presentation_time_us)
++        {
++            clock.wait(presentation_time_us).await;
++            self.timestamp = clock.timestamp(presentation_time_us);
++        }
+         append_native_hevc_footer(&mut frame);
+         let mut payloads = self
+             .hevc
+@@ -1236,6 +1300,25 @@ impl NativeVideoSender {
+         let payload_bytes = payloads.iter().map(|payload| payload.len() as u64).sum();
+ 
+         for (index, payload) in payloads.into_iter().enumerate() {
++            // A video AU commonly spans several UDP datagrams. Sending every
++            // fragment in one burst can monopolize the shared path long enough
++            // to starve audio and overflow AVConference's receive queue. Pace
++            // fragments across this frame's interval; absolute deadlines keep
++            // scheduler jitter from accumulating between packets.
++            if index > 0 {
++                if let (Some(clock), Some(presentation_time_us)) =
++                    (&self.media_clock, presentation_time_us)
++                {
++                    let packet_offset_us = self
++                        .frame_duration_ms
++                        .saturating_mul(1_000)
++                        .saturating_mul(index as u64)
++                        / packet_count;
++                    clock
++                        .wait(presentation_time_us.saturating_add(packet_offset_us))
++                        .await;
++                }
++            }
+             let packet = Packet {
+                 header: Header {
+                     version: 2,
+@@ -1281,41 +1364,36 @@ impl NativeVideoSender {
+         }
+ 
+         self.frame_number = self.frame_number.wrapping_add(1);
+-        self.timestamp = self.timestamp.wrapping_add(self.timestamp_increment);
+         self.frame_index = self.frame_index.saturating_add(1);
+-        let deadline = self.started
+-            + std::time::Duration::from_millis(
+-                self.frame_index.saturating_mul(self.frame_duration_ms),
+-            );
+-        tokio::time::sleep_until(deadline).await;
++        if presentation_time_us.is_none() {
++            self.timestamp = self.timestamp.wrapping_add(self.timestamp_increment);
++            let deadline = self.started
++                + std::time::Duration::from_millis(
++                    self.frame_index.saturating_mul(self.frame_duration_ms),
++                );
++            tokio::time::sleep_until(deadline).await;
++        }
+         Ok((packet_count, payload_bytes))
+     }
+ }
+ 
+ impl NativeAudioSender {
+-    async fn send_packet(&mut self, payload: Vec<u8>) -> Result<usize, PushError> {
+-        let payload_len = payload.len();
+-        if self.payload_type == 104 && payload_len > u8::MAX as usize {
+-            warn!(
+-                "FaceTime AAC-ELD access unit is too large for Apple audio framing: {} bytes",
+-                payload_len,
+-            );
+-            return Err(PushError::BadMsg);
++    async fn send_packet(
++        &mut self,
++        payload: Vec<u8>,
++        presentation_time_us: Option<u64>,
++    ) -> Result<usize, PushError> {
++        if let (Some(clock), Some(presentation_time_us)) =
++            (&self.media_clock, presentation_time_us)
++        {
++            clock.wait(presentation_time_us).await;
++            self.timestamp = clock.timestamp(presentation_time_us);
+         }
+-
+-        // PT104 carries one-byte-length-prefixed AAC-ELD access units. PT108
+-        // carries one complete EVS payload (including Apple's three-frame
+-        // bundle produced by VCAudioPayload) without an outer prefix.
+-        let framed_payload = if self.payload_type == 104 {
+-            let mut framed = Vec::with_capacity(payload_len + 1);
+-            framed.push(payload_len as u8);
+-            framed.extend_from_slice(&payload);
+-            framed
+-        } else if self.payload_type == 108 {
+-            payload
+-        } else {
+-            return Err(PushError::BadMsg);
+-        };
++        let payload_len = payload.len();
++        // Apple's VCPacketBundler prepends a one-byte access-unit length for
++        // both AAC-ELD/PT104 and EVS/PT108. VCAudioPayload produces the EVS
++        // codec bytes but does not add this RTP framing layer.
++        let framed_payload = frame_native_audio_payload(self.payload_type, payload)?;
+ 
+         let current_send = ((self.timestamp as u64 + 52_676) * 16 / 375) as u16;
+         let mut audio_control = vec![0u8; 20];
+@@ -1362,17 +1440,50 @@ impl NativeAudioSender {
+         }
+ 
+         self.sequence_number = self.sequence_number.wrapping_add(1);
+-        self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
+         self.packet_index = self.packet_index.saturating_add(1);
+-        let deadline = self.started
+-            + std::time::Duration::from_millis(
+-                self.packet_index.saturating_mul(self.packet_duration_ms),
+-            );
+-        tokio::time::sleep_until(deadline).await;
++        if presentation_time_us.is_none() {
++            self.timestamp = self.timestamp.wrapping_add(self.samples_per_packet);
++            let deadline = self.started
++                + std::time::Duration::from_millis(
++                    self.packet_index.saturating_mul(self.packet_duration_ms),
++                );
++            tokio::time::sleep_until(deadline).await;
++        }
+         Ok(payload_len)
+     }
+ }
+ 
++fn frame_native_audio_payload(payload_type: u8, payload: Vec<u8>) -> Result<Vec<u8>, PushError> {
++    if !matches!(payload_type, 104 | 108) || payload.len() > u8::MAX as usize {
++        return Err(PushError::BadMsg);
++    }
++    let mut framed = Vec::with_capacity(payload.len() + 1);
++    framed.push(payload.len() as u8);
++    framed.extend_from_slice(&payload);
++    Ok(framed)
++}
++
++fn native_hevc_is_random_access(frame: &[u8]) -> bool {
++    let mut offset = 0usize;
++    while offset + 4 < frame.len() {
++        let start_code_len = if frame[offset..].starts_with(&[0, 0, 0, 1]) {
++            4
++        } else if frame[offset..].starts_with(&[0, 0, 1]) {
++            3
++        } else {
++            offset += 1;
++            continue;
++        };
++        let nal_offset = offset + start_code_len;
++        let nal_type = (frame[nal_offset] >> 1) & 0x3f;
++        if (16..=23).contains(&nal_type) {
++            return true;
++        }
++        offset = nal_offset + 1;
++    }
++    false
++}
++
+ impl GlobalLink {
+     async fn connect_to_relay(response: &QuickRelayAllocationsResponse, incoming: tokio::sync::mpsc::Sender<GlobalPacket>) -> Result<(quinn::Connection, SendRequest<h3_quinn::OpenStreams, rasn::prelude::OctetString>), PushError> {
+         let mut client_crypto: ClientConfig = rustls::ClientConfig::builder()
+@@ -1418,8 +1529,23 @@ impl GlobalLink {
+         let item = runtime.wrap_udp_socket(connection.try_clone()?)?;
+         let channel_send = tokio::net::UdpSocket::from_std(connection)?;
+ 
+-        let client_config =
++        let mut transport_config = quinn::TransportConfig::default();
++        // The QuickRelay indication request can be quiet for the entire media
++        // portion of a one-to-one call. Quinn's default has no keepalive, so a
++        // healthy long call otherwise loses its H3 control connection around
++        // the idle timeout and iOS enters the reconnecting state. QUIC PINGs
++        // keep that relay/control leg alive while RTP continues over the direct
++        // path.
++        transport_config
++            .keep_alive_interval(Some(std::time::Duration::from_secs(5)))
++            .max_idle_timeout(Some(
++                std::time::Duration::from_secs(120)
++                    .try_into()
++                    .expect("QuickRelay idle timeout should fit QUIC varint"),
++            ));
++        let mut client_config =
+             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
++        client_config.transport_config(Arc::new(transport_config));
+         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+             EndpointConfig::default(),
+             None,
+@@ -2135,7 +2261,7 @@ impl GlobalLink {
+         self.bootstrap_session().await
+     }
+ 
+-    fn parse_audio_feedback(header: &rtc_rtp::Header) -> Option<(u16, u16, u16)> {
++    fn parse_audio_feedback(header: &rtc_rtp::Header) -> Option<NativeAudioFeedbackStatus> {
+         if !matches!(header.payload_type, 20 | 104 | 108 | 13) || !header.extension {
+             return None;
+         }
+@@ -2143,14 +2269,71 @@ impl GlobalLink {
+         if header.extension_profile >> 14 != 2 || payload.len() < 6 {
+             return None;
+         }
+-        let feedback_sequence = u16::from_be_bytes(payload[0..2].try_into().ok()?);
+-        let total_kb_received = u16::from_be_bytes(payload[2..4].try_into().ok()?);
+-        let packed_audio_receive_stats = u16::from_be_bytes(payload[4..6].try_into().ok()?);
+-        Some((
++        let marker = (header.extension_profile >> 8) as u8;
++        let mut cursor = 0usize;
++        let take_u16 = |cursor: &mut usize| -> Option<u16> {
++            let end = cursor.checked_add(2)?;
++            let value = u16::from_be_bytes(payload.get(*cursor..end)?.try_into().ok()?);
++            *cursor = end;
++            Some(value)
++        };
++        let feedback_sequence = take_u16(&mut cursor)?;
++        let total_kb_received = take_u16(&mut cursor)?;
++        let packed_audio = take_u16(&mut cursor)?;
++        let (queuing_delay, current_send_timestamp, q13_one_way_delay) =
++            if marker & 0x01 != 0 {
++                (
++                    Some(take_u16(&mut cursor)?),
++                    Some(take_u16(&mut cursor)?),
++                    Some(take_u16(&mut cursor)?),
++                )
++            } else {
++                (None, None, None)
++            };
++        let (video_burst_loss, video_frame_size, video_packet_loss, bandwidth_estimate) =
++            if marker & 0x04 != 0 {
++                let packed_video = take_u16(&mut cursor)?;
++                (
++                    Some((packed_video >> 12) as u8),
++                    Some(((packed_video >> 6) & 0x3f) as u8),
++                    Some((packed_video & 0x3f) as u8),
++                    Some(take_u16(&mut cursor)?),
++                )
++            } else {
++                (None, None, None, None)
++            };
++        let (ect, ce) = if marker & 0x08 != 0 {
++            (Some(take_u16(&mut cursor)?), Some(take_u16(&mut cursor)?))
++        } else {
++            (None, None)
++        };
++        let connection_stats_blob = if marker & 0x02 != 0 {
++            let end = cursor.checked_add(4)?;
++            Some(payload.get(cursor..end)?.try_into().ok()?)
++        } else {
++            None
++        };
++        Some(NativeAudioFeedbackStatus {
+             feedback_sequence,
+             total_kb_received,
+-            packed_audio_receive_stats & 0x0fff,
+-        ))
++            audio_burst_loss: (packed_audio >> 12) as u8,
++            audio_packets_received: packed_audio & 0x0fff,
++            queuing_delay,
++            current_send_timestamp,
++            q13_one_way_delay,
++            one_way_delay_ms: q13_one_way_delay.map(|value| value as u32 * 125 / 1024),
++            video_burst_loss,
++            video_frame_size,
++            video_packet_loss,
++            bandwidth_estimate,
++            ect,
++            ce,
++            connection_stats_blob,
++            peer_payload_type: Some(header.payload_type),
++            peer_extension_profile: Some(header.extension_profile),
++            peer_extension_hex: Some(encode_hex(payload)),
++            ..Default::default()
++        })
+     }
+ 
+     pub async fn remember_audio_header(&self, header: &rtc_rtp::Header, participant: Option<u64>) {
+@@ -2160,43 +2343,15 @@ impl GlobalLink {
+         if matches!(header.payload_type, 20 | 104 | 108 | 13) && header.extension {
+             let mut state = self.state.lock().await;
+             state.audio_header_template = Some((header.clone(), participant));
+-            if let Some((sequence, total_kb, packets)) = Self::parse_audio_feedback(header) {
+-                state.audio_feedback_updates = state.audio_feedback_updates.saturating_add(1);
+-                state.audio_feedback_sequence = sequence;
+-                state.audio_feedback_total_kb_received = total_kb;
+-                state.audio_feedback_packets_received = packets;
++            if let Some(mut feedback) = Self::parse_audio_feedback(header) {
++                feedback.updates = state.audio_feedback.updates.saturating_add(1);
++                state.audio_feedback = feedback;
+             }
+         }
+     }
+ 
+-    pub async fn audio_feedback_status(
+-        &self,
+-    ) -> (u64, u16, u16, u16, Option<u8>, Option<u16>, Option<String>) {
+-        let state = self.state.lock().await;
+-        let peer_payload_type = state
+-            .audio_header_template
+-            .as_ref()
+-            .map(|(header, _)| header.payload_type);
+-        let peer_extension_profile = state
+-            .audio_header_template
+-            .as_ref()
+-            .filter(|(header, _)| header.extension)
+-            .map(|(header, _)| header.extension_profile);
+-        let peer_extension_hex = state
+-            .audio_header_template
+-            .as_ref()
+-            .filter(|(header, _)| header.extension)
+-            .and_then(|(header, _)| header.extensions.first())
+-            .map(|extension| encode_hex(extension.payload.as_ref()));
+-        (
+-            state.audio_feedback_updates,
+-            state.audio_feedback_sequence,
+-            state.audio_feedback_total_kb_received,
+-            state.audio_feedback_packets_received,
+-            peer_payload_type,
+-            peer_extension_profile,
+-            peer_extension_hex,
+-        )
++    pub async fn audio_feedback_status(&self) -> NativeAudioFeedbackStatus {
++        self.state.lock().await.audio_feedback.clone()
+     }
+ 
+     pub async fn remember_video_header(
+@@ -2271,6 +2426,7 @@ impl GlobalLink {
+         payload_type: u8,
+         samples_per_packet: u32,
+         packet_duration_ms: u64,
++        media_clock: Option<NativeMediaClock>,
+     ) -> Result<NativeAudioSender, PushError> {
+         if !matches!(payload_type, 104 | 108)
+             || samples_per_packet == 0
+@@ -2326,6 +2482,7 @@ impl GlobalLink {
+             timestamp: samples_per_packet,
+             packet_index: 0,
+             started: tokio::time::Instant::now(),
++            media_clock,
+         })
+     }
+ 
+@@ -2343,10 +2500,11 @@ impl GlobalLink {
+                 payload_type,
+                 samples_per_packet,
+                 packet_duration_ms,
++                None,
+             )
+             .await?;
+         for payload in packets {
+-            sender.send_packet(payload).await?;
++            sender.send_packet(payload, None).await?;
+         }
+         Ok(())
+     }
+@@ -2354,22 +2512,45 @@ impl GlobalLink {
+     pub async fn send_audio_stream(
+         &self,
+         ssrc: u32,
+-        mut packets: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        mut packets: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>,
+         progress: tokio::sync::mpsc::UnboundedSender<usize>,
+         payload_type: u8,
+         samples_per_packet: u32,
+         packet_duration_ms: u64,
++        media_clock: NativeMediaClock,
+     ) -> Result<(), PushError> {
++        let timing_clock = media_clock.clone();
+         let mut sender = self
+             .create_native_audio_sender(
+                 ssrc,
+                 payload_type,
+                 samples_per_packet,
+                 packet_duration_ms,
++                Some(media_clock),
+             )
+             .await?;
+-        while let Some(payload) = packets.recv().await {
+-            let payload_bytes = sender.send_packet(payload).await?;
++        let mut dropped_packets = 0u64;
++        while let Some((payload, presentation_time_us)) = packets.recv().await {
++            // Never burst stale speech to catch up. A short loss is concealed
++            // by FaceTime; replaying late packets stretches speech and pushes
++            // audio behind video for the rest of the call.
++            if timing_clock.lateness(presentation_time_us)
++                > std::time::Duration::from_millis(120)
++            {
++                dropped_packets = dropped_packets.saturating_add(1);
++                if dropped_packets == 1 || dropped_packets % 50 == 0 {
++                    warn!(
++                        "Dropping stale FaceTime audio packet: dropped={} pts_us={} lateness_ms={}",
++                        dropped_packets,
++                        presentation_time_us,
++                        timing_clock.lateness(presentation_time_us).as_millis(),
++                    );
++                }
++                continue;
++            }
++            let payload_bytes = sender
++                .send_packet(payload, Some(presentation_time_us))
++                .await?;
+             let _ = progress.send(payload_bytes);
+         }
+         Ok(())
+@@ -2379,6 +2560,7 @@ impl GlobalLink {
+         &self,
+         ssrc: u32,
+         frame_duration_ms: u64,
++        media_clock: Option<NativeMediaClock>,
+     ) -> Result<NativeVideoSender, PushError> {
+         if !(20..=100).contains(&frame_duration_ms) {
+             return Err(PushError::BadMsg);
+@@ -2444,6 +2626,7 @@ impl GlobalLink {
+             frame_index: 0,
+             frame_duration_ms,
+             started: tokio::time::Instant::now(),
++            media_clock,
+         })
+     }
+ 
+@@ -2458,14 +2641,14 @@ impl GlobalLink {
+             return Err(PushError::BadMsg);
+         }
+         let mut sender = self
+-            .create_native_video_sender(ssrc, frame_duration_ms)
++            .create_native_video_sender(ssrc, frame_duration_ms, None)
+             .await?;
+         let mut packets = 0u64;
+         let mut payload_bytes = 0u64;
+         for (index, frame) in frames.into_iter().enumerate() {
+             let description = (index == 0).then_some(image_description.as_slice());
+             let (frame_packets, frame_payload_bytes) =
+-                sender.send_frame(frame, description).await?;
++                sender.send_frame(frame, description, None).await?;
+             packets = packets.saturating_add(frame_packets);
+             payload_bytes = payload_bytes.saturating_add(frame_payload_bytes);
+         }
+@@ -2475,21 +2658,45 @@ impl GlobalLink {
+     pub async fn send_video_stream(
+         &self,
+         ssrc: u32,
+-        mut frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        mut frames: tokio::sync::mpsc::Receiver<(Vec<u8>, u64)>,
+         image_description: Vec<u8>,
+         progress: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
+         frame_duration_ms: u64,
++        media_clock: NativeMediaClock,
+     ) -> Result<(), PushError> {
+         if image_description.is_empty() {
+             return Err(PushError::BadMsg);
+         }
++        let timing_clock = media_clock.clone();
+         let mut sender = self
+-            .create_native_video_sender(ssrc, frame_duration_ms)
++            .create_native_video_sender(ssrc, frame_duration_ms, Some(media_clock))
+             .await?;
+         let mut first_frame = true;
+-        while let Some(frame) = frames.recv().await {
++        let mut waiting_for_random_access = false;
++        let mut dropped_frames = 0u64;
++        while let Some((frame, presentation_time_us)) = frames.recv().await {
++            let stale = timing_clock.lateness(presentation_time_us)
++                > std::time::Duration::from_millis(200);
++            if stale || (waiting_for_random_access && !native_hevc_is_random_access(&frame)) {
++                waiting_for_random_access = true;
++                dropped_frames = dropped_frames.saturating_add(1);
++                if dropped_frames == 1 || dropped_frames % 25 == 0 {
++                    warn!(
++                        "Dropping stale FaceTime video frame: dropped={} pts_us={} lateness_ms={}",
++                        dropped_frames,
++                        presentation_time_us,
++                        timing_clock.lateness(presentation_time_us).as_millis(),
++                    );
++                }
++                continue;
++            }
++            if waiting_for_random_access {
++                waiting_for_random_access = false;
++            }
+             let description = first_frame.then_some(image_description.as_slice());
+-            let (packets, payload_bytes) = sender.send_frame(frame, description).await?;
++            let (packets, payload_bytes) = sender
++                .send_frame(frame, description, Some(presentation_time_us))
++                .await?;
+             first_frame = false;
+             let _ = progress.send((packets, payload_bytes));
+         }
+@@ -3133,10 +3340,7 @@ impl GlobalLink {
+                 audio_header_template: None,
+                 video_header_template: None,
+                 video_packets_received: 0,
+-                audio_feedback_updates: 0,
+-                audio_feedback_sequence: 0,
+-                audio_feedback_total_kb_received: 0,
+-                audio_feedback_packets_received: 0,
++                audio_feedback: NativeAudioFeedbackStatus::default(),
+                 control_send_counters: HashMap::new(),
+                 control_messages_received: 0,
+                 control_messages_authenticated: 0,
+@@ -3175,7 +3379,8 @@ impl GlobalLink {
+ mod tests {
+     use super::{
+         APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki,
+-        control_peer_session_candidates,
++        control_peer_session_candidates, frame_native_audio_payload,
++        native_hevc_is_random_access, NativeMediaClock,
+     };
+ 
+     #[test]
+@@ -3206,4 +3411,34 @@ mod tests {
+         assert_eq!(material.mki, apple_rtp_mki(participant_id));
+         assert!(material.has_apple_rtp_short_mki());
+     }
++
++    #[test]
++    fn live_media_clock_maps_both_tracks_to_the_same_24khz_timeline() {
++        let clock = NativeMediaClock::new(tokio::time::Instant::now(), 0xffff_ff00);
++        assert_eq!(clock.timestamp(0), 0xffff_ff00);
++        assert_eq!(clock.timestamp(20_000), 0x0000_00e0);
++        assert_eq!(clock.timestamp(1_000_000), 0x0000_5cc0);
++    }
++
++    #[test]
++    fn apple_audio_framing_prefixes_aac_and_evs_access_units() {
++        assert_eq!(
++            frame_native_audio_payload(104, vec![1, 2, 3]).unwrap(),
++            vec![3, 1, 2, 3],
++        );
++        assert_eq!(
++            frame_native_audio_payload(108, vec![4, 5]).unwrap(),
++            vec![2, 4, 5],
++        );
++        assert!(frame_native_audio_payload(108, vec![0; 256]).is_err());
++    }
++
++    #[test]
++    fn hevc_random_access_detection_ignores_aud_and_finds_idr() {
++        assert!(!native_hevc_is_random_access(&[0, 0, 0, 1, 35 << 1, 1]));
++        assert!(native_hevc_is_random_access(&[
++            0, 0, 0, 1, 35 << 1, 1,
++            0, 0, 1, 19 << 1, 1, 0xaa,
++        ]));
++    }
+ }
