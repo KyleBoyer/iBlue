@@ -868,6 +868,9 @@ struct FaceTimeNativeMediaCreateParams {
     targets: Vec<String>,
     from: Option<String>,
     audio_path: String,
+    video_path: Option<String>,
+    video_description_path: Option<String>,
+    video_frame_duration_ms: Option<u64>,
     #[serde(default = "default_true")]
     ring: bool,
 }
@@ -3201,8 +3204,14 @@ impl Engine {
                 if params.audio_path.trim().is_empty() {
                     return Err(RpcError::invalid_params("audioPath is required"));
                 }
+                if params.video_path.is_some() != params.video_description_path.is_some() {
+                    return Err(RpcError::invalid_params(
+                        "videoPath and videoDescriptionPath must be provided together",
+                    ));
+                }
                 let sender = self.sender(params.from)?;
                 let session_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                let is_video = params.video_path.is_some();
                 self.client()?
                     .get_facetime_client()
                     .await
@@ -3212,6 +3221,9 @@ impl Engine {
                         sender.clone(),
                         params.targets.clone(),
                         params.audio_path,
+                        params.video_path,
+                        params.video_description_path,
+                        params.video_frame_duration_ms,
                         params.ring,
                     )
                     .await
@@ -3223,6 +3235,7 @@ impl Engine {
                     "state": if params.ring { "ringing" } else { "allocated" },
                     "transport": "iblue-quickrelay",
                     "topology": "one-to-one",
+                    "mode": if is_video { "video" } else { "audio" },
                 }))
             }
             "facetime.native.start" => {

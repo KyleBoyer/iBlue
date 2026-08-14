@@ -3,11 +3,76 @@ import test from "node:test";
 
 import {
   applyNativeFaceTimeMediaStatus,
+  buildFaceTimeHvc1SampleEntry,
+  extractHvc1SampleEntry,
   faceTimeMediaStopDeadline,
   inspectAacEldCaf,
   inspectEvsPcmF32Le,
   type FaceTimeCall,
 } from "../../src/bluebubbles/facetime-media.js";
+
+test("FaceTime native video extracts the complete hvc1 image description", () => {
+  const entry = Buffer.alloc(96);
+  entry.writeUInt32BE(entry.length, 0);
+  entry.write("hvc1", 4, 4, "ascii");
+  entry.write("hvcC", 86, 4, "ascii");
+  const movie = Buffer.concat([Buffer.from("prefix"), entry, Buffer.from("suffix")]);
+
+  assert.deepEqual(extractHvc1SampleEntry(movie), entry);
+});
+
+test("FaceTime native video rejects an hvc1 entry without decoder configuration", () => {
+  const entry = Buffer.alloc(96);
+  entry.writeUInt32BE(entry.length, 0);
+  entry.write("hvc1", 4, 4, "ascii");
+
+  assert.throws(() => extractHvc1SampleEntry(entry), /hvcC/);
+});
+
+test("FaceTime native video emits Apple's canonical hvc1 ImageDescription", () => {
+  const parameterSets = new Map([
+    [32, Buffer.from([0x40, 0x01, 0x0c])],
+    [33, Buffer.from([0x42, 0x01, 0x01, 0x60])],
+    [34, Buffer.from([0x44, 0x01, 0xc0])],
+  ]);
+  const arrays = [...parameterSets].map(([nalType, nal]) => {
+    const array = Buffer.alloc(5 + nal.length);
+    array[0] = 0x80 | nalType;
+    array.writeUInt16BE(1, 1);
+    array.writeUInt16BE(nal.length, 3);
+    nal.copy(array, 5);
+    return array;
+  });
+  const hvcCPayload = Buffer.concat([Buffer.alloc(22), Buffer.from([3]), ...arrays]);
+  const hvcC = Buffer.alloc(8 + hvcCPayload.length);
+  hvcC.writeUInt32BE(hvcC.length, 0);
+  hvcC.write("hvcC", 4, 4, "ascii");
+  hvcCPayload.copy(hvcC, 8);
+  const ffmpegEntry = Buffer.alloc(86 + hvcC.length + 26);
+  ffmpegEntry.writeUInt32BE(ffmpegEntry.length, 0);
+  ffmpegEntry.write("hvc1", 4, 4, "ascii");
+  ffmpegEntry.writeUInt16BE(1, 14);
+  ffmpegEntry.write("FFMP", 20, 4, "ascii");
+  hvcC.copy(ffmpegEntry, 86);
+
+  const result = buildFaceTimeHvc1SampleEntry(ffmpegEntry);
+
+  assert.equal(result.readUInt32BE(0), result.length);
+  assert.equal(result.toString("ascii", 4, 8), "hvc1");
+  assert.equal(result.readUInt16BE(14), 0xffff);
+  assert.equal(result.readUInt32BE(24), 512);
+  assert.equal(result.readUInt32BE(28), 512);
+  assert.equal(result.readUInt16BE(32), 1920);
+  assert.equal(result.readUInt16BE(34), 1080);
+  assert.equal(result[50], 4);
+  assert.equal(result.toString("ascii", 51, 55), "HEVC");
+  assert.equal(result.readUInt16BE(82), 24);
+  assert.equal(result.readInt16BE(84), -1);
+  assert.equal(result.toString("ascii", 90, 94), "hvcC");
+  assert.equal(result[result.length - 1], 0);
+  assert.equal(result.includes(Buffer.from("FFMP", "ascii")), false);
+  for (const nal of parameterSets.values()) assert.equal(result.includes(nal), true);
+});
 
 function cafChunk(tag: string, payload: Buffer): Buffer {
   const header = Buffer.alloc(12);
@@ -106,11 +171,21 @@ test("FaceTime live calls publish the final post-drain native status", () => {
     payloadBytesTotal: 72_488,
     packetsSent: 614,
     payloadBytesSent: 72_488,
+    audioPacketsTotal: 600,
+    audioPayloadBytesTotal: 60_000,
+    audioPacketsSent: 600,
+    audioPayloadBytesSent: 60_000,
+    videoFramesTotal: 10,
+    videoFramesSent: 10,
+    videoSourceBytesTotal: 10_000,
+    videoPacketsSent: 14,
+    videoPayloadBytesSent: 12_488,
     completedAt: 3,
     controlMessagesReceived: 4,
     controlMessagesAuthenticated: 4,
     controlMessagesSent: 2,
     controlStreamStateSent: true,
+    controlStreamStateAcknowledged: true,
     controlReady: true,
     controlParticipantContexts: 1,
     controlPeerUuids: 1,
@@ -122,6 +197,10 @@ test("FaceTime live calls publish the final post-drain native status", () => {
     peerAudioPayloadType: 20,
     peerAudioRtpExtensionProfile: 0x8d00,
     peerAudioRtpExtensionHex: "01020304",
+    peerVideoPacketsReceived: 42,
+    peerVideoSsrc: 0x01020304,
+    peerVideoRtpExtensionProfile: 0x8001,
+    peerVideoRtpExtensionHex: "00010002",
   });
 
   assert.equal(call.nativeMediaState, "stream-ended");
@@ -129,7 +208,13 @@ test("FaceTime live calls publish the final post-drain native status", () => {
   assert.equal(call.nativePacketsSent, 614);
   assert.equal(call.nativePayloadBytesTotal, 72_488);
   assert.equal(call.nativePayloadBytesSent, 72_488);
+  assert.equal(call.nativeAudioPacketsSent, 600);
+  assert.equal(call.nativeVideoFramesSent, 10);
+  assert.equal(call.nativeVideoPacketsSent, 14);
   assert.equal(call.nativeControlReady, true);
+  assert.equal(call.nativeControlStreamStateAcknowledged, true);
   assert.equal(call.nativePeerAudioPayloadType, 20);
+  assert.equal(call.nativePeerVideoPacketsReceived, 42);
+  assert.equal(call.nativePeerVideoRtpExtensionProfile, 0x8001);
   assert.equal(call.nativeControlLastError, undefined);
 });

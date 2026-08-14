@@ -1,0 +1,862 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index f653525..4c8fb5e 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -188,6 +188,8 @@ pub struct FTSession {
+     #[serde(skip)]
+     pub is_ringing_inaccurate: bool,
+     pub mode: Option<FTMode>,
++    #[serde(default)]
++    pub is_video: bool,
+     #[serde(skip)]
+     pub recent_member_adds: HashMap<String, u64>,
+     #[serde(skip)]
+@@ -366,6 +368,7 @@ pub struct AVConfig {
+     device_type: String,
+     os_build: String,
+     audio_ssrc: u32,
++    video_ssrc: u32,
+ }
+ 
+ #[test]
+@@ -383,18 +386,26 @@ impl AVConfig {
+             device_type: register.hardware_version,
+             os_build: register.software_version,
+             audio_ssrc: rand::random(),
++            video_ssrc: rand::random(),
+         }
+     }
+ 
+     // MUST NOT USE RANDOMIZATION/Time, any mismatch between link avc and IDS avc will cause lack of stream.
+     fn avc_data(&self) -> AVCData {
+-        // FLS2;RVRA1;CH1;CR;CF;FA; - macos features
+-        let features = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
++        // Match the modern U1 HEVC feature ordering used by AVConference.
++        // RVRA1 is a legacy H.264 feature; advertising it for PT100 shifts
++        // every proprietary frame-footer bit and makes iOS reject the stream.
++        let features = EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;");
+         let mut video_features = features.to_bytes().to_vec();
+ 
+-        let supported_features = EnabledAVFeatures::from_str("FLS2;RVRA1;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;");
++        let supported_features = EnabledAVFeatures::from_str("FLS2;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;");
+         video_features.extend_from_slice(&supported_features.to_bytes());
+ 
++        let h264_features = EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;");
++        let mut h264_video_features = h264_features.to_bytes().to_vec();
++        let h264_supported_features = EnabledAVFeatures::from_str("FLS2;VRAE;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;");
++        h264_video_features.extend_from_slice(&h264_supported_features.to_bytes());
++
+ 
+         let now = Duration::from_millis(self.start_time);
+ 
+@@ -430,21 +441,21 @@ impl AVConfig {
+                 cipher_suites: Some(5),
+             }),
+             camera_u1: Some(VcMediaNegotiationBlobV2CameraSettingsU1 {
+-                rtp_ssrc: Some(911343032),
++                rtp_ssrc: Some(self.video_ssrc),
+                 payloads: vec![
+                     VcMediaNegotiationBlobV2VideoPayload {
+                         video_payload: None,
+                         parameter_set: Some(1),
+                         encode_formats: Some(404062694),
+                         decode_formats: Some(101975526),
+-                        encode_decode_features: Some(vec![0x2d, 0x00, 0xed, 0x0f]),
++                        encode_decode_features: Some(h264_video_features.clone()),
+                         preferred_decode_format: Some(0),
+                     },
+                     VcMediaNegotiationBlobV2VideoPayload {
+                         video_payload: Some(2),
+                         parameter_set: Some(14),
+-                        encode_formats: None,
+-                        decode_formats: Some(104333312),
++                        encode_formats: Some(311492966),
++                        decode_formats: Some(104005632),
+                         encode_decode_features: Some(video_features.clone()),
+                         preferred_decode_format: Some(0),
+                     },
+@@ -486,10 +497,19 @@ impl AVConfig {
+                 },
+                 VcMediaNegotiationBlobV2StreamGroup {
+                     stream_group: Some(3),
+-                    payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
+-                        rtcp_flags: Some(4),
+-                        ..Default::default()
+-                    }],
++                    // Payload array indexes select H.264 and H.265
++                    // respectively. Publishing only one slot leaves PT100
++                    // unselected even when settings_u1 advertises it.
++                    payloads: vec![
++                        VcMediaNegotiationBlobV2StreamGroupPayload {
++                            rtcp_flags: Some(4),
++                            ..Default::default()
++                        },
++                        VcMediaNegotiationBlobV2StreamGroupPayload {
++                            rtcp_flags: Some(4),
++                            ..Default::default()
++                        },
++                    ],
+                     streams: vec![
+                         VcMediaNegotiationBlobV2StreamGroupStream {
+                             payload_spec_or_payloads: Some(1),
+@@ -646,11 +666,11 @@ impl AVConfig {
+                         },
+                     ],
+                     settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+-                        rtp_ssrc: Some(911343032),
++                        rtp_ssrc: Some(self.video_ssrc),
+                         encode_decode_features: vec![
+                             VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                 rtp_payload: Some(123),
+-                                encode_decode_features: Some(vec![0x2d, 0x00, 0xed, 0x0f]),
++                                encode_decode_features: Some(h264_video_features.clone()),
+                             },
+                             VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                 rtp_payload: Some(100),
+@@ -702,7 +722,7 @@ impl AVConfig {
+                 use_sbr: Some(true),
+             }),
+             video_settings: Some(VcMediaNegotiationBlobVideoSettings {
+-                rtp_ssrc: Some(911343032),
++                rtp_ssrc: Some(self.video_ssrc),
+                 allow_rtcpfb: Some(false),
+                 video_payload_collections: vec![
+                     VcMediaNegotiationBlobVideoPayloadSettings {
+@@ -748,26 +768,30 @@ impl AVConfig {
+                             VcMediaNegotiationBlobVideoRuleCollection {
+                                 transport: Some(1),
+                                 operation: Some(1),
+-                                formats: Some(0),
++                                formats: Some(134351407),
++                                preferred_format: Some(0),
++                                formats_ext1: Some(2),
++                                preferred_format_ext1: Some(0),
+                                 ..Default::default()
+                             },
+                             VcMediaNegotiationBlobVideoRuleCollection {
+                                 transport: Some(1),
+                                 operation: Some(2),
+-                                formats: Some(1275471872),
++                                formats: Some(1208357376),
+                                 preferred_format: Some(0),
+                                 ..Default::default()
+                             },
+                             VcMediaNegotiationBlobVideoRuleCollection {
+                                 transport: Some(2),
+                                 operation: Some(1),
+-                                formats: Some(0),
++                                formats: Some(604028943),
++                                preferred_format: Some(0),
+                                 ..Default::default()
+                             },
+                             VcMediaNegotiationBlobVideoRuleCollection {
+                                 transport: Some(2),
+                                 operation: Some(2),
+-                                formats: Some(67158029),
++                                formats: Some(67158031),
+                                 preferred_format: Some(67141632),
+                                 ..Default::default()
+                             },
+@@ -965,7 +989,7 @@ impl AVConfig {
+     }
+ }
+ 
+-fn my_conv_participant(config: &AVConfig) -> ConversationParticipant {
++fn my_conv_participant(config: &AVConfig, video_mode: bool) -> ConversationParticipant {
+     let avc_data = config.avc_data();
+ 
+     ConversationParticipant {
+@@ -984,7 +1008,7 @@ fn my_conv_participant(config: &AVConfig) -> ConversationParticipant {
+         guest_mode_enabled: None,
+         association: None,
+         is_u_plus_n_downgrade_available: Some(true),
+-        av_mode: Some(2),
++        av_mode: Some(if video_mode { 2 } else { 1 }),
+         supports_leave_context: Some(true),
+         is_u_plus_one_screen_sharing_available: Some(true),
+         persona_handshake_data: None,
+@@ -1501,7 +1525,10 @@ impl FTClient {
+             participant.token = Some(base64_encode(allocation.token.as_ref()));
+         }
+ 
+-        let avc_data = my_conv_participant(session.av_config.as_ref().expect("no av config")).encode_to_vec();
++        let avc_data = my_conv_participant(
++            session.av_config.as_ref().expect("no av config"),
++            session.is_video,
++        ).encode_to_vec();
+         let register = self.os_config.get_register_meta();
+         relay_session.alloc_bind(
+             &avc_data,
+@@ -1528,6 +1555,7 @@ impl FTClient {
+         let item = session.connection.clone().unwrap();
+         let session_id = session.av_config.as_ref().expect("no av config").session.clone();
+         let media_session_id = session.group_id.clone();
++        let video_enabled = session.is_video;
+         let media_events = self.media_events.clone();
+         let inbound_capture_path = std::env::var_os("IBLUE_FACETIME_INBOUND_CAPTURE_DIR")
+             .map(std::path::PathBuf::from)
+@@ -1709,6 +1737,9 @@ impl FTClient {
+                         };
+                         let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+                         session_handle.remember_audio_header(&unmarshalled.header, recv.participant).await;
++                        session_handle
++                            .remember_video_header(&unmarshalled.header, recv.participant)
++                            .await;
+ 
+                         if let Some((payload_type, frames)) = primary_facetime_audio_frames(
+                             header.payload_type,
+@@ -1831,6 +1862,15 @@ impl FTClient {
+                                 continue;
+                             }
+                         };
++                        if let Some(acknowledgement) = wrapper.acknowledgement.as_ref() {
++                            session_handle
++                                .note_control_acknowledgement(
++                                    acknowledgement.transaction_id.unwrap_or_default(),
++                                    acknowledgement.status.unwrap_or_default(),
++                                )
++                                .await;
++                            continue;
++                        }
+                         let Some(message) = wrapper.message else {
+                             continue;
+                         };
+@@ -1861,25 +1901,34 @@ impl FTClient {
+                             // AVConference models these identifiers as u32,
+                             // but serializes their decimal representations.
+                             let stream_groups: HashMap<String, u8> = HashMap::from_iter([
+-                                ("136".to_string(), 0u8), ("128".to_string(), 2),
++                                ("136".to_string(), 0u8), ("128".to_string(), if video_enabled { 1 } else { 2 }),
+                                 ("10".to_string(), 0), ("132".to_string(), 0),
+                                 ("11".to_string(), 0), ("129".to_string(), 1),
+-                                ("133".to_string(), 0), ("1".to_string(), 2),
++                                ("133".to_string(), 0), ("1".to_string(), if video_enabled { 1 } else { 2 }),
+                                 ("2".to_string(), 1), ("3".to_string(), 0),
+                                 ("134".to_string(), 0), ("4".to_string(), 0),
+-                                ("5".to_string(), 2), ("130".to_string(), 0),
++                                ("5".to_string(), if video_enabled { 1 } else { 2 }), ("130".to_string(), 0),
+                                 ("6".to_string(), 1), ("135".to_string(), 0),
+                                 ("7".to_string(), 0), ("8".to_string(), 0),
+                                 ("131".to_string(), 0), ("9".to_string(), 0),
+                             ]);
++                            let stream_state_transaction = session_handle
++                                .next_control_vccc_transaction()
++                                .await;
+                             let state_message = VcccMessageWrapper {
+                                 message: Some(VcccMessage {
+-                                    transaction_id: Some(1),
++                                    transaction_id: Some(stream_state_transaction),
+                                     topic: Some("VCSessionMessageTopicStreamGroupsState".to_string()),
+                                     payload: Some(plist_to_bin(&stream_groups).unwrap()),
+                                 }),
+                                 ..Default::default()
+                             };
++                            // Arm acknowledgement tracking before the socket
++                            // send can yield; a fast direct-U1 acknowledgement
++                            // must not race past the pending transaction.
++                            session_handle
++                                .note_control_stream_state_sent(stream_state_transaction)
++                                .await;
+                             if let Err(error) = session_handle
+                                 .send_control_message(participant, &session_id, &state_message.encode_to_vec())
+                                 .await
+@@ -1888,8 +1937,10 @@ impl FTClient {
+                                 session_handle.note_control_error("stream-state-failed").await;
+                             } else {
+                                 sent_stream_group_state = true;
+-                                session_handle.note_control_stream_state_sent().await;
+-                                info!("Published FaceTime U1 microphone stream state");
++                                info!(
++                                    "Published FaceTime U1 media stream state transaction {}",
++                                    stream_state_transaction,
++                                );
+                             }
+                         }
+                     },
+@@ -1947,12 +1998,12 @@ impl FTClient {
+     }
+ 
+     /// Privacy-safe VC-control handshake state for API diagnostics. The tuple
+-    /// contains receive/auth/send counts, stream publication, key-context
++    /// contains receive/auth/send counts, stream publication/acknowledgement, key-context
+     /// counts, and a stable error code; it never exposes key or payload data.
+     pub async fn native_control_status(
+         &self,
+         group_id: &str,
+-    ) -> Option<(u64, u64, u64, bool, usize, usize, usize, Option<String>)> {
++    ) -> Option<(u64, u64, u64, bool, bool, usize, usize, usize, Option<String>)> {
+         let connection = {
+             let state = self.state.read().await;
+             state.sessions.get(group_id).and_then(|session| session.connection.clone())
+@@ -1973,6 +2024,19 @@ impl FTClient {
+         Some(connection.link.audio_feedback_status().await)
+     }
+ 
++    /// Authenticated inbound PT100 camera activity. This proves the peer's
++    /// video media graph is live without exposing any frame bytes.
++    pub async fn native_video_receive_status(
++        &self,
++        group_id: &str,
++    ) -> Option<(u64, Option<u32>, Option<u16>, Option<String>)> {
++        let connection = {
++            let state = self.state.read().await;
++            state.sessions.get(group_id).and_then(|session| session.connection.clone())
++        }?;
++        Some(connection.link.video_receive_status().await)
++    }
++
+     /// Encrypt and pace one already-encoded audio access unit per RTP packet
+     /// on the microphone SSRC advertised in this session's AVC blob.
+     pub async fn send_native_audio(
+@@ -2036,6 +2100,36 @@ impl FTClient {
+             .await
+     }
+ 
++    /// Encrypt, packetize, and pace deterministic Annex-B H.265 frames on
++    /// the camera SSRC advertised in this session's AVC blob.
++    pub async fn send_native_video(
++        &self,
++        group_id: &str,
++        frames: Vec<Vec<u8>>,
++        image_description: Vec<u8>,
++        frame_duration_ms: u64,
++    ) -> Result<(u64, u64), PushError> {
++        let (connection, video_ssrc) = {
++            let state = self.state.read().await;
++            let session = state.sessions.get(group_id).ok_or(PushError::BadMsg)?;
++            let connection = session.connection.clone().ok_or(PushError::BadMsg)?;
++            let video_ssrc = session.av_config.as_ref().ok_or(PushError::BadMsg)?.video_ssrc;
++            (connection, video_ssrc)
++        };
++        if !connection.link.is_bootstrapped().await {
++            return Err(PushError::NotConnected);
++        }
++        connection
++            .link
++            .send_video_frames(
++                video_ssrc,
++                frames,
++                image_description,
++                frame_duration_ms,
++            )
++            .await
++    }
++
+     // warning: Doesn't save the link
+     async fn new_link(&self, handle: &str, usage: Option<String>, supported_for: Duration) -> Result<FTLink, PushError> {
+         let since_the_epoch = duration_since_epoch();
+@@ -2168,6 +2262,10 @@ impl FTClient {
+     /// the command-207 invitation. Callers can finish local media setup and
+     /// then invoke `prop_up_conv(..., true)` exactly once to ring.
+     pub async fn create_session_allocated(&self, for_group: String, handle: String, participants: &[String]) -> Result<(), PushError> {
++        self.create_session_allocated_mode(for_group, handle, participants, false).await
++    }
++
++    pub async fn create_session_allocated_mode(&self, for_group: String, handle: String, participants: &[String], is_video: bool) -> Result<(), PushError> {
+         let since_the_epoch = duration_since_epoch();
+ 
+         let session = FTSession {
+@@ -2182,6 +2280,7 @@ impl FTClient {
+             is_propped: false,
+             is_ringing_inaccurate: true,
+             mode: Some(FTMode::Outgoing),
++            is_video,
+             recent_member_adds: HashMap::new(),
+             connection: None,
+             av_config: Some(AVConfig::new(self.os_config.as_ref())),
+@@ -2347,7 +2446,10 @@ impl FTClient {
+                 let mut update_context = ConversationParticipantDidJoinContext::default();
+                 update_context.members = builder_session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
+ 
+-                let participant = my_conv_participant(builder_session.av_config.as_ref().expect("no avc!"));
++                let participant = my_conv_participant(
++                    builder_session.av_config.as_ref().expect("no avc!"),
++                    builder_session.is_video,
++                );
+ 
+                 let mut message = ConversationMessage::default();
+                 // ring not sending to ourselves
+@@ -2371,8 +2473,8 @@ impl FTClient {
+                 update_context.is_moments_available = participant.is_moments_available.unwrap_or_default();
+                 update_context.provider_identifier = "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
+                 // maybe make these optional/forced
+-                update_context.video = Some(true);
+-                update_context.video_enabled = Some(false);
++                update_context.video = Some(builder_session.is_video);
++                update_context.video_enabled = Some(builder_session.is_video);
+ 
+                 update_context.is_screen_sharing_available = participant.is_screen_sharing_available.unwrap_or_default();
+                 update_context.is_mirage_available = participant.is_mirage_available.unwrap_or_default();
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index 5b83f6d..8298c49 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -13,7 +13,12 @@ use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint,
+ use plist::Data;
+ use quinn::{AsyncUdpSocket, EndpointConfig, Pod, crypto::rustls::QuicClientConfig, default_runtime};
+ use rtc_media::io::sample_builder::SampleBuilder;
+-use rtc_rtp::codec::h265::H265Packet;
++use rtc_rtp::{
++    Header, Packet,
++    codec::h265::{H265Packet, HevcPayloader},
++    header::Extension,
++    packetizer::Payloader,
++};
+ use rtc_shared::marshal::{Marshal, Unmarshal};
+ use rtc_srtp::{context::Context, protection_profile::ProtectionProfile};
+ use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
+@@ -875,6 +880,12 @@ pub struct GlobalLinkState {
+     /// the extension profile is negotiated dynamically and is not an RFC 8285
+     /// constant, so the outbound stream mirrors the live peer template.
+     pub audio_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
++    /// Most recently authenticated PT100 camera header from the peer. Besides
++    /// powering diagnostics, its presence proves that the remote video media
++    /// graph is live before this sender releases its one-shot description and
++    /// first IDR frame.
++    pub video_header_template: Option<(rtc_rtp::Header, Option<u64>)>,
++    video_packets_received: u64,
+     /// Authenticated feedback from the peer's proprietary audio RTP
+     /// extension. These counters prove whether the peer accepted outbound
+     /// SRTP independently from whether its decoder rendered the codec.
+@@ -890,6 +901,9 @@ pub struct GlobalLinkState {
+     control_messages_authenticated: u64,
+     control_messages_sent: u64,
+     control_stream_state_sent: bool,
++    control_vccc_transaction: u64,
++    control_stream_state_transaction: Option<u64>,
++    control_stream_state_acknowledged: bool,
+     control_last_error: Option<String>,
+     /// The local UUID that authenticated the peer's VC control channel. Older
+     /// QuickRelay implementations expose three plausible session UUIDs; retain
+@@ -1042,6 +1056,207 @@ struct NativeAudioSender {
+     started: tokio::time::Instant,
+ }
+ 
++#[derive(Debug, Default, PartialEq, Eq)]
++struct NativeVideoControlData {
++    version: u8,
++    camera_status: u8,
++    ltr_bits: u8,
++    ltr_timestamp: Option<u32>,
++    total_packets_per_frame: Option<u16>,
++    frame_sequence_number: Option<u16>,
++    probe: Option<u32>,
++}
++
++impl NativeVideoControlData {
++    fn to_extension(&self) -> (u16, Vec<u8>) {
++        let profile = ((self.version as u16) << 14)
++            | ((self.camera_status as u16) << 8)
++            | ((self.ltr_bits as u16) << 4)
++            | if self.ltr_timestamp.is_some() { 0x2 } else { 0 }
++            | if self.total_packets_per_frame.is_some() && self.version == 2 {
++                0x1
++            } else {
++                0
++            }
++            | if self.probe.is_some() { 0x8 } else { 0 };
++        let payload = [
++            self.ltr_timestamp
++                .map(|value| value.to_be_bytes().to_vec())
++                .unwrap_or_default(),
++            if self.version == 2 {
++                self.total_packets_per_frame
++                    .map(|value| value.to_be_bytes().to_vec())
++                    .unwrap_or_default()
++            } else {
++                Vec::new()
++            },
++            if self.version == 2 {
++                self.frame_sequence_number
++                    .map(|value| value.to_be_bytes().to_vec())
++                    .unwrap_or_default()
++            } else {
++                Vec::new()
++            },
++            self.probe
++                .map(|value| value.to_be_bytes().to_vec())
++                .unwrap_or_default(),
++        ]
++        .concat();
++        (profile, payload)
++    }
++}
++
++fn append_native_hevc_footer(frame: &mut Vec<u8>) {
++    // The U1 H.265 feature order advertised by AVConfig is
++    // CH1, CR, CF, FA. This frame carries CH1, CR, and FA.
++    let footer = [
++        0x00, 0x00, // CH1
++        0x65, 0x43, 0x00, 0x00, // CR
++        0x3e, 0x3e, 0xc0, 0xc0, // FA
++        0x0b, // feature bits 0, 1, and 3
++    ];
++    for byte in footer {
++        frame.push(byte);
++        if frame.len() >= 3
++            && matches!(
++                &frame[frame.len() - 3..],
++                [0, 0, 0] | [0, 0, 1] | [0, 0, 2] | [0, 0, 3]
++            )
++        {
++            frame.insert(frame.len() - 1, 3);
++        }
++    }
++}
++
++struct NativeVideoSender {
++    hevc: HevcPayloader,
++    context: Context,
++    peer_participant: Option<u64>,
++    avc_pod: Pod,
++    direct_socket: Option<Arc<UdpSocket>>,
++    direct_peer: Option<SocketAddr>,
++    ssrc: u32,
++    sequence_number: u16,
++    timestamp: u32,
++    timestamp_increment: u32,
++    frame_number: u16,
++    probe_number: u32,
++    last_probe: Option<tokio::time::Instant>,
++    frame_index: u64,
++    frame_duration_ms: u64,
++    started: tokio::time::Instant,
++}
++
++impl NativeVideoSender {
++    async fn send_frame(
++        &mut self,
++        mut frame: Vec<u8>,
++        description: Option<&[u8]>,
++    ) -> Result<(u64, u64), PushError> {
++        append_native_hevc_footer(&mut frame);
++        let mut payloads = self
++            .hevc
++            .payload(1024, &frame.into())
++            .map_err(|_| PushError::BadMsg)?;
++        if let Some(description) = description {
++            if description.len() > 64 * 1024 {
++                return Err(PushError::BadMsg);
++            }
++            let mut payload = Vec::with_capacity(description.len() + 4);
++            payload.extend_from_slice(&[0x92, 0xe6, 0xc0, 0xa3]);
++            payload.extend_from_slice(description);
++            payloads.insert(0, payload.into());
++        }
++        if payloads.is_empty() || payloads.len() > u16::MAX as usize {
++            return Err(PushError::BadMsg);
++        }
++
++        let elapsed_since_probe = self
++            .last_probe
++            .map(|instant| instant.elapsed())
++            .unwrap_or(std::time::Duration::from_secs(60));
++        let probe = if payloads.len() > 2
++            || (elapsed_since_probe > std::time::Duration::from_secs(5)
++                && payloads.len() > 1)
++            || elapsed_since_probe > std::time::Duration::from_secs(10)
++        {
++            let value = self.probe_number;
++            self.probe_number = self.probe_number.wrapping_add(1);
++            self.last_probe = Some(tokio::time::Instant::now());
++            Some(value)
++        } else {
++            None
++        };
++        let control = NativeVideoControlData {
++            version: 2,
++            camera_status: 0,
++            ltr_bits: u8::from(description.is_some()),
++            total_packets_per_frame: Some(payloads.len() as u16),
++            frame_sequence_number: Some(self.frame_number),
++            probe,
++            ..Default::default()
++        };
++        let (extension_profile, extension_payload) = control.to_extension();
++        let packet_count = payloads.len() as u64;
++        let payload_bytes = payloads.iter().map(|payload| payload.len() as u64).sum();
++
++        for (index, payload) in payloads.into_iter().enumerate() {
++            let packet = Packet {
++                header: Header {
++                    version: 2,
++                    padding: false,
++                    extension: true,
++                    marker: index + 1 == packet_count as usize,
++                    payload_type: 100,
++                    sequence_number: self.sequence_number,
++                    timestamp: self.timestamp,
++                    ssrc: self.ssrc,
++                    csrc: Vec::new(),
++                    extension_profile,
++                    extensions: vec![Extension {
++                        id: 0,
++                        payload: extension_payload.clone().into(),
++                    }],
++                    extensions_padding: 0,
++                },
++                payload,
++            };
++            let plaintext = packet.marshal().map_err(|_| PushError::BadMsg)?;
++            let encrypted = self
++                .context
++                .encrypt_rtp(&plaintext)
++                .map_err(|_| PushError::BadMsg)?;
++            if let (Some(socket), Some(peer)) = (&self.direct_socket, self.direct_peer) {
++                socket
++                    .send_to(&encrypted, peer)
++                    .await
++                    .map_err(|_| PushError::NotConnected)?;
++            } else {
++                let framed = GlobalPacket {
++                    participant: self.peer_participant,
++                    link: LinkType::Pod,
++                    data: encrypted.to_vec(),
++                }
++                .to_qr_raw();
++                self.avc_pod
++                    .send_datagram(framed.into())
++                    .map_err(|_| PushError::NotConnected)?;
++            }
++            self.sequence_number = self.sequence_number.wrapping_add(1);
++        }
++
++        self.frame_number = self.frame_number.wrapping_add(1);
++        self.timestamp = self.timestamp.wrapping_add(self.timestamp_increment);
++        self.frame_index = self.frame_index.saturating_add(1);
++        let deadline = self.started
++            + std::time::Duration::from_millis(
++                self.frame_index.saturating_mul(self.frame_duration_ms),
++            );
++        tokio::time::sleep_until(deadline).await;
++        Ok((packet_count, payload_bytes))
++    }
++}
++
+ impl NativeAudioSender {
+     async fn send_packet(&mut self, payload: Vec<u8>) -> Result<usize, PushError> {
+         let payload_len = payload.len();
+@@ -1640,19 +1855,51 @@ impl GlobalLink {
+         self.state.lock().await.control_last_error = Some(detail.to_string());
+     }
+ 
+-    pub async fn note_control_stream_state_sent(&self) {
++    pub async fn next_control_vccc_transaction(&self) -> u64 {
++        let mut state = self.state.lock().await;
++        state.control_vccc_transaction = state.control_vccc_transaction.wrapping_add(1);
++        state.control_vccc_transaction
++    }
++
++    pub async fn note_control_stream_state_sent(&self, transaction_id: u64) {
+         let mut state = self.state.lock().await;
+         state.control_stream_state_sent = true;
++        state.control_stream_state_transaction = Some(transaction_id);
++        state.control_stream_state_acknowledged = false;
+         state.control_last_error = None;
+     }
+ 
+-    pub async fn control_status(&self) -> (u64, u64, u64, bool, usize, usize, usize, Option<String>) {
++    pub async fn note_control_acknowledgement(&self, transaction_id: u64, status: u32) {
++        let mut state = self.state.lock().await;
++        if state.control_stream_state_transaction == Some(transaction_id) && status == 0 {
++            state.control_stream_state_acknowledged = true;
++            state.control_last_error = None;
++        }
++    }
++
++    async fn wait_for_video_stream_state_acknowledgement(&self) -> Result<(), PushError> {
++        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
++        loop {
++            if self.state.lock().await.control_stream_state_acknowledged {
++                return Ok(());
++            }
++            if tokio::time::Instant::now() >= deadline {
++                self.state.lock().await.control_last_error =
++                    Some("stream-state-ack-timeout".to_string());
++                return Err(PushError::NotConnected);
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        }
++    }
++
++    pub async fn control_status(&self) -> (u64, u64, u64, bool, bool, usize, usize, usize, Option<String>) {
+         let state = self.state.lock().await;
+         (
+             state.control_messages_received,
+             state.control_messages_authenticated,
+             state.control_messages_sent,
+             state.control_stream_state_sent,
++            state.control_stream_state_acknowledged,
+             state.states.len(),
+             state.states.values().filter(|peer| peer.avc_uuid.is_some()).count(),
+             state.states.values().map(|peer| peer.mkm.len()).sum(),
+@@ -1784,6 +2031,46 @@ impl GlobalLink {
+         )
+     }
+ 
++    pub async fn remember_video_header(
++        &self,
++        header: &rtc_rtp::Header,
++        participant: Option<u64>,
++    ) {
++        if header.payload_type == 100 && header.extension {
++            let mut state = self.state.lock().await;
++            state.video_header_template = Some((header.clone(), participant));
++            state.video_packets_received = state.video_packets_received.saturating_add(1);
++        }
++    }
++
++    pub async fn video_receive_status(
++        &self,
++    ) -> (u64, Option<u32>, Option<u16>, Option<String>) {
++        let state = self.state.lock().await;
++        let header = state.video_header_template.as_ref().map(|(header, _)| header);
++        (
++            state.video_packets_received,
++            header.map(|header| header.ssrc),
++            header.map(|header| header.extension_profile),
++            header
++                .and_then(|header| header.extensions.first())
++                .map(|extension| encode_hex(extension.payload.as_ref())),
++        )
++    }
++
++    async fn wait_for_peer_video_media_or_settle(&self) {
++        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
++        loop {
++            if self.state.lock().await.video_header_template.is_some() {
++                return;
++            }
++            if tokio::time::Instant::now() >= deadline {
++                return;
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        }
++    }
++
+     async fn wait_for_audio_header_template(&self) -> Result<(rtc_rtp::Header, Option<u64>), PushError> {
+         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+         loop {
+@@ -1907,6 +2194,103 @@ impl GlobalLink {
+         Ok(())
+     }
+ 
++    async fn create_native_video_sender(
++        &self,
++        ssrc: u32,
++        frame_duration_ms: u64,
++    ) -> Result<NativeVideoSender, PushError> {
++        if !(20..=100).contains(&frame_duration_ms) {
++            return Err(PushError::BadMsg);
++        }
++        // Unlike microphone audio, iOS does not render camera RTP merely
++        // because the QuickRelay path is live. Wait until it acknowledges the
++        // VC stream-groups transaction that marks Jade's camera active, so the
++        // one-shot ImageDescription and first IDR cannot race subscription.
++        self.wait_for_video_stream_state_acknowledgement().await?;
++        self.wait_for_peer_video_media_or_settle().await;
++        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
++        let (peer_participant, avc_pod, direct_socket, direct_peer, key) = loop {
++            let state = self.state.lock().await;
++            if !state.my_mkm.has_apple_rtp_short_mki() {
++                return Err(PushError::BadMsg);
++            }
++            let participant = state
++                .audio_header_template
++                .as_ref()
++                .and_then(|(_, participant)| *participant)
++                .or_else(|| state.states.keys().next().copied());
++            let pod = state.avc_pod.clone();
++            if participant.is_some() && pod.is_some() {
++                break (
++                    participant,
++                    pod.unwrap(),
++                    state.direct_socket.clone(),
++                    state.direct_peer,
++                    state.my_mkm.get_key(ssrc),
++                );
++            }
++            drop(state);
++            if tokio::time::Instant::now() >= deadline {
++                return Err(PushError::NotConnected);
++            }
++            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++        };
++        let context = Context::new(
++            &key[..16],
++            &key[16..],
++            ProtectionProfile::Aes128CmHmacSha2mki_80,
++            None,
++            None,
++        )
++        .map_err(|_| PushError::BadMsg)?;
++        Ok(NativeVideoSender {
++            hevc: HevcPayloader::default(),
++            context,
++            peer_participant,
++            avc_pod,
++            direct_socket,
++            direct_peer,
++            ssrc,
++            sequence_number: rand::random(),
++            timestamp: 800,
++            // Apple U1 video uses a 24 kHz RTP clock. For example, native
++            // 30 fps camera frames advance by 800 ticks and 25 fps frames by
++            // 960 ticks.
++            timestamp_increment: (frame_duration_ms as u32).saturating_mul(24),
++            frame_number: rand::random(),
++            probe_number: 0,
++            last_probe: None,
++            frame_index: 0,
++            frame_duration_ms,
++            started: tokio::time::Instant::now(),
++        })
++    }
++
++    pub async fn send_video_frames(
++        &self,
++        ssrc: u32,
++        frames: Vec<Vec<u8>>,
++        image_description: Vec<u8>,
++        frame_duration_ms: u64,
++    ) -> Result<(u64, u64), PushError> {
++        if frames.is_empty() || image_description.is_empty() {
++            return Err(PushError::BadMsg);
++        }
++        let mut sender = self
++            .create_native_video_sender(ssrc, frame_duration_ms)
++            .await?;
++        let mut packets = 0u64;
++        let mut payload_bytes = 0u64;
++        for (index, frame) in frames.into_iter().enumerate() {
++            let description = (index == 0).then_some(image_description.as_slice());
++            let (frame_packets, frame_payload_bytes) =
++                sender.send_frame(frame, description).await?;
++            packets = packets.saturating_add(frame_packets);
++            payload_bytes = payload_bytes.saturating_add(frame_payload_bytes);
++        }
++        Ok((packets, payload_bytes))
++    }
++
+     pub async fn get_public_key(&self) -> Result<Vec<u8>, PushError> {
+         let mut bignum = BigNumContext::new()?;
+         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+@@ -2224,6 +2608,8 @@ impl GlobalLink {
+                 local_candidate_port: None,
+                 bootstrapped: false,
+                 audio_header_template: None,
++                video_header_template: None,
++                video_packets_received: 0,
+                 audio_feedback_updates: 0,
+                 audio_feedback_sequence: 0,
+                 audio_feedback_total_kb_received: 0,
+@@ -2233,6 +2619,9 @@ impl GlobalLink {
+                 control_messages_authenticated: 0,
+                 control_messages_sent: 0,
+                 control_stream_state_sent: false,
++                control_vccc_transaction: 0,
++                control_stream_state_transaction: None,
++                control_stream_state_acknowledged: false,
+                 control_last_error: None,
+                 control_local_uuid: None,
+                 control_incoming_peer_first: true,

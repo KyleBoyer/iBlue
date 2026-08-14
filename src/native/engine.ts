@@ -134,6 +134,7 @@ export interface FaceTimeNativeMediaStart {
   state: "allocated" | "ringing";
   transport: "iblue-quickrelay";
   topology: "one-to-one";
+  mode?: "audio" | "video";
 }
 
 export interface FaceTimeNativeLiveAudioStart extends FaceTimeNativeMediaStart {
@@ -162,6 +163,15 @@ export interface FaceTimeNativeMediaStatus {
   payloadBytesTotal: number;
   packetsSent: number;
   payloadBytesSent: number;
+  audioPacketsTotal: number;
+  audioPayloadBytesTotal: number;
+  audioPacketsSent: number;
+  audioPayloadBytesSent: number;
+  videoFramesTotal: number;
+  videoFramesSent: number;
+  videoSourceBytesTotal: number;
+  videoPacketsSent: number;
+  videoPayloadBytesSent: number;
   startedAt?: number;
   completedAt?: number;
   error?: string;
@@ -169,6 +179,7 @@ export interface FaceTimeNativeMediaStatus {
   controlMessagesAuthenticated: number;
   controlMessagesSent: number;
   controlStreamStateSent: boolean;
+  controlStreamStateAcknowledged: boolean;
   controlReady: boolean;
   controlParticipantContexts: number;
   controlPeerUuids: number;
@@ -181,6 +192,10 @@ export interface FaceTimeNativeMediaStatus {
   peerAudioPayloadType?: number;
   peerAudioRtpExtensionProfile?: number;
   peerAudioRtpExtensionHex?: string;
+  peerVideoPacketsReceived: number;
+  peerVideoSsrc?: number;
+  peerVideoRtpExtensionProfile?: number;
+  peerVideoRtpExtensionHex?: string;
 }
 
 export interface FaceTimeNativeMediaStreamStatus {
@@ -266,6 +281,9 @@ export interface IMessageEngine {
     targets: string[];
     from?: string;
     audioPath: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
     ring?: boolean;
   }): Promise<FaceTimeNativeMediaStart>;
   startNativeFaceTimeMediaSession?(sessionId: string): Promise<{
@@ -578,6 +596,9 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
     targets: string[];
     from?: string;
     audioPath: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
     ring?: boolean;
   }): Promise<FaceTimeNativeMediaStart> {
     return this.rpc.request("facetime.native.create", params);

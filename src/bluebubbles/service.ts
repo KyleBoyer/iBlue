@@ -332,6 +332,9 @@ export class BlueBubblesService extends EventEmitter {
     targets: string[];
     from?: string;
     audioPath: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
   }) {
     if (!this.engine.createNativeFaceTimeMediaSession) {
       throw new Error("Native FaceTime media is unavailable");

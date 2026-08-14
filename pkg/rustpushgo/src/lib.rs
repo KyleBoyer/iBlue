@@ -7742,6 +7742,9 @@ pub struct WrappedFaceTimeClient {
 
 struct NativeFaceTimeMedia {
     source_path: Option<String>,
+    video_path: Option<String>,
+    video_description_path: Option<String>,
+    video_frame_duration_ms: u64,
     send_task: Option<tokio::task::JoinHandle<()>>,
     live_audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     #[cfg(target_os = "macos")]
@@ -7940,6 +7943,15 @@ pub struct NativeFaceTimeMediaStatus {
     payload_bytes_total: u64,
     packets_sent: u64,
     payload_bytes_sent: u64,
+    audio_packets_total: u64,
+    audio_payload_bytes_total: u64,
+    audio_packets_sent: u64,
+    audio_payload_bytes_sent: u64,
+    video_frames_total: u64,
+    video_frames_sent: u64,
+    video_source_bytes_total: u64,
+    video_packets_sent: u64,
+    video_payload_bytes_sent: u64,
     started_at: Option<u64>,
     completed_at: Option<u64>,
     error: Option<String>,
@@ -7947,6 +7959,7 @@ pub struct NativeFaceTimeMediaStatus {
     control_messages_authenticated: u64,
     control_messages_sent: u64,
     control_stream_state_sent: bool,
+    control_stream_state_acknowledged: bool,
     control_ready: bool,
     control_participant_contexts: u64,
     control_peer_uuids: u64,
@@ -7959,6 +7972,10 @@ pub struct NativeFaceTimeMediaStatus {
     peer_audio_payload_type: Option<u8>,
     peer_audio_rtp_extension_profile: Option<u16>,
     peer_audio_rtp_extension_hex: Option<String>,
+    peer_video_packets_received: u64,
+    peer_video_ssrc: Option<u32>,
+    peer_video_rtp_extension_profile: Option<u16>,
+    peer_video_rtp_extension_hex: Option<String>,
 }
 
 fn native_facetime_media_now_ms() -> u64 {
@@ -7978,6 +7995,15 @@ fn new_native_facetime_media_status(
         payload_bytes_total: 0,
         packets_sent: 0,
         payload_bytes_sent: 0,
+        audio_packets_total: 0,
+        audio_payload_bytes_total: 0,
+        audio_packets_sent: 0,
+        audio_payload_bytes_sent: 0,
+        video_frames_total: 0,
+        video_frames_sent: 0,
+        video_source_bytes_total: 0,
+        video_packets_sent: 0,
+        video_payload_bytes_sent: 0,
         started_at: None,
         completed_at: None,
         error: None,
@@ -7985,6 +8011,7 @@ fn new_native_facetime_media_status(
         control_messages_authenticated: 0,
         control_messages_sent: 0,
         control_stream_state_sent: false,
+        control_stream_state_acknowledged: false,
         control_ready: false,
         control_participant_contexts: 0,
         control_peer_uuids: 0,
@@ -7997,6 +8024,10 @@ fn new_native_facetime_media_status(
         peer_audio_payload_type: None,
         peer_audio_rtp_extension_profile: None,
         peer_audio_rtp_extension_hex: None,
+        peer_video_packets_received: 0,
+        peer_video_ssrc: None,
+        peer_video_rtp_extension_profile: None,
+        peer_video_rtp_extension_hex: None,
     }))
 }
 
@@ -8328,6 +8359,152 @@ async fn read_native_facetime_audio(
     })
 }
 
+struct NativeFaceTimeVideoFrames {
+    frames: Vec<Vec<u8>>,
+    image_description: Vec<u8>,
+    frame_duration_ms: u64,
+}
+
+fn split_native_facetime_hevc_access_units(data: &[u8]) -> Result<Vec<Vec<u8>>, WrappedError> {
+    fn start_codes(data: &[u8]) -> Vec<(usize, usize)> {
+        let mut result = Vec::new();
+        let mut index = 0usize;
+        while index + 3 <= data.len() {
+            let length = if index + 4 <= data.len() && data[index..index + 4] == [0, 0, 0, 1] {
+                4
+            } else if data[index..index + 3] == [0, 0, 1] {
+                3
+            } else {
+                index += 1;
+                continue;
+            };
+            result.push((index, length));
+            index += length;
+        }
+        result
+    }
+
+    let starts = start_codes(data);
+    if starts.is_empty() {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime video must be Annex-B H.265".to_string(),
+        });
+    }
+    let mut frames = Vec::new();
+    let mut frame = Vec::new();
+    let mut saw_access_unit_delimiter = false;
+    for (index, (start, start_code_length)) in starts.iter().copied().enumerate() {
+        let nal_start = start + start_code_length;
+        let nal_end = starts.get(index + 1).map_or(data.len(), |(next, _)| *next);
+        if nal_start >= nal_end {
+            continue;
+        }
+        let nal_type = (data[nal_start] >> 1) & 0x3f;
+        if nal_type == 35 {
+            saw_access_unit_delimiter = true;
+            if !frame.is_empty() {
+                frames.push(std::mem::take(&mut frame));
+            }
+            continue;
+        }
+        frame.extend_from_slice(&[0, 0, 0, 1]);
+        frame.extend_from_slice(&data[nal_start..nal_end]);
+    }
+    if !frame.is_empty() {
+        frames.push(frame);
+    }
+    if !saw_access_unit_delimiter || frames.is_empty() || frames.len() > 15_000 {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime H.265 must contain one AUD-delimited access unit per frame"
+                .to_string(),
+        });
+    }
+    Ok(frames)
+}
+
+async fn read_native_facetime_video(
+    path: &str,
+    image_description_path: &str,
+    frame_duration_ms: u64,
+) -> Result<NativeFaceTimeVideoFrames, WrappedError> {
+    if !(20..=100).contains(&frame_duration_ms) {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime video frame duration must be between 20 and 100 ms".to_string(),
+        });
+    }
+    let encoded = tokio::fs::read(path)
+        .await
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Could not read native FaceTime H.265: {error}"),
+        })?;
+    if encoded.is_empty() || encoded.len() > 64 * 1024 * 1024 {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime H.265 must be between 1 byte and 64 MiB".to_string(),
+        });
+    }
+    let image_description = tokio::fs::read(image_description_path)
+        .await
+        .map_err(|error| WrappedError::GenericError {
+            msg: format!("Could not read native FaceTime H.265 image description: {error}"),
+        })?;
+    let declared_size = image_description
+        .get(..4)
+        .and_then(|size| <[u8; 4]>::try_from(size).ok())
+        .map(u32::from_be_bytes)
+        .unwrap_or_default() as usize;
+    if image_description.len() < 86
+        || image_description.len() > 64 * 1024
+        || declared_size != image_description.len()
+        || image_description.get(4..8) != Some(b"hvc1")
+        || !image_description.windows(4).any(|value| value == b"hvcC")
+    {
+        return Err(WrappedError::GenericError {
+            msg: "Native FaceTime video description must be one complete hvc1 sample entry containing hvcC"
+                .to_string(),
+        });
+    }
+    Ok(NativeFaceTimeVideoFrames {
+        frames: split_native_facetime_hevc_access_units(&encoded)?,
+        image_description,
+        frame_duration_ms,
+    })
+}
+
+#[cfg(test)]
+mod native_facetime_video_tests {
+    use super::split_native_facetime_hevc_access_units;
+
+    #[test]
+    fn splits_aud_delimited_annex_b_into_access_units() {
+        // H.265 NAL type 35 is AUD. Types 32 and 19 stand in for parameter
+        // and coded-slice NAL units; their payload content is irrelevant to
+        // this framing test.
+        let encoded = [
+            &[0, 0, 0, 1, 35 << 1, 1][..],
+            &[0, 0, 1, 32 << 1, 1, 2][..],
+            &[0, 0, 1, 19 << 1, 3, 4][..],
+            &[0, 0, 0, 1, 35 << 1, 1][..],
+            &[0, 0, 1, 19 << 1, 5, 6][..],
+        ]
+        .concat();
+
+        let frames = split_native_facetime_hevc_access_units(&encoded).expect("valid Annex-B");
+
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].starts_with(&[0, 0, 0, 1, 32 << 1]));
+        assert!(frames[0]
+            .windows(5)
+            .any(|value| value == [0, 0, 0, 1, 19 << 1]));
+        assert!(frames[1].starts_with(&[0, 0, 0, 1, 19 << 1]));
+    }
+
+    #[test]
+    fn rejects_annex_b_without_access_unit_delimiters() {
+        let encoded = [0, 0, 0, 1, 19 << 1, 1, 2, 3];
+        assert!(split_native_facetime_hevc_access_units(&encoded).is_err());
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl WrappedFaceTimeClient {
     pub async fn export_state_json(&self) -> Result<String, WrappedError> {
@@ -8651,6 +8828,9 @@ impl WrappedFaceTimeClient {
         handle: String,
         participants: Vec<String>,
         audio_file: String,
+        video_file: Option<String>,
+        video_description_file: Option<String>,
+        video_frame_duration_ms: Option<u64>,
         ring: bool,
     ) -> Result<(), WrappedError> {
         if participants.len() != 1 {
@@ -8659,8 +8839,22 @@ impl WrappedFaceTimeClient {
                     .to_string(),
             });
         }
+        let is_video = video_file.is_some();
+        if is_video != video_description_file.is_some() {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime video requires both video and image-description files"
+                    .to_string(),
+            });
+        }
+        let frame_duration_ms = video_frame_duration_ms.unwrap_or(40);
+        if is_video && !(20..=100).contains(&frame_duration_ms) {
+            return Err(WrappedError::GenericError {
+                msg: "Native FaceTime video frame duration must be between 20 and 100 ms"
+                    .to_string(),
+            });
+        }
         self.inner
-            .create_session_allocated(group_id.clone(), handle, &participants)
+            .create_session_allocated_mode(group_id.clone(), handle, &participants, is_video)
             .await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("native FaceTime allocation failed: {:?}", e),
@@ -8670,6 +8864,9 @@ impl WrappedFaceTimeClient {
             group_id.clone(),
             NativeFaceTimeMedia {
                 source_path: Some(audio_file),
+                video_path: video_file,
+                video_description_path: video_description_file,
+                video_frame_duration_ms: frame_duration_ms,
                 send_task: None,
                 live_audio_sender: None,
                 #[cfg(target_os = "macos")]
@@ -8716,6 +8913,9 @@ impl WrappedFaceTimeClient {
             group_id.clone(),
             NativeFaceTimeMedia {
                 source_path: None,
+                video_path: None,
+                video_description_path: None,
+                video_frame_duration_ms: 40,
                 send_task: None,
                 live_audio_sender: None,
                 #[cfg(target_os = "macos")]
@@ -8744,7 +8944,7 @@ impl WrappedFaceTimeClient {
                 msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
             });
         }
-        let (source_path, status) = {
+        let (source_path, video_path, video_description_path, video_frame_duration_ms, status) = {
             let media = self.native_media_sources.lock().await;
             let source = media
                 .get(session_id)
@@ -8761,16 +8961,43 @@ impl WrappedFaceTimeClient {
                     msg: "Native FaceTime live audio sessions must be started with the live audio stream method".to_string(),
                 }
             })?;
-            (source_path, source.status.clone())
+            (
+                source_path,
+                source.video_path.clone(),
+                source.video_description_path.clone(),
+                source.video_frame_duration_ms,
+                source.status.clone(),
+            )
         };
         let audio = read_native_facetime_audio(&source_path).await?;
-        let packets_total = audio.packets.len() as u64;
-        let payload_bytes_total = audio.packets.iter().map(Vec::len).sum::<usize>() as u64;
+        let video = match (video_path, video_description_path) {
+            (Some(video_path), Some(description_path)) => Some(
+                read_native_facetime_video(&video_path, &description_path, video_frame_duration_ms)
+                    .await?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(WrappedError::GenericError {
+                    msg: "Native FaceTime video media is incomplete".to_string(),
+                })
+            }
+        };
+        let audio_packets_total = audio.packets.len() as u64;
+        let audio_payload_bytes_total = audio.packets.iter().map(Vec::len).sum::<usize>() as u64;
+        let video_frames_total = video.as_ref().map_or(0, |video| video.frames.len() as u64);
+        let video_payload_bytes_total = video.as_ref().map_or(0, |video| {
+            video.frames.iter().map(Vec::len).sum::<usize>() as u64
+        });
         {
             let mut current = status.lock().await;
             current.state = "waiting-for-peer-template".to_string();
-            current.packets_total = packets_total;
-            current.payload_bytes_total = payload_bytes_total;
+            current.packets_total = audio_packets_total.saturating_add(video_frames_total);
+            current.payload_bytes_total =
+                audio_payload_bytes_total.saturating_add(video_payload_bytes_total);
+            current.audio_packets_total = audio_packets_total;
+            current.audio_payload_bytes_total = audio_payload_bytes_total;
+            current.video_frames_total = video_frames_total;
+            current.video_source_bytes_total = video_payload_bytes_total;
             current.started_at = Some(native_facetime_media_now_ms());
             current.completed_at = None;
             current.error = None;
@@ -8778,29 +9005,57 @@ impl WrappedFaceTimeClient {
         let inner = self.inner.clone();
         let group_id = session_id.to_string();
         let task = tokio::spawn(async move {
-            let result = inner
-                .send_native_audio(
+            let audio_send = inner.send_native_audio(
+                &group_id,
+                audio.packets,
+                audio.payload_type,
+                audio.samples_per_packet,
+                audio.packet_duration_ms,
+            );
+            let result = if let Some(video) = video {
+                let video_send = inner.send_native_video(
                     &group_id,
-                    audio.packets,
-                    audio.payload_type,
-                    audio.samples_per_packet,
-                    audio.packet_duration_ms,
-                )
-                .await;
+                    video.frames,
+                    video.image_description,
+                    video.frame_duration_ms,
+                );
+                let (audio_result, video_result) = tokio::join!(audio_send, video_send);
+                match (audio_result, video_result) {
+                    (Ok(()), Ok((video_packets, video_bytes))) => Ok((
+                        audio_packets_total.saturating_add(video_packets),
+                        audio_payload_bytes_total.saturating_add(video_bytes),
+                        video_packets,
+                        video_bytes,
+                    )),
+                    (Err(error), _) => Err(format!("audio sender failed: {error:?}")),
+                    (_, Err(error)) => Err(format!("video sender failed: {error:?}")),
+                }
+            } else {
+                audio_send
+                    .await
+                    .map(|()| (audio_packets_total, audio_payload_bytes_total, 0, 0))
+                    .map_err(|error| format!("audio sender failed: {error:?}"))
+            };
             let mut current = status.lock().await;
             current.completed_at = Some(native_facetime_media_now_ms());
             match result {
-                Ok(()) => {
+                Ok((packets_sent, payload_bytes_sent, video_packets_sent, video_payload_bytes_sent)) => {
                     current.state = "completed".to_string();
-                    current.packets_sent = packets_total;
-                    current.payload_bytes_sent = payload_bytes_total;
+                    current.packets_total = packets_sent;
+                    current.payload_bytes_total = payload_bytes_sent;
+                    current.packets_sent = packets_sent;
+                    current.payload_bytes_sent = payload_bytes_sent;
+                    current.audio_packets_sent = audio_packets_total;
+                    current.audio_payload_bytes_sent = audio_payload_bytes_total;
+                    current.video_frames_sent = video_frames_total;
+                    current.video_packets_sent = video_packets_sent;
+                    current.video_payload_bytes_sent = video_payload_bytes_sent;
                 }
-                Err(error) => {
-                    let detail = format!("{error:?}");
+                Err(detail) => {
                     current.state = "failed".to_string();
                     current.error = Some(detail.clone());
                     error!(
-                        "Native FaceTime audio sender failed for session {}: {}",
+                        "Native FaceTime media sender failed for session {}: {}",
                         group_id, detail
                     );
                 }
@@ -9055,6 +9310,7 @@ impl WrappedFaceTimeClient {
             authenticated,
             sent,
             stream_state_sent,
+            stream_state_acknowledged,
             participants,
             peer_uuids,
             media_keys,
@@ -9065,6 +9321,7 @@ impl WrappedFaceTimeClient {
             result.control_messages_authenticated = authenticated;
             result.control_messages_sent = sent;
             result.control_stream_state_sent = stream_state_sent;
+            result.control_stream_state_acknowledged = stream_state_acknowledged;
             result.control_ready = authenticated > 0 && stream_state_sent;
             result.control_participant_contexts = participants as u64;
             result.control_peer_uuids = peer_uuids as u64;
@@ -9088,6 +9345,14 @@ impl WrappedFaceTimeClient {
             result.peer_audio_payload_type = payload_type;
             result.peer_audio_rtp_extension_profile = extension_profile;
             result.peer_audio_rtp_extension_hex = extension_hex;
+        }
+        if let Some((packets, ssrc, extension_profile, extension_hex)) =
+            self.inner.native_video_receive_status(session_id).await
+        {
+            result.peer_video_packets_received = packets;
+            result.peer_video_ssrc = ssrc;
+            result.peer_video_rtp_extension_profile = extension_profile;
+            result.peer_video_rtp_extension_hex = extension_hex;
         }
         Ok(result)
     }

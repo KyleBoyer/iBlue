@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -40,6 +40,7 @@ export interface FaceTimeCall {
   maxDurationSeconds: number;
   mediaDurationSeconds?: number;
   nativeAudioInput?: "transcoded-aac-eld" | "transcoded-evs" | "passthrough-aac-eld";
+  nativeVideoInput?: "transcoded-hevc" | "passthrough-hevc";
   mediaSource?: "uploaded" | "live-stream";
   liveAudioFormat?: {
     encoding: "pcm-f32le";
@@ -65,10 +66,20 @@ export interface FaceTimeCall {
   nativePacketsSent?: number;
   nativePayloadBytesTotal?: number;
   nativePayloadBytesSent?: number;
+  nativeAudioPacketsTotal?: number;
+  nativeAudioPayloadBytesTotal?: number;
+  nativeAudioPacketsSent?: number;
+  nativeAudioPayloadBytesSent?: number;
+  nativeVideoFramesTotal?: number;
+  nativeVideoFramesSent?: number;
+  nativeVideoSourceBytesTotal?: number;
+  nativeVideoPacketsSent?: number;
+  nativeVideoPayloadBytesSent?: number;
   nativeControlMessagesReceived?: number;
   nativeControlMessagesAuthenticated?: number;
   nativeControlMessagesSent?: number;
   nativeControlStreamStateSent?: boolean;
+  nativeControlStreamStateAcknowledged?: boolean;
   nativeControlReady?: boolean;
   nativeControlParticipantContexts?: number;
   nativeControlPeerUuids?: number;
@@ -81,6 +92,10 @@ export interface FaceTimeCall {
   nativePeerAudioPayloadType?: number;
   nativePeerAudioRtpExtensionProfile?: number;
   nativePeerAudioRtpExtensionHex?: string;
+  nativePeerVideoPacketsReceived?: number;
+  nativePeerVideoSsrc?: number;
+  nativePeerVideoRtpExtensionProfile?: number;
+  nativePeerVideoRtpExtensionHex?: string;
   error?: string;
   transport: "iblue-quickrelay" | "apple-web-bridge";
 }
@@ -90,6 +105,7 @@ interface InternalFaceTimeCall extends FaceTimeCall {
   workDirectory?: string;
   audioPath?: string;
   videoPath?: string;
+  videoDescriptionPath?: string;
   browser?: Browser;
   page?: Page;
   session?: FaceTimeSessionStart;
@@ -106,6 +122,7 @@ export interface FaceTimeCallInput {
   maxDurationSeconds?: number;
   preRollSeconds?: number;
   nativeAudioPassthrough?: boolean;
+  nativeVideoPassthrough?: boolean;
 }
 
 export interface FaceTimeLiveAudioCallInput {
@@ -125,6 +142,9 @@ export interface FaceTimeMediaSignaling {
     targets: string[];
     from?: string;
     audioPath: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
   }): Promise<{ sessionId: string }>;
   startNativeMediaSession?(sessionId: string): Promise<unknown>;
   nativeMediaStatus?(sessionId: string): Promise<FaceTimeNativeMediaStatus>;
@@ -163,9 +183,133 @@ export interface FaceTimeMediaManagerOptions {
 }
 
 const TERMINAL_STATES = new Set<FaceTimeCallState>(["ended", "failed"]);
+const NATIVE_MEDIA_POST_ANSWER_SETTLE_MS = 3_000;
 const WINDOWS_CHROME_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
   + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+
+export function extractHvc1SampleEntry(movie: Buffer): Buffer {
+  for (let typeOffset = 4; typeOffset + 4 <= movie.length; typeOffset += 1) {
+    if (movie.toString("ascii", typeOffset, typeOffset + 4) !== "hvc1") continue;
+    const boxOffset = typeOffset - 4;
+    const size = movie.readUInt32BE(boxOffset);
+    if (size < 86 || size > 64 * 1024 || boxOffset + size > movie.length) continue;
+    const entry = movie.subarray(boxOffset, boxOffset + size);
+    if (entry.indexOf(Buffer.from("hvcC", "ascii")) < 0) continue;
+    return Buffer.from(entry);
+  }
+  throw new Error("Encoded FaceTime video does not contain an hvc1 sample entry with hvcC");
+}
+
+function extractHevcParameterSets(sampleEntry: Buffer): Map<number, Buffer> {
+  const hvcCTypeOffset = sampleEntry.indexOf(Buffer.from("hvcC", "ascii"));
+  if (hvcCTypeOffset < 4) {
+    throw new Error("Encoded FaceTime video does not contain an hvcC decoder configuration");
+  }
+  const boxOffset = hvcCTypeOffset - 4;
+  const boxSize = sampleEntry.readUInt32BE(boxOffset);
+  const payloadOffset = hvcCTypeOffset + 4;
+  const boxEnd = boxOffset + boxSize;
+  if (boxSize < 31 || boxEnd > sampleEntry.length || payloadOffset + 23 > boxEnd) {
+    throw new Error("Encoded FaceTime hvcC decoder configuration is truncated");
+  }
+
+  const parameterSets = new Map<number, Buffer>();
+  const arrayCount = sampleEntry[payloadOffset + 22]!;
+  let offset = payloadOffset + 23;
+  for (let arrayIndex = 0; arrayIndex < arrayCount; arrayIndex += 1) {
+    if (offset + 3 > boxEnd) {
+      throw new Error("Encoded FaceTime hvcC parameter array is truncated");
+    }
+    const nalType = sampleEntry[offset]! & 0x3f;
+    const nalCount = sampleEntry.readUInt16BE(offset + 1);
+    offset += 3;
+    for (let nalIndex = 0; nalIndex < nalCount; nalIndex += 1) {
+      if (offset + 2 > boxEnd) {
+        throw new Error("Encoded FaceTime hvcC parameter length is truncated");
+      }
+      const nalSize = sampleEntry.readUInt16BE(offset);
+      offset += 2;
+      if (offset + nalSize > boxEnd) {
+        throw new Error("Encoded FaceTime hvcC parameter data is truncated");
+      }
+      if (!parameterSets.has(nalType)) {
+        parameterSets.set(nalType, Buffer.from(sampleEntry.subarray(offset, offset + nalSize)));
+      }
+      offset += nalSize;
+    }
+  }
+  for (const nalType of [32, 33, 34]) {
+    if (!parameterSets.has(nalType)) {
+      throw new Error(`Encoded FaceTime hvcC is missing HEVC NAL type ${nalType}`);
+    }
+  }
+  return parameterSets;
+}
+
+/**
+ * Convert FFmpeg's hvc1 sample entry into the exact ImageDescription shape
+ * emitted by Apple's AVConference stack. The decoder parameter sets remain
+ * those of the encoded source; container-only fields use Apple's canonical
+ * values instead of FFmpeg's data reference, vendor, compressor name, and
+ * optional fiel/pasp child boxes.
+ */
+export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
+  const parameterSets = extractHevcParameterSets(extractHvc1SampleEntry(movie));
+  const arrays: Buffer[] = [];
+  for (const nalType of [32, 33, 34]) {
+    const nal = parameterSets.get(nalType)!;
+    if (nal.length > 0xffff) {
+      throw new Error(`Encoded FaceTime HEVC NAL type ${nalType} is too large`);
+    }
+    const array = Buffer.alloc(5 + nal.length);
+    array[0] = 0x80 | nalType;
+    array.writeUInt16BE(1, 1);
+    array.writeUInt16BE(nal.length, 3);
+    nal.copy(array, 5);
+    arrays.push(array);
+  }
+
+  // HEVCDecoderConfigurationRecord values mirror Apple's native
+  // ImageDescription::new_hevc implementation. The VPS/SPS/PPS arrays below
+  // are source-specific and therefore remain synchronized with the frames.
+  const hvcCPayload = Buffer.concat([
+    Buffer.from([
+      0x01, 0x01,
+      0x60, 0x00, 0x00, 0x00,
+      0xb0, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x78,
+      0xf0, 0x00,
+      0xfc, 0xfd, 0xf8, 0xf8,
+      0x00, 0x00,
+      0x0b,
+      0x03,
+    ]),
+    ...arrays,
+  ]);
+  const hvcC = Buffer.alloc(8 + hvcCPayload.length);
+  hvcC.writeUInt32BE(hvcC.length, 0);
+  hvcC.write("hvcC", 4, 4, "ascii");
+  hvcCPayload.copy(hvcC, 8);
+
+  const entry = Buffer.alloc(86 + hvcC.length + 4);
+  entry.writeUInt32BE(entry.length, 0);
+  entry.write("hvc1", 4, 4, "ascii");
+  entry.writeUInt16BE(0xffff, 14);
+  entry.writeUInt32BE(512, 24);
+  entry.writeUInt32BE(512, 28);
+  entry.writeUInt16BE(1920, 32);
+  entry.writeUInt16BE(1080, 34);
+  entry.writeUInt32BE(0x0048_0000, 36);
+  entry.writeUInt32BE(0x0048_0000, 40);
+  entry.writeUInt16BE(1, 48);
+  entry[50] = 4;
+  entry.write("HEVC", 51, 4, "ascii");
+  entry.writeUInt16BE(24, 82);
+  entry.writeInt16BE(-1, 84);
+  hvcC.copy(entry, 86);
+  return entry;
+}
 
 function publicCall(call: InternalFaceTimeCall): FaceTimeCall {
   const {
@@ -173,6 +317,7 @@ function publicCall(call: InternalFaceTimeCall): FaceTimeCall {
     workDirectory: _workDirectory,
     audioPath: _audioPath,
     videoPath: _videoPath,
+    videoDescriptionPath: _videoDescriptionPath,
     browser: _browser,
     page: _page,
     session: _session,
@@ -192,10 +337,20 @@ export function applyNativeFaceTimeMediaStatus(
   call.nativePacketsSent = native.packetsSent;
   call.nativePayloadBytesTotal = native.payloadBytesTotal;
   call.nativePayloadBytesSent = native.payloadBytesSent;
+  call.nativeAudioPacketsTotal = native.audioPacketsTotal;
+  call.nativeAudioPayloadBytesTotal = native.audioPayloadBytesTotal;
+  call.nativeAudioPacketsSent = native.audioPacketsSent;
+  call.nativeAudioPayloadBytesSent = native.audioPayloadBytesSent;
+  call.nativeVideoFramesTotal = native.videoFramesTotal;
+  call.nativeVideoFramesSent = native.videoFramesSent;
+  call.nativeVideoSourceBytesTotal = native.videoSourceBytesTotal;
+  call.nativeVideoPacketsSent = native.videoPacketsSent;
+  call.nativeVideoPayloadBytesSent = native.videoPayloadBytesSent;
   call.nativeControlMessagesReceived = native.controlMessagesReceived;
   call.nativeControlMessagesAuthenticated = native.controlMessagesAuthenticated;
   call.nativeControlMessagesSent = native.controlMessagesSent;
   call.nativeControlStreamStateSent = native.controlStreamStateSent;
+  call.nativeControlStreamStateAcknowledged = native.controlStreamStateAcknowledged;
   call.nativeControlReady = native.controlReady;
   call.nativeControlParticipantContexts = native.controlParticipantContexts;
   call.nativeControlPeerUuids = native.controlPeerUuids;
@@ -212,6 +367,16 @@ export function applyNativeFaceTimeMediaStatus(
   }
   if (native.peerAudioRtpExtensionHex !== undefined) {
     call.nativePeerAudioRtpExtensionHex = native.peerAudioRtpExtensionHex;
+  }
+  call.nativePeerVideoPacketsReceived = native.peerVideoPacketsReceived;
+  if (native.peerVideoSsrc !== undefined) {
+    call.nativePeerVideoSsrc = native.peerVideoSsrc;
+  }
+  if (native.peerVideoRtpExtensionProfile !== undefined) {
+    call.nativePeerVideoRtpExtensionProfile = native.peerVideoRtpExtensionProfile;
+  }
+  if (native.peerVideoRtpExtensionHex !== undefined) {
+    call.nativePeerVideoRtpExtensionHex = native.peerVideoRtpExtensionHex;
   }
   if (native.controlLastError) call.nativeControlLastError = native.controlLastError;
   else delete call.nativeControlLastError;
@@ -561,8 +726,7 @@ export class FaceTimeMediaManager {
     this.#emit(call);
 
     try {
-      const useNative = call.mode === "audio"
-        && process.platform === "darwin"
+      const useNative = process.platform === "darwin"
         && Boolean(
           this.#signaling.createNativeMediaSession
           && this.#signaling.startNativeMediaSession
@@ -575,12 +739,20 @@ export class FaceTimeMediaManager {
           : Math.min(60, Math.max(0, input.preRollSeconds ?? 15)),
         useNative,
         input.nativeAudioPassthrough ?? false,
+        input.nativeVideoPassthrough ?? false,
       );
       if (useNative) {
         const session = await this.#signaling.createNativeMediaSession!({
           targets: call.targets,
           ...(input.from ? { from: input.from } : {}),
           audioPath: call.audioPath!,
+          ...(call.mode === "video"
+            ? {
+              videoPath: call.videoPath!,
+              videoDescriptionPath: call.videoDescriptionPath!,
+              videoFrameDurationMs: 40,
+            }
+            : {}),
         });
         call.sessionId = session.sessionId;
         call.transport = "iblue-quickrelay";
@@ -704,6 +876,7 @@ export class FaceTimeMediaManager {
     preRollSeconds: number,
     nativeAudio = false,
     nativeAudioPassthrough = false,
+    nativeVideoPassthrough = false,
   ): Promise<void> {
     const root = process.platform === "darwin"
       ? "/private/tmp/vp/inject"
@@ -711,6 +884,9 @@ export class FaceTimeMediaManager {
     await mkdir(root, { recursive: true, mode: 0o700 });
     const directory = await mkdtemp(join(root, "iblue-facetime-"));
     call.workDirectory = directory;
+    if (nativeVideoPassthrough && (!nativeAudio || call.mode !== "video" || preRollSeconds !== 0)) {
+      throw new Error("Native video passthrough is available only for native video calls without pre-roll");
+    }
     if (nativeAudioPassthrough) {
       if (!nativeAudio || call.mode !== "audio" || preRollSeconds !== 0) {
         throw new Error("Native audio passthrough is available only for native audio calls without pre-roll");
@@ -765,16 +941,56 @@ export class FaceTimeMediaManager {
     }
 
     if (call.mode === "video") {
-      call.videoPath = join(directory, "camera.y4m");
-      await execFileAsync(this.#ffmpegPath, [
-        "-hide_banner", "-loglevel", "error", "-y",
-        "-i", call.sourcePath,
-        "-map", "0:v:0",
-        "-vf",
-        `tpad=start_duration=${preRollSeconds}:start_mode=clone,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p`,
-        "-f", "yuv4mpegpipe",
-        call.videoPath,
-      ], { maxBuffer: 4 * 1024 * 1024 });
+      if (nativeAudio) {
+        const moviePath = join(directory, "camera-hvc1.mov");
+        call.videoPath = join(directory, "camera-annexb.h265");
+        call.videoDescriptionPath = join(directory, "camera-hvc1.qtff");
+        if (nativeVideoPassthrough) {
+          await copyFile(call.sourcePath, moviePath);
+          call.nativeVideoInput = "passthrough-hevc";
+        } else {
+          await execFileAsync(this.#ffmpegPath, [
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", call.sourcePath,
+            "-map", "0:v:0",
+            "-vf",
+            "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2:black,fps=25,format=nv12",
+            "-an", "-c:v", "hevc_videotoolbox", "-tag:v", "hvc1",
+            "-b:v", "1200k", "-g", "25", "-bf", "0", "-r", "25",
+            moviePath,
+          ], { maxBuffer: 4 * 1024 * 1024 });
+          call.nativeVideoInput = "transcoded-hevc";
+        }
+        const videoCopyArguments = [
+          "-hide_banner", "-loglevel", "error", "-y",
+          "-i", moviePath,
+          ...(call.mediaDurationSeconds && call.mediaDurationSeconds > 0
+            ? ["-t", String(call.mediaDurationSeconds)]
+            : []),
+          "-map", "0:v:0", "-c:v", "copy",
+          "-bsf:v", "hevc_mp4toannexb,hevc_metadata=aud=insert",
+          "-f", "hevc", call.videoPath,
+        ];
+        await execFileAsync(this.#ffmpegPath, videoCopyArguments, {
+          maxBuffer: 4 * 1024 * 1024,
+        });
+        await writeFile(
+          call.videoDescriptionPath,
+          buildFaceTimeHvc1SampleEntry(await readFile(moviePath)),
+          { mode: 0o600 },
+        );
+      } else {
+        call.videoPath = join(directory, "camera.y4m");
+        await execFileAsync(this.#ffmpegPath, [
+          "-hide_banner", "-loglevel", "error", "-y",
+          "-i", call.sourcePath,
+          "-map", "0:v:0",
+          "-vf",
+          `tpad=start_duration=${preRollSeconds}:start_mode=clone,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p`,
+          "-f", "yuv4mpegpipe",
+          call.videoPath,
+        ], { maxBuffer: 4 * 1024 * 1024 });
+      }
     }
 
     if (!nativeAudioPassthrough && !nativeAudio) {
@@ -808,6 +1024,8 @@ export class FaceTimeMediaManager {
       if (call.stopRequested) return;
       throw new Error("Native FaceTime call was not answered before the ring timeout");
     }
+    await new Promise((resolve) => setTimeout(resolve, NATIVE_MEDIA_POST_ANSWER_SETTLE_MS));
+    if (call.stopRequested) return;
 
     this.#setState(call, "waiting-for-media");
     let lastError: unknown;
@@ -863,6 +1081,8 @@ export class FaceTimeMediaManager {
       if (call.stopRequested) return;
       throw new Error("Native FaceTime live audio call was not answered before the ring timeout");
     }
+    await new Promise((resolve) => setTimeout(resolve, NATIVE_MEDIA_POST_ANSWER_SETTLE_MS));
+    if (call.stopRequested) return;
 
     this.#setState(call, "waiting-for-media");
     const startDeadline = Date.now() + 10_000;

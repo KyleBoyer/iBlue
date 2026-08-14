@@ -590,7 +590,8 @@ export class BlueBubblesServer {
           ? "apple-web-bridge"
           : null,
       nativeMedia: this.service.nativeFaceTimeMediaAvailable,
-      nativeMediaModes: this.service.nativeFaceTimeMediaAvailable ? ["audio"] : [],
+      nativeMediaModes: this.service.nativeFaceTimeMediaAvailable ? ["audio", "video"] : [],
+      experimentalNativeMediaModes: [],
       nativeMediaUnavailableReason: this.service.nativeFaceTimeMediaAvailable
         ? null
         : this.service.nativeFaceTimeMediaUnavailableReason,
@@ -643,9 +644,29 @@ export class BlueBubblesServer {
         },
         video: {
           available: Boolean(this.#faceTimeMedia),
-          transport: this.#faceTimeMedia ? "apple-web-bridge" : null,
-          topology: this.#faceTimeMedia ? "group" : null,
-          outboundIdentity: this.#faceTimeMedia ? "apple-web-guest" : null,
+          verification: this.service.nativeFaceTimeMediaAvailable
+            ? "verified-uploaded-playback"
+            : this.#faceTimeMedia
+              ? "web-fallback"
+              : "unavailable",
+          productionReady: this.service.nativeFaceTimeMediaAvailable,
+          transport: this.service.nativeFaceTimeMediaAvailable
+            ? "iblue-quickrelay"
+            : this.#faceTimeMedia
+              ? "apple-web-bridge"
+              : null,
+          topology: this.service.nativeFaceTimeMediaAvailable
+            ? "one-to-one"
+            : this.#faceTimeMedia
+              ? "group"
+              : null,
+          outboundIdentity: this.service.nativeFaceTimeMediaAvailable
+            ? "registered-apple-handle"
+            : this.#faceTimeMedia
+              ? "apple-web-guest"
+              : null,
+          outboundCodec: this.service.nativeFaceTimeMediaAvailable ? "hevc-pt100" : null,
+          streamStateAcknowledgement: this.service.nativeFaceTimeMediaAvailable,
         },
       },
       webFallbackBrowserSandbox: "default",
@@ -713,7 +734,7 @@ export class BlueBubblesServer {
           && this.#faceTimeMedia.pushLiveAudioFrame
           && this.#faceTimeMedia.finishLiveAudio,
         ),
-        verification: "native-aac-eld-pt104; pending live-call listening confirmation",
+        verification: "verified-native-aac-eld-pt104-playback",
         createEvent: "facetime-live-audio-create",
         frameEvent: "facetime-live-audio-frame",
         finishEvent: "facetime-live-audio-finish",
@@ -832,6 +853,14 @@ export class BlueBubblesServer {
             "VALIDATION_ERROR",
           );
         }
+        const nativeVideoPassthrough = multipartField(file, "nativeVideoPassthrough") === "true";
+        if (nativeVideoPassthrough && mode !== "video") {
+          throw new RequestError(
+            400,
+            "nativeVideoPassthrough is available only for video calls",
+            "VALIDATION_ERROR",
+          );
+        }
         const call = await this.#faceTimeMedia.start({
           mode,
           targets,
@@ -840,6 +869,7 @@ export class BlueBubblesServer {
           ...(multipartField(file, "from") ? { from: multipartField(file, "from")! } : {}),
           ...(maxDurationSeconds === undefined ? {} : { maxDurationSeconds }),
           ...(nativeAudioPassthrough ? { nativeAudioPassthrough: true } : {}),
+          ...(nativeVideoPassthrough ? { nativeVideoPassthrough: true } : {}),
         });
         return success(call, "FaceTime media call is starting!");
       } finally {

@@ -66,6 +66,7 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "quickrelay-rustls.patch"),
   join(projectRoot, "rustpush", "facetime-av-feature-fix.patch"),
   join(projectRoot, "rustpush", "facetime-native-live-audio.patch"),
+  join(projectRoot, "rustpush", "facetime-native-video.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 
