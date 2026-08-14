@@ -116,7 +116,8 @@ message rows.
 | Area | Level | Notes |
 | --- | --- | --- |
 | Existing Messages.app history | Unsupported by default | Reading the main user's `chat.db` would violate account isolation and would not represent the secondary account. |
-| macOS control, FCM registration, Find My, FaceTime sessions, and themes/settings backup | Explicitly unsupported | These are separate Apple services or BlueBubbles server-administration features, not the implemented iMessage transport. Routes return a structured `501`; Socket.IO mutations acknowledge with the same structured error. |
+| macOS control, FCM registration, stock Find My routes, and themes/settings backup | Explicitly unsupported | These are separate host or BlueBubbles server-administration features. Routes return a structured `501`; Socket.IO mutations acknowledge with the same structured error. iBlue's additive Find My/location and iCloud Photos APIs are documented separately in Swagger. |
+| FaceTime | Additive iBlue API | Profile-isolated signaling, one-to-one native audio, uploaded/live media, lifecycle control, and explicitly subscribed inbound audio/video are exposed under `/api/v1/iblue/facetime/*` and authenticated Socket.IO. The three stock BlueBubbles FaceTime routes remain unsupported because their host-FaceTime.app semantics do not describe iBlue's isolated native transport. |
 | AppleScript/private-API method selector | Accepted, ignored | iBlue always uses its direct IDS engine. |
 
 Synthetic database fields such as `originalROWID` are stable values from iBlue's

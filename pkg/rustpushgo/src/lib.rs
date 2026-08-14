@@ -7796,9 +7796,7 @@ mod macos_aac_eld {
     impl Encoder {
         pub fn new() -> Result<Self, WrappedError> {
             let mut error = [0 as libc::c_char; 512];
-            let context = unsafe {
-                iblue_aac_eld_encoder_create(error.as_mut_ptr(), error.len())
-            };
+            let context = unsafe { iblue_aac_eld_encoder_create(error.as_mut_ptr(), error.len()) };
             if context.is_null() {
                 return Err(WrappedError::GenericError {
                     msg: format!(
@@ -7921,8 +7919,14 @@ mod macos_aac_eld {
                 }
             }
             packets.extend(encoder.finish().expect("AAC-ELD drain"));
-            assert!((100..=101).contains(&packets.len()), "packets={}", packets.len());
-            assert!(packets.iter().all(|packet| !packet.is_empty() && packet.len() <= 255));
+            assert!(
+                (100..=101).contains(&packets.len()),
+                "packets={}",
+                packets.len()
+            );
+            assert!(packets
+                .iter()
+                .all(|packet| !packet.is_empty() && packet.len() <= 255));
         }
     }
 }
@@ -8928,7 +8932,7 @@ impl WrappedFaceTimeClient {
 
         #[cfg(target_os = "macos")]
         {
-            let (encoded_size, status) = {
+            let (packet, status, sender) = {
                 let mut media = self.native_media_sources.lock().await;
                 let source = media.get_mut(session_id).ok_or_else(|| {
                     WrappedError::GenericError {
@@ -8943,29 +8947,24 @@ impl WrappedFaceTimeClient {
                     }
                 })?;
                 let packet = encoder.encode_frame(pcm_f32le)?;
-                let encoded_size = packet.as_ref().map_or(0, Vec::len);
-                let sender = source.live_audio_sender.as_ref().ok_or_else(|| {
-                    WrappedError::GenericError {
-                        msg: "Native FaceTime live audio stream is closed".to_string(),
-                    }
-                })?;
-                if let Some(packet) = packet {
-                    sender.try_send(packet).map_err(|error| {
-                        let detail = match error {
-                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                                "Native FaceTime live audio queue is full; producer must apply backpressure"
-                            }
-                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                                "Native FaceTime live audio stream is closed"
-                            }
-                        };
-                        WrappedError::GenericError {
-                            msg: detail.to_string(),
-                        }
-                    })?;
-                }
-                (encoded_size, source.status.clone())
+                let sender =
+                    source
+                        .live_audio_sender
+                        .clone()
+                        .ok_or_else(|| WrappedError::GenericError {
+                            msg: "Native FaceTime live audio stream is closed".to_string(),
+                        })?;
+                (packet, source.status.clone(), sender)
             };
+            let encoded_size = packet.as_ref().map_or(0, Vec::len);
+            if let Some(packet) = packet {
+                sender
+                    .send(packet)
+                    .await
+                    .map_err(|_| WrappedError::GenericError {
+                        msg: "Native FaceTime live audio stream is closed".to_string(),
+                    })?;
+            }
             let mut current = status.lock().await;
             if encoded_size > 0 {
                 current.packets_total = current.packets_total.saturating_add(1);
@@ -8978,7 +8977,7 @@ impl WrappedFaceTimeClient {
     }
 
     pub async fn finish_native_audio_stream(&self, session_id: &str) -> Result<(), WrappedError> {
-        let (sender, status, flushed_packets) = {
+        let (sender, status, flushed_packets, send_task) = {
             let mut media = self.native_media_sources.lock().await;
             let source = media
                 .get_mut(session_id)
@@ -8998,6 +8997,7 @@ impl WrappedFaceTimeClient {
                 source.live_audio_sender.take(),
                 source.status.clone(),
                 flushed_packets,
+                source.send_task.take(),
             )
         };
         if let Some(sender) = sender {
@@ -9005,9 +9005,12 @@ impl WrappedFaceTimeClient {
             let mut bytes = 0u64;
             for packet in flushed_packets {
                 bytes = bytes.saturating_add(packet.len() as u64);
-                sender.send(packet).await.map_err(|_| WrappedError::GenericError {
-                    msg: "Native FaceTime live audio stream closed while draining".to_string(),
-                })?;
+                sender
+                    .send(packet)
+                    .await
+                    .map_err(|_| WrappedError::GenericError {
+                        msg: "Native FaceTime live audio stream closed while draining".to_string(),
+                    })?;
                 packets = packets.saturating_add(1);
             }
             if packets > 0 {
@@ -9017,9 +9020,16 @@ impl WrappedFaceTimeClient {
             }
             drop(sender);
         }
-        let mut current = status.lock().await;
-        if current.state == "streaming" {
-            current.state = "draining".to_string();
+        {
+            let mut current = status.lock().await;
+            if current.state == "streaming" {
+                current.state = "draining".to_string();
+            }
+        }
+        if let Some(task) = send_task {
+            task.await.map_err(|error| WrappedError::GenericError {
+                msg: format!("Native FaceTime live audio drain task failed: {error}"),
+            })?;
         }
         Ok(())
     }

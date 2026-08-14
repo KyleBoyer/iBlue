@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyNativeFaceTimeMediaStatus,
   faceTimeMediaStopDeadline,
   inspectAacEldCaf,
   inspectEvsPcmF32Le,
+  type FaceTimeCall,
 } from "../../src/bluebubbles/facetime-media.js";
 
 function cafChunk(tag: string, payload: Buffer): Buffer {
@@ -75,4 +77,59 @@ test("FaceTime native EVS PCM reports 20 ms packet boundaries", () => {
 
 test("FaceTime native EVS PCM rejects partial float samples", () => {
   assert.throws(() => inspectEvsPcmF32Le(Buffer.alloc(7)), /float32 PCM/i);
+});
+
+test("FaceTime live calls publish the final post-drain native status", () => {
+  const call: FaceTimeCall = {
+    id: "call-1",
+    sessionId: "session-1",
+    mode: "audio",
+    targets: ["tel:+16513196252"],
+    displayName: "Jade",
+    state: "ending",
+    createdAt: 1,
+    updatedAt: 2,
+    maxDurationSeconds: 60,
+    participantCount: 1,
+    transport: "iblue-quickrelay",
+    mediaSource: "live-stream",
+    nativeMediaState: "streaming",
+    nativePacketsTotal: 610,
+    nativePacketsSent: 558,
+    nativeControlLastError: "stale pre-drain detail",
+  };
+
+  applyNativeFaceTimeMediaStatus(call, {
+    sessionId: "session-1",
+    state: "stream-ended",
+    packetsTotal: 614,
+    payloadBytesTotal: 72_488,
+    packetsSent: 614,
+    payloadBytesSent: 72_488,
+    completedAt: 3,
+    controlMessagesReceived: 4,
+    controlMessagesAuthenticated: 4,
+    controlMessagesSent: 2,
+    controlStreamStateSent: true,
+    controlReady: true,
+    controlParticipantContexts: 1,
+    controlPeerUuids: 1,
+    controlMediaKeys: 2,
+    peerAudioFeedbackUpdates: 7,
+    peerAudioFeedbackSequence: 8,
+    peerAudioKbReceived: 9,
+    peerAudioPacketsReceived: 10,
+    peerAudioPayloadType: 20,
+    peerAudioRtpExtensionProfile: 0x8d00,
+    peerAudioRtpExtensionHex: "01020304",
+  });
+
+  assert.equal(call.nativeMediaState, "stream-ended");
+  assert.equal(call.nativePacketsTotal, 614);
+  assert.equal(call.nativePacketsSent, 614);
+  assert.equal(call.nativePayloadBytesTotal, 72_488);
+  assert.equal(call.nativePayloadBytesSent, 72_488);
+  assert.equal(call.nativeControlReady, true);
+  assert.equal(call.nativePeerAudioPayloadType, 20);
+  assert.equal(call.nativeControlLastError, undefined);
 });

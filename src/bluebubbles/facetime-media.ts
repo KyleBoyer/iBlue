@@ -183,6 +183,41 @@ function publicCall(call: InternalFaceTimeCall): FaceTimeCall {
   return structuredClone(result);
 }
 
+export function applyNativeFaceTimeMediaStatus(
+  call: FaceTimeCall,
+  native: FaceTimeNativeMediaStatus,
+): void {
+  call.nativeMediaState = native.state;
+  call.nativePacketsTotal = native.packetsTotal;
+  call.nativePacketsSent = native.packetsSent;
+  call.nativePayloadBytesTotal = native.payloadBytesTotal;
+  call.nativePayloadBytesSent = native.payloadBytesSent;
+  call.nativeControlMessagesReceived = native.controlMessagesReceived;
+  call.nativeControlMessagesAuthenticated = native.controlMessagesAuthenticated;
+  call.nativeControlMessagesSent = native.controlMessagesSent;
+  call.nativeControlStreamStateSent = native.controlStreamStateSent;
+  call.nativeControlReady = native.controlReady;
+  call.nativeControlParticipantContexts = native.controlParticipantContexts;
+  call.nativeControlPeerUuids = native.controlPeerUuids;
+  call.nativeControlMediaKeys = native.controlMediaKeys;
+  call.nativePeerAudioFeedbackUpdates = native.peerAudioFeedbackUpdates;
+  call.nativePeerAudioFeedbackSequence = native.peerAudioFeedbackSequence;
+  call.nativePeerAudioKbReceived = native.peerAudioKbReceived;
+  call.nativePeerAudioPacketsReceived = native.peerAudioPacketsReceived;
+  if (native.peerAudioPayloadType !== undefined) {
+    call.nativePeerAudioPayloadType = native.peerAudioPayloadType;
+  }
+  if (native.peerAudioRtpExtensionProfile !== undefined) {
+    call.nativePeerAudioRtpExtensionProfile = native.peerAudioRtpExtensionProfile;
+  }
+  if (native.peerAudioRtpExtensionHex !== undefined) {
+    call.nativePeerAudioRtpExtensionHex = native.peerAudioRtpExtensionHex;
+  }
+  if (native.controlLastError) call.nativeControlLastError = native.controlLastError;
+  else delete call.nativeControlLastError;
+  if (native.error) call.error = native.error;
+}
+
 function resolveExecutable(explicit: string | undefined, candidates: string[]): string {
   const value = explicit || candidates.find(existsSync);
   if (!value || !existsSync(value)) {
@@ -794,35 +829,7 @@ export class FaceTimeMediaManager {
     const safetyDeadline = Date.now() + call.maxDurationSeconds * 1_000;
     while (!call.stopRequested && Date.now() < safetyDeadline) {
       const native = await this.#signaling.nativeMediaStatus!(call.sessionId);
-      call.nativeMediaState = native.state;
-      call.nativePacketsTotal = native.packetsTotal;
-      call.nativePacketsSent = native.packetsSent;
-      call.nativePayloadBytesTotal = native.payloadBytesTotal;
-      call.nativePayloadBytesSent = native.payloadBytesSent;
-      call.nativeControlMessagesReceived = native.controlMessagesReceived;
-      call.nativeControlMessagesAuthenticated = native.controlMessagesAuthenticated;
-      call.nativeControlMessagesSent = native.controlMessagesSent;
-      call.nativeControlStreamStateSent = native.controlStreamStateSent;
-      call.nativeControlReady = native.controlReady;
-      call.nativeControlParticipantContexts = native.controlParticipantContexts;
-      call.nativeControlPeerUuids = native.controlPeerUuids;
-      call.nativeControlMediaKeys = native.controlMediaKeys;
-      call.nativePeerAudioFeedbackUpdates = native.peerAudioFeedbackUpdates;
-      call.nativePeerAudioFeedbackSequence = native.peerAudioFeedbackSequence;
-      call.nativePeerAudioKbReceived = native.peerAudioKbReceived;
-      call.nativePeerAudioPacketsReceived = native.peerAudioPacketsReceived;
-      if (native.peerAudioPayloadType !== undefined) {
-        call.nativePeerAudioPayloadType = native.peerAudioPayloadType;
-      }
-      if (native.peerAudioRtpExtensionProfile !== undefined) {
-        call.nativePeerAudioRtpExtensionProfile = native.peerAudioRtpExtensionProfile;
-      }
-      if (native.peerAudioRtpExtensionHex !== undefined) {
-        call.nativePeerAudioRtpExtensionHex = native.peerAudioRtpExtensionHex;
-      }
-      if (native.controlLastError) call.nativeControlLastError = native.controlLastError;
-      else delete call.nativeControlLastError;
-      if (native.error) call.error = native.error;
+      applyNativeFaceTimeMediaStatus(call, native);
       const snapshot = await this.#signaling.listSessions();
       const activeTargets = activeTargetsInSession(snapshot, call.sessionId, call.targets);
       call.participantCount = activeTargets;
@@ -880,16 +887,7 @@ export class FaceTimeMediaManager {
         this.#signaling.nativeMediaStatus!(call.sessionId),
         this.#signaling.listSessions(),
       ]);
-      call.nativeMediaState = native.state;
-      call.nativePacketsTotal = native.packetsTotal;
-      call.nativePacketsSent = native.packetsSent;
-      call.nativePayloadBytesTotal = native.payloadBytesTotal;
-      call.nativePayloadBytesSent = native.payloadBytesSent;
-      call.nativeControlMessagesReceived = native.controlMessagesReceived;
-      call.nativeControlMessagesAuthenticated = native.controlMessagesAuthenticated;
-      call.nativeControlMessagesSent = native.controlMessagesSent;
-      call.nativeControlStreamStateSent = native.controlStreamStateSent;
-      call.nativeControlReady = native.controlReady;
+      applyNativeFaceTimeMediaStatus(call, native);
       call.participantCount = activeTargetsInSession(snapshot, call.sessionId, call.targets);
       this.#emit(call);
       if (native.state === "failed") {
@@ -1207,6 +1205,9 @@ export class FaceTimeMediaManager {
       if (call.sessionId) {
         if (call.mediaSource === "live-stream") {
           await this.#signaling.finishNativeLiveAudioStream?.(call.sessionId).catch(() => undefined);
+          const finalNative = await this.#signaling.nativeMediaStatus?.(call.sessionId)
+            .catch(() => undefined);
+          if (finalNative) applyNativeFaceTimeMediaStatus(call, finalNative);
         }
         await this.#signaling.leaveSession(call.sessionId).catch(() => undefined);
       }

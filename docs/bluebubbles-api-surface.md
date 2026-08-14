@@ -63,7 +63,9 @@ The exact REST implementations cover:
 - empty isolated BlueBubbles contact reads plus profile-local Socket.IO VCF
   storage and the additive iBlue contact/location API described below;
 - webhook create/list/delete; and
-- FaceTime availability as an explicit `false` capability result.
+- FaceTime availability as a runtime capability result, plus additive
+  profile-isolated signaling, deterministic media calls, and authenticated
+  realtime media/control metadata under `/api/v1/iblue/facetime/*`.
 
 Account alias removals are eligible for both Socket.IO and webhook delivery.
 Incoming APNs envelope IDs are durably claimed before event conversion. A
@@ -112,12 +114,34 @@ the rest of `/api/v1`:
 | `GET` | `/api/v1/iblue/poll/:messageGuid` | Fetch an Apple Messages poll definition plus its aggregated current votes. |
 | `POST` | `/api/v1/iblue/poll` | Author and send an Apple Messages poll using `{chatGuid, options, title?}`. |
 | `POST` | `/api/v1/iblue/poll/:messageGuid/vote` | Replace the sending profile's complete selection set using `{optionIdentifiers: string[]}`; an empty array clears its votes. |
+| `GET` | `/api/v1/iblue/facetime/capabilities` | Feature-detect profile-isolated signaling, native versus fallback media modes, identity/topology, codecs, verification state, and realtime streaming availability. |
+| `GET` | `/api/v1/iblue/facetime/realtime` | Return the authoritative authenticated Socket.IO event map, frame formats, queue limits, ownership rules, subscription TTLs, and privacy guarantees. |
+| `POST` / `GET` | `/api/v1/iblue/facetime/session` | Create or list profile-local FaceTime signaling sessions without controlling FaceTime.app. |
+| `POST` | `/api/v1/iblue/facetime/session/:sessionId/leave` | Leave a profile-local signaling session. |
+| `POST` / `GET` | `/api/v1/iblue/facetime/call` | Start one uploaded deterministic media call or list the process-local call lifecycle records. |
+| `GET` / `DELETE` | `/api/v1/iblue/facetime/call/:callId` | Inspect or explicitly end one deterministic media call. |
 
 Apple Music sends use the same song specialization as the Music app, including
 catalog offers and the preview control. Supply `chatGuid`, `originalUrl`, a
 previously stored `artworkAttachmentGuid`, and an `appleMusic` object containing
 `storefrontIdentifier`, `storeIdentifier`, `name`, `artist`, `album`, and
 `previewUrl` to `POST /api/v1/iblue/rich-link`.
+
+FaceTime realtime clients authenticate in the Socket.IO handshake with the
+same server password. `facetime-live-audio-create`,
+`facetime-live-audio-frame`, and `facetime-live-audio-finish` provide
+socket-owned 24 kHz mono float32 injection; every 1,920-byte/20 ms frame is
+acknowledged and the native encoder retains one AAC-ELD/PT104 stream context.
+The queue is bounded, calls have a 15–600 second safety deadline, disconnecting
+the owning socket ends its call, and finishing drains accepted frames before
+leaving. `facetime-media-subscribe` and `facetime-media-unsubscribe` opt an
+authenticated socket into time-limited inbound audio/video delivery on
+`ft-media-frame`; media bytes are not stored, copied to webhooks, or inserted
+into ordinary iMessage events. `facetime-call-list`, `facetime-call-get`, and
+`facetime-call-stop` expose controls, while `ft-call-status-changed` carries the
+lifecycle. Uploaded and live audio use the selected iBlue profile's one-to-one
+QuickRelay transport. Until native outbound AVC video is complete, uploaded
+video is accurately reported as the isolated Apple web-guest group fallback.
 
 Handles gain an optional `iBlue.contact` summary. Messages gain optional
 `iBlue.senderContact`, `iBlue.sharedLocation`, `iBlue.messageFlair`,
@@ -259,7 +283,7 @@ grouped rather than disguised as successful operations:
 | FCM | 1 | iBlue supplies Socket.IO and webhooks instead of Firebase; device registration is unsupported while the config read reports the normal missing-config response. |
 | Blurhash/live-photo derivatives | 2 | The original attachment remains downloadable; no image derivative or paired live-video file is currently stored. |
 | Share contact | 1 | BlueBubbles asks Messages.app to share its signed-in user's personal card. iBlue has no equivalent main-user contact identity and does not infer one from the profile VCF. |
-| FaceTime sessions | 3 | FaceTime call control is not part of the current iBlue API. |
+| Stock FaceTime sessions | 3 | These BlueBubbles routes assume FaceTime.app/host call semantics. iBlue instead exposes profile-isolated signaling, deterministic media, call controls, and realtime media under `/api/v1/iblue/facetime/*`; the stock aliases intentionally remain unavailable rather than misrepresenting that transport. |
 | Contact creation | 1 | iBlue must not mutate the main macOS user's Contacts database. |
 | Theme/settings backup | 6 | BlueBubbles client/server administration, not iMessage transport. |
 
