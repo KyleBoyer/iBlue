@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import type {
+  FaceTimeIncomingSession,
   FaceTimeSessionCreateParams,
   FaceTimeSessionStart,
   IMessageEngine,
@@ -107,6 +108,24 @@ function outgoingControlTarget(message: IncomingMessage): string {
   return message.error?.forUuid ?? message.uuid;
 }
 
+export function parseIncomingFaceTimeSignal(message: IncomingMessage): {
+  sessionId: string;
+  state: "ringing" | "declined" | "answered-elsewhere";
+} | undefined {
+  const match = message.text?.match(
+    /^\[\[FACETIME_(RING|MISSED|ANSWERED_ELSEWHERE)\]\]\s+guid=([0-9A-F-]+)/i,
+  );
+  if (!match) return undefined;
+  return {
+    sessionId: match[2]!.toUpperCase(),
+    state: match[1]!.toUpperCase() === "RING"
+      ? "ringing"
+      : match[1]!.toUpperCase() === "MISSED"
+        ? "declined"
+        : "answered-elsewhere",
+  };
+}
+
 export class BlueBubblesService extends EventEmitter {
   readonly profile: string;
   readonly password: string;
@@ -125,6 +144,7 @@ export class BlueBubblesService extends EventEmitter {
   #webhookWakeRequested = false;
   #incomingTasks = new Set<Promise<void>>();
   #outgoingAnnouncements = new Set<string>();
+  #incomingFaceTimeAnnouncements = new Set<string>();
   #focusByHandle = new Map<string, IBlueFocusStatus>();
   #pendingOutgoingControls = new Map<
     string,
@@ -270,6 +290,16 @@ export class BlueBubblesService extends EventEmitter {
       && Boolean(this.engine.setNativeFaceTimeMediaStream);
   }
 
+  get nativeFaceTimeIncomingAvailable(): boolean {
+    return process.platform === "darwin" && Boolean(
+      this.engine.listIncomingFaceTimeSessions
+      && this.engine.answerIncomingFaceTimeSession
+      && this.engine.declineIncomingFaceTimeSession
+      && this.engine.startNativeFaceTimeMediaSession
+      && this.engine.nativeFaceTimeMediaStatus,
+    );
+  }
+
   get nativeFaceTimeLiveAudioAvailable(): boolean {
     return process.platform === "darwin" && Boolean(
       this.engine.createNativeFaceTimeLiveAudioSession
@@ -277,6 +307,14 @@ export class BlueBubblesService extends EventEmitter {
       && this.engine.pushNativeFaceTimeLiveAudioFrame
       && this.engine.finishNativeFaceTimeLiveAudioStream
       && this.engine.nativeFaceTimeMediaStatus,
+    );
+  }
+
+  get nativeFaceTimeLiveVideoAvailable(): boolean {
+    return this.nativeFaceTimeIncomingAvailable && Boolean(
+      this.engine.startNativeFaceTimeLiveVideoStream
+      && this.engine.pushNativeFaceTimeLiveVideoFrame
+      && this.engine.finishNativeFaceTimeLiveVideoStream,
     );
   }
 
@@ -356,6 +394,37 @@ export class BlueBubblesService extends EventEmitter {
     return this.engine.nativeFaceTimeMediaStatus(sessionId);
   }
 
+  async listIncomingFaceTimeSessions(): Promise<FaceTimeIncomingSession[]> {
+    if (!this.engine.listIncomingFaceTimeSessions) {
+      throw new Error("Native incoming FaceTime is unavailable");
+    }
+    return this.engine.listIncomingFaceTimeSessions();
+  }
+
+  async answerIncomingFaceTimeSession(params: {
+    sessionId: string;
+    audioPath?: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
+  }): Promise<FaceTimeIncomingSession> {
+    if (!this.engine.answerIncomingFaceTimeSession) {
+      throw new Error("Native incoming FaceTime is unavailable");
+    }
+    const session = await this.engine.answerIncomingFaceTimeSession(params);
+    this.#incomingFaceTimeAnnouncements.delete(params.sessionId.toUpperCase());
+    return session;
+  }
+
+  async declineIncomingFaceTimeSession(sessionId: string): Promise<FaceTimeIncomingSession> {
+    if (!this.engine.declineIncomingFaceTimeSession) {
+      throw new Error("Native incoming FaceTime is unavailable");
+    }
+    const session = await this.engine.declineIncomingFaceTimeSession(sessionId);
+    this.#incomingFaceTimeAnnouncements.delete(sessionId.toUpperCase());
+    return session;
+  }
+
   async setNativeFaceTimeMediaStream(params: {
     sessionId: string;
     enabled: boolean;
@@ -402,6 +471,34 @@ export class BlueBubblesService extends EventEmitter {
       throw new Error("Native FaceTime live audio is unavailable");
     }
     return this.engine.finishNativeFaceTimeLiveAudioStream(sessionId);
+  }
+
+  async startNativeFaceTimeLiveVideoStream(params: {
+    sessionId: string;
+    imageDescription: Buffer;
+    frameDurationMs?: number;
+  }) {
+    if (!this.engine.startNativeFaceTimeLiveVideoStream) {
+      throw new Error("Native FaceTime live video is unavailable");
+    }
+    return this.engine.startNativeFaceTimeLiveVideoStream(params);
+  }
+
+  async pushNativeFaceTimeLiveVideoFrame(sessionId: string, frame: Buffer) {
+    if (!this.engine.pushNativeFaceTimeLiveVideoFrame) {
+      throw new Error("Native FaceTime live video is unavailable");
+    }
+    if (frame.length === 0 || frame.length > 4 * 1024 * 1024) {
+      throw new Error("Native FaceTime live video frames must be between 1 byte and 4 MiB");
+    }
+    return this.engine.pushNativeFaceTimeLiveVideoFrame(sessionId, frame);
+  }
+
+  async finishNativeFaceTimeLiveVideoStream(sessionId: string) {
+    if (!this.engine.finishNativeFaceTimeLiveVideoStream) {
+      throw new Error("Native FaceTime live video is unavailable");
+    }
+    return this.engine.finishNativeFaceTimeLiveVideoStream(sessionId);
   }
 
   async syncICloudContacts(): Promise<{ contacts: number; addresses: number; syncedAt: number }> {
@@ -1528,6 +1625,32 @@ export class BlueBubblesService extends EventEmitter {
   }
 
   async #handleClaimedIncoming(message: IncomingMessage): Promise<void> {
+    const faceTime = parseIncomingFaceTimeSignal(message);
+    if (faceTime) {
+      if (faceTime.state === "ringing") {
+        if (this.#incomingFaceTimeAnnouncements.has(faceTime.sessionId)) return;
+        this.#incomingFaceTimeAnnouncements.add(faceTime.sessionId);
+        const native = this.engine.listIncomingFaceTimeSessions
+          ? (await this.engine.listIncomingFaceTimeSessions())
+            .find((session) => session.sessionId.toUpperCase() === faceTime.sessionId)
+          : undefined;
+        this.dispatch("incoming-facetime", native ?? {
+          sessionId: faceTime.sessionId,
+          state: "ringing",
+          direction: "incoming",
+          caller: message.sender,
+          participants: message.participants,
+        });
+      } else {
+        this.#incomingFaceTimeAnnouncements.delete(faceTime.sessionId);
+        this.dispatch("ft-call-status-changed", {
+          sessionId: faceTime.sessionId,
+          direction: "incoming",
+          status: faceTime.state,
+        });
+      }
+      return;
+    }
     const chatGuid = deriveIncomingChatGuid(message, this.handles);
     const previousParticipants = this.store.conversationForChat(chatGuid)?.participants ?? [];
     const verification = message.verificationFailed === undefined

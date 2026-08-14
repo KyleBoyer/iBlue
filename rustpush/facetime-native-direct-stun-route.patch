@@ -1,0 +1,31 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2432,13 +2432,23 @@
+                 let (len, addr) = connection.recv_from(&mut buf).await.unwrap();
+                 if buf[0] & 0xc0 == 0 {
+                     stun_msg.unmarshal_binary(&buf[..len]).unwrap();
+-                    match integrity.check(&mut stun_msg) {
+-                        Ok(()) => {},
+-                        Err(rtc_shared::error::Error::ErrAttributeNotFound) => {},
++                    let authenticated = match integrity.check(&mut stun_msg) {
++                        Ok(()) => true,
++                        Err(rtc_shared::error::Error::ErrAttributeNotFound) => false,
+                         Err(e) => panic!("Integrity check error {e}!"),
+-                    }
++                    };
+                     info!("Got stun message {stun_msg:?}");
+                     match stun_msg.typ {
+                         BINDING_REQUEST => {
++                            // This UDP socket and candidate are scoped to the
++                            // current FaceTime session. Apple legitimately
++                            // omits MESSAGE-INTEGRITY on some direct ICE
++                            // bindings; malformed/invalid integrity still
++                            // fails above. Remember the validated STUN source
++                            // now rather than deadlocking on receive-first RTP.
++                            link_state.lock().await.direct_peer = Some(addr);
++                            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                                warn!("FaceTime direct route selected from session STUN binding (message_integrity={authenticated})");
++                            }
+                             // let it know the binding was successful
+                             stun_msg.build(&[

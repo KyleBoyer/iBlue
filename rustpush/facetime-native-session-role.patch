@@ -1,0 +1,59 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -210,6 +210,11 @@ pub struct FTSession {
+     pub connection: Option<Arc<FTSessionConnection>>,
+     #[serde(skip)]
+     pub av_config: Option<AVConfig>,
++    /// Whether this participant owns the call invitation. Incoming sessions
++    /// must remain responders; advertising them as initiators prevents the
++    /// caller from committing the responder's U1 media stream.
++    #[serde(skip)]
++    pub is_initiator: bool,
+     /// Peer QuickRelay bootstrap data can arrive in the IDS invitation before
+     /// this profile creates its own GlobalLink while answering. Preserve it by
+     /// handle so the later relay allocation can seed the matching participant.
+@@ -2472,6 +2477,7 @@ impl FTClient {
+             recent_member_adds: HashMap::new(),
+             connection: None,
+             av_config: Some(AVConfig::new(self.os_config.as_ref())),
++            is_initiator: true,
+             native_peer_prekeys: HashMap::new(),
+             native_peer_session_ids: HashMap::new(),
+             native_peer_tokens: HashMap::new(),
+@@ -2530,7 +2536,7 @@ impl FTClient {
+ 
+         let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
+ 
+-        let is_initiator = true; // todo, what does this mean
++        let is_initiator = session.is_initiator;
+         let is_u_plus_one = join_type == 3; // new user flag (one on one downgrade??)
+         let wire_message = FTWireMessage {
+             session: session.group_id.clone(),
+@@ -2620,7 +2626,7 @@ impl FTClient {
+             Some(link.link.get_public_key().await?.into())
+         } else { None };
+ 
+-        let is_initiator = true; // todo, what does this mean
++        let is_initiator = session.is_initiator;
+         let is_u_plus_one = false; // new user flag (one on one downgrade??)
+ 
+         let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();
+@@ -2853,7 +2859,7 @@ impl FTClient {
+ 
+     pub async fn unprop_conv(&self, session: &mut FTSession) -> Result<(), PushError> {
+         let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
+-        let is_initiator = true; // todo, what does this mean
++        let is_initiator = session.is_initiator;
+         let is_u_plus_one = true; // new user flag (one on one downgrade??)
+         let wire_message = FTWireMessage {
+             session: session.group_id.clone(),
+@@ -2875,6 +2881,8 @@ impl FTClient {
+                 a
+             })),
+         };
++
++        session.is_initiator = false;
+ 
+ 
+         let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();

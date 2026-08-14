@@ -1,0 +1,211 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -196,6 +196,13 @@
+     pub connection: Option<Arc<FTSessionConnection>>,
+     #[serde(skip)]
+     pub av_config: Option<AVConfig>,
++    /// Peer QuickRelay bootstrap data can arrive in the IDS invitation before
++    /// this profile creates its own GlobalLink while answering. Preserve it by
++    /// handle so the later relay allocation can seed the matching participant.
++    #[serde(skip)]
++    pub native_peer_prekeys: HashMap<String, Vec<u8>>,
++    #[serde(skip)]
++    pub native_peer_session_ids: HashMap<String, String>,
+     // A headless web caller must remain propped until its media leg ends.
+     #[serde(skip)]
+     pub hold_bridge_for_web: bool,
+@@ -1516,6 +1523,15 @@
+         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+ 
+         let mut relay_session = GlobalLink::new(self.identity.clone(), handle, &people_in_chatroom, &session.group_id).await?;
++        let mut seeded_peer_session_ids = HashMap::new();
++        for (peer_handle, prekey) in &session.native_peer_prekeys {
++            let participant_id = relay_session
++                .seed_participant_prekey(peer_handle, prekey)
++                .await?;
++            if let Some(peer_session_id) = session.native_peer_session_ids.get(peer_handle) {
++                seeded_peer_session_ids.insert(participant_id, peer_session_id.clone());
++            }
++        }
+ 
+         for allocation in &relay_session.state.lock().await.configuration.allocations {
+             let id = allocation.id as u64;
+@@ -1549,7 +1565,7 @@
+         session.connection = Some(Arc::new(FTSessionConnection {
+             link: relay_session.clone(),
+             frames: Mutex::new(recv),
+-            their_session_id: Mutex::new(HashMap::new()),
++            their_session_id: Mutex::new(seeded_peer_session_ids),
+         }));
+ 
+         let item = session.connection.clone().unwrap();
+@@ -2316,6 +2332,8 @@
+             recent_member_adds: HashMap::new(),
+             connection: None,
+             av_config: Some(AVConfig::new(self.os_config.as_ref())),
++            native_peer_prekeys: HashMap::new(),
++            native_peer_session_ids: HashMap::new(),
+             hold_bridge_for_web: false,
+         };
+ 
+@@ -3085,6 +3103,15 @@
+                     let v2 = VcMediaNegotiationBlobV2::decode(avc.b2n.as_ref())?;
+                     info!("Got media blob {blob:?}");
+                     info!("Got v2 blob {v2:?}");
++                    if let Some(prekey) = received.prekey.as_ref() {
++                        session
++                            .native_peer_prekeys
++                            .insert(sender.clone(), prekey.as_ref().to_vec());
++                    }
++                    session.native_peer_session_ids.insert(
++                        sender.clone(),
++                        avc.vc_session_participant_key_uuid.clone(),
++                    );
+                     if let Some(conn) = &session.connection {
+                         conn.their_session_id.lock().await.insert(participant.into(), avc.vc_session_participant_key_uuid.clone());
+                     }
+@@ -3169,6 +3196,36 @@
+                 (210, _, _, _) => {
+                     // we don't have any realtime connection so we use the peridic rekeys as heartbeats
+                     session.last_rekey = Some(ns_since_epoch / 1000000);
++                    if let Some(prekey) = received.prekey.as_ref() {
++                        let public_prekey = prekey.as_ref().to_vec();
++                        session
++                            .native_peer_prekeys
++                            .insert(sender.clone(), public_prekey.clone());
++                        if let Some(connection) = &session.connection {
++                            let link = connection.link.clone();
++                            match link.seed_participant_prekey(&sender, &public_prekey).await {
++                                Ok(participant_id) => {
++                                    if let Some(peer_session_id) =
++                                        session.native_peer_session_ids.get(&sender)
++                                    {
++                                        connection
++                                            .their_session_id
++                                            .lock()
++                                            .await
++                                            .insert(participant_id, peer_session_id.clone());
++                                    }
++                                    tokio::spawn(async move {
++                                        if let Err(error) = link.ensure_bootstrapped().await {
++                                            warn!("Late QuickRelay bootstrap failed: {error:?}");
++                                        }
++                                    });
++                                }
++                                Err(error) => {
++                                    warn!("Unable to seed command-210 FaceTime prekey: {error:?}");
++                                }
++                            }
++                        }
++                    }
+                     (self.update_state)(&state);
+                     None
+                 }
+@@ -1952,6 +2009,6 @@
+         };
+         match connection {
+-            Some(connection) => connection.link.is_bootstrapped().await,
++            Some(connection) => connection.link.is_media_ready().await,
+             None => false,
+         }
+     }
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1031,6 +1031,9 @@
+     pub identity: IdentityManager,
+     pub handle: String,
+     pub state: Arc<DebugMutex<GlobalLinkState>>,
++    /// Serialize bootstrap attempts. The IDS SessionInfo indication and a
++    /// late command-210 peer prekey can race on incoming calls.
++    bootstrap: Mutex<()>,
+     pub incoming: Mutex<tokio::sync::mpsc::Receiver<GlobalPacket>>,
+     inc_send: tokio::sync::mpsc::Sender<GlobalPacket>,
+     ind_send: tokio::sync::mpsc::Sender<IdsqrProtoH3Message>,
+@@ -1559,6 +1562,14 @@
+     }
+ 
+     async fn bootstrap_session(&self) -> Result<(), PushError> {
++        let _bootstrap = self.bootstrap.lock().await;
++        {
++            let state = self.state.lock().await;
++            if !state.states.values().any(|participant| participant.prekey.is_some()) {
++                warn!("QuickRelay bootstrap waiting for a peer prekey");
++                return Err(PushError::NotConnected);
++            }
++        }
+         let (candidate_ipv4, candidate_port) = {
+             let state = self.state.lock().await;
+             (
+@@ -1964,6 +1978,25 @@
+     pub async fn is_bootstrapped(&self) -> bool {
+         self.state.lock().await.bootstrapped
+     }
++
++    /// Outbound media needs more than a completed local bootstrap. Wait until
++    /// the peer has published decryptable media keys and its first microphone
++    /// RTP header, which also proves the negotiated route is live.
++    pub async fn is_media_ready(&self) -> bool {
++        let state = self.state.lock().await;
++        state.bootstrapped
++            && state.audio_header_template.is_some()
++            && state
++                .states
++                .values()
++                .any(|participant| !participant.mkm.is_empty() && !participant.skm.is_empty())
++    }
++
++    /// Retry QuickRelay bootstrap after a late peer prekey arrives through the
++    /// FaceTime IDS command-210 heartbeat used by an answering participant.
++    pub async fn ensure_bootstrapped(&self) -> Result<(), PushError> {
++        self.bootstrap_session().await
++    }
+ 
+     fn parse_audio_feedback(header: &rtc_rtp::Header) -> Option<(u16, u16, u16)> {
+         if !matches!(header.payload_type, 20 | 104 | 108 | 13) || !header.extension {
+@@ -2319,6 +2319,36 @@
+         let mut bignum = BigNumContext::new()?;
+         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+         Ok(self.state.lock().await.prekey.public_key().to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut bignum)?)
++    }
++
++    /// Seed a peer prekey that arrived in the authenticated IDS invitation
++    /// before this answerer allocated its own QuickRelay link. Apple does not
++    /// necessarily replay that material indication to a late-joining answerer.
++    pub async fn seed_participant_prekey(
++        &self,
++        handle: &str,
++        public_prekey: &[u8],
++    ) -> Result<u64, PushError> {
++        let mut context = BigNumContext::new()?;
++        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
++        EcPoint::from_bytes(&group, public_prekey, &mut context)?;
++        let mut state = self.state.lock().await;
++        let participant_id = state
++            .configuration
++            .allocations
++            .iter()
++            .find(|allocation| allocation.participant == handle)
++            .map(|allocation| allocation.id as u64)
++            .ok_or(PushError::BadMsg)?;
++        state.states.entry(participant_id).or_default().prekey = Some(QuickRelayPreKey {
++            public_prekey: public_prekey.to_vec().into(),
++            wrap_mode: 1,
++            creation_date: SystemTime::now()
++                .duration_since(SystemTime::UNIX_EPOCH)
++                .map_err(|_| PushError::BadMsg)?
++                .as_secs_f64(),
++        });
++        Ok(participant_id)
+     }
+ 
+     pub async fn alloc_bind(
+@@ -2654,6 +2704,7 @@
+                 direct_socket: None,
+                 direct_peer: None,
+             })),
++            bootstrap: Mutex::new(()),
+             inc_send,
+             ind_send,
+             incoming: Mutex::new(inc),

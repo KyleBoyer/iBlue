@@ -1,0 +1,75 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -222,6 +222,11 @@
+     pub native_peer_prekeys: HashMap<String, Vec<u8>>,
+     #[serde(skip)]
+     pub native_peer_session_ids: HashMap<String, String>,
++    /// FaceTime session UUIDs belong to concrete IDS devices, not handles.
++    /// Preserve that association across relay allocation so multi-device
++    /// callers can authenticate control before the later join notification.
++    #[serde(skip)]
++    native_peer_device_session_ids: HashMap<String, String>,
+     #[serde(skip)]
+     pub native_peer_tokens: HashMap<String, Vec<u8>>,
+     /// A FaceTime handle can have several registered devices. Keep every
+@@ -1597,12 +1602,20 @@
+         } else {
+             for device in session.native_peer_device_prekeys.values() {
+-                relay_session
++                let participant_id = relay_session
+                     .seed_participant_prekey(
+                         &device.handle,
+                         Some(&device.token),
+                         &device.prekey,
+                     )
+                     .await?;
++                let token_key = base64_encode(&device.token);
++                if let Some(peer_session_id) = session
++                    .native_peer_device_session_ids
++                    .get(&token_key)
++                    .or_else(|| session.native_peer_session_ids.get(&device.handle))
++                {
++                    seeded_peer_session_ids.insert(participant_id, peer_session_id.clone());
++                }
+             }
+         }
+ 
+@@ -2150,14 +2163,15 @@
+             let Some(session) = state.sessions.get(group_id) else {
+                 return false;
+             };
+-            if matches!(session.mode, Some(FTMode::Incoming))
+-                && session.native_command211_republished.is_empty()
+-            {
++            let require_stream_state_acknowledgement = !session.is_initiator;
++            if require_stream_state_acknowledgement
++                && session.native_command211_republished.is_empty()
++            {
+                 return false;
+             }
+             (
+                 session.connection.clone(),
+-                matches!(session.mode, Some(FTMode::Incoming)),
++                require_stream_state_acknowledgement,
+             )
+         };
+         match connection {
+@@ -2501,6 +2515,7 @@
+             is_initiator: true,
+             native_peer_prekeys: HashMap::new(),
+             native_peer_session_ids: HashMap::new(),
++            native_peer_device_session_ids: HashMap::new(),
+             native_peer_tokens: HashMap::new(),
+             native_peer_device_prekeys: HashMap::new(),
+             native_command211_republished: HashSet::new(),
+@@ -3357,6 +3372,10 @@
+                             sender.clone(),
+                             avc.vc_session_participant_key_uuid.clone(),
+                         );
++                        session.native_peer_device_session_ids.insert(
++                            base64_encode(&token),
++                            avc.vc_session_participant_key_uuid.clone(),
++                        );
+                     }
+                     if let Some(conn) = &session.connection {
+                         conn.their_session_id.lock().await.insert(participant.into(), avc.vc_session_participant_key_uuid.clone());

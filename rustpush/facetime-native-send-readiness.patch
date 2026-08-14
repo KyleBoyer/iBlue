@@ -1,0 +1,27 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1984,12 +1984,6 @@
+-    /// Outbound media needs a completed local bootstrap and peer key context.
+-    /// A peer microphone header improves route selection, but cannot be a
+-    /// readiness prerequisite because a muted or receive-first peer may not
+-    /// send RTP until this participant starts its own microphone stream.
++    /// Sending uses this participant's own MKM. Peer keys and microphone RTP
++    /// are receive-side context, so neither may gate a receive-first sender.
+     pub async fn is_media_ready(&self) -> bool {
+         let state = self.state.lock().await;
+         state.bootstrapped
+-            && state
+-                .states
+-                .values()
+-                .any(|participant| !participant.mkm.is_empty() && !participant.skm.is_empty())
+     }
+@@ -2114,7 +2108,4 @@
+                 let state = self.state.lock().await;
+-                let peer_participant = state.states.iter().find_map(|(participant_id, participant)| {
+-                    (!participant.mkm.is_empty() && !participant.skm.is_empty())
+-                        .then_some(*participant_id)
+-                });
++                let peer_participant = state.states.keys().next().copied();
+                 if state.bootstrapped && peer_participant.is_some() {
+                     // NativeAudioSender replaces every direction-specific RTP

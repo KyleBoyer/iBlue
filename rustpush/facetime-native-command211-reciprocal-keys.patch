@@ -1,0 +1,73 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -224,6 +224,10 @@
+     /// response overwrite the prekey for the device that actually answered.
+     #[serde(skip)]
+     native_peer_device_prekeys: HashMap<String, NativePeerDevicePrekey>,
++    /// Participants for which Jade's responder keys have been re-published
++    /// after that exact device delivered its own command-211 material.
++    #[serde(skip)]
++    native_command211_republished: HashSet<u64>,
+     /// AVConference queues IDS key material until its one-to-one participant
+     /// exists. Keep the same bounded, memory-only behavior for command 211.
+     #[serde(skip)]
+@@ -1641,6 +1645,21 @@
+             relay_session
+                 .import_peer_key_material(participant_id, pending.media, pending.session)
+                 .await?;
++            match relay_session
++                .republish_outgoing_key_materials(participant_id)
++                .await
++            {
++                Ok(()) => {
++                    session.native_command211_republished.insert(participant_id);
++                    warn!(
++                        "Re-published reciprocal FaceTime responder keys after queued command-211 participant={}",
++                        participant_id,
++                    );
++                }
++                Err(error) => warn!(
++                    "Unable to publish reciprocal FaceTime responder keys after queued command-211: {error:?}"
++                ),
++            }
+         }
+ 
+         let item = session.connection.clone().unwrap();
+@@ -2449,6 +2468,7 @@
+             native_peer_session_ids: HashMap::new(),
+             native_peer_tokens: HashMap::new(),
+             native_peer_device_prekeys: HashMap::new(),
++            native_command211_republished: HashSet::new(),
+             native_pending_key_material: Vec::new(),
+             hold_bridge_for_web: false,
+         };
+@@ -3504,6 +3524,29 @@
+                                 mkm_added,
+                                 skm_added,
+                             );
++                            if !session
++                                .native_command211_republished
++                                .contains(&participant_id)
++                            {
++                                match connection
++                                    .link
++                                    .republish_outgoing_key_materials(participant_id)
++                                    .await
++                                {
++                                    Ok(()) => {
++                                        session
++                                            .native_command211_republished
++                                            .insert(participant_id);
++                                        warn!(
++                                            "Re-published reciprocal FaceTime responder keys after command-211 participant={}",
++                                            participant_id,
++                                        );
++                                    }
++                                    Err(error) => warn!(
++                                        "Unable to publish reciprocal FaceTime responder keys after command-211: {error:?}"
++                                    ),
++                                }
++                            }
+                         } else {
+                             warn!("Ignoring FaceTime command-211 keys for an unknown participant token");
+                         }

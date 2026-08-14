@@ -1,0 +1,16 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2644,8 +2644,12 @@
+         self.ensure_allocations(session, &[]).await?;
+         let connection = session.connection.as_ref().ok_or(PushError::NotConnected)?;
+         connection.link.ensure_bootstrapped().await?;
+-        self.publish_native_key_material(session).await?;
+         self.prop_up_conv(session, false).await?;
++        // The caller must learn that this responder is active before it can
++        // associate the participant-targeted command-211 key material with
++        // Jade's media leg. Publishing before the join is advertised leaves
++        // iOS retransmitting DeviceState because it cannot decrypt our ACKs.
++        self.publish_native_key_material(session).await?;
+         session.is_ringing_inaccurate = false;
+         (self.update_state)(&state);
+         Ok(())

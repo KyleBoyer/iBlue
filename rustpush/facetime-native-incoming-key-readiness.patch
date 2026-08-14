@@ -1,0 +1,133 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2132,12 +2132,20 @@
+         Ok(())
+     }
+ 
+-    /// True only after the profile-owned relay has accepted AllocBind and the
+-    /// IDS QPod has completed candidate and key-material bootstrap.
++    /// True only after the profile-owned relay has accepted AllocBind and, for
++    /// an incoming call, Jade's keys reached a concrete caller participant.
+     pub async fn native_media_ready(&self, group_id: &str) -> bool {
+         let connection = {
+             let state = self.state.read().await;
+-            state.sessions.get(group_id).and_then(|session| session.connection.clone())
++            let Some(session) = state.sessions.get(group_id) else {
++                return false;
++            };
++            if matches!(session.mode, Some(FTMode::Incoming))
++                && session.native_command211_republished.is_empty()
++            {
++                return false;
++            }
++            session.connection.clone()
+         };
+         match connection {
+             Some(connection) => connection.link.is_media_ready().await,
+@@ -3446,11 +3454,26 @@
+                                             .await
+                                             .insert(participant_id, peer_session_id.clone());
+                                     }
+-                                    tokio::spawn(async move {
+-                                        if let Err(error) = link.ensure_bootstrapped().await {
+-                                            warn!("Late QuickRelay bootstrap failed: {error:?}");
++                                    if let Err(error) = link.ensure_bootstrapped().await {
++                                        warn!("Late QuickRelay bootstrap failed: {error:?}");
++                                    }
++                                    match link
++                                        .republish_outgoing_key_materials(participant_id)
++                                        .await
++                                    {
++                                        Ok(()) => {
++                                            session
++                                                .native_command211_republished
++                                                .insert(participant_id);
++                                            warn!(
++                                                "Re-published reciprocal FaceTime responder keys after command-210 participant={}",
++                                                participant_id,
++                                            );
+                                         }
+-                                    });
++                                        Err(error) => warn!(
++                                            "Unable to publish reciprocal FaceTime responder keys after command-210: {error:?}"
++                                        ),
++                                    }
+                                 }
+                                 Err(error) => {
+                                     warn!("Unable to seed command-210 FaceTime prekey: {error:?}");
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2443,7 +2443,12 @@
+             })
+             .map(|allocation| allocation.id as u64)
+             .ok_or(PushError::BadMsg)?;
+-        state.states.entry(participant_id).or_default().prekey = Some(QuickRelayPreKey {
++        let participant = state.states.entry(participant_id).or_default();
++        let prekey_changed = participant
++            .prekey
++            .as_ref()
++            .is_some_and(|known| known.public_prekey.as_ref() != public_prekey);
++        participant.prekey = Some(QuickRelayPreKey {
+             public_prekey: public_prekey.to_vec().into(),
+             wrap_mode: 1,
+             creation_date: SystemTime::now()
+@@ -2451,6 +2456,9 @@
+                 .map_err(|_| PushError::BadMsg)?
+                 .as_secs_f64(),
+         });
++        if prekey_changed {
++            participant.outgoing_key_material = None;
++        }
+         Ok(participant_id)
+     }
+ 
+@@ -2665,15 +2673,6 @@
+                 }],
+             },
+         ];
+-        self.contact_qr(
+-            "PUT",
+-            "Material",
+-            IdsqrProtoH3Message {
+-                putmaterial_request: Some(IdsqrProtoPutMaterialRequest { materials }),
+-                ..Default::default()
+-            },
+-        )
+-        .await?;
+         let wire_message = FTWireMessage::responder_key_material(
+             self.group_id.clone(),
+             session_key_material,
+@@ -2686,7 +2685,10 @@
+             .duration_since(SystemTime::UNIX_EPOCH)
+             .map_err(|_| PushError::BadMsg)?
+             .as_secs();
+-        self.message_participants(
++        // IDS is the reliable side channel that activates Apple's responder
++        // decryptor. Send it independently before the QR refresh so a stale
++        // or reconnecting H3 material stream cannot suppress command 211.
++        let ids_result = self.message_participants(
+             Some(participant),
+             IDSSendMessage {
+                 sender: self.handle.clone(),
+@@ -2704,7 +2706,20 @@
+                 ]),
+             },
+         )
+-        .await?;
++        .await;
++        let qr_result = self.contact_qr(
++            "PUT",
++            "Material",
++            IdsqrProtoH3Message {
++                putmaterial_request: Some(IdsqrProtoPutMaterialRequest { materials }),
++                ..Default::default()
++            },
++        )
++        .await;
++        if let Err(error) = qr_result {
++            warn!("Unable to refresh FaceTime responder keys on QuickRelay: {error:?}");
++        }
++        ids_result?;
+         if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+             warn!(
+                 "Published FaceTime responder key material: participant={participant} generated={generated}"

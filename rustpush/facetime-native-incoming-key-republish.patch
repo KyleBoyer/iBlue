@@ -1,0 +1,142 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1351,6 +1351,24 @@
+     uri_to_participant_id_key: Option<HashMap<String, Vec<ParticipantID>>>,
+ }
+ 
++impl FTWireMessage {
++    pub(crate) fn responder_key_material(
++        session: String,
++        session_key_material: QuickRelaySkmMaterial,
++        media_key_material: QuickRelayMkmMaterial,
++        all_mkm_uri: Vec<String>,
++    ) -> Self {
++        Self {
++            fanout_groupid: session.clone(),
++            session,
++            session_key_material: Some(session_key_material),
++            media_key_material: Some(media_key_material),
++            all_mkm_uri: Some(all_mkm_uri),
++            ..Default::default()
++        }
++    }
++}
++
+ #[derive(Clone, Debug)]
+ pub enum NativeFaceTimeMediaEvent {
+     Audio {
+@@ -1594,6 +1612,7 @@
+             let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
+             let mut logged_audio_diagnostic = false;
+             let mut sent_stream_group_state = false;
++            let mut republished_responder_keys = false;
+             let mut raw_diagnostics_remaining = 32usize;
+             let capture_sender = inbound_capture_path.clone().map(|capture_path| {
+                 let (capture_send, mut capture_recv) = tokio::sync::mpsc::channel::<(u8, u32, Vec<u8>)>(2048);
+@@ -1920,6 +1939,26 @@
+                             );
+                         }
+ 
++                        if !republished_responder_keys
++                            && message.topic.as_deref()
++                                == Some("VCSessionMessageTopicDeviceState")
++                        {
++                            match session_handle
++                                .republish_outgoing_key_materials(participant)
++                                .await
++                            {
++                                Ok(()) => {
++                                    republished_responder_keys = true;
++                                    warn!(
++                                        "Re-published FaceTime responder key material after authenticated device state"
++                                    );
++                                }
++                                Err(error) => warn!(
++                                    "Unable to re-publish FaceTime responder key material: {error}"
++                                ),
++                            }
++                        }
++
+                         // iOS waits for these transaction acknowledgements
+                         // before committing the remote media stream.
+                         let transaction_id = message.transaction_id.unwrap_or_default();
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -10,7 +10,7 @@
+ use keystore::software::plist_to_bin;
+ use log::{info, warn};
+ use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private, Public}, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
+-use plist::Data;
++use plist::{Data, Dictionary, Value};
+ use quinn::{AsyncUdpSocket, EndpointConfig, Pod, crypto::rustls::QuicClientConfig, default_runtime};
+ use rtc_media::io::sample_builder::SampleBuilder;
+ use rtc_rtp::{
+@@ -32,9 +32,9 @@
+ use std::io::Cursor;
+ use aes_gcm::KeyInit;
+ use aes_gcm::aead::Aead;
+-use crate::{facetime::{AVCData, ControlKeySet, facetimep::{ConversationParticipant, VcMediaNegotiationBlob, VcMediaNegotiationBlobV2}}, ids::link::qrp::IdsqrProtoPutMaterialRequest, util::{bin_deserialize, bin_serialize, decode_hex, inflate}};
++use crate::{facetime::{AVCData, ControlKeySet, FTWireMessage, facetimep::{ConversationParticipant, VcMediaNegotiationBlob, VcMediaNegotiationBlobV2}}, ids::link::qrp::IdsqrProtoPutMaterialRequest, util::{bin_deserialize, bin_serialize, decode_hex, inflate}};
+ 
+-use crate::{CompactECKey, DebugMutex, IdentityManager, MessageTarget, PushError, aps::get_message, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage}, link::qrp::IdsqrProtoH3Message, user::QueryOptions}, util::encode_hex};
++use crate::{CompactECKey, DebugMutex, IdentityManager, MessageTarget, PushError, aps::get_message, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage, Raw}, link::qrp::IdsqrProtoH3Message, user::QueryOptions}, util::encode_hex};
+ 
+ pub mod qrp {
+     include!(concat!(env!("OUT_DIR"), "/qrp.rs"));
+@@ -2534,6 +2534,55 @@
+         Ok(())
+     }
+ 
++    /// Re-advertise this participant's responder keys once the caller's VC
++    /// control channel proves that the incoming media leg is active. An early
++    /// command-211 can race the peer's join processing and be discarded even
++    /// though QuickRelay has already accepted the encrypted material.
++    pub async fn republish_outgoing_key_materials(
++        &self,
++        participant: u64,
++    ) -> Result<(), PushError> {
++        let Some((_, media_key_material, session_key_material)) = self
++            .outgoing_key_materials()
++            .await
++            .into_iter()
++            .find(|(candidate, _, _)| *candidate == participant)
++        else {
++            return Err(PushError::BadMsg);
++        };
++        let wire_message = FTWireMessage::responder_key_material(
++            self.group_id.clone(),
++            session_key_material,
++            media_key_material,
++            self.participant_handles().await,
++        );
++        let expires = SystemTime::now()
++            .checked_add(std::time::Duration::from_secs(605))
++            .ok_or(PushError::BadMsg)?
++            .duration_since(SystemTime::UNIX_EPOCH)
++            .map_err(|_| PushError::BadMsg)?
++            .as_secs();
++        self.message_participants(
++            Some(participant),
++            IDSSendMessage {
++                sender: self.handle.clone(),
++                raw: Raw::Body(plist_to_bin(&wire_message)?),
++                send_delivered: false,
++                command: 211,
++                no_response: false,
++                id: Uuid::new_v4().to_string().to_uppercase(),
++                scheduled_ms: None,
++                queue_id: None,
++                relay: None,
++                extras: Dictionary::from_iter([
++                    ("siu", Value::Boolean(false)),
++                    ("eX", Value::Integer(expires.into())),
++                ]),
++            },
++        )
++        .await
++    }
++
+     pub async fn alloc_bind(
+         &self,
+         avc_data: &[u8],
+

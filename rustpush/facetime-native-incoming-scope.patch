@@ -1,0 +1,50 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3103,15 +3103,20 @@
+                     let v2 = VcMediaNegotiationBlobV2::decode(avc.b2n.as_ref())?;
+                     info!("Got media blob {blob:?}");
+                     info!("Got v2 blob {v2:?}");
+-                    if let Some(prekey) = received.prekey.as_ref() {
+-                        session
+-                            .native_peer_prekeys
+-                            .insert(sender.clone(), prekey.as_ref().to_vec());
++                    let is_incoming_invitation = message.r#type()
++                        == ConversationMessageType::Invitation
++                        && sender != target;
++                    if matches!(session.mode, Some(FTMode::Incoming)) || is_incoming_invitation {
++                        if let Some(prekey) = received.prekey.as_ref() {
++                            session
++                                .native_peer_prekeys
++                                .insert(sender.clone(), prekey.as_ref().to_vec());
++                        }
++                        session.native_peer_session_ids.insert(
++                            sender.clone(),
++                            avc.vc_session_participant_key_uuid.clone(),
++                        );
+                     }
+-                    session.native_peer_session_ids.insert(
+-                        sender.clone(),
+-                        avc.vc_session_participant_key_uuid.clone(),
+-                    );
+                     if let Some(conn) = &session.connection {
+                         conn.their_session_id.lock().await.insert(participant.into(), avc.vc_session_participant_key_uuid.clone());
+                     }
+@@ -3196,7 +3201,8 @@
+                 (210, _, _, _) => {
+                     // we don't have any realtime connection so we use the peridic rekeys as heartbeats
+                     session.last_rekey = Some(ns_since_epoch / 1000000);
+-                    if let Some(prekey) = received.prekey.as_ref() {
++                    if matches!(session.mode, Some(FTMode::Incoming)) {
++                        if let Some(prekey) = received.prekey.as_ref() {
+                         let public_prekey = prekey.as_ref().to_vec();
+                         session
+                             .native_peer_prekeys
+@@ -3226,6 +3232,7 @@
+                             }
+                         }
+                     }
++                    }
+                     (self.update_state)(&state);
+                     None
+                 }

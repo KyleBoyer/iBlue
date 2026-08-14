@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 
 import type {
+  FaceTimeIncomingSession,
   FaceTimeNativeMediaStatus,
   FaceTimeSessionCreateParams,
   FaceTimeSessionStart,
@@ -29,6 +30,7 @@ export type FaceTimeCallState =
 export interface FaceTimeCall {
   id: string;
   sessionId?: string;
+  direction: "incoming" | "outgoing";
   mode: FaceTimeMediaMode;
   targets: string[];
   displayName: string;
@@ -132,6 +134,15 @@ export interface FaceTimeLiveAudioCallInput {
   maxDurationSeconds?: number;
 }
 
+export interface FaceTimeIncomingCallInput {
+  sessionId: string;
+  displayName: string;
+  sourcePath: string;
+  maxDurationSeconds?: number;
+  nativeAudioPassthrough?: boolean;
+  nativeVideoPassthrough?: boolean;
+}
+
 export interface FaceTimeMediaSignaling {
   createSession(params: FaceTimeSessionCreateParams): Promise<FaceTimeSessionStart>;
   listSessions(): Promise<unknown>;
@@ -148,6 +159,15 @@ export interface FaceTimeMediaSignaling {
   }): Promise<{ sessionId: string }>;
   startNativeMediaSession?(sessionId: string): Promise<unknown>;
   nativeMediaStatus?(sessionId: string): Promise<FaceTimeNativeMediaStatus>;
+  listIncomingSessions?(): Promise<FaceTimeIncomingSession[]>;
+  answerIncomingSession?(params: {
+    sessionId: string;
+    audioPath?: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
+  }): Promise<FaceTimeIncomingSession>;
+  declineIncomingSession?(sessionId: string): Promise<FaceTimeIncomingSession>;
   createNativeLiveAudioSession?(params: {
     targets: string[];
     from?: string;
@@ -539,6 +559,7 @@ export interface AacEldCafInfo {
   packetCount: number;
   payloadBytes: number;
   durationSeconds: number;
+  sampleRate: 24_000 | 48_000;
 }
 
 export interface EvsPcmInfo {
@@ -573,7 +594,7 @@ export function inspectAacEldCaf(caf: Buffer): AacEldCafInfo {
   if (caf.length < 8 || caf.subarray(0, 4).toString("ascii") !== "caff") {
     throw new Error("Native audio passthrough requires an Apple CAF file");
   }
-  let validDescription = false;
+  let sampleRate: 24_000 | 48_000 | undefined;
   let packetCount: number | undefined;
   let packetBytes: number | undefined;
   let dataBytes: number | undefined;
@@ -591,9 +612,14 @@ export function inspectAacEldCaf(caf: Buffer): AacEldCafInfo {
       throw new Error("Native audio CAF contains a truncated chunk");
     }
     if (tag === "desc" && size >= 32) {
-      validDescription = caf.subarray(start + 8, start + 12).toString("ascii") === "aace"
-        && caf.readDoubleBE(start) === 24_000
-        && caf.readUInt32BE(start + 20) === 480;
+      const describedRate = caf.readDoubleBE(start);
+      if (
+        caf.subarray(start + 8, start + 12).toString("ascii") === "aace"
+        && (describedRate === 24_000 || describedRate === 48_000)
+        && caf.readUInt32BE(start + 20) === 480
+      ) {
+        sampleRate = describedRate;
+      }
     } else if (tag === "pakt" && size >= 24) {
       const rawPacketCount = caf.readBigUInt64BE(start);
       if (rawPacketCount === 0n || rawPacketCount > 1_000_000n) {
@@ -624,8 +650,8 @@ export function inspectAacEldCaf(caf: Buffer): AacEldCafInfo {
     }
     offset = end;
   }
-  if (!validDescription) {
-    throw new Error("Native audio CAF must contain 24 kHz AAC-ELD with 480 frames per packet");
+  if (sampleRate === undefined) {
+    throw new Error("Native audio CAF must contain 24 or 48 kHz AAC-ELD with 480 frames per packet");
   }
   if (packetCount === undefined || packetBytes === undefined || dataBytes === undefined) {
     throw new Error("Native audio CAF is missing its packet table or audio data");
@@ -636,7 +662,8 @@ export function inspectAacEldCaf(caf: Buffer): AacEldCafInfo {
   return {
     packetCount,
     payloadBytes: packetBytes,
-    durationSeconds: packetCount * 480 / 24_000,
+    durationSeconds: packetCount * 480 / sampleRate,
+    sampleRate,
   };
 }
 
@@ -709,6 +736,7 @@ export class FaceTimeMediaManager {
     const now = Date.now();
     const call: InternalFaceTimeCall = {
       id: randomUUID(),
+      direction: "outgoing",
       mode: input.mode,
       targets: [...input.targets],
       displayName: input.displayName.trim() || "iBlue",
@@ -785,6 +813,84 @@ export class FaceTimeMediaManager {
     return publicCall(call);
   }
 
+  async answerIncoming(input: FaceTimeIncomingCallInput): Promise<FaceTimeCall> {
+    if ([...this.#calls.values()].some((call) => !TERMINAL_STATES.has(call.state))) {
+      throw new Error("Only one FaceTime media call may run at a time");
+    }
+    if (
+      !this.#signaling.listIncomingSessions
+      || !this.#signaling.answerIncomingSession
+      || !this.#signaling.startNativeMediaSession
+      || !this.#signaling.nativeMediaStatus
+    ) {
+      throw new Error("Native incoming FaceTime media is unavailable");
+    }
+    const source = await stat(input.sourcePath).catch(() => undefined);
+    if (!source?.isFile() || source.size === 0) {
+      throw new Error("FaceTime media source is empty or is not a regular file");
+    }
+    const incoming = (await this.#signaling.listIncomingSessions())
+      .find((session) => session.sessionId === input.sessionId);
+    if (!incoming) throw new Error("Incoming FaceTime session was not found");
+    if (incoming.state !== "ringing") {
+      throw new Error(`Incoming FaceTime session is not ringing (${incoming.state})`);
+    }
+    if (incoming.participants.length !== 1) {
+      throw new Error("Native incoming FaceTime currently requires exactly one remote participant");
+    }
+
+    const now = Date.now();
+    const call: InternalFaceTimeCall = {
+      id: randomUUID(),
+      sessionId: incoming.sessionId,
+      direction: "incoming",
+      mode: incoming.mode,
+      targets: [...incoming.participants],
+      displayName: input.displayName.trim() || "iBlue",
+      sourcePath: input.sourcePath,
+      state: "preparing",
+      createdAt: now,
+      updatedAt: now,
+      maxDurationSeconds: Math.min(600, Math.max(15, input.maxDurationSeconds ?? 90)),
+      participantCount: 0,
+      stopRequested: false,
+      transport: "iblue-quickrelay",
+      mediaSource: "uploaded",
+    };
+    this.#calls.set(call.id, call);
+    this.#emit(call);
+    try {
+      await this.#prepareMedia(
+        call,
+        0,
+        true,
+        input.nativeAudioPassthrough ?? false,
+        input.nativeVideoPassthrough ?? false,
+        // FaceTime negotiates its send and receive directions independently.
+        // Keep Jade's outbound leg on AAC-ELD/PT104: the Apple EVS encoder path
+        // is accepted by the phone, but currently produces badly degraded audio.
+        "aac-eld",
+      );
+      this.#setState(call, "ringing");
+      await this.#signaling.answerIncomingSession({
+        sessionId: incoming.sessionId,
+        audioPath: call.audioPath!,
+        ...(call.mode === "video"
+          ? {
+            videoPath: call.videoPath!,
+            videoDescriptionPath: call.videoDescriptionPath!,
+            videoFrameDurationMs: 40,
+          }
+          : {}),
+      });
+      void this.#runNative(call).catch((error: unknown) => this.#fail(call, error));
+      return publicCall(call);
+    } catch (error) {
+      await this.#fail(call, error);
+      throw error;
+    }
+  }
+
   async startLiveAudio(input: FaceTimeLiveAudioCallInput): Promise<FaceTimeCall> {
     if ([...this.#calls.values()].some((call) => !TERMINAL_STATES.has(call.state))) {
       throw new Error("Only one FaceTime media call may run at a time");
@@ -804,6 +910,7 @@ export class FaceTimeMediaManager {
     const now = Date.now();
     const call: InternalFaceTimeCall = {
       id: randomUUID(),
+      direction: "outgoing",
       mode: "audio",
       targets: [...input.targets],
       displayName: input.displayName.trim() || "iBlue",
@@ -877,6 +984,7 @@ export class FaceTimeMediaManager {
     nativeAudio = false,
     nativeAudioPassthrough = false,
     nativeVideoPassthrough = false,
+    nativeAudioCodec: "aac-eld" | "evs" = "aac-eld",
   ): Promise<void> {
     const root = process.platform === "darwin"
       ? "/private/tmp/vp/inject"
@@ -896,6 +1004,20 @@ export class FaceTimeMediaManager {
       await copyFile(call.sourcePath, aacEldPath);
       call.audioPath = aacEldPath;
       call.nativeAudioInput = "passthrough-aac-eld";
+      call.mediaDurationSeconds = info.durationSeconds;
+    } else if (nativeAudio && nativeAudioCodec === "evs") {
+      call.audioPath = join(directory, "microphone-evs.f32le");
+      const delayMilliseconds = Math.round(preRollSeconds * 1_000);
+      await execFileAsync(this.#ffmpegPath, [
+        "-hide_banner", "-loglevel", "error", "-y",
+        "-i", call.sourcePath,
+        "-map", "0:a:0",
+        "-af", `adelay=${delayMilliseconds}:all=1`,
+        "-ar", "24000", "-ac", "1", "-c:a", "pcm_f32le",
+        "-f", "f32le", call.audioPath,
+      ], { maxBuffer: 4 * 1024 * 1024 });
+      const info = inspectEvsPcmF32Le(await readFile(call.audioPath));
+      call.nativeAudioInput = "transcoded-evs";
       call.mediaDurationSeconds = info.durationSeconds;
     } else if (nativeAudio) {
       if (!this.#afconvertPath) {
@@ -1029,7 +1151,7 @@ export class FaceTimeMediaManager {
 
     this.#setState(call, "waiting-for-media");
     let lastError: unknown;
-    const mediaStartDeadline = Date.now() + 10_000;
+    const mediaStartDeadline = Date.now() + 20_000;
     while (!call.stopRequested && Date.now() < mediaStartDeadline) {
       try {
         await this.#signaling.startNativeMediaSession(call.sessionId);
@@ -1402,6 +1524,7 @@ export class FaceTimeMediaManager {
   async #finish(call: InternalFaceTimeCall, terminalState: "ended" | "failed"): Promise<void> {
     if (call.finishing) return call.finishing;
     call.finishing = (async () => {
+      let finalState = terminalState;
       if (!TERMINAL_STATES.has(call.state)) this.#setState(call, "ending");
       const page = call.page;
       if (page && !page.isClosed()) {
@@ -1429,7 +1552,28 @@ export class FaceTimeMediaManager {
             .catch(() => undefined);
           if (finalNative) applyNativeFaceTimeMediaStatus(call, finalNative);
         }
-        await this.#signaling.leaveSession(call.sessionId).catch(() => undefined);
+        let leaveError: unknown;
+        let left = false;
+        for (let attempt = 0; attempt < 12 && !left; attempt += 1) {
+          try {
+            await this.#signaling.leaveSession(call.sessionId);
+            left = true;
+          } catch (error) {
+            leaveError = error;
+            if (attempt < 11) {
+              // The native worker can be reconnecting after a relay timeout.
+              // Keep teardown authoritative instead of reporting an ended
+              // call while the iPhone remains connected to an orphaned leg.
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+          }
+        }
+        if (!left) {
+          call.error ??= `FaceTime leave failed: ${
+            leaveError instanceof Error ? leaveError.message : String(leaveError ?? "unknown error")
+          }`;
+          finalState = "failed";
+        }
       }
       await call.browser?.close().catch(() => undefined);
       if (call.workDirectory) {
@@ -1438,7 +1582,7 @@ export class FaceTimeMediaManager {
       delete call.browser;
       delete call.page;
       call.endedAt = Date.now();
-      this.#setState(call, terminalState);
+      this.#setState(call, finalState);
     })();
     return call.finishing;
   }

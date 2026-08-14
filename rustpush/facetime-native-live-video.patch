@@ -1,0 +1,79 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2122,9 +2122,41 @@
+         connection
+             .link
+             .send_video_frames(
++                video_ssrc,
++                frames,
++                image_description,
++                frame_duration_ms,
++            )
++            .await
++    }
++
++    /// Encrypt, packetize, and pace a bounded live stream of Annex-B H.265
++    /// access units on the camera SSRC advertised in this session's AVC blob.
++    pub async fn send_native_video_stream(
++        &self,
++        group_id: &str,
++        frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        image_description: Vec<u8>,
++        progress: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
++        frame_duration_ms: u64,
++    ) -> Result<(), PushError> {
++        let (connection, video_ssrc) = {
++            let state = self.state.read().await;
++            let session = state.sessions.get(group_id).ok_or(PushError::BadMsg)?;
++            let connection = session.connection.clone().ok_or(PushError::BadMsg)?;
++            let video_ssrc = session.av_config.as_ref().ok_or(PushError::BadMsg)?.video_ssrc;
++            (connection, video_ssrc)
++        };
++        if !connection.link.is_bootstrapped().await {
++            return Err(PushError::NotConnected);
++        }
++        connection
++            .link
++            .send_video_stream(
+                 video_ssrc,
+                 frames,
+                 image_description,
++                progress,
+                 frame_duration_ms,
+             )
+             .await
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2289,6 +2289,30 @@
+             payload_bytes = payload_bytes.saturating_add(frame_payload_bytes);
+         }
+         Ok((packets, payload_bytes))
++    }
++
++    pub async fn send_video_stream(
++        &self,
++        ssrc: u32,
++        mut frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
++        image_description: Vec<u8>,
++        progress: tokio::sync::mpsc::UnboundedSender<(u64, u64)>,
++        frame_duration_ms: u64,
++    ) -> Result<(), PushError> {
++        if image_description.is_empty() {
++            return Err(PushError::BadMsg);
++        }
++        let mut sender = self
++            .create_native_video_sender(ssrc, frame_duration_ms)
++            .await?;
++        let mut first_frame = true;
++        while let Some(frame) = frames.recv().await {
++            let description = first_frame.then_some(image_description.as_slice());
++            let (packets, payload_bytes) = sender.send_frame(frame, description).await?;
++            first_frame = false;
++            let _ = progress.send((packets, payload_bytes));
++        }
++        Ok(())
+     }
+ 
+     pub async fn get_public_key(&self) -> Result<Vec<u8>, PushError> {

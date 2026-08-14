@@ -1,0 +1,158 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -177,6 +177,13 @@
+     session: Option<QuickRelaySkmMaterial>,
+ }
+ 
++#[derive(Clone)]
++struct NativePeerDevicePrekey {
++    handle: String,
++    token: Vec<u8>,
++    prekey: Vec<u8>,
++}
++
+ #[derive(Serialize, Deserialize, Default, Clone)]
+ pub struct FTSession {
+     pub group_id: String,
+@@ -212,6 +219,11 @@
+     pub native_peer_session_ids: HashMap<String, String>,
+     #[serde(skip)]
+     pub native_peer_tokens: HashMap<String, Vec<u8>>,
++    /// A FaceTime handle can have several registered devices. Keep every
++    /// authenticated device prekey instead of letting the last IDS fanout
++    /// response overwrite the prekey for the device that actually answered.
++    #[serde(skip)]
++    native_peer_device_prekeys: HashMap<String, NativePeerDevicePrekey>,
+     /// AVConference queues IDS key material until its one-to-one participant
+     /// exists. Keep the same bounded, memory-only behavior for command 211.
+     #[serde(skip)]
+@@ -1561,17 +1573,29 @@
+ 
+         let mut relay_session = GlobalLink::new(self.identity.clone(), handle, &people_in_chatroom, &session.group_id).await?;
+         let mut seeded_peer_session_ids = HashMap::new();
+-        for (peer_handle, prekey) in &session.native_peer_prekeys {
+-            let participant_id = relay_session
+-                .seed_participant_prekey(
+-                    peer_handle,
+-                    session.native_peer_tokens.get(peer_handle).map(Vec::as_slice),
+-                    prekey,
+-                )
+-                .await?;
+-            if let Some(peer_session_id) = session.native_peer_session_ids.get(peer_handle) {
+-                seeded_peer_session_ids.insert(participant_id, peer_session_id.clone());
++        if session.native_peer_device_prekeys.is_empty() {
++            for (peer_handle, prekey) in &session.native_peer_prekeys {
++                let participant_id = relay_session
++                    .seed_participant_prekey(
++                        peer_handle,
++                        session.native_peer_tokens.get(peer_handle).map(Vec::as_slice),
++                        prekey,
++                    )
++                    .await?;
++                if let Some(peer_session_id) = session.native_peer_session_ids.get(peer_handle) {
++                    seeded_peer_session_ids.insert(participant_id, peer_session_id.clone());
++                }
+             }
++        } else {
++            for device in session.native_peer_device_prekeys.values() {
++                relay_session
++                    .seed_participant_prekey(
++                        &device.handle,
++                        Some(&device.token),
++                        &device.prekey,
++                    )
++                    .await?;
++            }
+         }
+ 
+         for allocation in &relay_session.state.lock().await.configuration.allocations {
+@@ -2424,6 +2448,7 @@
+             native_peer_prekeys: HashMap::new(),
+             native_peer_session_ids: HashMap::new(),
+             native_peer_tokens: HashMap::new(),
++            native_peer_device_prekeys: HashMap::new(),
+             native_pending_key_material: Vec::new(),
+             hold_bridge_for_web: false,
+         };
+@@ -3263,9 +3288,18 @@
+                         && sender != target;
+                     if matches!(session.mode, Some(FTMode::Incoming)) || is_incoming_invitation {
+                         if let Some(prekey) = received.prekey.as_ref() {
++                            let public_prekey = prekey.as_ref().to_vec();
+                             session
+                                 .native_peer_prekeys
+-                                .insert(sender.clone(), prekey.as_ref().to_vec());
++                                .insert(sender.clone(), public_prekey.clone());
++                            session.native_peer_device_prekeys.insert(
++                                base64_encode(&token),
++                                NativePeerDevicePrekey {
++                                    handle: sender.clone(),
++                                    token: token.clone(),
++                                    prekey: public_prekey,
++                                },
++                            );
+                         }
+                         session
+                             .native_peer_tokens
+@@ -3368,6 +3402,14 @@
+                         session
+                             .native_peer_tokens
+                             .insert(sender.clone(), token.clone());
++                        session.native_peer_device_prekeys.insert(
++                            base64_encode(&token),
++                            NativePeerDevicePrekey {
++                                handle: sender.clone(),
++                                token: token.clone(),
++                                prekey: public_prekey.clone(),
++                            },
++                        );
+                         if let Some(connection) = &session.connection {
+                             let link = connection.link.clone();
+                             match link
+@@ -3407,6 +3449,46 @@
+                         warn!("Ignoring empty FaceTime command-211 key material");
+                         None
+                     } else if let Some(connection) = session.connection.clone() {
++                        let device_prekey = session
++                            .native_peer_device_prekeys
++                            .get(&base64_encode(&token))
++                            .cloned()
++                            .or_else(|| {
++                                let token_matches = session
++                                    .native_peer_tokens
++                                    .get(&sender)
++                                    .is_some_and(|stored| stored.as_slice() == token.as_slice());
++                                if token_matches {
++                                    session.native_peer_prekeys.get(&sender).map(|prekey| {
++                                        NativePeerDevicePrekey {
++                                            handle: sender.clone(),
++                                            token: token.clone(),
++                                            prekey: prekey.clone(),
++                                        }
++                                    })
++                                } else {
++                                    None
++                                }
++                            });
++                        if let Some(device) = device_prekey {
++                            match connection
++                                .link
++                                .seed_participant_prekey(
++                                    &device.handle,
++                                    Some(&device.token),
++                                    &device.prekey,
++                                )
++                                .await
++                            {
++                                Ok(participant_id) => warn!(
++                                    "Seeded FaceTime device prekey for command-211 participant={}",
++                                    participant_id,
++                                ),
++                                Err(error) => warn!(
++                                    "Unable to seed FaceTime device prekey for command-211: {error:?}"
++                                ),
++                            }
++                        }
+                         if let Some(participant_id) = connection.link.token_to_participant(&token).await {
+                             let (mkm_added, skm_added) = connection
+                                 .link

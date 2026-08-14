@@ -81,10 +81,10 @@ function cafChunk(tag: string, payload: Buffer): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-function diagnosticAacEldCaf(dataBytes = 133): Buffer {
+function diagnosticAacEldCaf(dataBytes = 133, sampleRate: 24_000 | 48_000 = 24_000): Buffer {
   const header = Buffer.from([0x63, 0x61, 0x66, 0x66, 0, 1, 0, 0]);
   const description = Buffer.alloc(32);
-  description.writeDoubleBE(24_000, 0);
+  description.writeDoubleBE(sampleRate, 0);
   description.write("aace", 8, 4, "ascii");
   description.writeUInt32BE(480, 20);
   const packetTable = Buffer.alloc(27);
@@ -122,6 +122,16 @@ test("FaceTime native AAC-ELD passthrough validates packet framing before ringin
     packetCount: 2,
     payloadBytes: 133,
     durationSeconds: 0.04,
+    sampleRate: 24_000,
+  });
+});
+
+test("FaceTime native AAC-ELD passthrough preserves captured 48 kHz packet timing", () => {
+  assert.deepEqual(inspectAacEldCaf(diagnosticAacEldCaf(133, 48_000)), {
+    packetCount: 2,
+    payloadBytes: 133,
+    durationSeconds: 0.02,
+    sampleRate: 48_000,
   });
 });
 
@@ -148,6 +158,7 @@ test("FaceTime live calls publish the final post-drain native status", () => {
   const call: FaceTimeCall = {
     id: "call-1",
     sessionId: "session-1",
+    direction: "outgoing",
     mode: "audio",
     targets: ["tel:+16513196252"],
     displayName: "Jade",

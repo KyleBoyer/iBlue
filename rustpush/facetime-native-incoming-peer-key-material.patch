@@ -1,0 +1,169 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -170,6 +170,13 @@
+     MissedOutgoing,
+ }
+ 
++#[derive(Clone)]
++struct PendingNativeKeyMaterial {
++    token: Vec<u8>,
++    media: Option<QuickRelayMkmMaterial>,
++    session: Option<QuickRelaySkmMaterial>,
++}
++
+ #[derive(Serialize, Deserialize, Default, Clone)]
+ pub struct FTSession {
+     pub group_id: String,
+@@ -205,6 +212,10 @@
+     pub native_peer_session_ids: HashMap<String, String>,
+     #[serde(skip)]
+     pub native_peer_tokens: HashMap<String, Vec<u8>>,
++    /// AVConference queues IDS key material until its one-to-one participant
++    /// exists. Keep the same bounded, memory-only behavior for command 211.
++    #[serde(skip)]
++    native_pending_key_material: Vec<PendingNativeKeyMaterial>,
+     // A headless web caller must remain propped until its media leg ends.
+     #[serde(skip)]
+     pub hold_bridge_for_web: bool,
+@@ -2416,6 +2427,7 @@
+             native_peer_prekeys: HashMap::new(),
+             native_peer_session_ids: HashMap::new(),
+             native_peer_tokens: HashMap::new(),
++            native_pending_key_material: Vec::new(),
+             hold_bridge_for_web: false,
+         };
+ 
+@@ -1597,6 +1608,16 @@
+             frames: Mutex::new(recv),
+             their_session_id: Mutex::new(seeded_peer_session_ids),
+         }));
++
++        for pending in std::mem::take(&mut session.native_pending_key_material) {
++            let Some(participant_id) = relay_session.token_to_participant(&pending.token).await else {
++                warn!("Ignoring queued FaceTime key material for an unknown participant token");
++                continue;
++            };
++            relay_session
++                .import_peer_key_material(participant_id, pending.media, pending.session)
++                .await?;
++        }
+ 
+         let item = session.connection.clone().unwrap();
+         let session_id = session.av_config.as_ref().expect("no av config").session.clone();
+@@ -3377,6 +3398,45 @@
+                     }
+                     (self.update_state)(&state);
+                     None
++                }
++                (211, _, _, wire) => {
++                    let media = wire.media_key_material.clone();
++                    let session_material = wire.session_key_material.clone();
++                    if media.is_none() && session_material.is_none() {
++                        warn!("Ignoring empty FaceTime command-211 key material");
++                        None
++                    } else if let Some(connection) = session.connection.clone() {
++                        if let Some(participant_id) = connection.link.token_to_participant(&token).await {
++                            let (mkm_added, skm_added) = connection
++                                .link
++                                .import_peer_key_material(
++                                    participant_id,
++                                    media,
++                                    session_material,
++                                )
++                                .await?;
++                            warn!(
++                                "Imported FaceTime IDS key material: participant={} mkm_added={} skm_added={}",
++                                participant_id,
++                                mkm_added,
++                                skm_added,
++                            );
++                        } else {
++                            warn!("Ignoring FaceTime command-211 keys for an unknown participant token");
++                        }
++                        None
++                    } else {
++                        if session.native_pending_key_material.len() == 8 {
++                            session.native_pending_key_material.remove(0);
++                        }
++                        session.native_pending_key_material.push(PendingNativeKeyMaterial {
++                            token: token.clone(),
++                            media,
++                            session: session_material,
++                        });
++                        warn!("Queued FaceTime IDS key material until the native participant is ready");
++                        None
++                    }
+                 }
+                 (208, a, b, FTWireMessage { participant_id_key: Some(participant), .. }) => {
+                     let id = *participant;
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2483,6 +2483,68 @@
+         handles.sort();
+         handles.dedup();
+         handles
++    }
++
++    pub async fn token_to_participant(&self, token: &[u8]) -> Option<u64> {
++        self.state
++            .lock()
++            .await
++            .configuration
++            .allocations
++            .iter()
++            .find(|allocation| allocation.token.as_ref() == token)
++            .map(|allocation| allocation.id as u64)
++    }
++
++    /// Import the IDS command-211 copy of peer keys. This is the reliable
++    /// side-channel equivalent of QuickRelay material types 13 and 14.
++    pub async fn import_peer_key_material(
++        &self,
++        participant_id: u64,
++        media: Option<QuickRelayMkmMaterial>,
++        session_material: Option<QuickRelaySkmMaterial>,
++    ) -> Result<(bool, bool), PushError> {
++        let relay_session_id = Uuid::from_bytes(
++            self.session_id
++                .clone()
++                .try_into()
++                .map_err(|_| PushError::BadMsg)?,
++        )
++        .to_string()
++        .to_uppercase();
++        let mut state = self.state.lock().await;
++        let decrypted_skm = if let Some(mut item) = session_material {
++            item.skm = state.decode_key_material(item.skm.as_ref())?;
++            Some(item)
++        } else {
++            None
++        };
++        let decrypted_mkm = if let Some(mut item) = media {
++            item.mkm = state.decode_key_material(item.mkm.as_ref())?;
++            Some(item)
++        } else {
++            None
++        };
++        let participant = state.states.entry(participant_id).or_default();
++        let mut skm_added = false;
++        if let Some(item) = decrypted_skm {
++            if !participant.skm.iter().any(|known| known.ski == item.ski) {
++                participant.skm.push(item);
++                participant.try_decrypt(&relay_session_id)?;
++                skm_added = true;
++            }
++        }
++        let mut mkm_added = false;
++        if let Some(item) = decrypted_mkm {
++            for material in item.current_and_next(&relay_session_id, 3) {
++                if participant.mkm.iter().any(|known| known.mki == material.mki) {
++                    continue;
++                }
++                participant.mkm.push(material);
++                mkm_added = true;
++            }
++        }
++        Ok((mkm_added, skm_added))
+     }
+ 
+     /// Deliver a FaceTime IDS side-channel message to all allocated devices or

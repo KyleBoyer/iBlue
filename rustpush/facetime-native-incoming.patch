@@ -1,0 +1,61 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2537,6 +2537,39 @@
+         Ok(())
+     }
+ 
++    /// Answer a peer-initiated one-to-one call with this profile's native
++    /// QuickRelay participant. No new session or web guest is created.
++    pub async fn answer_incoming_native(&self, group_id: &str) -> Result<(), PushError> {
++        let mut state = self.state.write().await;
++        let session = state.sessions.get_mut(group_id).ok_or(PushError::BadMsg)?;
++        if !matches!(session.mode, Some(FTMode::Incoming)) || !session.is_ringing_inaccurate {
++            return Err(PushError::BadMsg);
++        }
++        if session.av_config.is_none() {
++            session.av_config = Some(AVConfig::new(self.os_config.as_ref()));
++        }
++        self.ensure_allocations(session, &[]).await?;
++        self.prop_up_conv(session, false).await?;
++        session.is_ringing_inaccurate = false;
++        (self.update_state)(&state);
++        Ok(())
++    }
++
++    /// Decline a still-ringing peer-initiated call without creating a relay
++    /// allocation or advertising an active participant.
++    pub async fn decline_incoming_native(&self, group_id: &str) -> Result<(), PushError> {
++        let mut state = self.state.write().await;
++        let session = state.sessions.get_mut(group_id).ok_or(PushError::BadMsg)?;
++        if !matches!(session.mode, Some(FTMode::Incoming)) || !session.is_ringing_inaccurate {
++            return Err(PushError::BadMsg);
++        }
++        self.decline_invite(session).await?;
++        session.is_ringing_inaccurate = false;
++        session.mode = Some(FTMode::Missed);
++        (self.update_state)(&state);
++        Ok(())
++    }
++
+     pub async fn decline_invite(&self, session: &mut FTSession) -> Result<(), PushError> {
+         let mut message = ConversationMessage::default();
+         message.set_type(ConversationMessageType::Decline);
+@@ -2983,6 +3016,18 @@
+                     let participant = *participant;
+                     let decoded_context = ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
+                     let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
++
++                    // Preserve the caller's initial Audio/Video intent on an
++                    // incoming session. The headless answer path constructs
++                    // its own AVConference participant later, so relying on
++                    // FTSession::default() here would incorrectly answer every
++                    // peer-initiated FaceTime Video call as audio-only.
++                    if message.r#type() == ConversationMessageType::Invitation {
++                        session.is_video = decoded_context
++                            .video_enabled
++                            .or(decoded_context.video)
++                            .unwrap_or(message.av_mode == Some(2));
++                    }
+ 
+                     if let Some(link) = &message.link {
+                         session.link = Some(link.clone());

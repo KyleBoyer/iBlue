@@ -137,6 +137,17 @@ export interface FaceTimeNativeMediaStart {
   mode?: "audio" | "video";
 }
 
+export interface FaceTimeIncomingSession {
+  sessionId: string;
+  state: "ringing" | "active" | "answered-elsewhere" | "declined";
+  mode: "audio" | "video";
+  caller?: string;
+  participants: string[];
+  myHandles: string[];
+  startedAt?: number;
+  nativeMediaAttached: boolean;
+}
+
 export interface FaceTimeNativeLiveAudioStart extends FaceTimeNativeMediaStart {
   mediaSource: "live-stream";
   audioFormat: {
@@ -292,6 +303,15 @@ export interface IMessageEngine {
     transport: "iblue-quickrelay";
   }>;
   nativeFaceTimeMediaStatus?(sessionId: string): Promise<FaceTimeNativeMediaStatus>;
+  listIncomingFaceTimeSessions?(): Promise<FaceTimeIncomingSession[]>;
+  answerIncomingFaceTimeSession?(params: {
+    sessionId: string;
+    audioPath?: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
+  }): Promise<FaceTimeIncomingSession>;
+  declineIncomingFaceTimeSession?(sessionId: string): Promise<FaceTimeIncomingSession>;
   createNativeFaceTimeLiveAudioSession?(params: {
     targets: string[];
     from?: string;
@@ -309,6 +329,26 @@ export interface IMessageEngine {
     frameBytes: 1_920;
   }>;
   finishNativeFaceTimeLiveAudioStream?(sessionId: string): Promise<{
+    stopped: boolean;
+    sessionId: string;
+  }>;
+  startNativeFaceTimeLiveVideoStream?(params: {
+    sessionId: string;
+    imageDescription: Buffer;
+    frameDurationMs?: number;
+  }): Promise<{
+    started: boolean;
+    sessionId: string;
+    encoding: "hevc-annex-b";
+    frameDurationMs: number;
+    queueCapacityFrames: number;
+  }>;
+  pushNativeFaceTimeLiveVideoFrame?(sessionId: string, frame: Buffer): Promise<{
+    queued: boolean;
+    sessionId: string;
+    frameBytes: number;
+  }>;
+  finishNativeFaceTimeLiveVideoStream?(sessionId: string): Promise<{
     stopped: boolean;
     sessionId: string;
   }>;
@@ -616,6 +656,24 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
     return this.rpc.request("facetime.native.status", { sessionId });
   }
 
+  listIncomingFaceTimeSessions(): Promise<FaceTimeIncomingSession[]> {
+    return this.rpc.request("facetime.incoming.list");
+  }
+
+  answerIncomingFaceTimeSession(params: {
+    sessionId: string;
+    audioPath?: string;
+    videoPath?: string;
+    videoDescriptionPath?: string;
+    videoFrameDurationMs?: number;
+  }): Promise<FaceTimeIncomingSession> {
+    return this.rpc.request("facetime.incoming.answer", params);
+  }
+
+  declineIncomingFaceTimeSession(sessionId: string): Promise<FaceTimeIncomingSession> {
+    return this.rpc.request("facetime.incoming.decline", { sessionId });
+  }
+
   createNativeFaceTimeLiveAudioSession(params: {
     targets: string[];
     from?: string;
@@ -649,6 +707,44 @@ export class NativeEngine extends EventEmitter implements IMessageEngine {
     sessionId: string;
   }> {
     return this.rpc.request("facetime.native.audio.stop", { sessionId });
+  }
+
+  startNativeFaceTimeLiveVideoStream(params: {
+    sessionId: string;
+    imageDescription: Buffer;
+    frameDurationMs?: number;
+  }): Promise<{
+    started: boolean;
+    sessionId: string;
+    encoding: "hevc-annex-b";
+    frameDurationMs: number;
+    queueCapacityFrames: number;
+  }> {
+    return this.rpc.request("facetime.native.video.start", {
+      sessionId: params.sessionId,
+      imageDescriptionBase64: params.imageDescription.toString("base64"),
+      ...(params.frameDurationMs === undefined
+        ? {}
+        : { frameDurationMs: params.frameDurationMs }),
+    });
+  }
+
+  pushNativeFaceTimeLiveVideoFrame(sessionId: string, frame: Buffer): Promise<{
+    queued: boolean;
+    sessionId: string;
+    frameBytes: number;
+  }> {
+    return this.rpc.request("facetime.native.video.push", {
+      sessionId,
+      dataBase64: frame.toString("base64"),
+    });
+  }
+
+  finishNativeFaceTimeLiveVideoStream(sessionId: string): Promise<{
+    stopped: boolean;
+    sessionId: string;
+  }> {
+    return this.rpc.request("facetime.native.video.stop", { sessionId });
   }
 
   setNativeFaceTimeMediaStream(params: {

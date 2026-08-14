@@ -877,6 +877,16 @@ struct FaceTimeNativeMediaCreateParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct FaceTimeNativeIncomingAnswerParams {
+    session_id: String,
+    audio_path: Option<String>,
+    video_path: Option<String>,
+    video_description_path: Option<String>,
+    video_frame_duration_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FaceTimeNativeLiveAudioCreateParams {
     targets: Vec<String>,
     from: Option<String>,
@@ -887,6 +897,21 @@ struct FaceTimeNativeLiveAudioCreateParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FaceTimeNativeAudioFrameParams {
+    session_id: String,
+    data_base64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeVideoStartParams {
+    session_id: String,
+    image_description_base64: String,
+    frame_duration_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FaceTimeNativeVideoFrameParams {
     session_id: String,
     data_base64: String,
 }
@@ -3254,6 +3279,70 @@ impl Engine {
                     "transport": "iblue-quickrelay",
                 }))
             }
+            "facetime.incoming.list" => {
+                let sessions = self
+                    .client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .list_native_incoming_sessions()
+                    .await;
+                serde_json::to_value(sessions).map_err(RpcError::native)
+            }
+            "facetime.incoming.answer" => {
+                let params: FaceTimeNativeIncomingAnswerParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                if params
+                    .audio_path
+                    .as_ref()
+                    .is_some_and(|path| path.trim().is_empty())
+                {
+                    return Err(RpcError::invalid_params("audioPath cannot be empty"));
+                }
+                if params.video_path.is_some() != params.video_description_path.is_some() {
+                    return Err(RpcError::invalid_params(
+                        "videoPath and videoDescriptionPath must be provided together",
+                    ));
+                }
+                let session = self
+                    .client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .answer_native_incoming_session(
+                        &params.session_id,
+                        params.audio_path,
+                        params.video_path,
+                        params.video_description_path,
+                        params.video_frame_duration_ms,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                serde_json::to_value(session).map_err(RpcError::native)
+            }
+            "facetime.incoming.decline" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                let session = self
+                    .client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .decline_native_incoming_session(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                self.facetime_media_streams
+                    .write()
+                    .await
+                    .remove(&params.session_id);
+                serde_json::to_value(session).map_err(RpcError::native)
+            }
             "facetime.native.audio.create" => {
                 let params: FaceTimeNativeLiveAudioCreateParams = serde_json::from_value(params)
                     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
@@ -3360,6 +3449,87 @@ impl Engine {
                     .await
                     .map_err(RpcError::native)?
                     .finish_native_audio_stream(&params.session_id)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "stopped": true,
+                    "sessionId": params.session_id,
+                }))
+            }
+            "facetime.native.video.start" => {
+                let params: FaceTimeNativeVideoStartParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                if params.image_description_base64.len() > 96 * 1024 {
+                    return Err(RpcError::invalid_params(
+                        "imageDescriptionBase64 exceeds the supported size",
+                    ));
+                }
+                let image_description = BASE64
+                    .decode(params.image_description_base64.as_bytes())
+                    .map_err(|_| {
+                    RpcError::invalid_params("imageDescriptionBase64 must contain valid base64")
+                })?;
+                let frame_duration_ms = params.frame_duration_ms.unwrap_or(40);
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .start_native_video_stream(
+                        &params.session_id,
+                        &image_description,
+                        frame_duration_ms,
+                    )
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "started": true,
+                    "sessionId": params.session_id,
+                    "encoding": "hevc-annex-b",
+                    "frameDurationMs": frame_duration_ms,
+                    "queueCapacityFrames": 8,
+                }))
+            }
+            "facetime.native.video.push" => {
+                let params: FaceTimeNativeVideoFrameParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                if params.data_base64.len() > 6 * 1024 * 1024 {
+                    return Err(RpcError::invalid_params(
+                        "live video frame exceeds the supported size",
+                    ));
+                }
+                let frame = BASE64.decode(params.data_base64.as_bytes()).map_err(|_| {
+                    RpcError::invalid_params("dataBase64 must contain valid base64")
+                })?;
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .push_native_video_frame(&params.session_id, &frame)
+                    .await
+                    .map_err(RpcError::native)?;
+                Ok(json!({
+                    "queued": true,
+                    "sessionId": params.session_id,
+                    "frameBytes": frame.len(),
+                }))
+            }
+            "facetime.native.video.stop" => {
+                let params: FaceTimeSessionParams = serde_json::from_value(params)
+                    .map_err(|error| RpcError::invalid_params(error.to_string()))?;
+                if params.session_id.trim().is_empty() {
+                    return Err(RpcError::invalid_params("sessionId is required"));
+                }
+                self.client()?
+                    .get_facetime_client()
+                    .await
+                    .map_err(RpcError::native)?
+                    .finish_native_video_stream(&params.session_id)
                     .await
                     .map_err(RpcError::native)?;
                 Ok(json!({

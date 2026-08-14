@@ -1,0 +1,72 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1875,6 +1875,17 @@
+         if let Some((participant, peer_uuid, local_uuid, incoming_peer_first, plaintext)) =
+             authenticated
+         {
++            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                warn!(
++                    "FaceTime VC control authenticated: participant={} peer_uuid={} local_uuid={} advertised_local_uuid={} local_matches_advertised={} incoming_peer_first={}",
++                    participant,
++                    peer_uuid,
++                    local_uuid,
++                    local_session_id,
++                    local_uuid == local_session_id,
++                    incoming_peer_first,
++                );
++            }
+             if let Some(participant_state) = state.states.get_mut(&participant) {
+                 participant_state.avc_uuid = Some(peer_uuid);
+             }
+@@ -1988,6 +1999,18 @@
+                     .my_mkm
+                     .get_control(&peer_session_id, &selected_local_session_id)
+             };
++            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                warn!(
++                    "FaceTime VC control sending: participant={} counter={} peer_uuid={} selected_local_uuid={} advertised_local_uuid={} local_matches_advertised={} outgoing_local_first={}",
++                    participant,
++                    packet_counter,
++                    peer_session_id,
++                    selected_local_session_id,
++                    local_session_id,
++                    selected_local_session_id == local_session_id,
++                    state.control_incoming_peer_first,
++                );
++            }
+             (
+                 key.encrypt(plaintext, packet_counter)?,
+                 state.direct_socket.clone(),
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1891,6 +1891,14 @@
+                             }
+                         };
+                         if let Some(acknowledgement) = wrapper.acknowledgement.as_ref() {
++                            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                                warn!(
++                                    "FaceTime VC acknowledgement received: participant={} transaction={} status={}",
++                                    participant,
++                                    acknowledgement.transaction_id.unwrap_or_default(),
++                                    acknowledgement.status.unwrap_or_default(),
++                                );
++                            }
+                             session_handle
+                                 .note_control_acknowledgement(
+                                     acknowledgement.transaction_id.unwrap_or_default(),
+@@ -1902,6 +1910,15 @@
+                         let Some(message) = wrapper.message else {
+                             continue;
+                         };
++                        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                            warn!(
++                                "FaceTime VC message received: participant={} transaction={} topic={} payload_bytes={}",
++                                participant,
++                                message.transaction_id.unwrap_or_default(),
++                                message.topic.as_deref().unwrap_or("<none>"),
++                                message.payload.as_ref().map_or(0, Vec::len),
++                            );
++                        }
+ 
+                         // iOS waits for these transaction acknowledgements
+                         // before committing the remote media stream.

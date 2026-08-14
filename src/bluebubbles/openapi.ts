@@ -531,14 +531,89 @@ const routeDocumentation: Record<string, FastifySchema> = {
       properties: { sessionId: stringProperty("Uppercase FaceTime session UUID returned at creation time.") },
     },
   },
+  "GET /api/v1/iblue/facetime/incoming": {
+    summary: "List incoming FaceTime calls",
+    description: "Returns profile-owned peer-initiated FaceTime sessions with a stable session UUID, ringing/active/answered-elsewhere/declined state, detected Audio or Video mode, caller and participant handles, local registered handles, start time, and whether iBlue attached its native media engine. Historical entries may remain in rustpush state; answer and decline accept only entries whose state is ringing.",
+    tags: ["iBlue FaceTime"],
+  },
+  "GET /api/v1/iblue/facetime/incoming/auto-answer": {
+    summary: "Get the armed FaceTime auto-answer",
+    description: "Returns the current one-shot auto-answer arm, or null when none is armed. The response exposes its mode, optional caller filter, expiry, playback deadline, and state but never its private temporary source path.",
+    tags: ["iBlue FaceTime"],
+  },
+  "POST /api/v1/iblue/facetime/incoming/auto-answer": {
+    summary: "Arm one-shot incoming FaceTime auto-answer",
+    description: "Uploads media before a call arrives and arms iBlue to answer the next matching native incoming FaceTime call directly from the incoming-call event, avoiding API polling and human round-trip delay. The arm is consumed once and its private upload is deleted after use, replacement, expiry, disarm, or server shutdown.",
+    tags: ["iBlue FaceTime"],
+    consumes: ["multipart/form-data"],
+    body: {
+      type: "object",
+      required: ["media"],
+      properties: {
+        media: { type: "string", format: "binary", description: "Audio or audio-bearing video to play once on the matching incoming call, up to 95 MiB." },
+        mode: { type: "string", enum: ["audio", "video"], description: "Incoming call mode to match. Defaults from the upload MIME type." },
+        caller: stringProperty("Optional phone number, email address, or canonical tel:/mailto: handle to match. Calls from other people leave the arm available."),
+        displayName: stringProperty("Local diagnostic display name. The call remains owned by the registered iBlue Apple identity."),
+        maxDurationSeconds: integerProperty("Hard safety deadline after the matching call is answered.", { minimum: 15, maximum: 600, default: 90 }),
+        expiresInSeconds: integerProperty("How long the one-shot arm waits for a matching call before it securely removes the upload.", { minimum: 15, maximum: 86_400, default: 300 }),
+      },
+    },
+  },
+  "DELETE /api/v1/iblue/facetime/incoming/auto-answer": {
+    summary: "Disarm FaceTime auto-answer",
+    description: "Cancels an armed but unclaimed one-shot auto-answer and removes its temporary media. A call already claimed for answering cannot be disarmed through this route.",
+    tags: ["iBlue FaceTime"],
+  },
+  "POST /api/v1/iblue/facetime/incoming/:sessionId/answer": {
+    summary: "Answer an incoming FaceTime call",
+    description: "Answers one currently ringing, peer-initiated one-to-one FaceTime session as the selected iBlue profile over native QuickRelay. This creates no outgoing call, FaceTime.app participant, or Apple web guest. It attaches the native media/control plane without starting deterministic playback; use answer-with-media when a file should play immediately after connection.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["sessionId"],
+      properties: { sessionId: stringProperty("Incoming FaceTime session UUID returned by the incoming-call list or event.") },
+    },
+  },
+  "POST /api/v1/iblue/facetime/incoming/:sessionId/answer-with-media": {
+    summary: "Answer an incoming FaceTime call and play uploaded media",
+    description: "Validates and converts one uploaded source while the peer is ringing, then answers that exact incoming one-to-one session as iBlue, waits for native media readiness, plays the source once as AAC-ELD/PT104 Audio or synchronized AAC-ELD plus HEVC/PT100 Video according to the caller's invitation, and hangs up after sender completion or the safety deadline. It never creates a second session or a web guest. Use the auto-answer route to upload ahead of time and answer from the first native ring event.",
+    tags: ["iBlue FaceTime"],
+    consumes: ["multipart/form-data"],
+    params: {
+      type: "object",
+      required: ["sessionId"],
+      properties: { sessionId: stringProperty("Currently ringing incoming FaceTime session UUID.") },
+    },
+    body: {
+      type: "object",
+      required: ["media"],
+      properties: {
+        media: { type: "string", format: "binary", description: "Audio for an incoming FaceTime Audio call or audio-bearing video for an incoming FaceTime Video call, up to 95 MiB." },
+        displayName: stringProperty("Local diagnostic display name. The Apple identity remains the registered iBlue profile."),
+        maxDurationSeconds: integerProperty("Hard safety deadline after answering.", { minimum: 15, maximum: 600, default: 90 }),
+        nativeAudioPassthrough: { type: "boolean", default: false, description: "Accept an already validated 24 kHz AAC-ELD CAF for an incoming FaceTime Audio call." },
+        nativeVideoPassthrough: { type: "boolean", default: false, description: "Preserve an uploaded hvc1/HEVC track for an incoming FaceTime Video call while rebuilding Apple's ImageDescription." },
+      },
+    },
+  },
+  "POST /api/v1/iblue/facetime/incoming/:sessionId/decline": {
+    summary: "Decline an incoming FaceTime call",
+    description: "Sends Apple's native decline control for one currently ringing peer-initiated session without allocating a media relay or affecting unrelated calls.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["sessionId"],
+      properties: { sessionId: stringProperty("Currently ringing incoming FaceTime session UUID.") },
+    },
+  },
   "GET /api/v1/iblue/facetime/capabilities": {
     summary: "Get FaceTime runtime capabilities",
-    description: "Reports signaling, deterministic media transport, identity/topology, supported mode, lifecycle event, codec, verification state, inbound streaming, and outbound live-injection availability separately so agent harnesses can feature-detect each layer without attempting a call. On macOS, uploaded audio and video use a one-to-one iBlue-owned QuickRelay session authenticated as the selected profile (for example Jade); they do not use FaceTime.app, the macOS user's FaceTime account, or an Apple web guest. Ordinary generated-source audio, byte-for-byte replay of phone-originated AAC-ELD/PT104, and uploaded HEVC/PT100 video have been verified with clear playback or visible remote rendering and automatic hangup on an answered iPhone call. Live audio injection is also verified; live video injection remains unavailable and is reported separately.",
+    description: "Reports signaling, deterministic media transport, identity/topology, supported mode, lifecycle event, codec, verification state, incoming-call controls, inbound streaming, and live media-injection availability separately so agent harnesses can feature-detect each layer without attempting a call. On macOS, uploaded audio and video use a one-to-one iBlue-owned QuickRelay session authenticated as the selected profile (for example Jade); they do not use FaceTime.app, the macOS user's FaceTime account, or an Apple web guest. Ordinary generated-source audio, byte-for-byte replay of phone-originated AAC-ELD/PT104, and uploaded HEVC/PT100 video have been verified with clear playback or visible remote rendering and automatic hangup on an answered iPhone call. Incoming calls may be answered or declined, answered with deterministic media, subscribed for authenticated peer audio/video, and driven with bounded live audio plus Annex-B H.265 video streams through Socket.IO.",
     tags: ["iBlue FaceTime"],
   },
   "GET /api/v1/iblue/facetime/realtime": {
     summary: "Get FaceTime realtime protocol metadata",
-    description: "Authoritative machine-readable event map for authenticated Socket.IO call controls, explicit time-limited inbound-media subscriptions, and outbound live audio injection. Raw microphone/camera frames are delivered only to opted-in authenticated sockets and are never persisted, placed in API events, or forwarded to webhooks. A live outbound stream is exclusively owned by its creating socket; 20 ms 24 kHz mono float32 frames are individually acknowledged, encoded persistently as FaceTime AAC-ELD/PT104, bounded by a 50-frame queue and a 15–600 second safety deadline, and the call is ended if the owner disconnects. OpenAPI cannot model Socket.IO events directly, so clients must feature-detect and consume the event definitions returned here.",
+    description: "Authoritative machine-readable event map for authenticated Socket.IO call controls, incoming list/answer/decline/leave, explicit time-limited inbound-media subscriptions, outgoing live audio, and live audio/video injection into an answered incoming call. Raw microphone/camera frames are delivered only to opted-in authenticated sockets and are never persisted, placed in API events, or forwarded to webhooks. Subscriptions accept either an iBlue media-call ID or the native session ID of a call iBlue answered; each returns a stable subscription ID. Incoming live audio uses individually acknowledged 20 ms, 24 kHz mono float32 frames and persistent FaceTime AAC-ELD/PT104 encoding. Incoming live video uses one Annex-B H.265 access unit per acknowledged binary frame plus an hvc1 ImageDescription supplied at stream start. Both paths use bounded queues, are exclusively owned by one socket, and end the call if that owner disconnects. OpenAPI cannot model Socket.IO events directly, so clients must feature-detect and consume the event definitions returned here.",
     tags: ["iBlue FaceTime"],
   },
   "GET /api/v1/iblue/facetime/call": {

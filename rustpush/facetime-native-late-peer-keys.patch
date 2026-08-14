@@ -1,0 +1,101 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2604,14 +2604,76 @@
+         &self,
+         participant: u64,
+     ) -> Result<(), PushError> {
+-        let Some((_, media_key_material, session_key_material)) = self
+-            .outgoing_key_materials()
+-            .await
+-            .into_iter()
+-            .find(|(candidate, _, _)| *candidate == participant)
+-        else {
+-            return Err(PushError::BadMsg);
++        // Current AVConference creates responder material per participant as
++        // soon as that participant's prekey arrives. The older GlobalLink
++        // bootstrap is one-shot, so a late iPhone prekey could leave this
++        // participant without any responder keys forever.
++        let (media_key_material, session_key_material, generated) = {
++            let mut state = self.state.lock().await;
++            if let Some((media, session)) = state
++                .states
++                .get(&participant)
++                .and_then(|peer| peer.outgoing_key_material.as_ref())
++            {
++                (media.clone(), session.clone(), false)
++            } else {
++                let prekey = state
++                    .states
++                    .get(&participant)
++                    .and_then(|peer| peer.prekey.clone())
++                    .ok_or(PushError::BadMsg)?;
++                if !state.my_mkm.has_apple_rtp_short_mki() {
++                    return Err(PushError::BadMsg);
++                }
++                let mut media = state.my_mkm.clone();
++                media.mkm = prekey.encrypt_key_material(&media.mkm)?;
++                let mut session = state.my_skm.clone();
++                session.skm = prekey.encrypt_key_material(&session.skm)?;
++                state
++                    .states
++                    .entry(participant)
++                    .or_default()
++                    .outgoing_key_material = Some((media.clone(), session.clone()));
++                (media, session, true)
++            }
+         };
++        let materials = vec![
++            qrp::IdsqrProtoMaterial {
++                owner_participant_id: Some(0),
++                receiver_participant_id: Some(participant),
++                material_infos: vec![qrp::IdsqrProtoMaterialInfo {
++                    material_id: Some(media_key_material.mki.clone()),
++                    material_type: Some(13),
++                    material_content: Some(plist_to_bin(
++                        &self.sign_data(&plist_to_bin(&media_key_material)?).await?,
++                    )?),
++                    short_material_id_length: Some(0),
++                    ..Default::default()
++                }],
++            },
++            qrp::IdsqrProtoMaterial {
++                owner_participant_id: Some(0),
++                receiver_participant_id: Some(participant),
++                material_infos: vec![qrp::IdsqrProtoMaterialInfo {
++                    material_id: Some(session_key_material.ski.clone()),
++                    material_type: Some(14),
++                    material_content: Some(plist_to_bin(
++                        &self.sign_data(&plist_to_bin(&session_key_material)?).await?,
++                    )?),
++                    short_material_id_length: Some(0),
++                    ..Default::default()
++                }],
++            },
++        ];
++        self.contact_qr(
++            "PUT",
++            "Material",
++            IdsqrProtoH3Message {
++                putmaterial_request: Some(IdsqrProtoPutMaterialRequest { materials }),
++                ..Default::default()
++            },
++        )
++        .await?;
+         let wire_message = FTWireMessage::responder_key_material(
+             self.group_id.clone(),
+             session_key_material,
+@@ -2642,7 +2704,13 @@
+                 ]),
+             },
+         )
+-        .await
++        .await?;
++        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            warn!(
++                "Published FaceTime responder key material: participant={participant} generated={generated}"
++            );
++        }
++        Ok(())
+     }
+ 
+     pub async fn alloc_bind(

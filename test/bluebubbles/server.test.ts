@@ -14,6 +14,7 @@ import { BlueBubblesService } from "../../src/bluebubbles/service.js";
 import { BlueBubblesStore } from "../../src/bluebubbles/store.js";
 import { ICloudShareResolver } from "../../src/bluebubbles/icloud-share.js";
 import type {
+  FaceTimeIncomingSession,
   FaceTimeNativeMediaStreamStatus,
   FocusPeersSyncPage,
   FreshICloudPhotoShare,
@@ -358,6 +359,100 @@ class NativeStreamTestService extends BlueBubblesService {
   }
 }
 
+class IncomingFaceTimeTestService extends NativeStreamTestService {
+  readonly liveAudioFrames: Buffer[] = [];
+  readonly liveVideoFrames: Buffer[] = [];
+  readonly liveVideoStarts: Array<{
+    sessionId: string;
+    imageDescription: Buffer;
+    frameDurationMs?: number;
+  }> = [];
+  readonly incoming: FaceTimeIncomingSession[] = [{
+    sessionId: "INCOMING-SESSION-1",
+    state: "ringing",
+    mode: "video",
+    caller: "tel:+12025550142",
+    participants: ["tel:+12025550142"],
+    myHandles: ["mailto:secondary@example.com"],
+    startedAt: 1_234,
+    nativeMediaAttached: false,
+  }];
+
+  override get nativeFaceTimeIncomingAvailable(): boolean {
+    return true;
+  }
+
+  override get nativeFaceTimeLiveVideoAvailable(): boolean {
+    return true;
+  }
+
+  override listIncomingFaceTimeSessions(): Promise<FaceTimeIncomingSession[]> {
+    return Promise.resolve(structuredClone(this.incoming));
+  }
+
+  override answerIncomingFaceTimeSession(
+    params: { sessionId: string },
+  ): Promise<FaceTimeIncomingSession> {
+    const session = this.incoming.find((value) => value.sessionId === params.sessionId);
+    if (!session) throw new Error("not found");
+    session.state = "active";
+    session.nativeMediaAttached = true;
+    return Promise.resolve(structuredClone(session));
+  }
+
+  override declineIncomingFaceTimeSession(sessionId: string): Promise<FaceTimeIncomingSession> {
+    const session = this.incoming.find((value) => value.sessionId === sessionId);
+    if (!session) throw new Error("not found");
+    session.state = "declined";
+    return Promise.resolve(structuredClone(session));
+  }
+
+  override startNativeFaceTimeLiveAudioStream(sessionId: string) {
+    return Promise.resolve({
+      started: true,
+      sessionId,
+      frameBytes: 1_920 as const,
+      queueCapacityFrames: 50,
+    });
+  }
+
+  override pushNativeFaceTimeLiveAudioFrame(sessionId: string, frame: Buffer) {
+    this.liveAudioFrames.push(Buffer.from(frame));
+    return Promise.resolve({ queued: true, sessionId, frameBytes: 1_920 as const });
+  }
+
+  override finishNativeFaceTimeLiveAudioStream(sessionId: string) {
+    return Promise.resolve({ stopped: true, sessionId });
+  }
+
+  override startNativeFaceTimeLiveVideoStream(params: {
+    sessionId: string;
+    imageDescription: Buffer;
+    frameDurationMs?: number;
+  }) {
+    this.liveVideoStarts.push({
+      ...params,
+      imageDescription: Buffer.from(params.imageDescription),
+    });
+    return Promise.resolve({
+      started: true,
+      sessionId: params.sessionId,
+      encoding: "hevc-annex-b" as const,
+      frameDurationMs: params.frameDurationMs ?? 40,
+      queueCapacityFrames: 8,
+    });
+  }
+
+  override pushNativeFaceTimeLiveVideoFrame(sessionId: string, frame: Buffer) {
+    this.liveVideoFrames.push(Buffer.from(frame));
+    return Promise.resolve({ queued: true, sessionId, frameBytes: frame.length });
+  }
+
+  override finishNativeFaceTimeLiveVideoStream(sessionId: string) {
+    return Promise.resolve({ stopped: true, sessionId });
+  }
+}
+
 class PassiveFakeEngine extends FakeEngine {
   readonly passiveSnapshot: EngineSnapshot = { ...snapshot, idsMode: "passive" };
 
@@ -421,6 +516,269 @@ function serviceEvent(
   });
 }
 
+test("incoming FaceTime controls are authenticated, session-scoped, and media-aware", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "iblue-facetime-incoming-test-"));
+  const engine = new FakeEngine();
+  const store = new BlueBubblesStore(join(root, "test.sqlite"), join(root, "attachments"));
+  const service = new IncomingFaceTimeTestService({
+    profile: "test",
+    password: "secret",
+    engine,
+    store,
+    sessionStore: new SessionStore("test", join(root, "session.json")),
+  });
+  await service.start({
+    version: 1,
+    profile: "test",
+    deviceId: "device-test",
+    apsState: "aps",
+    users: "users",
+    identity: "identity",
+    accountUsername: "secondary@example.com",
+    handles: snapshot.handles,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const mediaAnswers: Array<{ sessionId: string; data: Buffer }> = [];
+  let notifyMediaAnswer: (() => void) | undefined;
+  const mediaManager = {
+    list: (): FaceTimeCall[] => [],
+    get: (): FaceTimeCall | undefined => undefined,
+    start: async (): Promise<FaceTimeCall> => { throw new Error("not used"); },
+    stop: async (): Promise<FaceTimeCall | undefined> => undefined,
+    answerIncoming: async (input: {
+      sessionId: string;
+      displayName: string;
+      sourcePath: string;
+      maxDurationSeconds?: number;
+    }): Promise<FaceTimeCall> => {
+      mediaAnswers.push({ sessionId: input.sessionId, data: await readFile(input.sourcePath) });
+      notifyMediaAnswer?.();
+      const now = Date.now();
+      return {
+        id: "incoming-call-1",
+        sessionId: input.sessionId,
+        direction: "incoming",
+        mode: "video",
+        targets: ["tel:+12025550142"],
+        displayName: input.displayName,
+        state: "ringing",
+        createdAt: now,
+        updatedAt: now,
+        maxDurationSeconds: input.maxDurationSeconds ?? 90,
+        participantCount: 1,
+        transport: "iblue-quickrelay",
+        mediaSource: "uploaded",
+      };
+    },
+    close: async (): Promise<void> => {},
+  };
+  const api = new BlueBubblesServer({ service, port: 0, faceTimeMediaManager: mediaManager });
+  const listening = await api.start();
+  const socket = socketClient(listening.address, {
+    query: { password: "secret" },
+    transports: ["websocket"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("connect_error", reject);
+  });
+  t.after(async () => {
+    socket.disconnect();
+    await api.stop();
+    await service.stop();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const unauthorized = await fetch(`${listening.address}/api/v1/iblue/facetime/incoming`);
+  assert.equal(unauthorized.status, 401);
+
+  const listed = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming?password=secret`,
+  ).then((response) => response.json()) as { data: FaceTimeIncomingSession[] };
+  assert.equal(listed.data[0]?.sessionId, "INCOMING-SESSION-1");
+  assert.equal(listed.data[0]?.mode, "video");
+
+  const answered = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming/INCOMING-SESSION-1/answer?password=secret`,
+    { method: "POST" },
+  ).then((response) => response.json()) as { data: FaceTimeIncomingSession };
+  assert.equal(answered.data.state, "active");
+  assert.equal(answered.data.nativeMediaAttached, true);
+
+  const liveAudioStarted = await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-audio-start",
+    { sessionId: "INCOMING-SESSION-1" },
+  );
+  assert.equal(liveAudioStarted.status, 200);
+  const liveAudioFrame = await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-audio-session-frame",
+    { sessionId: "INCOMING-SESSION-1", data: Buffer.alloc(1_920, 1) },
+  );
+  assert.equal(liveAudioFrame.status, 200);
+  assert.deepEqual(service.liveAudioFrames, [Buffer.alloc(1_920, 1)]);
+
+  const imageDescription = Buffer.from("hvc1-description");
+  const liveVideoStarted = await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-video-start",
+    {
+      sessionId: "INCOMING-SESSION-1",
+      imageDescription,
+      frameDurationMs: 40,
+    },
+  );
+  assert.equal(liveVideoStarted.status, 200);
+  assert.deepEqual(service.liveVideoStarts, [{
+    sessionId: "INCOMING-SESSION-1",
+    imageDescription,
+    frameDurationMs: 40,
+  }]);
+  const videoAccessUnit = Buffer.from([0, 0, 0, 1, 0x26, 1, 2, 3]);
+  const liveVideoFrame = await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-video-frame",
+    { sessionId: "INCOMING-SESSION-1", data: videoAccessUnit },
+  );
+  assert.equal(liveVideoFrame.status, 200);
+  assert.deepEqual(service.liveVideoFrames, [videoAccessUnit]);
+  assert.equal((await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-audio-session-finish",
+    { sessionId: "INCOMING-SESSION-1" },
+  )).status, 200);
+  assert.equal((await socketAck<{ status: number }>(
+    socket,
+    "facetime-live-video-finish",
+    { sessionId: "INCOMING-SESSION-1" },
+  )).status, 200);
+
+  const socketList = await socketAck<{ status: number; data: FaceTimeIncomingSession[] }>(
+    socket,
+    "facetime-incoming-list",
+    {},
+  );
+  assert.equal(socketList.data[0]?.state, "active");
+  const subscribed = await socketAck<{
+    status: number;
+    data: { subscriptionId: string; sessionId: string; audio: boolean; video: boolean };
+  }>(socket, "facetime-media-subscribe", {
+    sessionId: "INCOMING-SESSION-1",
+    audio: true,
+    video: true,
+    ttlSeconds: 60,
+  });
+  assert.equal(subscribed.status, 200);
+  assert.equal(subscribed.data.subscriptionId, "session:INCOMING-SESSION-1");
+  assert.deepEqual(service.streamPolicies.at(-1), {
+    sessionId: "INCOMING-SESSION-1",
+    enabled: true,
+    audio: true,
+    video: true,
+    ttlSeconds: 60,
+  });
+  const incomingFrame = new Promise<Record<string, unknown>>((resolve) =>
+    socket.once("ft-media-frame", resolve));
+  engine.emit("facetime.media.frame", {
+    sessionId: "INCOMING-SESSION-1",
+    kind: "audio",
+    codec: "aac-eld",
+    payloadType: 104,
+    rtpTimestamp: 480,
+    dataBase64: Buffer.from([4, 5, 6]).toString("base64"),
+    receivedAt: Date.now(),
+  });
+  const frame = await incomingFrame;
+  assert.equal(frame.callId, undefined);
+  assert.equal(frame.subscriptionId, "session:INCOMING-SESSION-1");
+  assert.deepEqual(Buffer.from(frame.data as Buffer), Buffer.from([4, 5, 6]));
+  const unsubscribed = await socketAck<{ status: number; data: { removed: boolean } }>(
+    socket,
+    "facetime-media-unsubscribe",
+    { sessionId: "INCOMING-SESSION-1" },
+  );
+  assert.equal(unsubscribed.data.removed, true);
+
+  service.incoming[0]!.state = "ringing";
+  service.incoming[0]!.nativeMediaAttached = false;
+  const form = new FormData();
+  form.append("media", new Blob([Buffer.from("video-fixture")], { type: "video/mp4" }), "fixture.mp4");
+  form.append("displayName", "Jade");
+  form.append("maxDurationSeconds", "45");
+  const mediaAnswer = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming/INCOMING-SESSION-1/answer-with-media?password=secret`,
+    { method: "POST", body: form },
+  ).then((response) => response.json()) as { data: FaceTimeCall };
+  assert.equal(mediaAnswer.data.direction, "incoming");
+  assert.equal(mediaAnswer.data.mode, "video");
+  assert.equal(mediaAnswer.data.maxDurationSeconds, 45);
+  assert.deepEqual(mediaAnswers, [{
+    sessionId: "INCOMING-SESSION-1",
+    data: Buffer.from("video-fixture"),
+  }]);
+
+  service.incoming[0]!.state = "ringing";
+  const armForm = new FormData();
+  armForm.append(
+    "media",
+    new Blob([Buffer.from("auto-answer-fixture")], { type: "video/mp4" }),
+    "auto-answer.mp4",
+  );
+  armForm.append("caller", "+1 (202) 555-0142");
+  armForm.append("displayName", "Primed Jade");
+  armForm.append("maxDurationSeconds", "45");
+  armForm.append("expiresInSeconds", "60");
+  const armed = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming/auto-answer?password=secret`,
+    { method: "POST", body: armForm },
+  ).then((response) => response.json()) as {
+    data: { state: string; mode: string; caller: string; filename: string };
+  };
+  assert.equal(armed.data.state, "armed");
+  assert.equal(armed.data.mode, "video");
+  assert.equal(armed.data.caller, "tel:+12025550142");
+  assert.equal(armed.data.filename, "auto-answer.mp4");
+  const armStatus = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming/auto-answer?password=secret`,
+  ).then((response) => response.json()) as { data: { id: string; state: string } | null };
+  assert.equal(armStatus.data?.state, "armed");
+
+  const autoAnswered = new Promise<void>((resolve) => { notifyMediaAnswer = resolve; });
+  service.dispatch("incoming-facetime", structuredClone(service.incoming[0]!));
+  await autoAnswered;
+  notifyMediaAnswer = undefined;
+  assert.deepEqual(mediaAnswers.at(-1), {
+    sessionId: "INCOMING-SESSION-1",
+    data: Buffer.from("auto-answer-fixture"),
+  });
+  const consumedArm = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming/auto-answer?password=secret`,
+  ).then((response) => response.json()) as { data: unknown };
+  assert.equal(consumedArm.data, null);
+
+  service.incoming[0]!.state = "ringing";
+  const declined = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/incoming/INCOMING-SESSION-1/decline?password=secret`,
+    { method: "POST" },
+  ).then((response) => response.json()) as { data: FaceTimeIncomingSession };
+  assert.equal(declined.data.state, "declined");
+
+  const capabilities = await fetch(
+    `${listening.address}/api/v1/iblue/facetime/capabilities?password=secret`,
+  ).then((response) => response.json()) as {
+    data: { incomingCalls: { available: boolean; topology: string; autoAnswer: string } };
+  };
+  assert.equal(capabilities.data.incomingCalls.available, true);
+  assert.equal(capabilities.data.incomingCalls.topology, "one-to-one");
+  assert.equal(
+    capabilities.data.incomingCalls.autoAnswer,
+    "/api/v1/iblue/facetime/incoming/auto-answer",
+  );
+});
+
 test("FaceTime realtime media is authenticated, opt-in, selective, and non-persistent", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "iblue-facetime-realtime-test-"));
   const engine = new FakeEngine();
@@ -447,6 +805,7 @@ test("FaceTime realtime media is authenticated, opt-in, selective, and non-persi
   const call: FaceTimeCall = {
     id: "call-1",
     sessionId: "SESSION-1",
+    direction: "outgoing",
     mode: "audio",
     targets: ["tel:+12025550142"],
     displayName: "Jade",
@@ -649,6 +1008,7 @@ test("FaceTime outbound live audio is socket-owned, exactly framed, bounded, and
       const call: FaceTimeCall = {
         id: `live-${++sequence}`,
         sessionId: `SESSION-LIVE-${sequence}`,
+        direction: "outgoing",
         mode: "audio",
         targets: [...input.targets],
         displayName: input.displayName,
@@ -1675,8 +2035,15 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
       .filter(([method]) => ["get", "post", "put", "patch", "delete"].includes(method))
       .map(([method, operation]) => ({ path, method, operation })),
   );
-  assert.equal(documentedOperations.length, 107);
+  assert.equal(documentedOperations.length, 114);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/realtime"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer"]?.post);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer"]?.delete);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/{sessionId}/answer"]?.post);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/{sessionId}/answer-with-media"]?.post);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/{sessionId}/decline"]?.post);
   const missingParameterDescriptions: string[] = [];
   const auditBodyProperties = (
     schema: Record<string, unknown> | undefined,

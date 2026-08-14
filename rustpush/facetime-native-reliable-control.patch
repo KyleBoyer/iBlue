@@ -1,0 +1,196 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1773,8 +1773,19 @@ impl GlobalLink {
+         let sender = self.ind_send.clone();
+         tokio::spawn(async move {
+             let mut total = vec![];
+-            let resp = stream.recv_response().await.unwrap();
+-            while let Some(mut chunk) = stream.recv_data().await.unwrap() {
++            if let Err(error) = stream.recv_response().await {
++                warn!("QuickRelay indication response ended: {error:?}");
++                return;
++            }
++            loop {
++                let mut chunk = match stream.recv_data().await {
++                    Ok(Some(chunk)) => chunk,
++                    Ok(None) => break,
++                    Err(error) => {
++                        warn!("QuickRelay indication stream ended: {error:?}");
++                        break;
++                    }
++                };
+                 let base = total.len();
+                 total.resize(base + chunk.remaining(), 0);
+                 chunk.copy_to_slice(&mut total[base..]);
+@@ -1970,13 +1981,13 @@ impl GlobalLink {
+ 
+     /// Encrypt and route one VC control-channel protobuf to a participant,
+     /// preferring the selected direct U1 path and falling back to the AVC pod.
+-    pub async fn send_control_message(
++    async fn prepare_control_message(
+         &self,
+         participant: u64,
+         local_session_id: &str,
+         plaintext: &[u8],
+-    ) -> Result<(), PushError> {
+-        let (encrypted, direct_socket, direct_peer, avc_pod) = {
++    ) -> Result<Vec<u8>, PushError> {
++        let encrypted = {
+             let mut state = self.state.lock().await;
+             let peer_session_id = state.states.get(&participant)
+                 .and_then(|peer| peer.avc_uuid.clone())
+@@ -2011,31 +2022,98 @@ impl GlobalLink {
+                     state.control_incoming_peer_first,
+                 );
+             }
++            key.encrypt(plaintext, packet_counter)?
++        };
++        let mut framed_control = Vec::with_capacity(encrypted.len() + 1);
++        framed_control.push(0x40);
++        framed_control.extend_from_slice(&encrypted);
++        Ok(framed_control)
++    }
++
++    async fn route_control_message(
++        &self,
++        participant: u64,
++        framed_control: &[u8],
++    ) -> Result<(), PushError> {
++        let (direct_socket, direct_peer, avc_pod) = {
++            let state = self.state.lock().await;
+             (
+-                key.encrypt(plaintext, packet_counter)?,
+                 state.direct_socket.clone(),
+                 state.direct_peer,
+                 state.avc_pod.clone().ok_or(PushError::NotConnected)?,
+             )
+         };
+-        let mut framed_control = Vec::with_capacity(encrypted.len() + 1);
+-        framed_control.push(0x40);
+-        framed_control.extend_from_slice(&encrypted);
+         if let (Some(socket), Some(peer)) = (direct_socket, direct_peer) {
+-            socket.send_to(&framed_control, peer).await.map_err(|_| PushError::NotConnected)?;
++            socket.send_to(framed_control, peer).await.map_err(|_| PushError::NotConnected)?;
+         } else {
+             let framed = GlobalPacket {
+                 participant: Some(participant),
+                 link: LinkType::Pod,
+-                data: framed_control,
++                data: framed_control.to_vec(),
+             }.to_qr_raw();
+             avc_pod.send_datagram(framed.into()).map_err(|_| PushError::NotConnected)?;
+         }
+         let mut state = self.state.lock().await;
+         state.control_messages_sent = state.control_messages_sent.saturating_add(1);
++        Ok(())
++    }
++
++    pub async fn send_control_message(
++        &self,
++        participant: u64,
++        local_session_id: &str,
++        plaintext: &[u8],
++    ) -> Result<(), PushError> {
++        let framed_control = self
++            .prepare_control_message(participant, local_session_id, plaintext)
++            .await?;
++        self.route_control_message(participant, &framed_control).await
++    }
++
++    /// Stream activation is a reliable VCCC transaction. Apple retransmits
++    /// the identical SFrame ciphertext until the peer acknowledges it; doing
++    /// the same avoids advancing the SFrame counter for a logical retry.
++    pub async fn send_control_message_reliably(
++        self: &Arc<Self>,
++        participant: u64,
++        local_session_id: &str,
++        plaintext: &[u8],
++        transaction_id: u64,
++    ) -> Result<(), PushError> {
++        let framed_control = self
++            .prepare_control_message(participant, local_session_id, plaintext)
++            .await?;
++        self.route_control_message(participant, &framed_control).await?;
++
++        let link = self.clone();
++        tokio::spawn(async move {
++            for _ in 0..20 {
++                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++                if !link.control_stream_state_pending(transaction_id).await {
++                    return;
++                }
++                if let Err(error) = link
++                    .route_control_message(participant, &framed_control)
++                    .await
++                {
++                    warn!("Unable to retry FaceTime stream group state: {error:?}");
++                }
++            }
++            link.note_control_error("stream-state-ack-timeout").await;
++        });
+         Ok(())
+     }
+ 
++    async fn control_stream_state_pending(&self, transaction_id: u64) -> bool {
++        let state = self.state.lock().await;
++        state.control_stream_state_transaction == Some(transaction_id)
++            && !state.control_stream_state_acknowledged
++    }
++
++    pub async fn has_acknowledged_control_stream_state(&self) -> bool {
++        self.state.lock().await.control_stream_state_acknowledged
++    }
++
+     pub async fn is_bootstrapped(&self) -> bool {
+         self.state.lock().await.bootstrapped
+     }
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2083,7 +2083,12 @@ impl FTClient {
+                                 .note_control_stream_state_sent(stream_state_transaction)
+                                 .await;
+                             if let Err(error) = session_handle
+-                                .send_control_message(participant, &session_id, &state_message.encode_to_vec())
++                                .send_control_message_reliably(
++                                    participant,
++                                    &session_id,
++                                    &state_message.encode_to_vec(),
++                                    stream_state_transaction,
++                                )
+                                 .await
+                             {
+                                 warn!("Unable to publish FaceTime stream group state: {error}");
+@@ -2140,7 +2145,7 @@ impl FTClient {
+     /// True only after the profile-owned relay has accepted AllocBind and, for
+     /// an incoming call, Jade's keys reached a concrete caller participant.
+     pub async fn native_media_ready(&self, group_id: &str) -> bool {
+-        let connection = {
++        let (connection, require_stream_state_acknowledgement) = {
+             let state = self.state.read().await;
+             let Some(session) = state.sessions.get(group_id) else {
+                 return false;
+@@ -2150,10 +2155,20 @@ impl FTClient {
+             {
+                 return false;
+             }
+-            session.connection.clone()
++            (
++                session.connection.clone(),
++                matches!(session.mode, Some(FTMode::Incoming)),
++            )
+         };
+         match connection {
+-            Some(connection) => connection.link.is_media_ready().await,
++            Some(connection) => {
++                if require_stream_state_acknowledgement
++                    && !connection.link.has_acknowledged_control_stream_state().await
++                {
++                    return false;
++                }
++                connection.link.is_media_ready().await
++            }
+             None => false,
+         }
+     }

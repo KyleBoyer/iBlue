@@ -1,0 +1,83 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2403,6 +2403,7 @@
+     pub async fn seed_participant_prekey(
+         &self,
+         handle: &str,
++        token: Option<&[u8]>,
+         public_prekey: &[u8],
+     ) -> Result<u64, PushError> {
+         let mut context = BigNumContext::new()?;
+@@ -2413,7 +2414,10 @@
+             .configuration
+             .allocations
+             .iter()
+-            .find(|allocation| allocation.participant == handle)
++            .find(|allocation| {
++                allocation.participant == handle
++                    && token.map_or(true, |token| allocation.token.as_ref() == token)
++            })
+             .map(|allocation| allocation.id as u64)
+             .ok_or(PushError::BadMsg)?;
+         state.states.entry(participant_id).or_default().prekey = Some(QuickRelayPreKey {
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -203,6 +203,8 @@
+     pub native_peer_prekeys: HashMap<String, Vec<u8>>,
+     #[serde(skip)]
+     pub native_peer_session_ids: HashMap<String, String>,
++    #[serde(skip)]
++    pub native_peer_tokens: HashMap<String, Vec<u8>>,
+     // A headless web caller must remain propped until its media leg ends.
+     #[serde(skip)]
+     pub hold_bridge_for_web: bool,
+@@ -1532,7 +1534,11 @@
+         let mut seeded_peer_session_ids = HashMap::new();
+         for (peer_handle, prekey) in &session.native_peer_prekeys {
+             let participant_id = relay_session
+-                .seed_participant_prekey(peer_handle, prekey)
++                .seed_participant_prekey(
++                    peer_handle,
++                    session.native_peer_tokens.get(peer_handle).map(Vec::as_slice),
++                    prekey,
++                )
+                 .await?;
+             if let Some(peer_session_id) = session.native_peer_session_ids.get(peer_handle) {
+                 seeded_peer_session_ids.insert(participant_id, peer_session_id.clone());
+@@ -2340,6 +2346,7 @@
+             av_config: Some(AVConfig::new(self.os_config.as_ref())),
+             native_peer_prekeys: HashMap::new(),
+             native_peer_session_ids: HashMap::new(),
++            native_peer_tokens: HashMap::new(),
+             hold_bridge_for_web: false,
+         };
+ 
+@@ -3178,6 +3185,9 @@
+                                 .native_peer_prekeys
+                                 .insert(sender.clone(), prekey.as_ref().to_vec());
+                         }
++                        session
++                            .native_peer_tokens
++                            .insert(sender.clone(), token.clone());
+                         session.native_peer_session_ids.insert(
+                             sender.clone(),
+                             avc.vc_session_participant_key_uuid.clone(),
+@@ -3273,9 +3283,15 @@
+                         session
+                             .native_peer_prekeys
+                             .insert(sender.clone(), public_prekey.clone());
++                        session
++                            .native_peer_tokens
++                            .insert(sender.clone(), token.clone());
+                         if let Some(connection) = &session.connection {
+                             let link = connection.link.clone();
+-                            match link.seed_participant_prekey(&sender, &public_prekey).await {
++                            match link
++                                .seed_participant_prekey(&sender, Some(&token), &public_prekey)
++                                .await
++                            {
+                                 Ok(participant_id) => {
+                                     if let Some(peer_session_id) =
+                                         session.native_peer_session_ids.get(&sender)

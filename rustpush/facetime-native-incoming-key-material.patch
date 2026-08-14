@@ -1,0 +1,307 @@
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -543,6 +543,18 @@
+     skgc: u32,
+ }
+ 
++impl std::fmt::Debug for QuickRelaySkmMaterial {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("QuickRelaySkmMaterial")
++            .field("participant_id", &self.participant_id)
++            .field("wrap_mode", &self.rtmpwm)
++            .field("key_id_length", &self.ski.len())
++            .field("generation", &self.skgc)
++            .finish_non_exhaustive()
++    }
++}
++
+ impl QuickRelaySkmMaterial {
+     fn create(pid: u64) -> Self {
+         Self {
+@@ -627,6 +639,19 @@
+     smkil: u32,
+ }
+ 
++impl std::fmt::Debug for QuickRelayMkmMaterial {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        formatter
++            .debug_struct("QuickRelayMkmMaterial")
++            .field("participant_id", &self.participant_id)
++            .field("wrap_mode", &self.rtmpwm)
++            .field("key_id_length", &self.mki.len())
++            .field("generation", &self.mkgc)
++            .field("short_key_id_length", &self.smkil)
++            .finish_non_exhaustive()
++    }
++}
++
+ impl QuickRelayMkmMaterial {
+     fn create(pid: u64) -> Self {
+         Self {
+@@ -762,6 +787,9 @@
+ #[derive(Default)]
+ pub struct ParticipantState {
+     prekey: Option<QuickRelayPreKey>,
++    /// The exact encrypted key material advertised to this participant. Keep
++    /// it so the FaceTime IDS command-211 copy matches the QuickRelay copy.
++    outgoing_key_material: Option<(QuickRelayMkmMaterial, QuickRelaySkmMaterial)>,
+     // these are decrypted
+     pub mkm: Vec<QuickRelayMkmMaterial>,
+     skm: Vec<QuickRelaySkmMaterial>,
+@@ -1566,6 +1569,9 @@
+         let _bootstrap = self.bootstrap.lock().await;
+         {
+             let state = self.state.lock().await;
++            if state.bootstrapped {
++                return Ok(());
++            }
+             if !state.states.values().any(|participant| participant.prekey.is_some()) {
+                 warn!("QuickRelay bootstrap waiting for a peer prekey");
+                 return Err(PushError::NotConnected);
+@@ -1648,18 +1654,28 @@
+         let mut materials = vec![];
+         
+         // send MKM/SKM
+-        let state = self.state.lock().await;
++        let mut state = self.state.lock().await;
+         if !state.my_mkm.has_apple_rtp_short_mki() {
+             warn!("FaceTime outbound media key ID does not match Apple's SRTP MKI");
+             return Err(PushError::BadMsg);
+         }
+-        for (id, participant) in &state.states {
++        let local_mkm = state.my_mkm.clone();
++        let local_skm = state.my_skm.clone();
++        for (id, participant) in &mut state.states {
+             let Some(prekey) = &participant.prekey else { 
+                 warn!("Participant missing prekey?");
+                 continue;
+             };
+-            let mut my_mkm = state.my_mkm.clone();
+-            my_mkm.mkm = prekey.encrypt_key_material(&my_mkm.mkm)?;
++            let (my_mkm, my_skm) = if let Some(material) = &participant.outgoing_key_material {
++                material.clone()
++            } else {
++                let mut my_mkm = local_mkm.clone();
++                my_mkm.mkm = prekey.encrypt_key_material(&my_mkm.mkm)?;
++                let mut my_skm = local_skm.clone();
++                my_skm.skm = prekey.encrypt_key_material(&my_skm.skm)?;
++                participant.outgoing_key_material = Some((my_mkm.clone(), my_skm.clone()));
++                (my_mkm, my_skm)
++            };
+             materials.push(qrp::IdsqrProtoMaterial {
+                 owner_participant_id: Some(0),
+                 receiver_participant_id: Some(*id),
+@@ -1674,8 +1690,6 @@
+                 ],
+             });
+ 
+-            let mut my_skm = state.my_skm.clone();
+-            my_skm.skm = prekey.encrypt_key_material(&my_skm.skm)?;
+             materials.push(qrp::IdsqrProtoMaterial {
+                 owner_participant_id: Some(0),
+                 receiver_participant_id: Some(*id),
+@@ -2386,6 +2400,86 @@
+                 .as_secs_f64(),
+         });
+         Ok(participant_id)
++    }
++
++    /// Return the encrypted media/session material already posted to
++    /// QuickRelay, keyed by its intended peer participant. The FaceTime IDS
++    /// layer mirrors these exact values in command 211 for Apple responders.
++    pub async fn outgoing_key_materials(
++        &self,
++    ) -> Vec<(u64, QuickRelayMkmMaterial, QuickRelaySkmMaterial)> {
++        let state = self.state.lock().await;
++        state
++            .states
++            .iter()
++            .filter_map(|(participant, peer)| {
++                peer.outgoing_key_material
++                    .as_ref()
++                    .map(|(mkm, skm)| (*participant, mkm.clone(), skm.clone()))
++            })
++            .collect()
++    }
++
++    pub async fn participant_handles(&self) -> Vec<String> {
++        let state = self.state.lock().await;
++        let mut handles = state
++            .configuration
++            .allocations
++            .iter()
++            .map(|allocation| allocation.participant.clone())
++            .collect::<Vec<_>>();
++        handles.sort();
++        handles.dedup();
++        handles
++    }
++
++    /// Deliver a FaceTime IDS side-channel message to all allocated devices or
++    /// to the device represented by one QuickRelay participant ID.
++    pub async fn message_participants(
++        &self,
++        participant: Option<u64>,
++        message: IDSSendMessage,
++    ) -> Result<(), PushError> {
++        let relevant_people = self.participant_handles().await;
++        let topic = "com.apple.private.alloy.facetime.multi";
++        self.identity
++            .cache_keys(
++                topic,
++                &relevant_people,
++                &self.handle,
++                false,
++                &QueryOptions {
++                    required_for_message: true,
++                    result_expected: true,
++                },
++            )
++            .await?;
++        let targets = if let Some(participant) = participant {
++            let token = self
++                .state
++                .lock()
++                .await
++                .configuration
++                .allocations
++                .iter()
++                .find(|allocation| allocation.id == participant as i64)
++                .map(|allocation| allocation.token.as_ref().to_vec())
++                .ok_or(PushError::BadMsg)?;
++            self.identity.cache.lock().await.get_targets(
++                topic,
++                &self.handle,
++                &relevant_people,
++                &[MessageTarget::Token(token)],
++            )?
++        } else {
++            self.identity
++                .cache
++                .lock()
++                .await
++                .get_participants_targets(topic, &self.handle, &relevant_people)
++        };
++        self.identity.send_message(topic, message, targets).await?;
++        Ok(())
+     }
+ 
+     pub async fn alloc_bind(
+diff --git a/src/facetime.rs b/src/facetime.rs
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -25,7 +25,7 @@
+ use aes_gcm::KeyInit;
+ use rtc_shared::marshal::Unmarshal;
+ 
+-use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, facetime::facetimep::{VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessage, VcccMessageAcknowledgment, VcccMessageWrapper}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::GlobalLink, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
++use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, facetime::facetimep::{VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessage, VcccMessageAcknowledgment, VcccMessageWrapper}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, QuickRelayMkmMaterial, QuickRelaySkmMaterial}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
+ 
+ pub mod facetimep {
+     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
+@@ -1330,6 +1330,12 @@
+     prekey: Option<Data>,
+     #[serde(rename = "rtmpwm")]
+     prekey_wrap_mode: Option<u32>,
++    #[serde(rename = "rtskm")]
++    session_key_material: Option<QuickRelaySkmMaterial>,
++    #[serde(rename = "rtmkm")]
++    media_key_material: Option<QuickRelayMkmMaterial>,
++    #[serde(rename = "rtallmkmuri")]
++    all_mkm_uri: Option<Vec<String>>,
+     #[serde(rename = "fanout-groupID-key")]
+     fanout_groupid: String,
+     client_context_data_key: Option<Data>,
+@@ -2392,6 +2398,9 @@
+             session: session.group_id.clone(),
+             prekey: None,
+             prekey_wrap_mode: None,
++            session_key_material: None,
++            media_key_material: None,
++            all_mkm_uri: None,
+             fanout_groupid: session.group_id.clone(),
+             client_context_data_key: Some(update_context.encode_to_vec().into()),
+             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
+@@ -2556,6 +2565,9 @@
+                     session: builder_session.group_id.clone(),
+                     prekey: link_prekey.clone(),
+                     prekey_wrap_mode: link_prekey.as_ref().map(|_| 1),
++                    session_key_material: None,
++                    media_key_material: None,
++                    all_mkm_uri: None,
+                     fanout_groupid: builder_session.group_id.clone(),
+                     client_context_data_key: Some(update_context.encode_to_vec().into()),
+                     participant_data_key: Some(participant.avc_data.clone().into()), // should be AV mode, hopefully this doens't give us trouble?
+@@ -2599,9 +2611,60 @@
+             session.av_config = Some(AVConfig::new(self.os_config.as_ref()));
+         }
+         self.ensure_allocations(session, &[]).await?;
++        let connection = session.connection.as_ref().ok_or(PushError::NotConnected)?;
++        connection.link.ensure_bootstrapped().await?;
++        self.publish_native_key_material(session).await?;
+         self.prop_up_conv(session, false).await?;
+         session.is_ringing_inaccurate = false;
+         (self.update_state)(&state);
++        Ok(())
++    }
++
++    /// Apple mirrors responder MKM/SKM through IDS command 211 in addition to
++    /// publishing it on QuickRelay. Some callers do not activate the remote
++    /// control/media decryptor until this participant-targeted copy arrives.
++    async fn publish_native_key_material(&self, session: &FTSession) -> Result<(), PushError> {
++        let connection = session.connection.as_ref().ok_or(PushError::NotConnected)?;
++        let all_mkm_uri = connection.link.participant_handles().await;
++        let expires = SystemTime::now()
++            .checked_add(Duration::from_secs(605))
++            .ok_or(PushError::BadMsg)?
++            .duration_since(SystemTime::UNIX_EPOCH)
++            .map_err(|_| PushError::BadMsg)?
++            .as_secs();
++        for (participant, media_key_material, session_key_material) in
++            connection.link.outgoing_key_materials().await
++        {
++            let wire_message = FTWireMessage {
++                session: session.group_id.clone(),
++                session_key_material: Some(session_key_material),
++                media_key_material: Some(media_key_material),
++                all_mkm_uri: Some(all_mkm_uri.clone()),
++                fanout_groupid: session.group_id.clone(),
++                ..Default::default()
++            };
++            connection
++                .link
++                .message_participants(
++                    Some(participant),
++                    IDSSendMessage {
++                        sender: connection.link.handle.clone(),
++                        raw: Raw::Body(plist_to_bin(&wire_message)?),
++                        send_delivered: false,
++                        command: 211,
++                        no_response: false,
++                        id: Uuid::new_v4().to_string().to_uppercase(),
++                        scheduled_ms: None,
++                        queue_id: None,
++                        relay: None,
++                        extras: Dictionary::from_iter([
++                            ("siu", Value::Boolean(false)),
++                            ("eX", Value::Integer(expires.into())),
++                        ]),
++                    },
++                )
++                .await?;
++        }
+         Ok(())
+     }
+ 
+@@ -2654,6 +2717,9 @@
+             session: session.group_id.clone(),
+             prekey: None,
+             prekey_wrap_mode: None,
++            session_key_material: None,
++            media_key_material: None,
++            all_mkm_uri: None,
+             fanout_groupid: session.group_id.clone(),
+             client_context_data_key: Some(vec![16, 0].into()),
+             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
