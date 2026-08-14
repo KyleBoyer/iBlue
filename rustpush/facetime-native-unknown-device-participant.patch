@@ -1,0 +1,217 @@
+diff --git a/src/facetime.rs b/src/facetime.rs
+index e047dde..be14713 100644
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -253,6 +253,17 @@ pub struct FTSessionConnection {
+     pub their_session_id: Mutex<HashMap<u64, String>>,
+ }
+ 
++fn native_peer_session_id_for_device(
++    session: &FTSession,
++    handle: &str,
++    token: &[u8],
++) -> Option<String> {
++    session.native_peer_device_session_ids
++        .get(&base64_encode(token))
++        .or_else(|| session.native_peer_session_ids.get(handle))
++        .cloned()
++}
++
+ pub enum ChannelFrame {
+     Sample(Vec<u8>),
+     ImageDescription(Vec<u8>),
+@@ -1639,6 +1650,12 @@ impl FTClient {
+             &register.hardware_version,
+         ).await?;
+ 
++        for (participant_id, peer_session_id) in &seeded_peer_session_ids {
++            relay_session
++                .bind_participant_session_id(*participant_id, peer_session_id)
++                .await?;
++        }
++
+         
+         let wire_message = FTWireMessage {
+             session: session.group_id.clone(),
+@@ -3384,7 +3401,16 @@ impl FTClient {
+                         );
+                     }
+                     if let Some(conn) = &session.connection {
+-                        conn.their_session_id.lock().await.insert(participant.into(), avc.vc_session_participant_key_uuid.clone());
++                        let participant_id = participant.into();
++                        let peer_session_id = avc.vc_session_participant_key_uuid.clone();
++                        conn.their_session_id.lock().await
++                            .insert(participant_id, peer_session_id.clone());
++                        if let Err(error) = conn.link
++                            .bind_participant_session_id(participant_id, &peer_session_id)
++                            .await
++                        {
++                            warn!("Unable to bind FaceTime IDS device UUID to participant {}: {error:?}", participant_id);
++                        }
+                     }
+ 
+                     session.participants.insert(participant.to_string(), FTParticipant {
+@@ -3492,13 +3518,19 @@ impl FTClient {
+                             {
+                                 Ok(participant_id) => {
+                                     if let Some(peer_session_id) =
+-                                        session.native_peer_session_ids.get(&sender)
++                                        native_peer_session_id_for_device(session, &sender, &token)
+                                     {
+                                         connection
+                                             .their_session_id
+                                             .lock()
+                                             .await
+                                             .insert(participant_id, peer_session_id.clone());
++                                        if let Err(error) = link
++                                            .bind_participant_session_id(participant_id, &peer_session_id)
++                                            .await
++                                        {
++                                            warn!("Unable to bind command-210 FaceTime device UUID to participant {}: {error:?}", participant_id);
++                                        }
+                                     }
+                                     if let Err(error) = link.ensure_bootstrapped().await {
+                                         warn!("Late QuickRelay bootstrap failed: {error:?}");
+@@ -3579,20 +3611,37 @@ impl FTClient {
+                             }
+                         }
+                         if let Some(participant_id) = connection.link.token_to_participant(&token).await {
+-                            let (mkm_added, skm_added) = connection
+-                                .link
++                            if let Some(peer_session_id) =
++                                native_peer_session_id_for_device(session, &sender, &token)
++                            {
++                                connection.their_session_id.lock().await
++                                    .insert(participant_id, peer_session_id.clone());
++                                if let Err(error) = connection.link
++                                    .bind_participant_session_id(participant_id, &peer_session_id)
++                                    .await
++                                {
++                                    warn!("Unable to bind command-211 FaceTime device UUID to participant {}: {error:?}", participant_id);
++                                }
++                            }
++                            match connection.link
+                                 .import_peer_key_material(
+                                     participant_id,
+                                     media,
+                                     session_material,
+                                 )
+-                                .await?;
+-                            warn!(
+-                                "Imported FaceTime IDS key material: participant={} mkm_added={} skm_added={}",
+-                                participant_id,
+-                                mkm_added,
+-                                skm_added,
+-                            );
++                                .await
++                            {
++                                Ok((mkm_added, skm_added)) => warn!(
++                                    "Imported FaceTime IDS key material: participant={} mkm_added={} skm_added={}",
++                                    participant_id,
++                                    mkm_added,
++                                    skm_added,
++                                ),
++                                Err(error) => warn!(
++                                    "Unable to import FaceTime IDS key material for participant={}: {error:?}",
++                                    participant_id,
++                                ),
++                            }
+                             if !session
+                                 .native_command211_republished
+                                 .contains(&participant_id)
+diff --git a/src/ids/link.rs b/src/ids/link.rs
+index f952b75..d47ceba 100644
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -636,9 +636,14 @@ pub struct QuickRelayMkmMaterial {
+     // generation counter
+     mkgc: u32,
+     // short key index legnth
++    #[serde(default = "default_apple_rtp_short_mki_length")]
+     smkil: u32,
+ }
+ 
++fn default_apple_rtp_short_mki_length() -> u32 {
++    APPLE_RTP_SHORT_MKI.len() as u32
++}
++
+ impl std::fmt::Debug for QuickRelayMkmMaterial {
+     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         formatter
+@@ -1683,7 +1688,11 @@ impl GlobalLink {
+                             let mut item: QuickRelayMkmMaterial = plist::from_bytes(parsed.payload.as_ref())?;
+ 
+                             let mut state = self.state.lock().await;
+-                            item.mkm = state.decode_key_material(item.mkm.as_ref()).unwrap();
++                            let Ok(material) = state.decode_key_material(item.mkm.as_ref()) else {
++                                warn!("Ignoring FaceTime MKM that was not wrapped for this QuickRelay participant");
++                                continue;
++                            };
++                            item.mkm = material;
+                             let participant = state
+                                 .states
+                                 .entry(mat.owner_participant_id())
+@@ -1701,7 +1710,11 @@ impl GlobalLink {
+                             let mut item: QuickRelaySkmMaterial = plist::from_bytes(parsed.payload.as_ref())?;
+ 
+                             let mut state = self.state.lock().await;
+-                            item.skm = state.decode_key_material(item.skm.as_ref()).unwrap();
++                            let Ok(material) = state.decode_key_material(item.skm.as_ref()) else {
++                                warn!("Ignoring FaceTime SKM that was not wrapped for this QuickRelay participant");
++                                continue;
++                            };
++                            item.skm = material;
+                             let participant = state.states.entry(mat.owner_participant_id()).or_default();
+                             participant.skm.push(item);
+                             participant.try_decrypt(&sid)?;
+@@ -2793,6 +2806,25 @@ impl GlobalLink {
+             .map(|allocation| allocation.id as u64)
+     }
+ 
++    /// Bind the VC session UUID learned from an authenticated IDS envelope to
++    /// the exact QuickRelay participant represented by that envelope's device
++    /// token. This call-local association must not depend on message history.
++    pub async fn bind_participant_session_id(
++        &self,
++        participant_id: u64,
++        peer_session_id: &str,
++    ) -> Result<(), PushError> {
++        let mut state = self.state.lock().await;
++        if !state.configuration.allocations.iter()
++            .any(|allocation| allocation.id == participant_id as i64)
++        {
++            return Err(PushError::BadMsg);
++        }
++        state.states.entry(participant_id).or_default().avc_uuid =
++            Some(peer_session_id.to_string());
++        Ok(())
++    }
++
+     /// Import the IDS command-211 copy of peer keys. This is the reliable
+     /// side-channel equivalent of QuickRelay material types 13 and 14.
+     pub async fn import_peer_key_material(
+@@ -3176,6 +3208,22 @@ mod tests {
+     use super::{
+         APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki,
+         control_peer_session_candidates,
+     };
+ 
++    #[test]
++    fn media_key_material_without_short_mki_length_uses_apple_default() {
++        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0"><dict>
++<key>participantID</key><integer>7</integer>
++<key>rtmpwm</key><integer>1</integer>
++<key>mki</key><data>ABAAAAAAAAAAAAAAAAAAAA==</data>
++<key>mkm</key><data>AA==</data>
++<key>mks</key><data>AA==</data>
++<key>mkgc</key><integer>1</integer>
++</dict></plist>"#;
++        let material: QuickRelayMkmMaterial = plist::from_bytes(xml).unwrap();
++        assert_eq!(material.smkil, APPLE_RTP_SHORT_MKI.len() as u32);
++    }
++
+     #[test]
+     fn fresh_ids_control_uuid_is_tried_after_cached_avc_uuid() {
+         assert_eq!(

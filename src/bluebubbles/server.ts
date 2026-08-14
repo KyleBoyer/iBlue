@@ -1041,8 +1041,8 @@ export class BlueBubblesServer {
           videoInputFormats: ["hevc-annex-b", "h264-annex-b", "raw-rgba", "raw-bgra"],
           videoTranscodedOutput: {
             codec: "hevc-annex-b",
-            width: 1_280,
-            height: 720,
+            width: 1_920,
+            height: 1_080,
             resizeMode: "contain-black",
           },
           transport: "socket.io",
@@ -1190,8 +1190,8 @@ export class BlueBubblesServer {
           startDefaults: { inputFormat: "hevc-annex-b", frameDurationMs: 40 },
           transcodedOutput: {
             codec: "Annex-B H.265/HEVC",
-            width: 1_280,
-            height: 720,
+            width: 1_920,
+            height: 1_080,
             resizeMode: "contain",
             borderFill: "black",
             hardwareEncoder: "VideoToolbox",
@@ -2997,8 +2997,8 @@ export class BlueBubblesServer {
               ? {}
               : { inputFrameBytes: transcoder.inputFrameBytes }),
             outputFormat: "hevc-annex-b",
-            outputWidth: 1_280,
-            outputHeight: 720,
+            outputWidth: 1_920,
+            outputHeight: 1_080,
             resizeMode: "contain-black",
             nativeStarted: false,
           };

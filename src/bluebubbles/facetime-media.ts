@@ -503,8 +503,11 @@ export interface FaceTimeLiveVideoTranscoderController {
   abort(): Promise<void>;
 }
 
-const LIVE_VIDEO_OUTPUT_WIDTH = 1_280;
-const LIVE_VIDEO_OUTPUT_HEIGHT = 720;
+// AVConference negotiates Jade's camera as a 1920x1080 surface. A smaller
+// coded frame is not scaled normally by iOS here: it is placed into that
+// surface and its edge pixels are repeated, producing visible smear bars.
+const LIVE_VIDEO_OUTPUT_WIDTH = 1_920;
+const LIVE_VIDEO_OUTPUT_HEIGHT = 1_080;
 const LIVE_VIDEO_MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const LIVE_VIDEO_MAX_OUTPUT_BUFFER_BYTES = 16 * 1024 * 1024;
 const LIVE_VIDEO_OUTPUT_QUEUE_FRAMES = 8;

@@ -771,8 +771,8 @@ test("incoming FaceTime controls are authenticated, session-scoped, and media-aw
     state: "encoder-ready",
     inputFormat: "h264-annex-b",
     outputFormat: "hevc-annex-b",
-    outputWidth: 1_280,
-    outputHeight: 720,
+    outputWidth: 1_920,
+    outputHeight: 1_080,
     resizeMode: "contain-black",
     nativeStarted: false,
   });
