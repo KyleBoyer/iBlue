@@ -29,7 +29,7 @@ test("FaceTime native video rejects an hvc1 entry without decoder configuration"
   assert.throws(() => extractHvc1SampleEntry(entry), /hvcC/);
 });
 
-test("FaceTime native video emits Apple's canonical hvc1 ImageDescription", () => {
+test("FaceTime native video emits Apple's canonical hvc1 ImageDescription with encoded dimensions", () => {
   const parameterSets = new Map([
     [32, Buffer.from([0x40, 0x01, 0x0c])],
     [33, Buffer.from([0x42, 0x01, 0x01, 0x60])],
@@ -53,6 +53,8 @@ test("FaceTime native video emits Apple's canonical hvc1 ImageDescription", () =
   ffmpegEntry.write("hvc1", 4, 4, "ascii");
   ffmpegEntry.writeUInt16BE(1, 14);
   ffmpegEntry.write("FFMP", 20, 4, "ascii");
+  ffmpegEntry.writeUInt16BE(640, 32);
+  ffmpegEntry.writeUInt16BE(360, 34);
   hvcC.copy(ffmpegEntry, 86);
 
   const result = buildFaceTimeHvc1SampleEntry(ffmpegEntry);
@@ -62,8 +64,8 @@ test("FaceTime native video emits Apple's canonical hvc1 ImageDescription", () =
   assert.equal(result.readUInt16BE(14), 0xffff);
   assert.equal(result.readUInt32BE(24), 512);
   assert.equal(result.readUInt32BE(28), 512);
-  assert.equal(result.readUInt16BE(32), 1920);
-  assert.equal(result.readUInt16BE(34), 1080);
+  assert.equal(result.readUInt16BE(32), 640);
+  assert.equal(result.readUInt16BE(34), 360);
   assert.equal(result[50], 4);
   assert.equal(result.toString("ascii", 51, 55), "HEVC");
   assert.equal(result.readUInt16BE(82), 24);

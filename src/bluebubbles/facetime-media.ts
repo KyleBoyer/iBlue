@@ -275,7 +275,13 @@ function extractHevcParameterSets(sampleEntry: Buffer): Map<number, Buffer> {
  * optional fiel/pasp child boxes.
  */
 export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
-  const parameterSets = extractHevcParameterSets(extractHvc1SampleEntry(movie));
+  const sourceEntry = extractHvc1SampleEntry(movie);
+  const width = sourceEntry.readUInt16BE(32);
+  const height = sourceEntry.readUInt16BE(34);
+  if (width === 0 || height === 0) {
+    throw new Error("Encoded FaceTime hvc1 sample entry has invalid dimensions");
+  }
+  const parameterSets = extractHevcParameterSets(sourceEntry);
   const arrays: Buffer[] = [];
   for (const nalType of [32, 33, 34]) {
     const nal = parameterSets.get(nalType)!;
@@ -318,8 +324,12 @@ export function buildFaceTimeHvc1SampleEntry(movie: Buffer): Buffer {
   entry.writeUInt16BE(0xffff, 14);
   entry.writeUInt32BE(512, 24);
   entry.writeUInt32BE(512, 28);
-  entry.writeUInt16BE(1920, 32);
-  entry.writeUInt16BE(1080, 34);
+  // The VisualSampleEntry dimensions must match the HEVC SPS. This remains
+  // important for diagnostic passthrough and any future non-1080p encoder:
+  // mismatched dimensions make VideoToolbox allocate the wrong surface,
+  // causing rotation-like tiling and stretched edge columns on the receiver.
+  entry.writeUInt16BE(width, 32);
+  entry.writeUInt16BE(height, 34);
   entry.writeUInt32BE(0x0048_0000, 36);
   entry.writeUInt32BE(0x0048_0000, 40);
   entry.writeUInt16BE(1, 48);
@@ -1076,7 +1086,11 @@ export class FaceTimeMediaManager {
             "-i", call.sourcePath,
             "-map", "0:v:0",
             "-vf",
-            "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2:black,fps=25,format=nv12",
+            // AVConference negotiates Jade's camera as a 1920x1080 surface.
+            // Sending a smaller coded frame makes iOS place the decoded planes
+            // into that larger surface and repeat their edge pixels. Preserve
+            // the complete source image on the negotiated canvas instead.
+            "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=25,format=nv12",
             "-an", "-c:v", "hevc_videotoolbox", "-tag:v", "hvc1",
             "-b:v", "1200k", "-g", "25", "-bf", "0", "-r", "25",
             moviePath,

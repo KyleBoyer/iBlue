@@ -428,7 +428,7 @@ index 5b83f6d..8298c49 100644
      control_last_error: Option<String>,
      /// The local UUID that authenticated the peer's VC control channel. Older
      /// QuickRelay implementations expose three plausible session UUIDs; retain
-@@ -1042,6 +1056,207 @@ struct NativeAudioSender {
+@@ -1042,6 +1056,211 @@ struct NativeAudioSender {
      started: tokio::time::Instant,
  }
  
@@ -565,7 +565,11 @@ index 5b83f6d..8298c49 100644
 +        };
 +        let control = NativeVideoControlData {
 +            version: 2,
-+            camera_status: 0,
++            // The upload pipeline emits display-ready landscape frames. A
++            // portrait camera status makes FaceTime rotate the decoded surface
++            // and stretch its edge pixels to fill the resulting geometry.
++            // Apple's low two camera-status bits encode LandscapeRight as 3.
++            camera_status: 3,
 +            ltr_bits: u8::from(description.is_some()),
 +            total_packets_per_frame: Some(payloads.len() as u16),
 +            frame_sequence_number: Some(self.frame_number),
