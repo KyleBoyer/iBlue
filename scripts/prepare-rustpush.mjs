@@ -100,6 +100,7 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "facetime-native-group-wrap-diagnostics.patch"),
   join(projectRoot, "rustpush", "facetime-native-group-participant-avc-import.patch"),
   join(projectRoot, "rustpush", "facetime-native-group-prekey-seeding.patch"),
+  join(projectRoot, "rustpush", "facetime-native-group-video-mode.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 

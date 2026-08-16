@@ -1,0 +1,28 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3490,6 +3490,25 @@ impl FTClient {
+                             .video_enabled
+                             .or(decoded_context.video)
+                             .unwrap_or(message.av_mode == Some(2));
++                    } else if let Some(video) = decoded_context
++                        .video_enabled
++                        .or(decoded_context.video)
++                        .or_else(|| message.av_mode.map(|mode| mode == 2))
++                    {
++                        // A group call is not announced with an Invitation, so
++                        // gating on that type left is_video at its default and
++                        // every group video call was answered as audio-only:
++                        // reported as FaceTime Audio and sent without a video
++                        // track. Only an explicit flag is taken here, so a
++                        // message that says nothing about video cannot
++                        // downgrade a call that already knows it is video.
++                        if session.is_video != video {
++                            warn!(
++                                "FaceTime session video mode resolved to {video} from {:?}",
++                                message.r#type(),
++                            );
++                        }
++                        session.is_video = video;
+                     }
+ 
+                     if let Some(link) = &message.link {
