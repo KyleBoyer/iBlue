@@ -1,0 +1,257 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -851,11 +851,40 @@
+     if let Some(uuid) = ids_uuid_hint {
+         if !candidates.iter().any(|candidate| candidate == uuid) {
+             candidates.push(uuid.to_string());
++        }
++    }
++    candidates
++}
++
++/// Prefer the participant carried by the relay packet, but do not treat that
++/// identifier as a cryptographic identity. Some Apple callers use a transient
++/// AVC owner participant that differs from the allocation associated with the
++/// same IDS device token. Authentication still unambiguously identifies the
++/// right state because every candidate uses a distinct MKM/UUID context.
++fn control_participant_candidates(
++    states: &HashMap<u64, ParticipantState>,
++    participant_hint: Option<u64>,
++) -> Vec<u64> {
++    let mut candidates = states.keys().copied().collect::<Vec<_>>();
++    candidates.sort_unstable();
++    if let Some(hint) = participant_hint {
++        if let Some(index) = candidates.iter().position(|candidate| *candidate == hint) {
++            candidates.swap(0, index);
+         }
+     }
+     candidates
+ }
+ 
++fn control_key_participant(
++    aliases: &HashMap<u64, u64>,
++    route_participant: u64,
++) -> u64 {
++    aliases
++        .get(&route_participant)
++        .copied()
++        .unwrap_or(route_participant)
++}
++
+ // all the places where packets can come from
+ enum LinkType {
+     Pod, // QPod AVC channel
+@@ -925,6 +954,10 @@
+     audio_feedback: NativeAudioFeedbackStatus,
+     /// Per-participant SFrame counter for outbound VC control messages.
+     control_send_counters: HashMap<u64, u64>,
++    /// Relay/pod participant IDs can be transient aliases for the allocation
++    /// participant that owns the authenticated IDS key material. Entries are
++    /// learned only after an SFrame control packet authenticates successfully.
++    control_participant_aliases: HashMap<u64, u64>,
+     /// Privacy-safe native VC-control diagnostics surfaced through iBlue's
+     /// call-status API. These counters never contain keys or payload bytes.
+     control_messages_received: u64,
+@@ -1982,10 +2015,10 @@
+                 local_session_ids.push(candidate.clone());
+             }
+         }
+-        for (participant, participant_state) in &state.states {
+-            if participant_hint.is_some_and(|hint| hint != *participant) {
++        for participant in control_participant_candidates(&state.states, participant_hint) {
++            let Some(participant_state) = state.states.get(&participant) else {
+                 continue;
+-            }
++            };
+             let peer_session_ids = control_peer_session_candidates(
+                 participant_state.avc_uuid.as_deref(),
+                 peer_session_id_hint,
+@@ -2001,7 +2034,7 @@
+                             };
+                             if let Ok(plaintext) = key.decrypt(payload) {
+                                 authenticated = Some((
+-                                    *participant,
++                                    participant,
+                                     peer_session_id.clone(),
+                                     local_session_id.clone(),
+                                     incoming_peer_first,
+@@ -2026,13 +2059,25 @@
+                 break;
+             }
+         }
+-        if let Some((participant, peer_uuid, local_uuid, incoming_peer_first, plaintext)) =
++        if let Some((key_participant, peer_uuid, local_uuid, incoming_peer_first, plaintext)) =
+             authenticated
+         {
++            let route_participant = participant_hint.unwrap_or(key_participant);
++            if route_participant != key_participant {
++                state
++                    .control_participant_aliases
++                    .insert(route_participant, key_participant);
++                warn!(
++                    "Authenticated FaceTime relay participant alias: route_participant={} key_participant={}",
++                    route_participant,
++                    key_participant,
++                );
++            }
+             if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+                 warn!(
+-                    "FaceTime VC control authenticated: participant={} peer_uuid={} local_uuid={} advertised_local_uuid={} local_matches_advertised={} incoming_peer_first={}",
+-                    participant,
++                    "FaceTime VC control authenticated: participant={} key_participant={} peer_uuid={} local_uuid={} advertised_local_uuid={} local_matches_advertised={} incoming_peer_first={}",
++                    route_participant,
++                    key_participant,
+                     peer_uuid,
+                     local_uuid,
+                     local_session_id,
+@@ -2040,14 +2085,14 @@
+                     incoming_peer_first,
+                 );
+             }
+-            if let Some(participant_state) = state.states.get_mut(&participant) {
++            if let Some(participant_state) = state.states.get_mut(&key_participant) {
+                 participant_state.avc_uuid = Some(peer_uuid);
+             }
+             state.control_local_uuid = Some(local_uuid);
+             state.control_incoming_peer_first = incoming_peer_first;
+             state.control_messages_authenticated = state.control_messages_authenticated.saturating_add(1);
+             state.control_last_error = None;
+-            return Ok((participant, plaintext));
++            return Ok((route_participant, plaintext));
+         }
+         Err(PushError::BadMsg)
+     }
+@@ -2132,7 +2177,11 @@
+     ) -> Result<Vec<u8>, PushError> {
+         let encrypted = {
+             let mut state = self.state.lock().await;
+-            let peer_session_id = state.states.get(&participant)
++            let key_participant = control_key_participant(
++                &state.control_participant_aliases,
++                participant,
++            );
++            let peer_session_id = state.states.get(&key_participant)
+                 .and_then(|peer| peer.avc_uuid.clone())
+                 .ok_or(PushError::BadMsg)?;
+             let counter = state.control_send_counters.entry(participant).or_default();
+@@ -2155,8 +2204,9 @@
+             };
+             if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+                 warn!(
+-                    "FaceTime VC control sending: participant={} counter={} peer_uuid={} selected_local_uuid={} advertised_local_uuid={} local_matches_advertised={} outgoing_local_first={}",
++                    "FaceTime VC control sending: participant={} key_participant={} counter={} peer_uuid={} selected_local_uuid={} advertised_local_uuid={} local_matches_advertised={} outgoing_local_first={}",
+                     participant,
++                    key_participant,
+                     packet_counter,
+                     peer_session_id,
+                     selected_local_session_id,
+@@ -2937,18 +2987,22 @@
+         // soon as that participant's prekey arrives. The older GlobalLink
+         // bootstrap is one-shot, so a late iPhone prekey could leave this
+         // participant without any responder keys forever.
+-        let (media_key_material, session_key_material, generated) = {
++        let (key_participant, media_key_material, session_key_material, generated) = {
+             let mut state = self.state.lock().await;
++            let key_participant = control_key_participant(
++                &state.control_participant_aliases,
++                participant,
++            );
+             if let Some((media, session)) = state
+                 .states
+-                .get(&participant)
++                .get(&key_participant)
+                 .and_then(|peer| peer.outgoing_key_material.as_ref())
+             {
+-                (media.clone(), session.clone(), false)
++                (key_participant, media.clone(), session.clone(), false)
+             } else {
+                 let prekey = state
+                     .states
+-                    .get(&participant)
++                    .get(&key_participant)
+                     .and_then(|peer| peer.prekey.clone())
+                     .ok_or(PushError::BadMsg)?;
+                 if !state.my_mkm.has_apple_rtp_short_mki() {
+@@ -2960,16 +3014,16 @@
+                 session.skm = prekey.encrypt_key_material(&session.skm)?;
+                 state
+                     .states
+-                    .entry(participant)
++                    .entry(key_participant)
+                     .or_default()
+                     .outgoing_key_material = Some((media.clone(), session.clone()));
+-                (media, session, true)
++                (key_participant, media, session, true)
+             }
+         };
+         let materials = vec![
+             qrp::IdsqrProtoMaterial {
+                 owner_participant_id: Some(0),
+-                receiver_participant_id: Some(participant),
++                receiver_participant_id: Some(key_participant),
+                 material_infos: vec![qrp::IdsqrProtoMaterialInfo {
+                     material_id: Some(media_key_material.mki.clone()),
+                     material_type: Some(13),
+@@ -2982,7 +3036,7 @@
+             },
+             qrp::IdsqrProtoMaterial {
+                 owner_participant_id: Some(0),
+-                receiver_participant_id: Some(participant),
++                receiver_participant_id: Some(key_participant),
+                 material_infos: vec![qrp::IdsqrProtoMaterialInfo {
+                     material_id: Some(session_key_material.ski.clone()),
+                     material_type: Some(14),
+@@ -3010,7 +3064,7 @@
+         // decryptor. Send it independently before the QR refresh so a stale
+         // or reconnecting H3 material stream cannot suppress command 211.
+         let ids_result = self.message_participants(
+-            Some(participant),
++            Some(key_participant),
+             IDSSendMessage {
+                 sender: self.handle.clone(),
+                 raw: Raw::Body(plist_to_bin(&wire_message)?),
+@@ -3043,7 +3097,7 @@
+         ids_result?;
+         if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
+             warn!(
+-                "Published FaceTime responder key material: participant={participant} generated={generated}"
++                "Published FaceTime responder key material: participant={participant} key_participant={key_participant} generated={generated}"
+             );
+         }
+         Ok(())
+@@ -3374,6 +3428,7 @@
+                 video_packets_received: 0,
+                 audio_feedback: NativeAudioFeedbackStatus::default(),
+                 control_send_counters: HashMap::new(),
++                control_participant_aliases: HashMap::new(),
+                 control_messages_received: 0,
+                 control_messages_authenticated: 0,
+                 control_messages_sent: 0,
+@@ -3411,11 +3466,27 @@
+ mod tests {
+     use super::{
+         APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki,
++        control_key_participant, control_participant_candidates,
+         control_peer_session_candidates, frame_native_audio_payload,
+         native_hevc_is_random_access, NativeMediaClock,
+     };
++    use std::collections::HashMap;
+ 
+     #[test]
++    fn relay_owner_can_authenticate_against_a_different_key_participant() {
++        let mut states = HashMap::new();
++        states.insert(42, Default::default());
++        assert_eq!(control_participant_candidates(&states, Some(99)), vec![42]);
++
++        states.insert(99, Default::default());
++        assert_eq!(control_participant_candidates(&states, Some(99)), vec![99, 42]);
++
++        let aliases = HashMap::from([(99, 42)]);
++        assert_eq!(control_key_participant(&aliases, 99), 42);
++        assert_eq!(control_key_participant(&aliases, 42), 42);
++    }
++
++    #[test]
+     fn media_key_material_without_short_mki_length_uses_apple_default() {
+         let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

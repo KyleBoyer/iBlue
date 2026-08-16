@@ -1,0 +1,179 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3411,6 +3411,10 @@ impl FTClient {
+                         {
+                             warn!("Unable to bind FaceTime IDS device UUID to participant {}: {error:?}", participant_id);
+                         }
++                        // This device is joining, so control must be addressed
++                        // to it rather than to a sibling device of the same
++                        // caller that was invited but never answered.
++                        conn.link.note_participant_joined(participant_id).await;
+                     }
+ 
+                     session.participants.insert(participant.to_string(), FTParticipant {
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, net::{SocketAddr, SocketAddrV4}, str::FromStr, sync::{Arc, mpsc}, task::Poll, time::SystemTime};
++use std::{collections::{HashMap, HashSet}, net::{SocketAddr, SocketAddrV4}, str::FromStr, sync::{Arc, mpsc}, task::Poll, time::SystemTime};
+ 
+ use aes_gcm::{Aes256Gcm, Nonce, aead::Payload};
+ use deku::prelude::*;
+@@ -885,6 +885,39 @@ fn control_key_participant(
+         .unwrap_or(route_participant)
+ }
+ 
++/// Choose the participant a VC control message should be addressed to.
++///
++/// A caller with several registered Apple devices invites all of them, so this
++/// link can hold a participant context per device. Only the device that
++/// actually joined has a live AVC session; control addressed to any other
++/// context is silently dropped by the peer, which then never acknowledges the
++/// stream group state and never publishes its own, and the call stalls with no
++/// media. Prefer a joined device that has an AVC UUID, and fall back to the
++/// previous alias behaviour while no join has been observed yet — control
++/// traffic can precede the join notification.
++fn control_target_participant(
++    states: &HashMap<u64, ParticipantState>,
++    aliases: &HashMap<u64, u64>,
++    joined: &HashSet<u64>,
++    route_participant: u64,
++) -> u64 {
++    let aliased = control_key_participant(aliases, route_participant);
++    let addressable =
++        |participant: u64| states.get(&participant).is_some_and(|state| state.avc_uuid.is_some());
++    for candidate in [aliased, route_participant] {
++        if joined.contains(&candidate) && addressable(candidate) {
++            return candidate;
++        }
++    }
++    let mut joined_candidates = joined
++        .iter()
++        .copied()
++        .filter(|participant| addressable(*participant))
++        .collect::<Vec<_>>();
++    joined_candidates.sort_unstable();
++    joined_candidates.first().copied().unwrap_or(aliased)
++}
++
+ // all the places where packets can come from
+ enum LinkType {
+     Pod, // QPod AVC channel
+@@ -958,6 +991,10 @@ pub struct GlobalLinkState {
+     /// participant that owns the authenticated IDS key material. Entries are
+     /// learned only after an SFrame control packet authenticates successfully.
+     control_participant_aliases: HashMap<u64, u64>,
++    /// Participants whose device has actually joined the call. A multi-device
++    /// caller yields one participant context per registered device; only these
++    /// have a live AVC session worth addressing.
++    joined_participants: HashSet<u64>,
+     /// Privacy-safe native VC-control diagnostics surfaced through iBlue's
+     /// call-status API. These counters never contain keys or payload bytes.
+     control_messages_received: u64,
+@@ -2177,8 +2214,10 @@ impl GlobalLink {
+     ) -> Result<Vec<u8>, PushError> {
+         let encrypted = {
+             let mut state = self.state.lock().await;
+-            let key_participant = control_key_participant(
++            let key_participant = control_target_participant(
++                &state.states,
+                 &state.control_participant_aliases,
++                &state.joined_participants,
+                 participant,
+             );
+             let peer_session_id = state.states.get(&key_participant)
+@@ -2859,6 +2898,23 @@ impl GlobalLink {
+     /// Bind the VC session UUID learned from an authenticated IDS envelope to
+     /// the exact QuickRelay participant represented by that envelope's device
+     /// token. This call-local association must not depend on message history.
++    /// Record that a participant's device has joined the call. FaceTime invites
++    /// every device registered to a caller's handle, but only the joined one
++    /// answers control traffic, so this is what makes targeting deterministic
++    /// for a multi-device caller.
++    pub async fn note_participant_joined(&self, participant_id: u64) {
++        let mut state = self.state.lock().await;
++        if state.joined_participants.insert(participant_id)
++            && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++        {
++            warn!(
++                "FaceTime participant joined: participant={} joined_total={}",
++                participant_id,
++                state.joined_participants.len(),
++            );
++        }
++    }
++
+     pub async fn bind_participant_session_id(
+         &self,
+         participant_id: u64,
+@@ -3429,6 +3485,7 @@ impl GlobalLink {
+                 audio_feedback: NativeAudioFeedbackStatus::default(),
+                 control_send_counters: HashMap::new(),
+                 control_participant_aliases: HashMap::new(),
++                joined_participants: HashSet::new(),
+                 control_messages_received: 0,
+                 control_messages_authenticated: 0,
+                 control_messages_sent: 0,
+@@ -3467,10 +3524,59 @@ mod tests {
+     use super::{
+         APPLE_RTP_SHORT_MKI, QuickRelayMkmMaterial, apple_rtp_mki,
+         control_key_participant, control_participant_candidates,
+-        control_peer_session_candidates, frame_native_audio_payload,
+-        native_hevc_is_random_access, NativeMediaClock,
++        control_peer_session_candidates, control_target_participant,
++        frame_native_audio_payload, native_hevc_is_random_access,
++        NativeMediaClock, ParticipantState,
+     };
+-    use std::collections::HashMap;
++    use std::collections::{HashMap, HashSet};
++
++    fn addressable(uuid: &str) -> ParticipantState {
++        let mut participant = ParticipantState::default();
++        participant.avc_uuid = Some(uuid.to_string());
++        participant
++    }
++
++    #[test]
++    fn control_is_addressed_to_the_device_that_joined() {
++        // One caller, two registered devices: 11 answered, 22 only rang.
++        let mut states: HashMap<u64, ParticipantState> = HashMap::new();
++        states.insert(11, addressable("JOINED-UUID"));
++        states.insert(22, addressable("IDLE-UUID"));
++        let joined = HashSet::from([11u64]);
++
++        // An alias learned onto the idle device must not win over the joined one.
++        let aliases = HashMap::from([(99u64, 22u64)]);
++        assert_eq!(control_target_participant(&states, &aliases, &joined, 99), 11);
++
++        // Nor may the route participant itself, when it is the idle device.
++        let no_alias: HashMap<u64, u64> = HashMap::new();
++        assert_eq!(control_target_participant(&states, &no_alias, &joined, 22), 11);
++
++        // When the alias already points at the joined device, it is kept.
++        let good = HashMap::from([(99u64, 11u64)]);
++        assert_eq!(control_target_participant(&states, &good, &joined, 99), 11);
++    }
++
++    #[test]
++    fn control_targeting_is_unchanged_before_any_join_is_seen() {
++        // Control traffic can precede the join notification; until then the
++        // previous alias behaviour must be preserved exactly.
++        let mut states: HashMap<u64, ParticipantState> = HashMap::new();
++        states.insert(11, addressable("A"));
++        states.insert(22, addressable("B"));
++        let none: HashSet<u64> = HashSet::new();
++        let aliases = HashMap::from([(99u64, 22u64)]);
++        assert_eq!(
++            control_target_participant(&states, &aliases, &none, 99),
++            control_key_participant(&aliases, 99),
++        );
++
++        // A joined device with no AVC UUID yet is not addressable either.
++        let mut bare: HashMap<u64, ParticipantState> = HashMap::new();
++        bare.insert(11, ParticipantState::default());
++        let joined = HashSet::from([11u64]);
++        assert_eq!(control_target_participant(&bare, &aliases, &joined, 99), 22);
++    }
+ 
+     #[test]
+     fn relay_owner_can_authenticate_against_a_different_key_participant() {

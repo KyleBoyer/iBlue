@@ -1,0 +1,185 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -875,6 +875,34 @@ fn control_participant_candidates(
+     candidates
+ }
+ 
++/// Flatten a peer's ConnectionData into socket addresses.
++///
++/// Each entry in `candidates` points at an entry in `ip_candidates` by index
++/// and carries the port, so the two lists have to be recombined. Unknown or
++/// IPv6-only entries are skipped rather than failing the whole set.
++/// How long to keep retrying connectivity checks, and how often. The answering
++/// responder abandons a call after 15s, so the window outlasts that while the
++/// interval stays well inside a normal ICE check pace.
++const CONNECTIVITY_CHECK_WINDOW_SECS: u64 = 30;
++const CONNECTIVITY_CHECK_INTERVAL_MS: u64 = 400;
++
++fn peer_candidate_addresses(connection_data: &ConnData) -> Vec<SocketAddr> {
++    connection_data
++        .candidates
++        .iter()
++        .filter_map(|candidate| {
++            let ip_candidate = connection_data
++                .ip_candidates
++                .get(candidate.ip_idx as usize)?;
++            let octets = ip_candidate.ipv4_addr?;
++            Some(SocketAddr::V4(SocketAddrV4::new(
++                std::net::Ipv4Addr::from(octets),
++                candidate.some_addr_meta,
++            )))
++        })
++        .collect()
++}
++
+ /// Learn the public address of a media socket with a STUN binding request.
+ ///
+ /// FaceTime publishes ICE candidates; iBlue previously published only the host
+@@ -1065,6 +1093,11 @@ pub struct GlobalLinkState {
+     /// instead of continuing to tunnel packets through the AVC QPod.
+     pub direct_socket: Option<Arc<UdpSocket>>,
+     pub direct_peer: Option<SocketAddr>,
++    /// ICE candidates advertised by the peer, learned from its ConnectionData.
++    /// Connectivity checks are sent to these so an address-restricted NAT will
++    /// admit the peer's own checks; without that a remote caller can never
++    /// validate a pair and the call stalls before media negotiation.
++    pub peer_candidates: Vec<SocketAddr>,
+ 
+     prekey: EcKey<Private>,
+     pub states: HashMap<u64, ParticipantState>,
+@@ -3279,6 +3312,51 @@ impl GlobalLink {
+         let session_id = self.session_id.clone();
+         let channel = self.inc_send.clone();
+         let link_state = self.state.clone();
++
++        // Drive outbound ICE connectivity checks. Previously iBlue only
++        // answered binding requests, which succeeds when the caller is on this
++        // LAN and never when it is remote: an address-restricted NAT drops the
++        // peer's checks until we have sent to that address ourselves. Sending
++        // opens the mapping in both directions, and the response nominates the
++        // pair.
++        {
++            let check_socket = connection.clone();
++            let check_state = self.state.clone();
++            let check_integrity = MessageIntegrity(self.session_id.clone());
++            tokio::spawn(async move {
++                use rtc_stun::message::{Message, TransactionId};
++                let diagnostics =
++                    std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1");
++                let deadline = tokio::time::Instant::now()
++                    + std::time::Duration::from_secs(CONNECTIVITY_CHECK_WINDOW_SECS);
++                let mut announced: Vec<SocketAddr> = Vec::new();
++                while tokio::time::Instant::now() < deadline {
++                    let (targets, established) = {
++                        let state = check_state.lock().await;
++                        (state.peer_candidates.clone(), state.direct_peer.is_some())
++                    };
++                    if established { break }
++                    for target in targets {
++                        let mut request = Message::new();
++                        if request.build(&[
++                            Box::new(BINDING_REQUEST),
++                            Box::new(TransactionId::new()),
++                            Box::new(check_integrity.clone()),
++                        ]).is_err() {
++                            continue;
++                        }
++                        let _ = check_socket.send_to(&request.raw, target).await;
++                        if diagnostics && !announced.contains(&target) {
++                            announced.push(target);
++                            warn!("FaceTime connectivity check sent to {target}");
++                        }
++                    }
++                    tokio::time::sleep(
++                        std::time::Duration::from_millis(CONNECTIVITY_CHECK_INTERVAL_MS),
++                    ).await;
++                }
++            });
++        }
+         
+         tokio::spawn(async move {
+             use rtc_stun::message::Message;
+@@ -3289,14 +3367,35 @@ impl GlobalLink {
+                 let random_type: [u8; 16] = rand::random();
+                 let (len, addr) = connection.recv_from(&mut buf).await.unwrap();
+                 if buf[0] & 0xc0 == 0 {
+-                    stun_msg.unmarshal_binary(&buf[..len]).unwrap();
++                    if let Err(error) = stun_msg.unmarshal_binary(&buf[..len]) {
++                        warn!("Ignoring undecodable FaceTime STUN message: {error}");
++                        continue;
++                    }
+                     let authenticated = match integrity.check(&mut stun_msg) {
+                         Ok(()) => true,
+                         Err(rtc_shared::error::Error::ErrAttributeNotFound) => false,
+-                        Err(e) => panic!("Integrity check error {e}!"),
++                        // Now that connectivity checks are sent, responses and
++                        // stray STUN traffic reach this socket too. Treating a
++                        // mismatch as unauthenticated keeps the media path
++                        // alive; panicking here killed the whole reader task.
++                        Err(e) => {
++                            warn!("Ignoring FaceTime STUN message with bad integrity: {e}");
++                            false
++                        }
+                     };
+                     info!("Got stun message {stun_msg:?}");
+                     match stun_msg.typ {
++                        BINDING_SUCCESS => {
++                            // Our connectivity check reached the peer and came
++                            // back, so this pair is validated and usable.
++                            let mut locked = link_state.lock().await;
++                            if locked.direct_peer != Some(addr) {
++                                locked.direct_peer = Some(addr);
++                                if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                                    warn!("FaceTime direct route selected from connectivity check response ({addr})");
++                                }
++                            }
++                        },
+                         BINDING_REQUEST => {
+                             // This UDP socket and candidate are scoped to the
+                             // current FaceTime session. Apple legitimately
+@@ -3499,6 +3598,7 @@ impl GlobalLink {
+         }
+ 
+         let sid = self.session_id.clone();
++        let candidate_state = self.state.clone();
+         tokio::spawn(async move {
+             while let Ok(datagram) = ids_pod.read_datagram().await {
+                 info!("Got IDS Payload {}", encode_hex(&datagram));
+@@ -3508,6 +3608,29 @@ impl GlobalLink {
+                 let msg = LinkMessage::from_raw(&parsed.data, &sid);
+                 info!("Got msg {msg:?}");
+ 
++                // Learn the peer's ICE candidates. These used to be parsed and
++                // discarded, leaving nothing to send connectivity checks to.
++                for parameter in &msg.parameters {
++                    let LinkParameter::ConnectionData(connection_data) = parameter else { continue };
++                    let learned = peer_candidate_addresses(connection_data);
++                    if learned.is_empty() { continue }
++                    let mut added = Vec::new();
++                    {
++                        let mut state = candidate_state.lock().await;
++                        for address in learned {
++                            if !state.peer_candidates.contains(&address) {
++                                state.peer_candidates.push(address);
++                                added.push(address);
++                            }
++                        }
++                    }
++                    if !added.is_empty()
++                        && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                    {
++                        warn!("FaceTime peer ICE candidates learned: {:?}", added);
++                    }
++                }
++
+                 // acknowlege message
+                 let ack = LinkMessage {
+                     command: msg.command | 0x8000,
+@@ -3589,6 +3712,7 @@ impl GlobalLink {
+                 control_incoming_peer_first: true,
+                 direct_socket: None,
+                 direct_peer: None,
++                peer_candidates: Vec::new(),
+             })),
+             bootstrap: Mutex::new(()),
+             inc_send,

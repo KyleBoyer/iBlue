@@ -1,0 +1,196 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -24,7 +24,7 @@ use rtc_srtp::{context::Context, protection_profile::ProtectionProfile};
+ use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
+ use serde::{Deserialize, Serialize};
+ use sha2::Sha256;
+-use rtc_stun::{attributes::{AttrType, RawAttribute}, integrity::MessageIntegrity, message::{BINDING_REQUEST, BINDING_SUCCESS, CLASS_INDICATION, METHOD_DATA, MessageType, Setter}, xoraddr::XorMappedAddress};
++use rtc_stun::{attributes::{AttrType, RawAttribute}, integrity::MessageIntegrity, message::{BINDING_REQUEST, BINDING_SUCCESS, CLASS_INDICATION, METHOD_DATA, Getter, MessageType, Setter}, xoraddr::XorMappedAddress};
+ use tokio::{net::UdpSocket, sync::Mutex};
+ use uuid::Uuid;
+ use prost::Message;
+@@ -875,6 +875,51 @@ fn control_participant_candidates(
+     candidates
+ }
+ 
++/// Learn the public address of a media socket with a STUN binding request.
++///
++/// FaceTime publishes ICE candidates; iBlue previously published only the host
++/// (private LAN) address, which pairs successfully when the caller is on the
++/// same network and is unroutable from anywhere else. Querying from the media
++/// socket itself yields the mapping peers will actually see. Endpoint-
++/// independent (cone) NAT gives a mapping valid for every destination; under
++/// symmetric NAT the learned mapping will not match and pairing still fails,
++/// which is a property of the network rather than something to work around.
++async fn discover_reflexive_candidate(socket: &UdpSocket) -> Option<([u8; 4], u16)> {
++    use rtc_stun::message::{Message, TransactionId};
++    const STUN_SERVERS: [&str; 3] = [
++        "stun.l.google.com:19302",
++        "stun1.l.google.com:19302",
++        "stun.cloudflare.com:3478",
++    ];
++    let mut buf = [0u8; 2048];
++    for server in STUN_SERVERS {
++        let Ok(resolved) = tokio::net::lookup_host(server).await else { continue };
++        let Some(target) = resolved.into_iter().find(|addr| addr.is_ipv4()) else { continue };
++        let mut request = Message::new();
++        if request
++            .build(&[Box::new(BINDING_REQUEST), Box::new(TransactionId::new())])
++            .is_err()
++        {
++            continue;
++        }
++        if socket.send_to(&request.raw, target).await.is_err() { continue }
++        let received = tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            socket.recv_from(&mut buf),
++        ).await;
++        let Ok(Ok((len, from))) = received else { continue };
++        if from != target { continue }
++        let mut response = Message::new();
++        if response.unmarshal_binary(&buf[..len]).is_err() { continue }
++        let mut mapped = XorMappedAddress::default();
++        if mapped.get_from(&response).is_err() { continue }
++        if let std::net::IpAddr::V4(ip) = mapped.ip {
++            return Some((ip.octets(), mapped.port));
++        }
++    }
++    None
++}
++
+ fn control_key_participant(
+     aliases: &HashMap<u64, u64>,
+     route_participant: u64,
+@@ -969,6 +1014,11 @@ pub struct GlobalLinkState {
+     pub link_id: u32,
+     pub local_candidate_ipv4: Option<[u8; 4]>,
+     pub local_candidate_port: Option<u16>,
++    /// Public address of `direct_socket`, learned by a STUN binding from that
++    /// exact socket. The host candidate above is a private LAN address, so a
++    /// caller outside this network has nothing reachable to pair with and no
++    /// direct media path can form without this.
++    pub reflexive_candidate: Option<([u8; 4], u16)>,
+     pub bootstrapped: bool,
+     /// Most recently observed clear RTP header for the peer's AAC-ELD stream.
+     /// FaceTime requires its proprietary RTP extension on every media packet;
+@@ -1815,13 +1865,51 @@ impl GlobalLink {
+                 return Err(PushError::NotConnected);
+             }
+         }
+-        let (candidate_ipv4, candidate_port) = {
++        let (candidate_ipv4, candidate_port, reflexive_candidate) = {
+             let state = self.state.lock().await;
+             (
+                 state.local_candidate_ipv4.ok_or(PushError::BadMsg)?,
+                 state.local_candidate_port.ok_or(PushError::BadMsg)?,
++                state.reflexive_candidate,
+             )
+         };
++        // Host candidate first, then the server-reflexive one when it differs,
++        // so on-network callers keep pairing exactly as before while remote
++        // callers finally have something routable to pair with.
++        let mut ip_candidate_list = vec![ConnIpCandidate {
++            is_ipv6: false,
++            is_active: true,
++            radio_access_technology: 0,
++            link_flags_4: false,
++            spacing: 0,
++            ipv4_addr: Some(candidate_ipv4),
++            ipv6_addr: None,
++        }];
++        let mut candidate_list = vec![ConnCandidate {
++            r#type: 0, // host
++            transport: 1,
++            ip_idx: 0,
++            some_addr_meta: candidate_port,
++        }];
++        if let Some((reflexive_ipv4, reflexive_port)) = reflexive_candidate {
++            if reflexive_ipv4 != candidate_ipv4 {
++                ip_candidate_list.push(ConnIpCandidate {
++                    is_ipv6: false,
++                    is_active: true,
++                    radio_access_technology: 0,
++                    link_flags_4: false,
++                    spacing: 0,
++                    ipv4_addr: Some(reflexive_ipv4),
++                    ipv6_addr: None,
++                });
++                candidate_list.push(ConnCandidate {
++                    r#type: 1, // server reflexive
++                    transport: 1,
++                    ip_idx: 1,
++                    some_addr_meta: reflexive_port,
++                });
++            }
++        }
+         let message = LinkMessage { 
+             command: 6, 
+             parameters: vec![
+@@ -1853,25 +1941,10 @@ impl GlobalLink {
+             parameters: vec![
+                 LinkParameter::ConnectionData(ConnData { 
+                     tag: 1, 
+-                    ip_list_count: 1, 
+-                    candidate_count: 1,
+-                    ip_candidates: vec![
+-                        ConnIpCandidate { 
+-                            is_ipv6: false, 
+-                            is_active: true, 
+-                            radio_access_technology: 0, 
+-                            link_flags_4: false, 
+-                            spacing: 0, 
+-                            ipv4_addr: Some(candidate_ipv4),
+-                            ipv6_addr: None 
+-                        }
+-                    ], candidates: vec![
+-                        ConnCandidate { 
+-                            r#type: 0, 
+-                            transport: 1, 
+-                            ip_idx: 0, 
+-                            some_addr_meta: candidate_port,
+-                        }] 
++                    ip_list_count: ip_candidate_list.len() as u8,
++                    candidate_count: candidate_list.len() as u8,
++                    ip_candidates: ip_candidate_list,
++                    candidates: candidate_list,
+                     }
+                 ), 
+                 LinkParameter::Counter(1)
+@@ -3179,12 +3252,29 @@ impl GlobalLink {
+         };
+         let connection = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+         let candidate_port = connection.local_addr()?.port();
++        // Must run before the STUN listener below takes over the socket, and
++        // must use this same socket so the mapping matches what peers see.
++        let reflexive_candidate = discover_reflexive_candidate(&connection).await;
+         {
+             let mut state = self.state.lock().await;
+             state.local_candidate_ipv4 = Some(candidate_ipv4);
+             state.local_candidate_port = Some(candidate_port);
++            state.reflexive_candidate = reflexive_candidate;
+             state.direct_socket = Some(connection.clone());
+         }
++        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            match reflexive_candidate {
++                Some((ip, port)) => warn!(
++                    "FaceTime reflexive candidate discovered: {}.{}.{}.{}:{} (host {}.{}.{}.{}:{})",
++                    ip[0], ip[1], ip[2], ip[3], port,
++                    candidate_ipv4[0], candidate_ipv4[1], candidate_ipv4[2], candidate_ipv4[3],
++                    candidate_port,
++                ),
++                None => warn!(
++                    "FaceTime reflexive candidate unavailable; publishing host candidate only,                      so callers outside this network will have no direct path"
++                ),
++            }
++        }
+         let integrity = MessageIntegrity(self.session_id.clone());
+         let session_id = self.session_id.clone();
+         let channel = self.inc_send.clone();
+@@ -3478,6 +3568,7 @@ impl GlobalLink {
+                 link_id: 0,
+                 local_candidate_ipv4: None,
+                 local_candidate_port: None,
++                reflexive_candidate: None,
+                 bootstrapped: false,
+                 audio_header_template: None,
+                 video_header_template: None,
