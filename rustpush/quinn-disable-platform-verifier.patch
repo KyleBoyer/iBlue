@@ -1,0 +1,16 @@
+--- a/quinn/Cargo.toml
++++ b/quinn/Cargo.toml
+@@ -15,7 +15,12 @@ rust-version.workspace = true
+ [features]
+ # NOTE: Please keep this in sync with the feature list in `.github/workflows/codecov.yml`, see
+ # comment in that file for more information.
+-default = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"]
++# iBlue authenticates QuickRelay with TLS 1.3 external PSKs and never
++# consults the OS trust store, so the platform verifier is unused. It also
++# pins rustls-platform-verifier ^0.4, which does not compile against the
++# patched rustls in this tree: its downcast of webpki::Error requires a
++# std::error::Error bound that no longer holds.
++default = ["log", "runtime-tokio", "rustls-ring"]
+ # Enables `Endpoint::client` and `Endpoint::server` conveniences
+ aws-lc-rs = ["proto/aws-lc-rs"]
+ aws-lc-rs-fips = ["proto/aws-lc-rs-fips"]

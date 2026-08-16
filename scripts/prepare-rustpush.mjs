@@ -139,6 +139,7 @@ if (!existsSync(join(quinnRoot, ".git"))) {
   }
 }
 applyPatch(quinnRoot, join(projectRoot, "rustpush", "quinn-qpod-dependencies.patch"));
+applyPatch(quinnRoot, join(projectRoot, "rustpush", "quinn-disable-platform-verifier.patch"));
 
 // Pin the public OpenBubbles WebRTC primitives used by the native FaceTime
 // transport for STUN, RTP, SRTP, and media packet assembly.
