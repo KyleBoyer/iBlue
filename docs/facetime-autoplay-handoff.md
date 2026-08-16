@@ -594,8 +594,12 @@ the failure will be invisible.
 
 ### Diagnosing a stalled or silent call
 
-Set `IBLUE_FACETIME_MEDIA_DIAGNOSTICS=1` (already set on the live agent) and read
-these markers in `serve.error.log`:
+FaceTime media diagnostics are **on by default**, because a call that fails once
+is rarely reproducible on demand. Silence them with
+`IBLUE_FACETIME_MEDIA_DIAGNOSTICS` set to `0`, `false`, `off`, or `no`; any
+other value, or leaving it unset, keeps them on.
+
+Read these markers in `serve.error.log`:
 
 ```bash
 rg -n 'control target|peer ICE candidates|connectivity check|direct route selected|reflexive candidate|QuickRelay material|wire message|video mode resolved' \
@@ -615,7 +619,19 @@ rg -n 'control target|peer ICE candidates|connectivity check|direct route select
   — whether inbound material is addressed to one of our allocations. `types`
   never containing 11 is normal; prekeys do not arrive this way.
 - `reflexive candidate discovered` / `connectivity check sent` / `direct route
-  selected` — the ICE exchange described above.
+  selected` — the ICE exchange described above. The peer's candidates also
+  reveal its network: a private `192.168.x`/`10.x` candidate means Wi-Fi, while
+  a carrier-public address plus a `100.64/10` CGNAT address with no private
+  candidate means cellular.
+- `outbound audio using canonical receive-first RTP template` followed by
+  `outbound audio template: extension_profile=0x0000 extensions=0` — the sender
+  never observed the peer's RTP header and guessed. Media is sent and the
+  lifecycle looks healthy, but the caller renders nothing. Compare with a
+  working call, which shows an observed profile such as `0x8d00 extensions=1`.
+- `FaceTime inbound payload type not recognised for templating` — the peer's
+  audio arrived under a payload type the template extraction ignores, which is
+  what produces the fallback above. `inbound media datagram` counts confirm the
+  media itself arrived.
 
 Comparing VC topics separates a media-path failure from everything else. A
 healthy call receives `StreamGroupsState`, `RateControlConfig`, and

@@ -1,0 +1,232 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1730,6 +1730,8 @@ impl FTClient {
+             let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+             let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
+             let mut logged_audio_diagnostic = false;
++            let mut logged_unknown_payload_types: std::collections::HashSet<u8> =
++                std::collections::HashSet::new();
+             let mut sent_stream_group_state = false;
+             let mut republished_responder_keys = false;
+             let mut raw_diagnostics_remaining = 32usize;
+@@ -1851,7 +1853,7 @@ impl FTClient {
+             });
+             while let Some(recv) = session_handle.recv().await {
+                 if raw_diagnostics_remaining > 0
+-                    && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                    && crate::ids::link::media_diagnostics_enabled()
+                 {
+                     let prefix_len = std::cmp::min(24, recv.data.len());
+                     warn!(
+@@ -1924,9 +1926,32 @@ impl FTClient {
+                             }
+                         }
+ 
++                        // Report every distinct inbound payload type once, not
++                        // only the ones already recognised. A peer whose audio
++                        // arrives under an unexpected payload type yields no
++                        // template, so the sender falls back to a canonical
++                        // guess and plays media the caller never renders. That
++                        // failure was previously invisible: the datagrams
++                        // arrived and nothing logged them.
++                        if crate::ids::link::media_diagnostics_enabled()
++                            && !matches!(header.payload_type, 20 | 104 | 108 | 13)
++                            && logged_unknown_payload_types.insert(header.payload_type)
++                        {
++                            warn!(
++                                "FaceTime inbound payload type not recognised for templating: \
++                                 participant={:?} payload_type={} extension={} \
++                                 extension_profile=0x{:04x} payload_len={}",
++                                recv.participant,
++                                header.payload_type,
++                                header.extension,
++                                header.extension_profile,
++                                unmarshalled.payload.len(),
++                            );
++                        }
++
+                         if !logged_audio_diagnostic
+                             && matches!(header.payload_type, 20 | 104 | 108 | 13)
+-                            && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                            && crate::ids::link::media_diagnostics_enabled()
+                         {
+                             let extension_lengths = header.extensions.iter()
+                                 .map(|extension| extension.payload.len())
+@@ -2029,7 +2054,7 @@ impl FTClient {
+                             }
+                         };
+                         if let Some(acknowledgement) = wrapper.acknowledgement.as_ref() {
+-                            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                            if crate::ids::link::media_diagnostics_enabled() {
+                                 warn!(
+                                     "FaceTime VC acknowledgement received: participant={} transaction={} status={}",
+                                     participant,
+@@ -2048,7 +2073,7 @@ impl FTClient {
+                         let Some(message) = wrapper.message else {
+                             continue;
+                         };
+-                        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                        if crate::ids::link::media_diagnostics_enabled() {
+                             warn!(
+                                 "FaceTime VC message received: participant={} transaction={} topic={} payload_bytes={}",
+                                 participant,
+@@ -3458,7 +3483,7 @@ impl FTClient {
+             }
+             let context = received.client_context_data_key.take();
+             let participant_meta = received.participant_data_key.take(); // BORING
+-            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            if crate::ids::link::media_diagnostics_enabled() {
+                 // Which wire commands a group call actually delivers, and
+                 // whether they carry the participant blob that supplies the
+                 // peer's VC session UUID.
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1031,6 +1031,22 @@ async fn deliver_encrypted_rtp(
+     Ok(())
+ }
+ 
++/// Whether FaceTime media diagnostics are emitted.
++///
++/// Default on. These lines are what make a failed call diagnosable after the
++/// fact, and a call that fails once is rarely reproducible on demand. Set
++/// `IBLUE_FACETIME_MEDIA_DIAGNOSTICS` to `0`, `false`, or `off` to silence
++/// them.
++pub fn media_diagnostics_enabled() -> bool {
++    match std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS") {
++        Ok(value) => !matches!(
++            value.trim().to_ascii_lowercase().as_str(),
++            "0" | "false" | "off" | "no"
++        ),
++        Err(_) => true,
++    }
++}
++
+ fn control_key_participant(
+     aliases: &HashMap<u64, u64>,
+     route_participant: u64,
+@@ -1925,7 +1941,7 @@ impl GlobalLink {
+         let sid = Uuid::from_bytes(self.session_id.clone().try_into().unwrap()).to_string().to_uppercase();
+         if let Some(mat) = indication.putmaterial_indication.as_ref() {
+             for mat in &mat.materials {
+-                if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                if media_diagnostics_enabled() {
+                     // Who each material is addressed to, against the local
+                     // allocations we could unwrap with. A group relay delivers
+                     // material for every member, so "not wrapped" is expected
+@@ -2355,7 +2371,7 @@ impl GlobalLink {
+                     key_participant,
+                 );
+             }
+-            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            if media_diagnostics_enabled() {
+                 warn!(
+                     "FaceTime VC control authenticated: participant={} key_participant={} peer_uuid={} local_uuid={} advertised_local_uuid={} local_matches_advertised={} incoming_peer_first={}",
+                     route_participant,
+@@ -2466,7 +2482,7 @@ impl GlobalLink {
+                 participant,
+             );
+             if state.control_target_logged != Some(key_participant)
+-                && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                && media_diagnostics_enabled()
+             {
+                 report_control_target(
+                     &state.states,
+@@ -2498,7 +2514,7 @@ impl GlobalLink {
+                     .my_mkm
+                     .get_control(&peer_session_id, &selected_local_session_id)
+             };
+-            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            if media_diagnostics_enabled() {
+                 warn!(
+                     "FaceTime VC control sending: participant={} key_participant={} counter={} peer_uuid={} selected_local_uuid={} advertised_local_uuid={} local_matches_advertised={} outgoing_local_first={}",
+                     participant,
+@@ -2768,7 +2784,7 @@ impl GlobalLink {
+                     // audio-control extension before marshalling. A default
+                     // header is therefore a safe receive-first fallback; the
+                     // live peer template remains preferred when available.
+-                    if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                    if media_diagnostics_enabled() {
+                         warn!("FaceTime outbound audio using canonical receive-first RTP template");
+                     }
+                     return Ok((rtc_rtp::Header::default(), peer_participant));
+@@ -2820,7 +2836,7 @@ impl GlobalLink {
+         )
+         .map_err(|_| PushError::BadMsg)?;
+         let using_direct = direct_socket.is_some() && direct_peer.is_some();
+-        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++        if media_diagnostics_enabled() {
+             warn!(
+                 "FaceTime outbound audio template: extension_profile=0x{:04x} extensions={} padding={} participant={:?} transport={}",
+                 header_template.extension_profile,
+@@ -3170,7 +3186,7 @@ impl GlobalLink {
+     pub async fn note_participant_joined(&self, participant_id: u64) {
+         let mut state = self.state.lock().await;
+         if state.joined_participants.insert(participant_id)
+-            && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++            && media_diagnostics_enabled()
+         {
+             warn!(
+                 "FaceTime participant joined: participant={} joined_total={}",
+@@ -3202,7 +3218,7 @@ impl GlobalLink {
+         let participant = state.states.entry(participant_id).or_default();
+         let changed = participant.avc_uuid.as_deref() != Some(session_id.as_str());
+         participant.avc_uuid = Some(session_id);
+-        if changed && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++        if changed && media_diagnostics_enabled() {
+             warn!(
+                 "Imported FaceTime participant AVC session UUID: participant={} peer_uuids={}",
+                 participant_id,
+@@ -3448,7 +3464,7 @@ impl GlobalLink {
+             warn!("Unable to refresh FaceTime responder keys on QuickRelay: {error:?}");
+         }
+         ids_result?;
+-        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++        if media_diagnostics_enabled() {
+             warn!(
+                 "Published FaceTime responder key material: participant={participant} key_participant={key_participant} generated={generated}"
+             );
+@@ -3486,7 +3502,7 @@ impl GlobalLink {
+             state.reflexive_candidate = reflexive_candidate;
+             state.direct_socket = Some(connection.clone());
+         }
+-        if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++        if media_diagnostics_enabled() {
+             match reflexive_candidate {
+                 Some((ip, port)) => warn!(
+                     "FaceTime reflexive candidate discovered: {}.{}.{}.{}:{} (host {}.{}.{}.{}:{})",
+@@ -3517,7 +3533,7 @@ impl GlobalLink {
+             tokio::spawn(async move {
+                 use rtc_stun::message::{Message, TransactionId};
+                 let diagnostics =
+-                    std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1");
++                    media_diagnostics_enabled();
+                 let deadline = tokio::time::Instant::now()
+                     + std::time::Duration::from_secs(CONNECTIVITY_CHECK_WINDOW_SECS);
+                 let mut announced: Vec<SocketAddr> = Vec::new();
+@@ -3582,7 +3598,7 @@ impl GlobalLink {
+                             let mut locked = link_state.lock().await;
+                             if locked.direct_peer != Some(addr) {
+                                 locked.direct_peer = Some(addr);
+-                                if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                                if media_diagnostics_enabled() {
+                                     warn!("FaceTime direct route selected from connectivity check response ({addr})");
+                                 }
+                             }
+@@ -3595,7 +3611,7 @@ impl GlobalLink {
+                             // fails above. Remember the validated STUN source
+                             // now rather than deadlocking on receive-first RTP.
+                             link_state.lock().await.direct_peer = Some(addr);
+-                            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                            if media_diagnostics_enabled() {
+                                 warn!("FaceTime direct route selected from session STUN binding (message_integrity={authenticated})");
+                             }
+                             // let it know the binding was successful
+@@ -3816,7 +3832,7 @@ impl GlobalLink {
+                         }
+                     }
+                     if !added.is_empty()
+-                        && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++                        && media_diagnostics_enabled()
+                     {
+                         warn!("FaceTime peer ICE candidates learned: {:?}", added);
+                     }
