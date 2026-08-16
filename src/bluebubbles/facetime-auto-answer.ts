@@ -1,5 +1,5 @@
 import { mkdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative as relativePath, resolve, sep } from "node:path";
 
 import type {
   BlueBubblesAutoAnswerMode,
@@ -155,11 +155,14 @@ export class FaceTimeAutoAnswerRules {
   async #removeMediaDirectory(mediaPath: string): Promise<void> {
     // Media lives one directory deep under mediaRoot; refuse anything that did
     // not come from there so a corrupted row cannot delete outside the profile.
-    const root = join(this.mediaRoot, "");
-    if (!mediaPath.startsWith(`${root}/`)) return;
-    const relative = mediaPath.slice(root.length + 1);
-    const token = relative.split("/")[0];
+    // Resolve both sides and compare with relative() rather than string
+    // prefixes: Windows separates with a backslash, so a hardcoded "/" matched
+    // nothing there and every removal was silently skipped.
+    const root = resolve(this.mediaRoot);
+    const relative = relativePath(root, resolve(mediaPath));
+    if (relative === "" || relative.startsWith("..") || isAbsolute(relative)) return;
+    const [token] = relative.split(sep);
     if (!token || token === "." || token === "..") return;
-    await rm(join(this.mediaRoot, token), { recursive: true, force: true });
+    await rm(join(root, token), { recursive: true, force: true });
   }
 }
