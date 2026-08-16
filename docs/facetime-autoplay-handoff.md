@@ -107,11 +107,20 @@ topics received on a good and a bad call. A healthy call shows
 `StreamGroupsState`, `RateControlConfig`, and `DeviceOrientation`; a stalled one
 shows only repeated `DeviceState` plus `GenerateKeyFrame`.
 
-Known gap: `facetime-native-joined-device-targeting.patch` is in the stack but
-its `note_participant_joined` hook has never been observed to fire, so
-`control_target_participant` always falls back to the previous alias behaviour.
-It is inert rather than harmful, and should either be wired to a join signal
-that actually fires or removed.
+`facetime-native-joined-device-targeting.patch` addresses the same multi-device
+problem from the other side: it records which participant's device actually
+joined and addresses control to that one, rather than to a sibling device that
+was invited and only rang. The hook fires from the AVC join path and was
+observed on an outgoing call:
+
+```text
+FaceTime participant joined: participant=472542193749416740 joined_total=1
+```
+
+It has not yet been observed firing on an incoming responder call. Until a join
+is seen, `control_target_participant` falls back to the previous alias
+behaviour, so the patch can only ever redirect away from a device that never
+answered.
 
 ## Quick safety control
 
