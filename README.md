@@ -74,6 +74,10 @@ document is available as JSON at `/openapi.json` or `/docs/json`, and as YAML
 at `/docs/yaml`. Documentation routes describe the API but do not expose
 profile data and therefore do not require the server password themselves.
 
+The current macOS FaceTime installation, persistent automatic video responder,
+launchd controls, staging workflow, logs, and troubleshooting steps are recorded
+in [the FaceTime autoplay handoff](docs/facetime-autoplay-handoff.md).
+
 ## Connect a BlueBubbles client
 
 Point the client at the address above and give it the same server password.
