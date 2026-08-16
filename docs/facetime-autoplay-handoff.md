@@ -1,71 +1,142 @@
-# iBlue FaceTime and automatic video responder handoff
+# iBlue FaceTime handoff
 
 Last verified: 2026-08-16 (America/Chicago)
 
-Repository commit at verification: the commit that added
-`facetime-native-ice-connectivity-checks.patch`.
+Repository commit at verification: `ab16a83e`
+(`Answer group FaceTime video calls as video`).
 
-This document describes the current macOS installation, the continuously armed
-dog-video responder, the build/deploy boundary, service controls, API checks,
-and the fastest way to diagnose an incoming FaceTime failure.
+This document describes the macOS installation, the built-in auto-answer and
+notification features, the build/deploy boundary, service controls, API checks,
+and the fastest way to diagnose a FaceTime failure.
+
+> The external `dog-autoplay.mjs` responder this document used to describe has
+> been retired. Auto-answer now lives in iBlue itself as durable rules with CRUD
+> routes, so nothing polls the incoming-call list from outside the server. Its
+> LaunchAgent is booted out but still present on disk; sections below that
+> mention it are retained only for the rollback path.
 
 ## Current status
 
-The live setup is working for incoming FaceTime Audio and FaceTime Video calls
-to the `secondary` iBlue profile. The profile's registered calling identity is
-Jade's Apple handle; it is isolated from the account signed into the Mac's
-FaceTime and Messages apps.
+The live setup answers incoming FaceTime Audio and Video calls to the
+`secondary` iBlue profile, one-to-one and group, from callers on or off the
+Mac's network. The profile's registered calling identity is a dedicated Apple
+handle isolated from the account signed into the Mac's FaceTime and Messages
+apps.
 
 Verified behavior:
 
-- Native one-to-one incoming and outgoing FaceTime audio works through iBlue's
-  QuickRelay transport.
-- Native one-to-one incoming and outgoing FaceTime video works. Video is sent
-  as HEVC/PT100; audio is sent as AAC-ELD/PT104.
-- Live audio and video can be injected over authenticated Socket.IO.
-- The live video transcoder uses FaceTime's negotiated 1920x1080 camera surface,
-  preserves the source aspect ratio, and fills unused space with black.
-- A caller with no prior iMessage history can call Jade and receive media. This
-  was verified from a previously unseen iPad after the call-local device-token,
-  participant, VC UUID, and responder-key fixes in commit `af1644ce`.
-- **Callers outside the Mac's local network work.** Verified 2026-08-16 from the
-  same handset both on and off the Mac's Wi-Fi. Until the ICE work described
-  below, only same-LAN callers ever received media; a remote caller rang, was
-  answered, and then stalled until the responder's 15 s media-key deadline.
-- The persistent responder detects caller hangup, stops FFmpeg, leaves the
-  native call, and re-arms for the next call.
-- The responder texts `+16513196252` over iMessage when a call starts and again
-  when it ends, including the caller, mode, and outcome. Names come from
-  `/api/v1/iblue/contact/query`; unknown numbers are reported bare.
-- The responder survives a startup race with the server. Its Socket.IO connect
-  is retried rather than fatal, and an unrecoverable startup failure now calls
-  `process.exit(1)`. Previously it set `process.exitCode` only, which never
-  terminated the process because the sockets kept the event loop alive, so
-  launchd's `KeepAlive` never restarted it. The agent then sat `state = running`
-  with healthy sockets and `last exit code = 0` while silently never arming —
-  every incoming call went unanswered. If calls are not being answered, confirm
-  `dog-autoplay.log` ends with `armed continuously` or `re-armed`; a running PID
-  is not sufficient evidence.
-- The latest full TypeScript suite passed: 113 tests passed and one intentionally
-  skipped native multi-profile test. The native release build also passed.
+- One-to-one incoming and outgoing FaceTime audio and video. Video is sent as
+  HEVC/PT100, audio as AAC-ELD/PT104.
+- **Callers outside the Mac's local network.** Verified from the same handset on
+  and off the Mac's Wi-Fi, and from a cellular peer. Before the ICE work below,
+  only same-LAN callers ever received media.
+- **Group FaceTime audio and video.** Verified on live group calls: control
+  authenticated with zero failures, `StreamGroupsState` received, media played.
+- Live audio and video injection over authenticated Socket.IO.
+- A caller with no prior iMessage history can call and receive media.
+- Auto-answer rules select media by caller and by audio/video, survive restart,
+  and answer repeatedly.
+- Notification rules text a chosen handle on call and message events, with
+  templates, caller filters, event filters, and duplicate suppression.
 
 Known limitations:
 
-- A caller can remain on a **Connecting...** screen even while audio/video is
-  playing correctly. In the verified iPad call, iBlue authenticated the VC
-  control channel, received the control acknowledgement, delivered all 5,473
-  video access units, ended the call, and re-armed. This is currently treated as
-  missing presentation/connected-state signaling, not a media transport or
-  teardown failure.
-- The responder answers **every** incoming FaceTime Audio or Video call to Jade.
-  There is currently no caller allowlist.
-- Calls are handled sequentially. A second simultaneous caller is not handled
-  until the active playback finishes or is stopped and the one-second re-arm
-  delay expires.
-- The responder script, LaunchAgent files, staging script, media file, password,
-  and profile data are local operational files. They are not managed by Git.
-- Launchd log rotation is not configured; the files under
-  `~/Library/Logs/iBlue` continue growing until they are rotated manually.
+- **Outgoing group calls are still one-to-one.** Three guards enforce this:
+  `pkg/rustpushgo/src/lib.rs` (`create_native_media_session`,
+  `create_native_live_audio_session`) and
+  `src/bluebubbles/facetime-media.ts` (`input.targets.length !== 1`).
+- **Capabilities still advertise `topology: "one-to-one"`** in six places across
+  `server.ts`, `facetime-media.ts`, and `native/engine.ts`. That is now wrong
+  for incoming calls.
+- **Media fan-out is unexercised with three or more participants.** Verified
+  group calls had two participant contexts but one real remote peer. Fan-out
+  sends the same ciphertext per participant over the relay, which is correct in
+  principle because `my_mkm` is one outbound key re-wrapped per peer, but it has
+  never been observed with several genuine participants.
+- A caller can remain on a **Connecting...** screen while media plays correctly.
+  Treated as missing presentation/connected-state signaling rather than a
+  transport failure.
+- Auto-answer rules answer one call at a time. A ring arriving during playback
+  is left alone rather than interrupting the call in progress.
+- LaunchAgent files, the staging script, media, password, and profile data are
+  local operational files not managed by Git.
+- Launchd log rotation is not configured; files under `~/Library/Logs/iBlue`
+  grow until rotated manually.
+
+## Auto-answer and notification rules
+
+Both are durable, profile-local, and managed over the API. Media for a rule is
+stored under the profile and converted once; conversions are cached by source
+identity so a caller is not left ringing through a repeated ffmpeg run.
+
+| Purpose | Route |
+| --- | --- |
+| Auto-answer rules | `/api/v1/iblue/facetime/incoming/auto-answer/rules` (+ `/:id`) |
+| Notification rules | `/api/v1/iblue/notification/rules` (+ `/:id`, `/:id/test`) |
+
+Auto-answer matching is by explicit priority, then caller specificity so a rule
+naming the caller beats a catch-all, then id. An empty `callers` list matches
+everyone; `mode: any` matches audio and video. The one-shot arm at
+`/incoming/auto-answer` still exists and outranks a standing rule for the very
+next call.
+
+Notification rules subscribe to `incoming-facetime`, `ft-call-status-changed`,
+`facetime-auto-answer-rule-matched`, `new-message`, and the membership and
+delivery events, or `*`. Templates support `{who}`, `{caller}`, `{callerName}`,
+`{mode}`, `{status}`, `{outcome}`, `{duration}`, `{durationSeconds}`,
+`{error}`, `{sessionId}`, `{text}`, and `{name}`. Prefer `{who}`: it renders
+the handle plus contact name when known and degrades to the bare handle, where
+composing `{caller} ({callerName})` leaves empty parentheses.
+
+Two behaviours worth knowing before subscribing to lifecycle events:
+
+- `ft-call-status-changed` has **two producers**. The incoming-signal path sends
+  `status`; the media lifecycle dispatches the whole call object with `state`
+  and fires on every transition. Use `filters`, for example
+  `{"status": ["ended", "declined"]}`, or a single call produces one text per
+  state.
+- Identical text for one rule is suppressed for five minutes, which is a
+  backstop rather than a substitute for filters.
+
+## Group FaceTime
+
+Group calls work for incoming audio and video. The findings that made that
+possible are not obvious from the code and are expensive to rediscover:
+
+- **Group calls arrive as `ConversationMessageType::Unknown`**, not `Invitation`
+  or `AddMember`. Code that switches on the message type will silently not run.
+  `is_video` was gated on `Invitation`, so every group video call was answered
+  as audio-only until it learned to read an explicit `video_enabled`/`video`/
+  `av_mode` flag from any type.
+- **Peer prekeys arrive over IDS on commands 207 and 210**, never as QuickRelay
+  type-11 material. The paths that consume them only seed the link when a
+  connection already exists, and `ensure_allocations` only harvests the cache
+  while building one, so a prekey arriving after the connection is up was
+  cached and never seeded. Bootstrap then failed with `NotConnected` for the
+  whole call.
+- **Peer VC session UUIDs are not delivered over QuickRelay in a group call.**
+  They are read from each participant's plaintext AVC blob at connection setup,
+  ported from upstream's `avconference::import_avc`. Doing this on message
+  receipt does not work: the state changes during a group call carry an empty
+  `active_participants`, so the cached blobs from the invitation are the only
+  copies. Without them every participant lacks an `avc_uuid`, `peer_uuids` is
+  zero, and no control message can be authenticated.
+- **`ResendAVCBlobRequest` is unimplemented upstream.** `callservicesd` names the
+  exchange `handleConversation:receivedBlobRecoveryRequest:`/`Response:` and
+  warns that a response must carry a participant the receiver can add or update.
+  iBlue answers it by re-advertising with the message type overridden, and
+  allocates first, because the blob only carries this side's public prekey once
+  a connection exists.
+- **Apple's `ConversationMessage` has a `requestBlobRecoveryOptions` field this
+  proto does not model** (the numbering skips 18, 26, 27). Replies ignore it and
+  send the full blob, which has been sufficient so far.
+
+The upstream `rustpush` pin is `origin/ft-testing`, which diverged from upstream
+`main` in April 2026. `main` has since restructured FaceTime into an
+`avconference` module with per-participant encryption state. Re-pinning was
+measured: of the current patch stack, **4 patches apply and 54 fail**, so it is a
+rewrite rather than a rebase. Port ideas backward instead unless that rewrite is
+deliberately scheduled.
 
 ## Remote callers and ICE
 
@@ -124,61 +195,62 @@ answered.
 
 ## Quick safety control
 
-The responder has `KeepAlive=true`. Killing only its Node process causes
-launchd to start it again. To disable automatic answering while keeping the
-iBlue API online, unload the responder LaunchAgent:
+To stop answering calls while keeping the iBlue API online, disable the
+auto-answer rules. Nothing needs restarting; matching reads the rule on each
+ring.
 
 ```bash
-IBLUE_DOMAIN="gui/$(id -u)"
-launchctl bootout "$IBLUE_DOMAIN" \
-  "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist"
+IBLUE_PASSWORD_VALUE="$(< "$HOME/Library/Application Support/iBlue/server-password.txt")"
+BASE="http://127.0.0.1:1234/api/v1/iblue/facetime/incoming/auto-answer/rules"
+
+# List rules and their enabled state
+curl -fsS --get --data-urlencode "password=$IBLUE_PASSWORD_VALUE" "$BASE" \
+  | jq -c '.data | map({id, name, enabled, mode, callers})'
+
+# Disable one
+curl -fsS -X PATCH "$BASE/<id>?password=$IBLUE_PASSWORD_VALUE" \
+  -H 'Content-Type: application/json' -d '{"enabled":false}'
+
+unset IBLUE_PASSWORD_VALUE
 ```
 
-Re-enable it with:
+Notification rules are disabled the same way against
+`/api/v1/iblue/notification/rules/<id>`.
+
+To stop everything, boot out the server agent:
 
 ```bash
-IBLUE_DOMAIN="gui/$(id -u)"
-launchctl bootstrap "$IBLUE_DOMAIN" \
-  "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist"
+launchctl bootout "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.plist"
 ```
 
 ## Architecture
 
-There are two independent launchd services:
-
-1. `com.kyleboyer.iblue` runs the staged iBlue TypeScript server and its native
-   Rust helper.
-2. `com.kyleboyer.iblue.dog-autoplay` connects to that server as an authenticated
-   Socket.IO client, watches for calls, answers them, and streams the fixed media.
+One launchd service, `com.kyleboyer.iblue`, runs the staged iBlue TypeScript
+server and its native Rust helper. Answering and notifications are internal to
+that server; nothing polls from outside it.
 
 ```mermaid
 flowchart LR
     Caller["Apple caller"] -->|"IDS / QuickRelay"| Native["iblue-native"]
     Native <--> Server["iBlue REST + Socket.IO\n127.0.0.1:1234"]
-    Player["dog-autoplay.mjs"] -->|"list / answer / audio frames"| Server
-    Player -->|"video frames"| Server
-    Server -->|"call status + inbound activity"| Player
-    Media["dog.mp4"] --> FFmpeg["two FFmpeg processes"]
-    FFmpeg --> Player
+    Server --> Rules["auto-answer rules\n(SQLite + profile media)"]
+    Rules -->|"cached conversion"| FFmpeg["ffmpeg (once per source)"]
+    FFmpeg --> Server
+    Server --> Notify["notification rules"]
+    Notify -->|"iMessage"| Server
     Server -->|"AAC-ELD + HEVC"| Native
 ```
 
-The player uses three Socket.IO connections so control/audio, video backpressure,
-and remote-call monitoring do not block one another. Incoming media is subscribed
-only to detect peer activity and hangup. Those frames are not persisted by the
-player or inserted into messages/webhooks.
+On a ring, the server matches auto-answer rules, answers the session, and plays
+the rule's media. Answering retries while the native session reports that it is
+not awaiting an answer or returns `NotConnected`, because the ring event derives
+from the parsed iMessage signal and can precede native readiness — routinely so
+for a group call, whose prekeys arrive after the invitation.
 
-The player does **not** use iBlue's built-in `incoming/auto-answer` REST feature.
-It polls `facetime-incoming-list` every 400 ms and calls
-`facetime-incoming-answer` itself. Consequently, this is expected:
-
-```text
-GET /api/v1/iblue/facetime/incoming/auto-answer
-=> FaceTime auto-answer is not armed.
-```
-
-Do not arm the built-in auto-answer feature while the dog responder is running;
-the two answer owners can race for the same call.
+The retired `com.kyleboyer.iblue.dog-autoplay` agent is booted out. Its plist
+and script remain on disk as a rollback path. Do not load it while auto-answer
+rules are enabled: two answer owners race for the same call.
 
 ## Files and directories
 
@@ -215,8 +287,9 @@ internal disk.
 | Previous native backup | `~/Library/Application Support/iBlue/runtime/iblue-native.previous` |
 | Main service wrapper | `~/Library/Application Support/iBlue/iblue-serve.sh` |
 | Staging script | `~/Library/Application Support/iBlue/iblue-stage.sh` |
-| Dog responder source | `~/Library/Application Support/iBlue/dog-autoplay.mjs` |
-| Served media | `~/Library/Application Support/iBlue/media/dog.mp4` |
+| Retired responder (rollback only) | `~/Library/Application Support/iBlue/dog-autoplay.mjs` |
+| Auto-answer rule media | `<profile>/attachments/facetime-auto-answer/<uuid>/` |
+| Cached media conversions | `/private/tmp/vp/inject/cache/` |
 | Server password | `~/Library/Application Support/iBlue/server-password.txt` |
 | Secondary profile | `~/Library/Application Support/iBlue/profiles/secondary` |
 
@@ -234,7 +307,7 @@ protocol diagnostics and should be redacted before sharing.
 | Service | LaunchAgent | Standard output | Standard error |
 | --- | --- | --- | --- |
 | iBlue API/native engine | `~/Library/LaunchAgents/com.kyleboyer.iblue.plist` | `~/Library/Logs/iBlue/serve.log` | `~/Library/Logs/iBlue/serve.error.log` |
-| Automatic dog responder | `~/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist` | `~/Library/Logs/iBlue/dog-autoplay.log` | `~/Library/Logs/iBlue/dog-autoplay.error.log` |
+| Retired responder (rollback only) | `~/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist` | `~/Library/Logs/iBlue/dog-autoplay.log` | `~/Library/Logs/iBlue/dog-autoplay.error.log` |
 
 Both agents use `RunAtLoad=true` and `KeepAlive=true`.
 
@@ -276,7 +349,6 @@ IBLUE_DOMAIN="gui/$(id -u)"
 
 ```bash
 launchctl print "$IBLUE_DOMAIN/com.kyleboyer.iblue"
-launchctl print "$IBLUE_DOMAIN/com.kyleboyer.iblue.dog-autoplay"
 ```
 
 A healthy agent reports `state = running` and a PID. For a compact view:
@@ -284,18 +356,9 @@ A healthy agent reports `state = running` and a PID. For a compact view:
 ```bash
 launchctl print "$IBLUE_DOMAIN/com.kyleboyer.iblue" \
   | rg 'state =|pid =|last exit code'
-launchctl print "$IBLUE_DOMAIN/com.kyleboyer.iblue.dog-autoplay" \
-  | rg 'state =|pid =|last exit code'
 ```
 
 ### Restart without unloading
-
-Restart the player after changing `dog-autoplay.mjs` or `dog.mp4`:
-
-```bash
-launchctl kickstart -k \
-  "$IBLUE_DOMAIN/com.kyleboyer.iblue.dog-autoplay"
-```
 
 Restart iBlue after staging a new TypeScript/native build:
 
@@ -303,13 +366,11 @@ Restart iBlue after staging a new TypeScript/native build:
 launchctl kickstart -k "$IBLUE_DOMAIN/com.kyleboyer.iblue"
 ```
 
-The Socket.IO client reconnects after a server restart, but explicitly
-restarting the responder too gives a clean test boundary:
+Restarting the server is sufficient; auto-answer and notification rules are
+read from SQLite on each event.
 
 ```bash
 launchctl kickstart -k "$IBLUE_DOMAIN/com.kyleboyer.iblue"
-launchctl kickstart -k \
-  "$IBLUE_DOMAIN/com.kyleboyer.iblue.dog-autoplay"
 ```
 
 Do not restart either service during an active test call unless terminating the
@@ -317,16 +378,14 @@ call is intentional.
 
 ### Stop/unload and start/load
 
-For maintenance, stop the responder first and the server second:
+For maintenance, stop the server:
 
 ```bash
-launchctl bootout "$IBLUE_DOMAIN" \
-  "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist"
 launchctl bootout "$IBLUE_DOMAIN" \
   "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.plist"
 ```
 
-Start the server first, confirm it is healthy, and then start the responder:
+Start it again and confirm it is healthy:
 
 ```bash
 launchctl bootstrap "$IBLUE_DOMAIN" \
@@ -334,8 +393,6 @@ launchctl bootstrap "$IBLUE_DOMAIN" \
 
 curl -fsS http://127.0.0.1:1234/docs/ >/dev/null
 
-launchctl bootstrap "$IBLUE_DOMAIN" \
-  "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist"
 ```
 
 If `bootstrap` says the service is already loaded, use `kickstart -k`. If
@@ -347,8 +404,6 @@ After changing a LaunchAgent file:
 
 ```bash
 plutil -lint "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.plist"
-plutil -lint \
-  "$HOME/Library/LaunchAgents/com.kyleboyer.iblue.dog-autoplay.plist"
 ```
 
 Unload and bootstrap the edited agent; `kickstart` alone does not reload plist
@@ -379,8 +434,6 @@ Stage the build onto the internal disk and restart the live services:
 
 IBLUE_DOMAIN="gui/$(id -u)"
 launchctl kickstart -k "$IBLUE_DOMAIN/com.kyleboyer.iblue"
-launchctl kickstart -k \
-  "$IBLUE_DOMAIN/com.kyleboyer.iblue.dog-autoplay"
 ```
 
 The staging script uses `rsync --delete` for staged `dist-ts` and
@@ -399,8 +452,11 @@ shasum -a 256 \
 The two hashes must match. At the 2026-08-16 verification snapshot, both were:
 
 ```text
-8485acbd4be8c37d6c7bf41ec7d364c70f5a655da034470c35c822dcf7f3a3a7
+59f3d26f44e164defbfed9d8f38dad0f229d969e0b48644d5b6541d1ead48a8d
 ```
+
+Take the value from `shasum -a 256` after a build rather than trusting this
+line: the native helper is rebuilt often and this snapshot goes stale quickly.
 
 Replacing the native executable on disk does not hot-reload the already-running
 native sidecar. Restart the main iBlue LaunchAgent after every native deploy.
@@ -441,11 +497,12 @@ also false after cleanup because the call's media attachment has been removed.
 
 ## Logs
 
-Watch the player lifecycle and errors in separate terminals:
+Answering, notifications, and native diagnostics all go to the server logs. The
+`dog-autoplay.*` logs belong to the retired responder and stop at its last run.
 
 ```bash
-tail -F "$HOME/Library/Logs/iBlue/dog-autoplay.log"
-tail -F "$HOME/Library/Logs/iBlue/dog-autoplay.error.log"
+tail -F "$HOME/Library/Logs/iBlue/serve.error.log"
+tail -F "$HOME/Library/Logs/iBlue/serve.log"
 ```
 
 Watch the iBlue server and native protocol diagnostics:
@@ -474,8 +531,6 @@ Filter both log layers by one FaceTime session UUID:
 ```bash
 IBLUE_SESSION_ID="PUT-SESSION-UUID-HERE"
 rg -n "$IBLUE_SESSION_ID" \
-  "$HOME/Library/Logs/iBlue/dog-autoplay.log" \
-  "$HOME/Library/Logs/iBlue/dog-autoplay.error.log" \
   "$HOME/Library/Logs/iBlue/serve.log" \
   "$HOME/Library/Logs/iBlue/serve.error.log"
 ```
@@ -493,27 +548,40 @@ Search for serious failures:
 ```bash
 rg -ni \
   'panicked|fatal|failed|timed out|media keys are not ready|No SKM|Unable to authenticate' \
-  "$HOME/Library/Logs/iBlue/serve.error.log" \
-  "$HOME/Library/Logs/iBlue/dog-autoplay.error.log" | tail -n 200
+  "$HOME/Library/Logs/iBlue/serve.error.log" | tail -n 200
 ```
 
 ## Troubleshooting by symptom
 
 ### The call rings but is not answered
 
-1. Confirm both LaunchAgents report `state = running`.
-2. Confirm `dog-autoplay.log` ends with `[watch] armed continuously` or
-   `[watch] re-armed`.
-3. Check `dog-autoplay.error.log` for Socket.IO authentication/connect errors.
-4. Call the incoming-session API and verify the new session is `ringing` and
-   has mode `audio` or `video`.
-5. If the player exited, remember `KeepAlive` should restart it; if it is crash
-   looping, `launchctl print` shows the last exit status and the error log gives
-   the cause.
+Background failures are reported to stderr and land in `serve.error.log`:
+
+```bash
+rg -n '\[iblue\]' "$HOME/Library/Logs/iBlue/serve.error.log" | tail -n 20
+```
+
+`[iblue] facetime auto-answer failed: <reason>` names the cause directly. Note
+that Fastify is constructed with `logger: false`, so anything routed to
+`app.log` is discarded; use `reportBackgroundFailure` for new background work or
+the failure will be invisible.
+
+1. Confirm `com.kyleboyer.iblue` reports `state = running`.
+2. Confirm an enabled auto-answer rule matches: `GET
+   /api/v1/iblue/facetime/incoming/auto-answer/rules`. Check `mode`, `callers`,
+   and `enabled`.
+3. Confirm the retired `com.kyleboyer.iblue.dog-autoplay` agent is **not**
+   loaded. Two answer owners race for the same call.
+4. Verify the session is `ringing` with mode `audio` or `video` via
+   `GET /api/v1/iblue/facetime/incoming`.
+5. `auto-answer waiting for native readiness` followed by `still waiting after
+   Ns` means the session is not yet answerable. That is expected briefly, and
+   for longer on a group call.
 
 ### The call is answered but no media plays
 
-1. Find its session UUID in `dog-autoplay.log`.
+1. Find its session UUID from `GET /api/v1/iblue/facetime/incoming` or the
+   `[iblue]` lines in `serve.error.log`.
 2. If the player repeatedly logs `waiting for authenticated FaceTime media
    keys`, inspect the same UUID in `serve.error.log`.
 3. A healthy first-time-device path should show an exact participant/device
@@ -524,13 +592,45 @@ rg -ni \
 5. If the player reaches its 15-second key deadline, it abandons that call so a
    dead session cannot monopolize the continuous responder, then re-arms.
 
+### Diagnosing a stalled or silent call
+
+Set `IBLUE_FACETIME_MEDIA_DIAGNOSTICS=1` (already set on the live agent) and read
+these markers in `serve.error.log`:
+
+```bash
+rg -n 'control target|peer ICE candidates|connectivity check|direct route selected|reflexive candidate|QuickRelay material|wire message|video mode resolved' \
+  "$HOME/Library/Logs/iBlue/serve.error.log" | tail -n 40
+```
+
+- `FaceTime control target: route=… chosen=… participants=N | …[avc_uuid= mkm= skm= prekey= published= joined=]`
+  — the whole participant table and which one control is addressed to. A group
+  call holds one context per remote device and the one that matters is the one
+  with decrypted key material.
+- `Unable to authenticate FaceTime VC control message: … peer_uuids=0` — no
+  participant has an AVC UUID, so nothing can be authenticated. See the group
+  section: the UUIDs come from cached participant blobs at connection setup.
+- `bootstrap waiting for a peer prekey` — QuickRelay cannot bootstrap. Prekeys
+  arrive on IDS commands 207/210, not as QuickRelay type-11 material.
+- `FaceTime QuickRelay material: owner=… receiver=… types=[…] local_allocations=[…]`
+  — whether inbound material is addressed to one of our allocations. `types`
+  never containing 11 is normal; prekeys do not arrive this way.
+- `reflexive candidate discovered` / `connectivity check sent` / `direct route
+  selected` — the ICE exchange described above.
+
+Comparing VC topics separates a media-path failure from everything else. A
+healthy call receives `StreamGroupsState`, `RateControlConfig`, and
+`DeviceOrientation`; a stalled one receives only repeated `DeviceState` plus
+`GenerateKeyFrame`.
+
 ### Audio works but video is absent
 
 1. Confirm the call mode in the player log is `video`; an audio call
    intentionally receives no video.
 2. Look for `delivered ... compressed video access units` in
-   `dog-autoplay.log`.
-3. Inspect `dog-autoplay.error.log` for FFmpeg exit/error output.
+   `serve.error.log`.
+3. Inspect `serve.error.log` for ffmpeg exit/error output. A group video call
+   answered as audio-only is a separate cause: see the group section on
+   `is_video` resolution.
 4. Query `/api/v1/iblue/facetime/capabilities` and confirm native video is
    available, `outboundCodec` is `hevc-pt100`, and the transcoded output is
    1920x1080.
@@ -567,35 +667,30 @@ connections and uses acknowledged backpressure. Check for:
 Do not remove the two-second shared media lead or collapse audio/video onto one
 Socket.IO connection without repeating the counting-video synchronization test.
 
-## Replacing the served media
+## Replacing the played media
 
-The responder expects the fixed path:
+Media belongs to an auto-answer rule, so replace it through the API rather than
+on disk. `PATCH` with multipart replaces the file; the previous copy is removed
+only after the row commits, so a rule never points at a missing file.
 
-```text
-~/Library/Application Support/iBlue/media/dog.mp4
+```bash
+IBLUE_PASSWORD_VALUE="$(< "$HOME/Library/Application Support/iBlue/server-password.txt")"
+BASE="http://127.0.0.1:1234/api/v1/iblue/facetime/incoming/auto-answer/rules"
+
+curl -fsS -X PATCH "$BASE/<id>?password=$IBLUE_PASSWORD_VALUE" \
+  -F "media=@/absolute/path/to/replacement.mp4;type=video/mp4"
+
+unset IBLUE_PASSWORD_VALUE
 ```
 
-The current script also hardcodes `sourceDurationSeconds`. Replacing the file
-without updating the duration can end early or wait beyond the source. Before a
-replacement:
+The source need not be FaceTime-ready; iBlue converts it. A video source must
+contain an audio track, and uploads are capped at 95 MiB. Duration is read from
+the file, so there is no hardcoded length to keep in sync.
 
-1. Disable/unload the dog responder.
-2. Verify the new file contains both an audio and video stream.
-3. Inspect its exact duration with:
-
-   ```bash
-   ffprobe -v error \
-     -show_entries format=duration:stream=codec_type,codec_name,width,height,sample_rate,channels \
-     -of json "/absolute/path/to/replacement.mp4"
-   ```
-
-4. Back up the existing media, copy the replacement to `media/dog.mp4`, and
-   update `sourceDurationSeconds` in `dog-autoplay.mjs`.
-5. Re-enable the responder and watch both dog logs through one complete call.
-
-The source need not already be FaceTime-ready. FFmpeg normalizes it to the
-player's bounded H.264/audio input formats, and iBlue performs the final native
-audio/video encoding.
+Conversions are cached under `/private/tmp/vp/inject/cache/`, keyed by source
+path, size, mtime, and every option affecting output, so replacing media
+invalidates the entry automatically. The first call after a replacement pays
+for the conversion and rings longer while it runs.
 
 ## Recovery and rollback
 
