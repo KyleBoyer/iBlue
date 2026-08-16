@@ -1,0 +1,58 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3389,6 +3389,21 @@ impl FTClient {
+             }
+             let context = received.client_context_data_key.take();
+             let participant_meta = received.participant_data_key.take(); // BORING
++            if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                // Which wire commands a group call actually delivers, and
++                // whether they carry the participant blob that supplies the
++                // peer's VC session UUID.
++                warn!(
++                    "FaceTime wire message: command={} context={} participant_meta={} prekey={} \
++                     participant_id={:?} sender={}",
++                    command,
++                    context.is_some(),
++                    participant_meta.is_some(),
++                    received.prekey.is_some(),
++                    received.participant_id_key,
++                    sender,
++                );
++            }
+             match (command, context, participant_meta, &received) {
+                 (207, Some(context), Some(avc_data), FTWireMessage { participant_id_key: Some(participant), .. }) => {
+                     info!("Someone joined!");
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1925,6 +1925,31 @@ impl GlobalLink {
+         let sid = Uuid::from_bytes(self.session_id.clone().try_into().unwrap()).to_string().to_uppercase();
+         if let Some(mat) = indication.putmaterial_indication.as_ref() {
+             for mat in &mat.materials {
++                if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++                    // Who each material is addressed to, against the local
++                    // allocations we could unwrap with. A group relay delivers
++                    // material for every member, so "not wrapped" is expected
++                    // for other people's copies and only alarming if none of
++                    // them names one of ours.
++                    let state = self.state.lock().await;
++                    let mine = state
++                        .configuration
++                        .allocations
++                        .iter()
++                        .map(|allocation| allocation.id.to_string())
++                        .collect::<Vec<_>>()
++                        .join(",");
++                    warn!(
++                        "FaceTime QuickRelay material: owner={} receiver={:?} types={:?} local_allocations=[{}]",
++                        mat.owner_participant_id(),
++                        mat.receiver_participant_id,
++                        mat.material_infos
++                            .iter()
++                            .map(|item| item.material_type())
++                            .collect::<Vec<_>>(),
++                        mine,
++                    );
++                }
+                 for item in &mat.material_infos {
+                     info!("Got material type {}", item.material_type());
+                     match item.material_type() {

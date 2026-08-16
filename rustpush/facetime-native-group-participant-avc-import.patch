@@ -1,0 +1,70 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -1656,6 +1656,26 @@ impl FTClient {
+                 .await?;
+         }
+ 
++        // Import every participant blob already cached on the session.
++        //
++        // Upstream does this at connection setup rather than on message
++        // receipt, which matters: the state changes that arrive during a group
++        // call carry an empty active_participants list, so the only copies of
++        // these blobs are the ones cached earlier from the invitation.
++        for participant in session.participants.values() {
++            let Some(active) = &participant.active else { continue };
++            if active.avc_data.is_empty() { continue }
++            if let Err(error) = relay_session
++                .import_participant_avc(active.identifier.into(), active.avc_data.as_ref())
++                .await
++            {
++                warn!(
++                    "Unable to import cached FaceTime AVC data for participant {}: {error:?}",
++                    u64::from(active.identifier),
++                );
++            }
++        }
++
+         
+         let wire_message = FTWireMessage {
+             session: session.group_id.clone(),
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -3180,6 +3180,38 @@ impl GlobalLink {
+         }
+     }
+ 
++    /// Record a participant's VC session UUID from its plaintext AVC blob.
++    ///
++    /// Ported from upstream's avconference import_avc. Incoming control is
++    /// authenticated against the peer session UUIDs held here, and this branch
++    /// otherwise only learns them by decrypting an AVC blob delivered over
++    /// QuickRelay. A group call never delivers that blob, so every participant
++    /// stays without a UUID and no control message can be authenticated. The
++    /// same value is already present in plaintext on each participant record.
++    pub async fn import_participant_avc(
++        &self,
++        participant_id: u64,
++        avc_data: &[u8],
++    ) -> Result<(), PushError> {
++        let avc: AVCData = plist::from_bytes(avc_data)?;
++        let session_id = avc.vc_session_participant_key_uuid;
++        if session_id.is_empty() {
++            return Ok(());
++        }
++        let mut state = self.state.lock().await;
++        let participant = state.states.entry(participant_id).or_default();
++        let changed = participant.avc_uuid.as_deref() != Some(session_id.as_str());
++        participant.avc_uuid = Some(session_id);
++        if changed && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
++            warn!(
++                "Imported FaceTime participant AVC session UUID: participant={} peer_uuids={}",
++                participant_id,
++                state.states.values().filter(|peer| peer.avc_uuid.is_some()).count(),
++            );
++        }
++        Ok(())
++    }
++
+     pub async fn bind_participant_session_id(
+         &self,
+         participant_id: u64,

@@ -1,0 +1,58 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3407,6 +3407,55 @@ impl FTClient {
+             if !session.my_handles.contains(&target) {
+                 session.my_handles.push(target.clone());
+             }
++            // Seed a peer prekey from any wire message that carries one.
++            //
++            // Prekeys reach this side on commands 207 and 210, but the paths
++            // that consume them only seed the link when a connection already
++            // exists, and ensure_allocations only harvests the cache while it
++            // is building one. A prekey that arrives after the connection is up
++            // is therefore cached and never seeded, no participant ever has
++            // one, and bootstrap_session fails with NotConnected for the whole
++            // call. Seeding here is idempotent and covers that ordering.
++            if sender != target {
++                if let Some(prekey) = received.prekey.as_ref() {
++                    let public_prekey = prekey.as_ref().to_vec();
++                    let already_known = session
++                        .native_peer_device_prekeys
++                        .get(&base64_encode(&token))
++                        .is_some_and(|known| known.prekey == public_prekey);
++                    session.native_peer_prekeys.insert(sender.clone(), public_prekey.clone());
++                    session.native_peer_tokens.insert(sender.clone(), token.clone());
++                    session.native_peer_device_prekeys.insert(
++                        base64_encode(&token),
++                        NativePeerDevicePrekey {
++                            handle: sender.clone(),
++                            token: token.clone(),
++                            prekey: public_prekey.clone(),
++                        },
++                    );
++                    if !already_known {
++                        if let Some(connection) = &session.connection {
++                            match connection
++                                .link
++                                .seed_participant_prekey(&sender, Some(&token), &public_prekey)
++                                .await
++                            {
++                                Ok(participant_id) => warn!(
++                                    "Seeded FaceTime peer prekey from wire message: \
++                                     participant={participant_id} sender={sender} command={command}"
++                                ),
++                                Err(error) => warn!(
++                                    "Unable to seed FaceTime peer prekey from wire message: {error:?}"
++                                ),
++                            }
++                        } else {
++                            warn!(
++                                "Cached FaceTime peer prekey before a connection existed: sender={sender} command={command}"
++                            );
++                        }
++                    }
++                }
++            }
+             let context = received.client_context_data_key.take();
+             let participant_meta = received.participant_data_key.take(); // BORING
+             if std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1") {
