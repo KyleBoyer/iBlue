@@ -1,0 +1,38 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -992,14 +992,18 @@ async fn deliver_encrypted_rtp(
+     direct_peer: Option<SocketAddr>,
+     avc_pod: &Pod,
+ ) -> Result<(), PushError> {
+-    if peer_participants.len() <= 1 {
+-        if let (Some(socket), Some(peer)) = (direct_socket, direct_peer) {
+-            socket
+-                .send_to(encrypted, peer)
+-                .await
+-                .map_err(|_| PushError::NotConnected)?;
+-            return Ok(());
+-        }
++    // A validated direct pair always wins. Gating this on the participant
++    // count was wrong: a one-to-one caller routinely presents a participant
++    // context per registered device, so counting contexts pushed ordinary
++    // calls onto the relay and their media stopped rendering. Group calls will
++    // need a validated pair per participant before fan-out can use direct at
++    // all; until then they take the relay branch below.
++    if let (Some(socket), Some(peer)) = (direct_socket, direct_peer) {
++        socket
++            .send_to(encrypted, peer)
++            .await
++            .map_err(|_| PushError::NotConnected)?;
++        return Ok(());
+     }
+     if peer_participants.is_empty() {
+         let framed = GlobalPacket {
+@@ -2798,7 +2802,7 @@ impl GlobalLink {
+                 header_template.extensions.len(),
+                 header_template.extensions_padding,
+                 peer_participants,
+-                if using_direct && peer_participants.len() <= 1 { "direct" } else { "quickrelay-pod" },
++                if using_direct { "direct" } else { "quickrelay-pod" },
+             );
+         }
+         Ok(NativeAudioSender {

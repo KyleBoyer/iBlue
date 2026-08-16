@@ -96,6 +96,7 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "facetime-native-group-media-fanout.patch"),
   join(projectRoot, "rustpush", "facetime-native-group-blob-handshake.patch"),
   join(projectRoot, "rustpush", "facetime-native-control-target-diagnostics.patch"),
+  join(projectRoot, "rustpush", "facetime-native-group-media-fanout-fix.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 
