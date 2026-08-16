@@ -1,0 +1,87 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2644,6 +2644,21 @@ impl FTClient {
+ 
+ 
+     pub async fn prop_up_conv(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
++        self.prop_up_conv_as(session, ring, None).await
++    }
++
++    /// Advertise this participant and its AVC blob.
++    ///
++    /// `as_type` overrides the outgoing message type. Group FaceTime asks a
++    /// joining participant to repeat its blob with a ResendAVCBlobRequest, and
++    /// the reply must be tagged ResendAVCBlobResponse so the caller matches it
++    /// to the outstanding request instead of treating it as a fresh join.
++    pub async fn prop_up_conv_as(
++        &self,
++        session: &mut FTSession,
++        ring: bool,
++        as_type: Option<ConversationMessageType>,
++    ) -> Result<(), PushError> {
+ 
+         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+         // we are picking up a call (the prop isn't to ring, and we are ringing)
+@@ -2707,7 +2722,9 @@ impl FTClient {
+ 
+                 let mut message = ConversationMessage::default();
+                 // ring not sending to ourselves
+-                if ring && target.participant != my_participant.handle {
++                if let Some(as_type) = as_type {
++                    message.set_type(as_type);
++                } else if ring && target.participant != my_participant.handle {
+                     message.set_type(ConversationMessageType::Invitation);
+                 }
+                 message.link = builder_session.link.clone();
+@@ -3310,6 +3327,51 @@ impl FTClient {
+                     }
+                     Some(FTMessage::RespondedElsewhere { guid: decoded.conversation_group_uuid_string.clone() })
+                 }
++                ConversationMessageType::ResendAvcBlobRequest => {
++                    // Group FaceTime asks a participant to repeat its AVC
++                    // negotiation blob. Until that reply lands the caller does
++                    // not publish the prekey this side needs, so QuickRelay
++                    // never bootstraps and the call can never be answered.
++                    let mut state = self.state.write().await;
++                    let group_id = decoded.conversation_group_uuid_string.clone();
++                    if let Some(session) = state.sessions.get_mut(&group_id) {
++                        if session.av_config.is_none() {
++                            session.av_config = Some(AVConfig::new(self.os_config.as_ref()));
++                        }
++                        let mut session = session.clone();
++                        drop(state);
++                        // The blob the peer is asking for is only useful if it
++                        // carries this side's QuickRelay public prekey, and
++                        // prop_up_conv only includes one when a connection has
++                        // been allocated. Without this the reply is sent, the
++                        // handshake still stalls, and the caller keeps asking.
++                        if let Err(error) = self.ensure_allocations(&mut session, &[]).await {
++                            warn!(
++                                "Unable to allocate before answering ResendAVCBlobRequest: {error:?}"
++                            );
++                        }
++                        match self.prop_up_conv_as(
++                            &mut session,
++                            false,
++                            Some(ConversationMessageType::ResendAvcBlobResponse),
++                        ).await {
++                            Ok(()) => warn!(
++                                "Answered FaceTime ResendAVCBlobRequest for session {group_id}"
++                            ),
++                            Err(error) => warn!(
++                                "Unable to answer FaceTime ResendAVCBlobRequest: {error:?}"
++                            ),
++                        }
++                        let mut state = self.state.write().await;
++                        if let Some(stored) = state.sessions.get_mut(&group_id) {
++                            *stored = session;
++                        }
++                        (self.update_state)(&state);
++                    } else {
++                        warn!("ResendAVCBlobRequest for unknown FaceTime session {group_id}");
++                    }
++                    None
++                },
+                 _type => {
+                     warn!("Couldn't handle message type {_type:?}");
+                     None

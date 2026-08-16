@@ -9101,11 +9101,13 @@ impl WrappedFaceTimeClient {
                 .iter()
                 .filter(|member| !session.my_handles.contains(&member.handle))
                 .count();
-            if remote_count != 1 {
+            // Group calls are answered the same way: the answer itself is
+            // per-session, and media fans out per participant over the relay
+            // using this profile's single outbound key. Only an empty session
+            // is unanswerable.
+            if remote_count == 0 {
                 return Err(WrappedError::GenericError {
-                    msg:
-                        "Native incoming FaceTime currently requires exactly one remote participant"
-                            .to_string(),
+                    msg: "Incoming FaceTime session has no remote participants".to_string(),
                 });
             }
             session.is_video

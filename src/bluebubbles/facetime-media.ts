@@ -1291,9 +1291,14 @@ export class FaceTimeMediaManager {
     if (incoming.state !== "ringing") {
       throw new Error(`Incoming FaceTime session is not ringing (${incoming.state})`);
     }
-    if (incoming.participants.length !== 1) {
-      throw new Error("Native incoming FaceTime currently requires exactly one remote participant");
+    if (incoming.participants.length === 0) {
+      throw new Error("Incoming FaceTime session has no remote participants");
     }
+    // Group calls ride the relay rather than a direct pair: media is encrypted
+    // once with this profile's single outbound key, which every participant
+    // receives re-wrapped with its own prekey, and delivered per participant.
+    // Playback begins when the first participant joins and ends when the last
+    // one leaves, which is what the lifecycle loop already tracks.
 
     const now = Date.now();
     const call: InternalFaceTimeCall = {

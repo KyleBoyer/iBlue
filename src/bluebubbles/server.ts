@@ -4757,14 +4757,19 @@ function notificationRuleDraft(
  * often to retry. The window comfortably outlasts the gap between the iMessage
  * ring signal and native readiness without holding a dead call open.
  */
-const AUTO_ANSWER_READY_TIMEOUT_MS = 15_000;
+const AUTO_ANSWER_READY_TIMEOUT_MS = 25_000;
 const AUTO_ANSWER_READY_POLL_MS = 250;
 /** Above this wait, the ring is long enough that the caller notices. */
 const AUTO_ANSWER_SLOW_WARN_MS = 2_000;
 
 function isSessionNotReadyToAnswer(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return message.includes("not awaiting an incoming answer");
+  // The native session can refuse an answer for two transient reasons: it has
+  // not yet registered the ring, or QuickRelay has no peer prekey to bootstrap
+  // against. A group call routinely hits the second, because the prekeys
+  // arrive after the invitation rather than with it.
+  return message.includes("not awaiting an incoming answer")
+    || message.includes("answer failed: NotConnected");
 }
 
 function formatCallDuration(milliseconds: number): string {

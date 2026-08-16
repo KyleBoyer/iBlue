@@ -93,6 +93,9 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "facetime-native-joined-device-targeting.patch"),
   join(projectRoot, "rustpush", "facetime-native-reflexive-candidate.patch"),
   join(projectRoot, "rustpush", "facetime-native-ice-connectivity-checks.patch"),
+  join(projectRoot, "rustpush", "facetime-native-group-media-fanout.patch"),
+  join(projectRoot, "rustpush", "facetime-native-group-blob-handshake.patch"),
+  join(projectRoot, "rustpush", "facetime-native-control-target-diagnostics.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 

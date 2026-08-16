@@ -1,0 +1,104 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3704,8 +3704,11 @@ impl FTClient {
+                                     skm_added,
+                                 ),
+                                 Err(error) => warn!(
+-                                    "Unable to import FaceTime IDS key material for participant={}: {error:?}",
++                                    "Unable to import FaceTime IDS key material for participant={} \
++                                     (sender={} token={}): {error:?}",
+                                     participant_id,
++                                    sender,
++                                    base64_encode(&token),
+                                 ),
+                             }
+                             if !session
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -1047,6 +1047,49 @@ fn control_key_participant(
+ /// media. Prefer a joined device that has an AVC UUID, and fall back to the
+ /// previous alias behaviour while no join has been observed yet — control
+ /// traffic can precede the join notification.
++/// Describe every participant and which one control is addressed to.
++///
++/// A group call holds one participant context per remote device, and the
++/// difference that matters is which of them actually has decrypted peer key
++/// material. Reporting the whole table alongside the choice makes a stalled
++/// call diagnosable from one line instead of inference.
++fn report_control_target(
++    states: &HashMap<u64, ParticipantState>,
++    joined: &HashSet<u64>,
++    aliases: &HashMap<u64, u64>,
++    route_participant: u64,
++    chosen: u64,
++) {
++    let mut participants = states.keys().copied().collect::<Vec<_>>();
++    participants.sort_unstable();
++    let table = participants
++        .iter()
++        .map(|participant| {
++            let state = &states[participant];
++            format!(
++                "{}{}[avc_uuid={} mkm={} skm={} prekey={} published={} joined={}]",
++                participant,
++                if *participant == chosen { "*" } else { "" },
++                state.avc_uuid.is_some(),
++                state.mkm.len(),
++                state.skm.len(),
++                state.prekey.is_some(),
++                state.outgoing_key_material.is_some(),
++                joined.contains(participant),
++            )
++        })
++        .collect::<Vec<_>>()
++        .join(" ");
++    warn!(
++        "FaceTime control target: route={} chosen={} aliased={:?} participants={} | {}",
++        route_participant,
++        chosen,
++        aliases.get(&route_participant),
++        participants.len(),
++        table,
++    );
++}
++
+ fn control_target_participant(
+     states: &HashMap<u64, ParticipantState>,
+     aliases: &HashMap<u64, u64>,
+@@ -1148,6 +1191,9 @@ pub struct GlobalLinkState {
+     /// participant that owns the authenticated IDS key material. Entries are
+     /// learned only after an SFrame control packet authenticates successfully.
+     control_participant_aliases: HashMap<u64, u64>,
++    /// Last control target reported by diagnostics, so the participant table
++    /// is logged once per decision rather than once per packet.
++    control_target_logged: Option<u64>,
+     /// Participants whose device has actually joined the call. A multi-device
+     /// caller yields one participant context per registered device; only these
+     /// have a live AVC session worth addressing.
+@@ -2390,6 +2436,18 @@ impl GlobalLink {
+                 &state.joined_participants,
+                 participant,
+             );
++            if state.control_target_logged != Some(key_participant)
++                && std::env::var("IBLUE_FACETIME_MEDIA_DIAGNOSTICS").as_deref() == Ok("1")
++            {
++                report_control_target(
++                    &state.states,
++                    &state.joined_participants,
++                    &state.control_participant_aliases,
++                    participant,
++                    key_participant,
++                );
++                state.control_target_logged = Some(key_participant);
++            }
+             let peer_session_id = state.states.get(&key_participant)
+                 .and_then(|peer| peer.avc_uuid.clone())
+                 .ok_or(PushError::BadMsg)?;
+@@ -3772,6 +3830,7 @@ impl GlobalLink {
+                 control_send_counters: HashMap::new(),
+                 control_participant_aliases: HashMap::new(),
+                 joined_participants: HashSet::new(),
++                control_target_logged: None,
+                 control_messages_received: 0,
+                 control_messages_authenticated: 0,
+                 control_messages_sent: 0,

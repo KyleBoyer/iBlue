@@ -1,0 +1,214 @@
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -948,6 +948,85 @@ async fn discover_reflexive_candidate(socket: &UdpSocket) -> Option<([u8; 4], u1
+     None
+ }
+ 
++/// Deliver one encrypted RTP packet to every participant on the call.
++///
++/// Media is encrypted exactly once. `my_mkm` is a single outbound key that each
++/// participant receives re-wrapped with its own prekey, so the ciphertext is
++/// identical for everyone and only the relay addressing differs. A one-to-one
++/// call with a validated direct pair keeps using that pair unchanged; group
++/// calls ride the relay, which routes by participant id.
++/// Every participant media should be delivered to, with `preferred` first so a
++/// one-to-one call behaves exactly as before. Participants without a control
++/// route are skipped: they have not joined and cannot decrypt yet.
++fn media_delivery_participants(
++    states: &HashMap<u64, ParticipantState>,
++    preferred: Option<u64>,
++) -> Vec<u64> {
++    let mut participants = Vec::new();
++    if let Some(first) = preferred {
++        if states.contains_key(&first) {
++            participants.push(first);
++        }
++    }
++    let mut others = states
++        .iter()
++        .filter(|(participant, state)| {
++            Some(**participant) != preferred && state.avc_uuid.is_some()
++        })
++        .map(|(participant, _)| *participant)
++        .collect::<Vec<_>>();
++    others.sort_unstable();
++    participants.extend(others);
++    if participants.is_empty() {
++        if let Some(first) = preferred {
++            participants.push(first);
++        }
++    }
++    participants
++}
++
++async fn deliver_encrypted_rtp(
++    encrypted: &[u8],
++    peer_participants: &[u64],
++    direct_socket: Option<&Arc<UdpSocket>>,
++    direct_peer: Option<SocketAddr>,
++    avc_pod: &Pod,
++) -> Result<(), PushError> {
++    if peer_participants.len() <= 1 {
++        if let (Some(socket), Some(peer)) = (direct_socket, direct_peer) {
++            socket
++                .send_to(encrypted, peer)
++                .await
++                .map_err(|_| PushError::NotConnected)?;
++            return Ok(());
++        }
++    }
++    if peer_participants.is_empty() {
++        let framed = GlobalPacket {
++            participant: None,
++            link: LinkType::Pod,
++            data: encrypted.to_vec(),
++        }
++        .to_qr_raw();
++        avc_pod
++            .send_datagram(framed.into())
++            .map_err(|_| PushError::NotConnected)?;
++        return Ok(());
++    }
++    for participant in peer_participants {
++        let framed = GlobalPacket {
++            participant: Some(*participant),
++            link: LinkType::Pod,
++            data: encrypted.to_vec(),
++        }
++        .to_qr_raw();
++        avc_pod
++            .send_datagram(framed.into())
++            .map_err(|_| PushError::NotConnected)?;
++    }
++    Ok(())
++}
++
+ fn control_key_participant(
+     aliases: &HashMap<u64, u64>,
+     route_participant: u64,
+@@ -1251,7 +1330,9 @@ pub struct GlobalLink {
+ struct NativeAudioSender {
+     context: Context,
+     header_template: rtc_rtp::Header,
+-    peer_participant: Option<u64>,
++    /// Every participant this stream is delivered to. One entry is a
++    /// one-to-one call; more is a group call.
++    peer_participants: Vec<u64>,
+     avc_pod: Pod,
+     direct_socket: Option<Arc<UdpSocket>>,
+     direct_peer: Option<SocketAddr>,
+@@ -1376,7 +1457,8 @@ fn append_native_hevc_footer(frame: &mut Vec<u8>) {
+ struct NativeVideoSender {
+     hevc: HevcPayloader,
+     context: Context,
+-    peer_participant: Option<u64>,
++    /// Every participant this stream is delivered to.
++    peer_participants: Vec<u64>,
+     avc_pod: Pod,
+     direct_socket: Option<Arc<UdpSocket>>,
+     direct_peer: Option<SocketAddr>,
+@@ -1502,22 +1584,13 @@ impl NativeVideoSender {
+                 .context
+                 .encrypt_rtp(&plaintext)
+                 .map_err(|_| PushError::BadMsg)?;
+-            if let (Some(socket), Some(peer)) = (&self.direct_socket, self.direct_peer) {
+-                socket
+-                    .send_to(&encrypted, peer)
+-                    .await
+-                    .map_err(|_| PushError::NotConnected)?;
+-            } else {
+-                let framed = GlobalPacket {
+-                    participant: self.peer_participant,
+-                    link: LinkType::Pod,
+-                    data: encrypted.to_vec(),
+-                }
+-                .to_qr_raw();
+-                self.avc_pod
+-                    .send_datagram(framed.into())
+-                    .map_err(|_| PushError::NotConnected)?;
+-            }
++            deliver_encrypted_rtp(
++                &encrypted,
++                &self.peer_participants,
++                self.direct_socket.as_ref(),
++                self.direct_peer,
++                &self.avc_pod,
++            ).await?;
+             self.sequence_number = self.sequence_number.wrapping_add(1);
+         }
+ 
+@@ -1580,22 +1653,13 @@ impl NativeAudioSender {
+             .context
+             .encrypt_rtp(&plaintext)
+             .map_err(|_| PushError::BadMsg)?;
+-        if let (Some(socket), Some(peer)) = (&self.direct_socket, self.direct_peer) {
+-            socket
+-                .send_to(&encrypted, peer)
+-                .await
+-                .map_err(|_| PushError::NotConnected)?;
+-        } else {
+-            let framed = GlobalPacket {
+-                participant: self.peer_participant,
+-                link: LinkType::Pod,
+-                data: encrypted.to_vec(),
+-            }
+-            .to_qr_raw();
+-            self.avc_pod
+-                .send_datagram(framed.into())
+-                .map_err(|_| PushError::NotConnected)?;
+-        }
++        deliver_encrypted_rtp(
++            &encrypted,
++            &self.peer_participants,
++            self.direct_socket.as_ref(),
++            self.direct_peer,
++            &self.avc_pod,
++        ).await?;
+ 
+         self.sequence_number = self.sequence_number.wrapping_add(1);
+         self.packet_index = self.packet_index.saturating_add(1);
+@@ -2643,6 +2707,10 @@ impl GlobalLink {
+             return Err(PushError::BadMsg);
+         }
+         let (header_template, peer_participant) = self.wait_for_audio_header_template().await?;
++        let peer_participants = {
++            let state = self.state.lock().await;
++            media_delivery_participants(&state.states, peer_participant)
++        };
+         let (avc_pod, direct_socket, direct_peer, key) = {
+             let state = self.state.lock().await;
+             if !state.my_mkm.has_apple_rtp_short_mki() {
+@@ -2671,14 +2739,14 @@ impl GlobalLink {
+                 header_template.extension_profile,
+                 header_template.extensions.len(),
+                 header_template.extensions_padding,
+-                peer_participant,
+-                if using_direct { "direct" } else { "quickrelay-pod" },
++                peer_participants,
++                if using_direct && peer_participants.len() <= 1 { "direct" } else { "quickrelay-pod" },
+             );
+         }
+         Ok(NativeAudioSender {
+             context,
+             header_template,
+-            peer_participant,
++            peer_participants,
+             avc_pod,
+             direct_socket,
+             direct_peer,
+@@ -2814,10 +2882,14 @@ impl GlobalLink {
+             None,
+         )
+         .map_err(|_| PushError::BadMsg)?;
++        let peer_participants = {
++            let state = self.state.lock().await;
++            media_delivery_participants(&state.states, peer_participant)
++        };
+         Ok(NativeVideoSender {
+             hevc: HevcPayloader::default(),
+             context,
+-            peer_participant,
++            peer_participants,
+             avc_pod,
+             direct_socket,
+             direct_peer,
