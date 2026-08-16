@@ -1,4 +1,3 @@
-diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
 --- a/rustls/src/client/tls13.rs
 +++ b/rustls/src/client/tls13.rs
 @@ -383,7 +383,7 @@ pub(super) fn fill_in_psk_binder(
@@ -10,7 +9,6 @@ diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
  
                  if suite_and_schedule.is_none() {
                      suite_and_schedule = Some((suite, ks));
-diff --git a/rustls/src/tls13/key_schedule.rs b/rustls/src/tls13/key_schedule.rs
 --- a/rustls/src/tls13/key_schedule.rs
 +++ b/rustls/src/tls13/key_schedule.rs
 @@ -15,6 +15,7 @@ use crate::{ConnectionTrafficSecrets, KeyLog, Tls13CipherSuite, quic};
@@ -29,7 +27,7 @@ diff --git a/rustls/src/tls13/key_schedule.rs b/rustls/src/tls13/key_schedule.rs
              ResumptionPskBinderKey => b"res binder",
              ClientEarlyTrafficSecret => b"c e traffic",
              ClientHandshakeTrafficSecret => b"c hs traffic",
-@@ -145,6 +147,16 @@ impl KeyScheduleEarly {
+@@ -145,6 +147,17 @@ impl KeyScheduleEarly {
          self.ks
              .sign_verify_data(&resumption_psk_binder_key, hs_hash)
      }
@@ -43,6 +41,7 @@ diff --git a/rustls/src/tls13/key_schedule.rs b/rustls/src/tls13/key_schedule.rs
 +            .derive_for_empty_hash(SecretKind::ExternalPskBinderKey);
 +        self.ks
 +            .sign_verify_data(&external_psk_binder_key, hs_hash)
-     }
++    }
  }
  
+ /// The "early secret" stage of the key schedule.
