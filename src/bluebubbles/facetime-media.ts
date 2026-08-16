@@ -1,7 +1,7 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -503,7 +503,7 @@ export interface FaceTimeLiveVideoTranscoderController {
   abort(): Promise<void>;
 }
 
-// AVConference negotiates Jade's camera as a 1920x1080 surface. A smaller
+// AVConference negotiates the profile's camera as a 1920x1080 surface. A smaller
 // coded frame is not scaled normally by iOS here: it is placed into that
 // surface and its edge pixels are repeated, producing visible smear bars.
 const LIVE_VIDEO_OUTPUT_WIDTH = 1_920;
@@ -1323,7 +1323,7 @@ export class FaceTimeMediaManager {
         input.nativeAudioPassthrough ?? false,
         input.nativeVideoPassthrough ?? false,
         // FaceTime negotiates its send and receive directions independently.
-        // Keep Jade's outbound leg on AAC-ELD/PT104: the Apple EVS encoder path
+        // Keep the profile's outbound leg on AAC-ELD/PT104: the Apple EVS encoder path
         // is accepted by the phone, but currently produces badly degraded audio.
         "aac-eld",
       );
@@ -1446,6 +1446,35 @@ export class FaceTimeMediaManager {
       ? "/private/tmp/vp/inject"
       : tmpdir();
     await mkdir(root, { recursive: true, mode: 0o700 });
+    // Converting the source is the slowest part of answering, and an
+    // auto-answer rule replays the same file for every call. Reuse a previous
+    // conversion so the caller is not left ringing through an ffmpeg run they
+    // have already paid for once.
+    const cacheKey = await mediaConversionKey(call, {
+      preRollSeconds,
+      nativeAudio,
+      nativeAudioPassthrough,
+      nativeVideoPassthrough,
+      nativeAudioCodec,
+    });
+    const cacheDirectory = cacheKey ? join(root, "cache", cacheKey) : undefined;
+    if (cacheDirectory) {
+      const cached = await readMediaConversionManifest(cacheDirectory);
+      if (cached) {
+        call.audioPath = cached.audioPath;
+        if (cached.videoPath) call.videoPath = cached.videoPath;
+        if (cached.videoDescriptionPath) {
+          call.videoDescriptionPath = cached.videoDescriptionPath;
+        }
+        if (cached.mediaDurationSeconds !== undefined) {
+          call.mediaDurationSeconds = cached.mediaDurationSeconds;
+        }
+        // Deliberately leave workDirectory unset: the cache outlives the call
+        // and must not be removed by per-call cleanup.
+        this.#emit(call);
+        return;
+      }
+    }
     const directory = await mkdtemp(join(root, "iblue-facetime-"));
     call.workDirectory = directory;
     if (nativeVideoPassthrough && (!nativeAudio || call.mode !== "video" || preRollSeconds !== 0)) {
@@ -1532,7 +1561,7 @@ export class FaceTimeMediaManager {
             "-i", call.sourcePath,
             "-map", "0:v:0",
             "-vf",
-            // AVConference negotiates Jade's camera as a 1920x1080 surface.
+            // AVConference negotiates the profile's camera as a 1920x1080 surface.
             // Sending a smaller coded frame makes iOS place the decoded planes
             // into that larger surface and repeat their edge pixels. Preserve
             // the complete source image on the negotiated canvas instead.
@@ -1583,6 +1612,7 @@ export class FaceTimeMediaManager {
       const duration = Number.parseFloat(stdout.trim());
       if (Number.isFinite(duration)) call.mediaDurationSeconds = duration;
     }
+    if (cacheDirectory) await publishMediaConversion(call, directory, cacheDirectory);
     this.#emit(call);
   }
 
@@ -2056,4 +2086,109 @@ export class FaceTimeMediaManager {
     call.updatedAt = Date.now();
     this.#onUpdate?.(publicCall(call));
   }
+}
+
+
+interface MediaConversionManifest {
+  audioPath: string;
+  videoPath?: string;
+  videoDescriptionPath?: string;
+  mediaDurationSeconds?: number;
+}
+
+const MEDIA_CONVERSION_MANIFEST = "conversion.json";
+
+/**
+ * Identity of a converted source: the file itself plus every option that
+ * changes the output. Size and mtime are included so replacing the media
+ * behind a rule invalidates the entry rather than silently replaying the old
+ * conversion.
+ */
+async function mediaConversionKey(
+  call: InternalFaceTimeCall,
+  options: {
+    preRollSeconds: number;
+    nativeAudio: boolean;
+    nativeAudioPassthrough: boolean;
+    nativeVideoPassthrough: boolean;
+    nativeAudioCodec: string;
+  },
+): Promise<string | undefined> {
+  if (!call.sourcePath) return undefined;
+  const source = await stat(call.sourcePath).catch(() => undefined);
+  if (!source?.isFile()) return undefined;
+  return createHash("sha256").update(JSON.stringify({
+    sourcePath: call.sourcePath,
+    size: source.size,
+    mtimeMs: Math.trunc(source.mtimeMs),
+    mode: call.mode,
+    ...options,
+  })).digest("hex").slice(0, 32);
+}
+
+/** A cached conversion, or undefined when absent or incomplete. */
+async function readMediaConversionManifest(
+  directory: string,
+): Promise<MediaConversionManifest | undefined> {
+  const manifestPath = join(directory, MEDIA_CONVERSION_MANIFEST);
+  const raw = await readFile(manifestPath, "utf8").catch(() => undefined);
+  if (!raw) return undefined;
+  let manifest: MediaConversionManifest;
+  try {
+    manifest = JSON.parse(raw) as MediaConversionManifest;
+  } catch {
+    return undefined;
+  }
+  // A half-written cache entry must never be served; verify every artifact it
+  // claims still exists before trusting it.
+  const required = [manifest.audioPath, manifest.videoPath, manifest.videoDescriptionPath]
+    .filter((path): path is string => typeof path === "string");
+  if (required.length === 0) return undefined;
+  for (const path of required) {
+    const artifact = await stat(path).catch(() => undefined);
+    if (!artifact?.isFile() || artifact.size === 0) return undefined;
+  }
+  return manifest;
+}
+
+/**
+ * Move a completed conversion into the shared cache and re-point the call at
+ * it. Publishing by rename keeps a partially written directory from ever being
+ * observable under the cache key.
+ */
+async function publishMediaConversion(
+  call: InternalFaceTimeCall,
+  workDirectory: string,
+  cacheDirectory: string,
+): Promise<void> {
+  const relocate = (path: string | undefined): string | undefined =>
+    path && path.startsWith(`${workDirectory}/`)
+      ? join(cacheDirectory, path.slice(workDirectory.length + 1))
+      : undefined;
+  const audioPath = relocate(call.audioPath);
+  if (!audioPath) return;
+  const videoPath = relocate(call.videoPath);
+  const videoDescriptionPath = relocate(call.videoDescriptionPath);
+  const manifest: MediaConversionManifest = {
+    audioPath,
+    ...(videoPath ? { videoPath } : {}),
+    ...(videoDescriptionPath ? { videoDescriptionPath } : {}),
+    ...(call.mediaDurationSeconds !== undefined
+      ? { mediaDurationSeconds: call.mediaDurationSeconds }
+      : {}),
+  };
+  try {
+    await mkdir(join(cacheDirectory, ".."), { recursive: true, mode: 0o700 });
+    await writeFile(join(workDirectory, MEDIA_CONVERSION_MANIFEST), JSON.stringify(manifest));
+    await rename(workDirectory, cacheDirectory);
+  } catch {
+    // Losing the cache is not worth failing a call that already converted
+    // successfully; the next call simply converts again.
+    return;
+  }
+  call.audioPath = audioPath;
+  if (videoPath) call.videoPath = videoPath;
+  if (videoDescriptionPath) call.videoDescriptionPath = videoDescriptionPath;
+  // The directory now belongs to the cache, so per-call cleanup must skip it.
+  delete call.workDirectory;
 }

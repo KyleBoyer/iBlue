@@ -7736,7 +7736,7 @@ pub struct WrappedFaceTimeClient {
     inner: Arc<rustpush::facetime::FTClient>,
     // Source media remains process-local and is never serialized into the
     // FaceTime signaling state. The corresponding native GlobalLink is owned
-    // by rustpush's FTSession under Jade's isolated profile.
+    // by rustpush's FTSession under the selected isolated profile.
     native_media_sources: tokio::sync::Mutex<HashMap<String, NativeFaceTimeMedia>>,
 }
 
@@ -9309,7 +9309,7 @@ impl WrappedFaceTimeClient {
     pub async fn start_native_media_session(&self, session_id: &str) -> Result<(), WrappedError> {
         if !self.inner.native_media_ready(session_id).await {
             return Err(WrappedError::GenericError {
-                msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
+                msg: "This profile's native FaceTime media keys are not ready yet".to_string(),
             });
         }
         let (source_path, video_path, video_description_path, video_frame_duration_ms, status) = {
@@ -9454,7 +9454,7 @@ impl WrappedFaceTimeClient {
     ) -> Result<(u64, u32), WrappedError> {
         if !self.inner.native_media_ready(session_id).await {
             return Err(WrappedError::GenericError {
-                msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
+                msg: "This profile's native FaceTime media keys are not ready yet".to_string(),
             });
         }
         #[cfg(not(target_os = "macos"))]
@@ -9739,7 +9739,7 @@ impl WrappedFaceTimeClient {
     ) -> Result<(u64, u32), WrappedError> {
         if !self.inner.native_media_ready(session_id).await {
             return Err(WrappedError::GenericError {
-                msg: "Jade's native FaceTime media keys are not ready yet".to_string(),
+                msg: "This profile's native FaceTime media keys are not ready yet".to_string(),
             });
         }
         if !(20..=100).contains(&frame_duration_ms) {
@@ -13208,7 +13208,7 @@ mod reply_target_tests {
                 layout: Some(BalloonLayout::TemplateLayout {
                     image_subtitle: String::new(),
                     image_title: String::new(),
-                    caption: "8 Ball Pool challenge from Jade".to_string(),
+                    caption: "8 Ball Pool challenge".to_string(),
                     secondary_subcaption: String::new(),
                     tertiary_subcaption: String::new(),
                     subcaption: "Tap to play".to_string(),

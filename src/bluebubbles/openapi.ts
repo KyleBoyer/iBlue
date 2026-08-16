@@ -509,7 +509,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
       properties: {
         address: stringProperty("One phone number or email address to call. Use targets for a group call."),
         targets: stringArrayProperty("Phone numbers or email addresses to call.", { minItems: 1, maxItems: 32 }),
-        from: stringProperty("Optional registered Jade/iBlue sending handle. The profile's first handle is used by default."),
+        from: stringProperty("Optional registered iBlue sending handle. The profile's first handle is used by default."),
         displayName: stringProperty("Display name shown for the isolated web participant."),
         ringTtlSeconds: integerProperty("How long the pending ring may wait for media to join.", { minimum: 15, maximum: 3600, default: 120 }),
       },
@@ -557,6 +557,156 @@ const routeDocumentation: Record<string, FastifySchema> = {
         maxDurationSeconds: integerProperty("Hard safety deadline after the matching call is answered.", { minimum: 15, maximum: 600, default: 90 }),
         expiresInSeconds: integerProperty("How long the one-shot arm waits for a matching call before it securely removes the upload.", { minimum: 15, maximum: 86_400, default: 300 }),
       },
+    },
+  },
+  "GET /api/v1/iblue/notification/rules": {
+    summary: "List notification rules",
+    description: "Returns every stored rule that texts a handle when iBlue dispatches an event, including delivery counters and the last delivery error.",
+    tags: ["iBlue Notifications"],
+  },
+  "POST /api/v1/iblue/notification/rules": {
+    summary: "Create a notification rule",
+    description: "Sends an iMessage to a chosen handle whenever a subscribed event occurs, such as an incoming FaceTime call, a call ending, or a new message. Delivery is best effort: a failure is recorded on the rule rather than interrupting call or message handling.",
+    tags: ["iBlue Notifications"],
+    body: {
+      type: "object",
+      required: ["destination"],
+      properties: {
+        destination: stringProperty("Phone number, email address, or canonical tel:/mailto: handle to notify."),
+        events: { type: "array", items: { type: "string" }, description: "Event types to subscribe to: incoming-facetime, ft-call-status-changed, facetime-auto-answer-rule-matched, new-message, updated-message, message-send-error, participant-added, participant-left, participant-removed, typing-indicator, or * for all." },
+        callers: stringProperty("JSON array or comma-separated list of handles to restrict on. Omit to notify for every counterparty."),
+        filters: { type: "object", additionalProperties: true, description: "Field values that must match for the rule to fire, as field name to allowed values. For example {\"status\":[\"ended\"]} turns a lifecycle subscription into a call-ended alert instead of one text per transition." },
+        name: stringProperty("Optional label to make the rule recognizable in listings."),
+        enabled: { type: "boolean", description: "Whether the rule participates in matching. Defaults to true.", default: true },
+        template: stringProperty("Optional message template supporting {event}, {who}, {caller}, {callerName}, {mode}, {status}, {outcome}, {duration}, {durationSeconds}, {error}, {sessionId}, {text}, and {name}. Omit for a sentence appropriate to the event."),
+      },
+    },
+  },
+  "GET /api/v1/iblue/notification/rules/:id": {
+    summary: "Get one notification rule",
+    description: "Returns a single stored rule, including how many notifications it has delivered and the last error if delivery failed.",
+    tags: ["iBlue Notifications"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
+    },
+  },
+  "PATCH /api/v1/iblue/notification/rules/:id": {
+    summary: "Update a notification rule",
+    description: "Updates any subset of a rule's fields. Fields that are absent are left unchanged.",
+    tags: ["iBlue Notifications"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
+    },
+    body: {
+      type: "object",
+      properties: {
+        destination: stringProperty("Handle to notify."),
+        events: { type: "array", items: { type: "string" }, description: "Event types to subscribe to: incoming-facetime, ft-call-status-changed, facetime-auto-answer-rule-matched, new-message, updated-message, message-send-error, participant-added, participant-left, participant-removed, typing-indicator, or * for all." },
+        callers: stringProperty("JSON array or comma-separated list of handles. An empty list notifies for every counterparty."),
+        filters: { type: "object", additionalProperties: true, description: "Field values that must match for the rule to fire, as field name to allowed values. For example {\"status\":[\"ended\"]} turns a lifecycle subscription into a call-ended alert instead of one text per transition." },
+        name: stringProperty("Optional label. Send an empty string to clear it."),
+        enabled: { type: "boolean", description: "Whether the rule participates in matching." },
+        template: stringProperty("Message template. Send an empty string to restore the default wording."),
+      },
+    },
+  },
+  "DELETE /api/v1/iblue/notification/rules/:id": {
+    summary: "Delete a notification rule",
+    description: "Removes the rule so it stops delivering notifications.",
+    tags: ["iBlue Notifications"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
+    },
+  },
+  "POST /api/v1/iblue/notification/rules/:id/test": {
+    summary: "Send a test notification",
+    description: "Renders and delivers the rule through the same path a real event uses, so a passing test exercises the destination and template rather than only the stored row. The delivery counters and last error update exactly as they would in production.",
+    tags: ["iBlue Notifications"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
+    },
+    body: {
+      type: "object",
+      properties: {
+        event: stringProperty("Event type to simulate. Defaults to the rule's first subscribed event."),
+      },
+    },
+  },
+  "GET /api/v1/iblue/facetime/incoming/auto-answer/rules": {
+    summary: "List standing FaceTime auto-answer rules",
+    description: "Returns every stored rule in the order matching consumes them: explicit priority first, then caller-specific rules ahead of catch-all rules, then id. Media is described by filename, MIME type, and size; the stored path is never returned.",
+    tags: ["iBlue FaceTime"],
+  },
+  "POST /api/v1/iblue/facetime/incoming/auto-answer/rules": {
+    summary: "Create a standing FaceTime auto-answer rule",
+    description: "Stores media to play whenever a matching call arrives, selected by caller and by whether the call is audio or video. Unlike the one-shot arm, a rule is durable, survives restart, and answers repeatedly. When a one-shot arm and a rule both match the same call the arm wins, because it is an explicit request for the very next call. Rules answer one call at a time; a ring that arrives during playback is left for another handler.",
+    tags: ["iBlue FaceTime"],
+    consumes: ["multipart/form-data"],
+    body: {
+      type: "object",
+      required: ["media"],
+      properties: {
+        media: { type: "string", format: "binary", description: "Audio or audio-bearing video to play on each matching call, up to 95 MiB." },
+        callers: stringProperty("JSON array or comma-separated list of phone numbers, email addresses, or canonical tel:/mailto: handles. Omit or send an empty list to match every caller."),
+        mode: { type: "string", enum: ["audio", "video", "any"], description: "Which call modes the rule answers. Defaults to any, matching both audio and video." },
+        name: stringProperty("Optional label to make the rule recognizable in listings."),
+        enabled: { type: "boolean", description: "Whether the rule participates in matching. Defaults to true.", default: true },
+        priority: integerProperty("Lower sorts first when several rules match. Ties break toward caller-specific rules, then id.", { default: 0 }),
+        displayName: stringProperty("Local diagnostic display name. The call remains owned by the registered iBlue Apple identity."),
+        maxDurationSeconds: integerProperty("Hard safety deadline after a matching call is answered.", { minimum: 15, maximum: 600, default: 90 }),
+      },
+    },
+  },
+  "GET /api/v1/iblue/facetime/incoming/auto-answer/rules/:id": {
+    summary: "Get one FaceTime auto-answer rule",
+    description: "Returns a single stored rule, including how many calls it has answered and when it last did.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
+    },
+  },
+  "PATCH /api/v1/iblue/facetime/incoming/auto-answer/rules/:id": {
+    summary: "Update a FaceTime auto-answer rule",
+    description: "Updates any subset of a rule's fields. Accepts JSON, or multipart when replacing the media. Fields that are absent are left unchanged, and replaced media is removed only after the update commits so a rule never points at a missing file.",
+    tags: ["iBlue FaceTime"],
+    consumes: ["application/json", "multipart/form-data"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
+    },
+    body: {
+      type: "object",
+      properties: {
+        media: { type: "string", format: "binary", description: "Replacement media, up to 95 MiB. Multipart only." },
+        callers: stringProperty("JSON array or comma-separated list of handles. An empty list matches every caller."),
+        mode: { type: "string", enum: ["audio", "video", "any"], description: "Which call modes the rule answers." },
+        name: stringProperty("Optional label. Send an empty string to clear it."),
+        enabled: { type: "boolean", description: "Whether the rule participates in matching." },
+        priority: integerProperty("Lower sorts first when several rules match."),
+        displayName: stringProperty("Local diagnostic display name."),
+        maxDurationSeconds: integerProperty("Hard safety deadline after a matching call is answered.", { minimum: 15, maximum: 600 }),
+      },
+    },
+  },
+  "DELETE /api/v1/iblue/facetime/incoming/auto-answer/rules/:id": {
+    summary: "Delete a FaceTime auto-answer rule",
+    description: "Removes the rule and its stored media.",
+    tags: ["iBlue FaceTime"],
+    params: {
+      type: "object",
+      required: ["id"],
+      properties: { id: integerProperty("Rule identifier.") },
     },
   },
   "DELETE /api/v1/iblue/facetime/incoming/auto-answer": {
@@ -608,7 +758,7 @@ const routeDocumentation: Record<string, FastifySchema> = {
   },
   "GET /api/v1/iblue/facetime/capabilities": {
     summary: "Get FaceTime runtime capabilities",
-    description: "Reports signaling, deterministic media transport, identity/topology, supported mode, lifecycle event, codec, verification state, incoming-call controls, inbound streaming, and live media-injection availability separately so agent harnesses can feature-detect each layer without attempting a call. On macOS, uploaded audio and video use a one-to-one iBlue-owned QuickRelay session authenticated as the selected profile (for example Jade); they do not use FaceTime.app, the macOS user's FaceTime account, or an Apple web guest. Ordinary generated-source audio, byte-for-byte replay of phone-originated AAC-ELD/PT104, and uploaded HEVC/PT100 video have been verified with clear playback or visible remote rendering and automatic hangup on an answered iPhone call. Incoming one-to-one auto-answer has also been verified with clear AAC-ELD/PT104 audio, visible synchronized HEVC/PT100 video, and automatic hangup. Incoming calls may be answered or declined, answered with deterministic media, subscribed for authenticated peer audio/video, and driven with bounded live audio plus H.265 passthrough, H.264, RGBA, or BGRA video streams through Socket.IO. Non-HEVC video is converted continuously with hardware HEVC encoding, aspect-preserving fit, and black padding.",
+    description: "Reports signaling, deterministic media transport, identity/topology, supported mode, lifecycle event, codec, verification state, incoming-call controls, inbound streaming, and live media-injection availability separately so agent harnesses can feature-detect each layer without attempting a call. On macOS, uploaded audio and video use a one-to-one iBlue-owned QuickRelay session authenticated as the selected profile; they do not use FaceTime.app, the macOS user's FaceTime account, or an Apple web guest. Ordinary generated-source audio, byte-for-byte replay of phone-originated AAC-ELD/PT104, and uploaded HEVC/PT100 video have been verified with clear playback or visible remote rendering and automatic hangup on an answered iPhone call. Incoming one-to-one auto-answer has also been verified with clear AAC-ELD/PT104 audio, visible synchronized HEVC/PT100 video, and automatic hangup. Incoming calls may be answered or declined, answered with deterministic media, subscribed for authenticated peer audio/video, and driven with bounded live audio plus H.265 passthrough, H.264, RGBA, or BGRA video streams through Socket.IO. Non-HEVC video is converted continuously with hardware HEVC encoding, aspect-preserving fit, and black padding.",
     tags: ["iBlue FaceTime"],
   },
   "GET /api/v1/iblue/facetime/realtime": {

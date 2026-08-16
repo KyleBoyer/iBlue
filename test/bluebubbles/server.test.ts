@@ -2195,11 +2195,22 @@ test("BlueBubbles REST auth, envelopes, message send, queries, and Socket.IO eve
       .filter(([method]) => ["get", "post", "put", "patch", "delete"].includes(method))
       .map(([method, operation]) => ({ path, method, operation })),
   );
-  assert.equal(documentedOperations.length, 114);
+  assert.equal(documentedOperations.length, 125);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/realtime"]?.get);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming"]?.get);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer"]?.get);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer"]?.post);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer/rules"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer/rules"]?.post);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer/rules/{id}"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer/rules/{id}"]?.patch);
+  assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer/rules/{id}"]?.delete);
+  assert.ok(openApi.paths["/api/v1/iblue/notification/rules"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/notification/rules"]?.post);
+  assert.ok(openApi.paths["/api/v1/iblue/notification/rules/{id}"]?.get);
+  assert.ok(openApi.paths["/api/v1/iblue/notification/rules/{id}"]?.patch);
+  assert.ok(openApi.paths["/api/v1/iblue/notification/rules/{id}"]?.delete);
+  assert.ok(openApi.paths["/api/v1/iblue/notification/rules/{id}/test"]?.post);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/auto-answer"]?.delete);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/{sessionId}/answer"]?.post);
   assert.ok(openApi.paths["/api/v1/iblue/facetime/incoming/{sessionId}/answer-with-media"]?.post);

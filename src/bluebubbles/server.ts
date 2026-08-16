@@ -15,10 +15,12 @@ import swaggerUi from "@fastify/swagger-ui";
 import Fastify, {
   type FastifyInstance,
   type FastifyReply,
+  type FastifyRequest,
 } from "fastify";
 import { Server as SocketIoServer, type Socket } from "socket.io";
 
 import type {
+  BlueBubblesAutoAnswerMode,
   BlueBubblesResponse,
   BlueBubblesScheduleInterval,
   IBlueContactCardAddress,
@@ -32,12 +34,14 @@ import type { NativeFaceTimeMediaFrame } from "../types.js";
 import type { FaceTimeIncomingSession } from "../native/engine.js";
 import { failure, success, unsupported } from "./response.js";
 import type { ScheduledMessageDraft } from "./scheduler.js";
+import { FaceTimeAutoAnswerRules } from "./facetime-auto-answer.js";
+import { BlueBubblesNotifications, type NotificationEventContext } from "./notifications.js";
 import {
   BlueBubblesService,
   StickerUnsendUnsupportedError,
   type BlueBubblesEvent,
 } from "./service.js";
-import { stripTransport, toTransportAddress } from "./guid.js";
+import { directChatGuid, stripTransport, toTransportAddress } from "./guid.js";
 import { buildVCardContact, parseVCardContactCards, parseVCardContacts } from "./contact.js";
 import { effectIdForMessageFlair, MESSAGE_FLAIRS } from "./message-flair.js";
 import {
@@ -247,12 +251,33 @@ export class BlueBubblesServer {
     options: FaceTimeLiveVideoTranscoderOptions,
   ) => FaceTimeLiveVideoTranscoderController;
   #faceTimeAutoAnswer: FaceTimeAutoAnswerArm | undefined;
+  /** Standing, durable auto-answer rules keyed by caller and call mode. */
+  readonly #autoAnswerRules: FaceTimeAutoAnswerRules;
+  /** Guards rule playback so two simultaneous rings cannot both answer. */
+  #autoAnswerRuleBusy = false;
+  /** Standing rules that text a handle when iBlue dispatches an event. */
+  readonly #notifications: BlueBubblesNotifications;
 
   constructor(options: BlueBubblesServerOptions) {
     this.service = options.service;
     this.host = options.host ?? "127.0.0.1";
     this.port = options.port ?? 1234;
     this.icloudShareResolver = options.icloudShareResolver ?? new ICloudShareResolver();
+    this.#autoAnswerRules = new FaceTimeAutoAnswerRules({
+      store: this.service.store,
+      mediaRoot: join(this.service.store.attachmentRoot, "facetime-auto-answer"),
+    });
+    this.#notifications = new BlueBubblesNotifications({
+      store: this.service.store,
+      send: (destination, message) => this.service.sendText({
+        chatGuid: directChatGuid(destination),
+        message,
+      }),
+      onError: (error, rule) => this.app.log.error(
+        { err: error, notificationRuleId: rule.id },
+        "notification delivery failed",
+      ),
+    });
     this.#faceTimeLiveVideoTranscoderFactory = options.faceTimeLiveVideoTranscoderFactory
       ?? ((transcoderOptions) => new FaceTimeLiveVideoTranscoder(transcoderOptions));
     this.app = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024 });
@@ -351,8 +376,13 @@ export class BlueBubblesServer {
       this.#socket?.emit(event.type, event.data);
       if (event.type === "incoming-facetime") {
         void this.tryFaceTimeAutoAnswer(event.data).catch((error) =>
-          this.app.log.error(error));
+          reportBackgroundFailure("facetime auto-answer", error));
       }
+      void this.#notifications.dispatch(notificationContext(
+        event.type,
+        event.data,
+        (address) => this.service.store.getContact(address)?.displayName,
+      )).catch((error) => reportBackgroundFailure("notification dispatch", error));
     });
     this.service.on("facetime-media-frame", (frame: NativeFaceTimeMediaFrame) =>
       this.routeFaceTimeMediaFrame(frame));
@@ -407,6 +437,7 @@ export class BlueBubblesServer {
           { name: "iBlue Polls", description: "Native Messages polls and votes." },
           { name: "iBlue iCloud Photos", description: "Resolve, create, download, and send iCloud Photos shares." },
           { name: "iBlue FaceTime", description: "Profile-isolated FaceTime signaling, media, lifecycle, and agent-facing realtime streams." },
+          { name: "iBlue Notifications", description: "Standing rules that text a chosen handle when iBlue dispatches an event." },
           { name: "iBlue Extensions", description: "Additional iBlue API extensions." },
         ],
         components: {
@@ -786,6 +817,159 @@ export class BlueBubblesServer {
         if (!installed) await rm(directory, { recursive: true, force: true });
       }
     });
+    this.app.get("/api/v1/iblue/notification/rules", async () =>
+      success(this.#notifications.list(), "Successfully fetched notification rules!"),
+    );
+    this.app.post("/api/v1/iblue/notification/rules", async (request) => {
+      const draft = notificationRuleDraft(asRecord(request.body), { create: true });
+      const rule = this.#notifications.create({
+        ...draft,
+        events: draft.events ?? ["*"],
+        destination: draft.destination!,
+      });
+      return success(rule, "Successfully created notification rule!");
+    });
+    this.app.get<{ Params: { id: string } }>(
+      "/api/v1/iblue/notification/rules/:id",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        const rule = id === undefined ? undefined : this.#notifications.get(id);
+        if (!rule) return reply.code(404).send(notFound("Notification rule not found"));
+        return success(rule, "Successfully fetched notification rule!");
+      },
+    );
+    this.app.patch<{ Params: { id: string } }>(
+      "/api/v1/iblue/notification/rules/:id",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        const draft = notificationRuleDraft(asRecord(request.body), { create: false });
+        const rule = id === undefined ? undefined : this.#notifications.update(id, draft);
+        if (!rule) return reply.code(404).send(notFound("Notification rule not found"));
+        return success(rule, "Successfully updated notification rule!");
+      },
+    );
+    this.app.delete<{ Params: { id: string } }>(
+      "/api/v1/iblue/notification/rules/:id",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        const removed = id === undefined ? undefined : this.#notifications.delete(id);
+        if (!removed) return reply.code(404).send(notFound("Notification rule not found"));
+        return success(undefined, "Successfully deleted notification rule!");
+      },
+    );
+    this.app.post<{ Params: { id: string } }>(
+      "/api/v1/iblue/notification/rules/:id/test",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        const rule = id === undefined ? undefined : this.#notifications.get(id);
+        if (!rule) return reply.code(404).send(notFound("Notification rule not found"));
+        const body = asRecord(request.body);
+        const event = typeof body.event === "string" ? body.event : rule.events[0] ?? "incoming-facetime";
+        // Deliver through the same path a real event uses so a passing test
+        // proves the destination and template, not just the stored row.
+        await this.#notifications.dispatch({
+          type: event === "*" ? "incoming-facetime" : event,
+          addresses: rule.callers,
+          fields: {
+            event,
+            caller: rule.callers[0] ? stripTransport(rule.callers[0]) : "test caller",
+            // Resolve the same way a live event does, so a test exercises the
+            // contact lookup rather than only the template string.
+            ...(rule.callers[0]
+              ? (() => {
+                  const displayName = this.service.store.getContact(rule.callers[0]!)?.displayName;
+                  return displayName ? { callerName: displayName } : {};
+                })()
+              : {}),
+            mode: "video",
+            status: "test",
+            sessionId: "TEST-SESSION",
+            text: "iBlue notification rule test",
+            name: rule.name ?? "test",
+          },
+        });
+        return success(this.#notifications.get(rule.id), "Notification rule test dispatched!");
+      },
+    );
+    this.app.get("/api/v1/iblue/facetime/incoming/auto-answer/rules", async () =>
+      success(this.#autoAnswerRules.list(), "Successfully fetched FaceTime auto-answer rules!"),
+    );
+    this.app.post("/api/v1/iblue/facetime/incoming/auto-answer/rules", async (request) => {
+      let directory: string | undefined;
+      try {
+        const { fields, media } = await readAutoAnswerRuleUpload(request, async (file) => {
+          directory = await this.#autoAnswerRules.prepareMediaDirectory(randomUUID());
+          const filename = safeAttachmentName(file.filename || "media");
+          const path = join(directory, filename);
+          const size = await saveMultipartFile(file, path);
+          assertAutoAnswerMediaSize(size);
+          return { filename, mimeType: file.mimetype || "application/octet-stream", size, path };
+        });
+        if (!media) {
+          throw new RequestError(400, "FaceTime media file is required", "VALIDATION_ERROR");
+        }
+        const draft = autoAnswerRuleDraft(fields, { requireMedia: true });
+        const rule = this.#autoAnswerRules.create(
+          {
+            ...draft,
+            callers: draft.callers ?? [],
+            mode: draft.mode ?? "any",
+            displayName: draft.displayName ?? "iBlue",
+            maxDurationSeconds: draft.maxDurationSeconds ?? 90,
+          },
+          media,
+        );
+        return success(rule, "Successfully created FaceTime auto-answer rule!");
+      } catch (error) {
+        if (directory) await rm(directory, { recursive: true, force: true });
+        throw error;
+      }
+    });
+    this.app.get<{ Params: { id: string } }>(
+      "/api/v1/iblue/facetime/incoming/auto-answer/rules/:id",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        const rule = id === undefined ? undefined : this.#autoAnswerRules.get(id);
+        if (!rule) return reply.code(404).send(notFound("FaceTime auto-answer rule not found"));
+        return success(rule, "Successfully fetched FaceTime auto-answer rule!");
+      },
+    );
+    this.app.patch<{ Params: { id: string } }>(
+      "/api/v1/iblue/facetime/incoming/auto-answer/rules/:id",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        if (id === undefined || !this.#autoAnswerRules.get(id)) {
+          return reply.code(404).send(notFound("FaceTime auto-answer rule not found"));
+        }
+        let directory: string | undefined;
+        try {
+          const { fields, media } = await readAutoAnswerRuleUpload(request, async (file) => {
+            directory = await this.#autoAnswerRules.prepareMediaDirectory(randomUUID());
+            const filename = safeAttachmentName(file.filename || "media");
+            const path = join(directory, filename);
+            const size = await saveMultipartFile(file, path);
+            assertAutoAnswerMediaSize(size);
+            return { filename, mimeType: file.mimetype || "application/octet-stream", size, path };
+          });
+          const draft = autoAnswerRuleDraft(fields, { requireMedia: false });
+          const rule = await this.#autoAnswerRules.update(id, draft, media);
+          if (!rule) return reply.code(404).send(notFound("FaceTime auto-answer rule not found"));
+          return success(rule, "Successfully updated FaceTime auto-answer rule!");
+        } catch (error) {
+          if (directory) await rm(directory, { recursive: true, force: true });
+          throw error;
+        }
+      },
+    );
+    this.app.delete<{ Params: { id: string } }>(
+      "/api/v1/iblue/facetime/incoming/auto-answer/rules/:id",
+      async (request, reply) => {
+        const id = positiveInteger(request.params.id);
+        const removed = id === undefined ? undefined : await this.#autoAnswerRules.delete(id);
+        if (!removed) return reply.code(404).send(notFound("FaceTime auto-answer rule not found"));
+        return success(undefined, "Successfully deleted FaceTime auto-answer rule!");
+      },
+    );
     this.app.delete("/api/v1/iblue/facetime/incoming/auto-answer", async () => {
       const arm = this.#faceTimeAutoAnswer;
       if (arm?.state === "answering") {
@@ -4099,11 +4283,10 @@ export class BlueBubblesServer {
   }
 
   private async tryFaceTimeAutoAnswer(data: unknown): Promise<void> {
+    if (!this.#faceTimeMedia?.answerIncoming) return;
     const arm = this.#faceTimeAutoAnswer;
-    if (!arm || arm.state !== "armed") return;
-    if (arm.expiresAt <= Date.now()) {
+    if (arm?.state === "armed" && arm.expiresAt <= Date.now()) {
       await this.clearFaceTimeAutoAnswer(arm);
-      return;
     }
     const event = asRecord(data);
     const sessionId = typeof event.sessionId === "string" ? event.sessionId : undefined;
@@ -4111,24 +4294,118 @@ export class BlueBubblesServer {
     let incoming = isFaceTimeIncomingSession(data) ? data : undefined;
     incoming ??= (await this.service.listIncomingFaceTimeSessions())
       .find((session) => session.sessionId.toUpperCase() === sessionId.toUpperCase());
-    if (!incoming || incoming.state !== "ringing" || incoming.mode !== arm.mode) return;
-    if (arm.caller) {
-      const remoteAddresses = [incoming.caller, ...incoming.participants]
-        .filter((value): value is string => Boolean(value))
-        .map(normalizeFaceTimeAddress);
-      if (!remoteAddresses.includes(arm.caller)) return;
+    if (!incoming || incoming.state !== "ringing") return;
+    const remoteAddresses = [incoming.caller, ...incoming.participants]
+      .filter((value): value is string => Boolean(value))
+      .map(normalizeFaceTimeAddress);
+
+    // The one-shot arm is an explicit request for the very next call, so it
+    // outranks any standing rule that would also match.
+    const armed = this.#faceTimeAutoAnswer;
+    if (
+      armed
+      && armed.state === "armed"
+      && incoming.mode === armed.mode
+      && (!armed.caller || remoteAddresses.includes(armed.caller))
+    ) {
+      armed.state = "answering";
+      clearTimeout(armed.timer);
+      try {
+        await this.#faceTimeMedia.answerIncoming({
+          sessionId: incoming.sessionId,
+          displayName: armed.displayName,
+          sourcePath: armed.sourcePath,
+          maxDurationSeconds: armed.maxDurationSeconds,
+        });
+      } finally {
+        await this.clearFaceTimeAutoAnswer(armed);
+      }
+      return;
     }
-    arm.state = "answering";
-    clearTimeout(arm.timer);
+
+    await this.tryFaceTimeAutoAnswerRule(incoming, remoteAddresses);
+  }
+
+  /**
+   * Answer a ringing call from a standing rule. Playback owns the native media
+   * session for its duration, so a second ring is left alone rather than
+   * interrupting the call already in progress.
+   */
+  private async tryFaceTimeAutoAnswerRule(
+    incoming: FaceTimeIncomingSession,
+    remoteAddresses: readonly string[],
+  ): Promise<void> {
+    if (this.#autoAnswerRuleBusy) return;
+    if (incoming.mode !== "audio" && incoming.mode !== "video") return;
+    const rule = this.#autoAnswerRules.match({
+      mode: incoming.mode,
+      addresses: remoteAddresses,
+    });
+    if (!rule) return;
+    const sourcePath = this.#autoAnswerRules.mediaPath(rule.id);
+    if (!sourcePath) return;
+    this.#autoAnswerRuleBusy = true;
+    // Dispatch rather than emit: this must reach notification rules and
+    // webhooks, not only a connected Socket.IO client.
+    this.service.dispatch("facetime-auto-answer-rule-matched", {
+      ruleId: rule.id,
+      name: rule.name,
+      sessionId: incoming.sessionId,
+      mode: incoming.mode,
+      caller: incoming.caller ?? null,
+      participants: incoming.participants,
+    });
     try {
-      await this.#faceTimeMedia!.answerIncoming!({
-        sessionId: incoming.sessionId,
-        displayName: arm.displayName,
-        sourcePath: arm.sourcePath,
-        maxDurationSeconds: arm.maxDurationSeconds,
-      });
+      // The ring event is derived from the iMessage signal, which can beat the
+      // native session into existence, and answering then fails with "not
+      // awaiting an incoming answer". The previous polling responder never saw
+      // this because it only observed sessions native already knew about, so
+      // wait the same way instead of dropping the call.
+      const startedWaitingAt = Date.now();
+      const deadline = startedWaitingAt + AUTO_ANSWER_READY_TIMEOUT_MS;
+      let attempts = 0;
+      for (;;) {
+        try {
+          attempts += 1;
+          await this.#faceTimeMedia!.answerIncoming!({
+            sessionId: incoming.sessionId,
+            displayName: rule.displayName,
+            sourcePath,
+            maxDurationSeconds: rule.maxDurationSeconds,
+          });
+          // Only a call that actually connected counts as answered.
+          this.#autoAnswerRules.recordAnswered(rule.id);
+          return;
+        } catch (error) {
+          if (!isSessionNotReadyToAnswer(error) || Date.now() >= deadline) throw error;
+          if (attempts === 1) {
+            // Record how long the ring lasts before native will accept an
+            // answer; this is the delay a caller actually hears.
+            console.error(
+              `[iblue] auto-answer waiting for native readiness: session=${incoming.sessionId}`,
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, AUTO_ANSWER_READY_POLL_MS));
+          const current = (await this.service.listIncomingFaceTimeSessions())
+            .find((session) => session.sessionId.toUpperCase()
+              === incoming.sessionId.toUpperCase());
+          if (!current || current.state !== "ringing") {
+            throw new Error(
+              `caller left before the call could be answered (${current?.state ?? "missing"})`,
+            );
+          }
+          if (Date.now() - startedWaitingAt >= AUTO_ANSWER_SLOW_WARN_MS
+            && attempts % 8 === 0) {
+            console.error(
+              `[iblue] auto-answer still waiting after `
+              + `${((Date.now() - startedWaitingAt) / 1000).toFixed(1)}s `
+              + `(${attempts} attempts) session=${incoming.sessionId}`,
+            );
+          }
+        }
+      }
     } finally {
-      await this.clearFaceTimeAutoAnswer(arm);
+      this.#autoAnswerRuleBusy = false;
     }
   }
 
@@ -4224,6 +4501,394 @@ function isFaceTimeIncomingSession(value: unknown): value is FaceTimeIncomingSes
       || record.state === "declined")
     && (record.mode === "audio" || record.mode === "video")
     && Array.isArray(record.participants);
+}
+
+const AUTO_ANSWER_MEDIA_MAX_BYTES = 95 * 1024 * 1024;
+
+function assertAutoAnswerMediaSize(size: number): void {
+  if (size === 0 || size > AUTO_ANSWER_MEDIA_MAX_BYTES) {
+    throw new RequestError(
+      400,
+      "FaceTime media must be between 1 byte and 95 MiB",
+      "VALIDATION_ERROR",
+    );
+  }
+}
+
+/**
+ * Read an auto-answer rule request as either multipart (fields plus optional
+ * media) or plain JSON. Update without new media is the common case, so
+ * requiring multipart there would be gratuitous.
+ *
+ * The media stream is handed to `saveMedia` the moment its part appears and
+ * iteration then continues, because a part must be consumed before the next
+ * one can be pulled. Returning the file to the caller instead would strand
+ * every field sent after it, and clients order form fields freely.
+ */
+async function readAutoAnswerRuleUpload(
+  request: FastifyRequest,
+  saveMedia: (file: MultipartFile) => Promise<AutoAnswerMedia>,
+): Promise<{ fields: Record<string, unknown>; media?: AutoAnswerMedia }> {
+  if (!request.isMultipart()) {
+    return { fields: asRecord(request.body) };
+  }
+  const fields: Record<string, unknown> = {};
+  let media: AutoAnswerMedia | undefined;
+  for await (const part of request.parts()) {
+    if (part.type === "file") {
+      if (part.fieldname === "media" && !media) {
+        media = await saveMedia(part);
+      } else {
+        // Drain unexpected files so the stream can advance.
+        await part.toBuffer();
+      }
+      continue;
+    }
+    fields[part.fieldname] = part.value;
+  }
+  return media ? { fields, media } : { fields };
+}
+
+interface AutoAnswerMedia {
+  filename: string;
+  mimeType: string;
+  size: number;
+  path: string;
+}
+
+function autoAnswerCallers(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return [];
+    if (trimmed.startsWith("[")) {
+      try {
+        raw = JSON.parse(trimmed);
+      } catch {
+        throw new RequestError(400, "callers must be a JSON array or comma-separated list", "VALIDATION_ERROR");
+      }
+    } else {
+      raw = trimmed.split(",");
+    }
+  }
+  if (!Array.isArray(raw)) {
+    throw new RequestError(400, "callers must be a list of addresses", "VALIDATION_ERROR");
+  }
+  const callers = raw
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "")
+    .map(normalizeFaceTimeAddress);
+  return [...new Set(callers)];
+}
+
+function autoAnswerRuleDraft(
+  fields: Record<string, unknown>,
+  options: { requireMedia: boolean },
+): {
+  name?: string | null;
+  enabled?: boolean;
+  callers?: string[];
+  mode?: BlueBubblesAutoAnswerMode;
+  priority?: number;
+  displayName?: string;
+  maxDurationSeconds?: number;
+} {
+  const draft: {
+    name?: string | null;
+    enabled?: boolean;
+    callers?: string[];
+    mode?: BlueBubblesAutoAnswerMode;
+    priority?: number;
+    displayName?: string;
+    maxDurationSeconds?: number;
+  } = {};
+  if (fields.name !== undefined) {
+    draft.name = fields.name === null || fields.name === "" ? null : String(fields.name);
+  }
+  if (fields.enabled !== undefined) {
+    draft.enabled = fields.enabled === true || fields.enabled === "true" || fields.enabled === 1
+      || fields.enabled === "1";
+  }
+  const callers = autoAnswerCallers(fields.callers ?? fields.caller);
+  if (callers !== undefined) draft.callers = callers;
+  if (fields.mode !== undefined) {
+    const mode = String(fields.mode);
+    if (mode !== "audio" && mode !== "video" && mode !== "any") {
+      throw new RequestError(400, "mode must be audio, video, or any", "VALIDATION_ERROR");
+    }
+    draft.mode = mode;
+  } else if (options.requireMedia) {
+    draft.mode = "any";
+  }
+  if (fields.priority !== undefined) {
+    const priority = Number(fields.priority);
+    if (!Number.isInteger(priority)) {
+      throw new RequestError(400, "priority must be an integer", "VALIDATION_ERROR");
+    }
+    draft.priority = priority;
+  }
+  if (fields.displayName !== undefined) draft.displayName = String(fields.displayName);
+  if (fields.maxDurationSeconds !== undefined) {
+    const seconds = Number(fields.maxDurationSeconds);
+    if (!Number.isInteger(seconds) || seconds < 15 || seconds > 600) {
+      throw new RequestError(
+        400,
+        "maxDurationSeconds must be an integer between 15 and 600",
+        "VALIDATION_ERROR",
+      );
+    }
+    draft.maxDurationSeconds = seconds;
+  }
+  return draft;
+}
+
+/**
+ * Describe an event for notification matching and templating.
+ *
+ * Each event carries its counterparty under a different key, so the addresses
+ * used for caller filtering are collected per type rather than guessed.
+ */
+const NOTIFICATION_EVENTS = new Set([
+  "*",
+  "incoming-facetime",
+  "ft-call-status-changed",
+  "facetime-auto-answer-rule-matched",
+  "new-message",
+  "updated-message",
+  "message-send-error",
+  "participant-added",
+  "participant-left",
+  "participant-removed",
+  "typing-indicator",
+]);
+
+function notificationRuleDraft(
+  body: Record<string, unknown>,
+  options: { create: boolean },
+): {
+  name?: string | null;
+  enabled?: boolean;
+  events?: string[];
+  destination?: string;
+  callers?: string[];
+  filters?: Record<string, string[]> | null;
+  template?: string | null;
+} {
+  const draft: {
+    name?: string | null;
+    enabled?: boolean;
+    events?: string[];
+    destination?: string;
+    callers?: string[];
+    filters?: Record<string, string[]> | null;
+    template?: string | null;
+  } = {};
+  if (body.name !== undefined) {
+    draft.name = body.name === null || body.name === "" ? null : String(body.name);
+  }
+  if (body.enabled !== undefined) draft.enabled = body.enabled === true || body.enabled === "true";
+  if (body.events !== undefined) {
+    const raw = Array.isArray(body.events)
+      ? body.events
+      : String(body.events).split(",");
+    const events = raw
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry !== "");
+    const unknown = events.filter((entry) => !NOTIFICATION_EVENTS.has(entry));
+    if (unknown.length > 0) {
+      throw new RequestError(
+        400,
+        `Unsupported notification events: ${unknown.join(", ")}`,
+        "VALIDATION_ERROR",
+      );
+    }
+    if (events.length === 0) {
+      throw new RequestError(400, "events must not be empty", "VALIDATION_ERROR");
+    }
+    draft.events = [...new Set(events)];
+  }
+  if (body.destination !== undefined) {
+    const destination = String(body.destination).trim();
+    if (destination === "") {
+      throw new RequestError(400, "destination is required", "VALIDATION_ERROR");
+    }
+    draft.destination = normalizeFaceTimeAddress(destination);
+  } else if (options.create) {
+    throw new RequestError(400, "destination is required", "VALIDATION_ERROR");
+  }
+  const callers = autoAnswerCallers(body.callers ?? body.caller);
+  if (callers !== undefined) draft.callers = callers;
+  if (body.filters !== undefined) {
+    if (body.filters === null || body.filters === "") {
+      draft.filters = null;
+    } else if (typeof body.filters === "object" && !Array.isArray(body.filters)) {
+      const filters: Record<string, string[]> = {};
+      for (const [field, allowed] of Object.entries(body.filters as Record<string, unknown>)) {
+        const values = Array.isArray(allowed) ? allowed : [allowed];
+        filters[field] = values
+          .filter((entry): entry is string | number => typeof entry === "string" || typeof entry === "number")
+          .map((entry) => String(entry));
+      }
+      draft.filters = Object.keys(filters).length > 0 ? filters : null;
+    } else {
+      throw new RequestError(
+        400,
+        "filters must be an object of field names to allowed values",
+        "VALIDATION_ERROR",
+      );
+    }
+  }
+  if (body.template !== undefined) {
+    draft.template = body.template === null || body.template === "" ? null : String(body.template);
+  }
+  return draft;
+}
+
+/**
+ * Report a failure from a background task. Fastify is constructed with
+ * `logger: false`, so `app.log` discards everything; stderr reaches
+ * `serve.error.log` where the rest of the diagnostics already land.
+ */
+/**
+ * How long to keep waiting for a ringing session to become answerable, and how
+ * often to retry. The window comfortably outlasts the gap between the iMessage
+ * ring signal and native readiness without holding a dead call open.
+ */
+const AUTO_ANSWER_READY_TIMEOUT_MS = 15_000;
+const AUTO_ANSWER_READY_POLL_MS = 250;
+/** Above this wait, the ring is long enough that the caller notices. */
+const AUTO_ANSWER_SLOW_WARN_MS = 2_000;
+
+function isSessionNotReadyToAnswer(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("not awaiting an incoming answer");
+}
+
+function formatCallDuration(milliseconds: number): string {
+  const seconds = Math.round(milliseconds / 1000);
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"}`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder === 0
+    ? `${minutes} minute${minutes === 1 ? "" : "s"}`
+    : `${minutes}m ${remainder}s`;
+}
+
+/**
+ * A plain-language outcome for a finished call: whether media played, who
+ * ended it, or why it failed. `state` alone cannot distinguish "the caller
+ * hung up early" from "the media finished and iBlue hung up", which is the
+ * distinction worth texting about.
+ */
+function describeCallOutcome(
+  record: Record<string, unknown>,
+  status: unknown,
+  answeredAt: number | undefined,
+): string {
+  if (status === "failed") {
+    const reason = typeof record.error === "string" && record.error !== ""
+      ? `: ${record.error}`
+      : "";
+    return `failed${reason}`;
+  }
+  if (status === "declined") return "declined";
+  if (status === "missed") return "missed";
+  if (status === "answered-elsewhere") return "answered on another device";
+  if (status !== "ended") return String(status ?? "updated");
+  if (answeredAt === undefined) return "ended before it was answered";
+
+  // The media sender reports how much of the source it delivered. Reaching the
+  // end means iBlue hung up on completion; stopping short means the far side
+  // went away first.
+  const total = typeof record.mediaDurationSeconds === "number"
+    ? record.mediaDurationSeconds
+    : undefined;
+  const endedAt = typeof record.endedAt === "number" ? record.endedAt : undefined;
+  const played = endedAt !== undefined ? (endedAt - answeredAt) / 1000 : undefined;
+  if (total !== undefined && played !== undefined) {
+    return played >= total - 2
+      ? "media played fully and iBlue ended the call"
+      : "caller hung up before the media finished";
+  }
+  return "ended";
+}
+
+function reportBackgroundFailure(what: string, error: unknown): void {
+  const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  console.error(`[iblue] ${what} failed: ${detail}`);
+}
+
+function notificationContext(
+  type: string,
+  data: unknown,
+  resolveName?: (address: string) => string | undefined,
+): NotificationEventContext {
+  const record = asRecord(data);
+  const fields: Record<string, string> = { event: type };
+  const addresses: string[] = [];
+  const addAddress = (value: unknown) => {
+    if (typeof value !== "string" || value === "") return;
+    addresses.push(normalizeFaceTimeAddress(value));
+  };
+
+  switch (type) {
+    case "incoming-facetime":
+    case "facetime-auto-answer-rule-matched": {
+      addAddress(record.caller);
+      if (Array.isArray(record.participants)) record.participants.forEach(addAddress);
+      if (typeof record.caller === "string") fields.caller = stripTransport(record.caller);
+      if (typeof record.mode === "string") fields.mode = record.mode;
+      if (typeof record.sessionId === "string") fields.sessionId = record.sessionId;
+      if (typeof record.name === "string") fields.name = record.name;
+      break;
+    }
+    case "ft-call-status-changed": {
+      const identifier = record.sessionId ?? record.callUuid;
+      if (typeof identifier === "string") fields.sessionId = identifier;
+      // Two producers use this event name: the incoming-signal path sends
+      // `status`, while the media lifecycle dispatches the whole call object
+      // with `state`. Read both so the placeholder is never blank.
+      const status = record.status ?? record.state;
+      if (typeof status === "string") fields.status = status;
+      if (typeof record.direction === "string") fields.direction = record.direction;
+      if (Array.isArray(record.targets)) record.targets.forEach(addAddress);
+      if (typeof record.mode === "string") fields.mode = record.mode;
+      if (typeof record.error === "string" && record.error !== "") fields.error = record.error;
+
+      // How long the caller was actually connected, and who hung up. The
+      // lifecycle payload carries the timestamps; without deriving these a
+      // call-ended text can only repeat the state name.
+      const answeredAt = typeof record.answeredAt === "number" ? record.answeredAt : undefined;
+      const endedAt = typeof record.endedAt === "number" ? record.endedAt : undefined;
+      if (answeredAt !== undefined && endedAt !== undefined && endedAt >= answeredAt) {
+        fields.durationSeconds = String(Math.round((endedAt - answeredAt) / 1000));
+        fields.duration = formatCallDuration(endedAt - answeredAt);
+      } else if (answeredAt === undefined) {
+        fields.duration = "not answered";
+        fields.durationSeconds = "0";
+      }
+      fields.outcome = describeCallOutcome(record, status, answeredAt);
+      break;
+    }
+    default: {
+      const handle = record.handle ?? record.address ?? record.sender;
+      addAddress(typeof handle === "object" ? asRecord(handle).address : handle);
+      if (typeof record.text === "string") fields.text = record.text;
+      if (Array.isArray(record.handles)) record.handles.forEach(addAddress);
+      break;
+    }
+  }
+
+  const [first] = addresses;
+  if (!fields.caller && first) fields.caller = stripTransport(first);
+  // Apple's contact name when iBlue knows one. Unknown numbers are common, so
+  // a miss leaves {callerName} empty rather than inventing a placeholder.
+  const name = first ? resolveName?.(first) : undefined;
+  if (name) fields.callerName = name;
+  return { type, addresses, fields };
 }
 
 function publicFaceTimeAutoAnswerArm(

@@ -541,3 +541,88 @@ export interface BlueBubblesScheduledMessage {
   sentAt: string | null;
   created: string;
 }
+
+/**
+ * Which incoming FaceTime calls a standing auto-answer rule applies to.
+ * `any` matches audio and video, so a caller can be given one rule rather than
+ * a near-duplicate pair.
+ */
+export type BlueBubblesAutoAnswerMode = "audio" | "video" | "any";
+
+export interface BlueBubblesAutoAnswerRuleMedia {
+  filename: string;
+  mimeType: string;
+  size: number;
+}
+
+export interface BlueBubblesAutoAnswerRule {
+  id: number;
+  name: string | null;
+  enabled: boolean;
+  /**
+   * Normalized handles this rule answers for. An empty list matches every
+   * caller, which is how a catch-all rule is expressed.
+   */
+  callers: string[];
+  mode: BlueBubblesAutoAnswerMode;
+  /** Lower sorts first. Ties break toward caller-specific rules, then id. */
+  priority: number;
+  displayName: string;
+  maxDurationSeconds: number;
+  media: BlueBubblesAutoAnswerRuleMedia;
+  lastAnsweredAt: string | null;
+  answerCount: number;
+  created: string;
+  updated: string;
+}
+
+/**
+ * Events a notification rule can subscribe to. `*` matches every event iBlue
+ * dispatches, which is useful for debugging but noisy in normal use.
+ */
+export type BlueBubblesNotificationEvent =
+  | "*"
+  | "incoming-facetime"
+  | "ft-call-status-changed"
+  | "facetime-auto-answer-rule-matched"
+  | "new-message"
+  | "updated-message"
+  | "message-send-error"
+  | "participant-added"
+  | "participant-left"
+  | "participant-removed"
+  | "typing-indicator";
+
+export interface BlueBubblesNotificationRule {
+  id: number;
+  name: string | null;
+  enabled: boolean;
+  /** Event types this rule fires on. */
+  events: BlueBubblesNotificationEvent[];
+  /** Canonical handle the notification text is sent to. */
+  destination: string;
+  /**
+   * Normalized handles to restrict on. An empty list notifies for every
+   * counterparty; otherwise the event must involve one of these.
+   */
+  callers: string[];
+  /**
+   * Field values that must match for the rule to fire, as field -> allowed
+   * values. `{"status": ["ended"]}` turns a lifecycle subscription into a
+   * call-ended alert instead of one text per transition.
+   */
+  filters: Record<string, string[]> | null;
+  /**
+   * Optional message template. Supports `{event}`, `{who}`, `{caller}`,
+   * `{callerName}`, `{mode}`, `{status}`, `{outcome}`, `{duration}`,
+   * `{durationSeconds}`, `{error}`, `{sessionId}`, `{text}`, and `{name}`
+   * placeholders. `{who}` renders the handle plus contact name when known. When
+   * omitted, iBlue renders a sentence appropriate to the event.
+   */
+  template: string | null;
+  deliveredCount: number;
+  lastDeliveredAt: string | null;
+  lastError: string | null;
+  created: string;
+  updated: string;
+}

@@ -15,6 +15,10 @@ import type {
   BlueBubblesChat,
   BlueBubblesHandle,
   BlueBubblesMessage,
+  BlueBubblesAutoAnswerMode,
+  BlueBubblesAutoAnswerRule,
+  BlueBubblesNotificationEvent,
+  BlueBubblesNotificationRule,
   BlueBubblesScheduledMessage,
   BlueBubblesScheduledMessagePayload,
   BlueBubblesScheduledMessageSchedule,
@@ -331,6 +335,114 @@ function hardenDatabaseFiles(databasePath: string): void {
   }
 }
 
+interface AutoAnswerRuleRow {
+  id: number;
+  name: string | null;
+  enabled: number;
+  callers_json: string;
+  mode: string;
+  priority: number;
+  display_name: string;
+  max_duration_seconds: number;
+  media_path: string;
+  media_filename: string;
+  media_mime: string;
+  media_size: number;
+  last_answered_at: number | null;
+  answer_count: number;
+  created_at: number;
+  updated_at: number;
+}
+
+function autoAnswerRuleFromRow(row: AutoAnswerRuleRow): BlueBubblesAutoAnswerRule {
+  let callers: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.callers_json);
+    if (Array.isArray(parsed)) callers = parsed.filter((v): v is string => typeof v === "string");
+  } catch {
+    // A malformed row should degrade to a catch-all rule rather than break the
+    // whole listing; matching still requires an explicit mode.
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    enabled: row.enabled !== 0,
+    callers,
+    mode: (row.mode === "audio" || row.mode === "video" ? row.mode : "any") as BlueBubblesAutoAnswerMode,
+    priority: row.priority,
+    displayName: row.display_name,
+    maxDurationSeconds: row.max_duration_seconds,
+    media: {
+      filename: row.media_filename,
+      mimeType: row.media_mime,
+      size: row.media_size,
+    },
+    lastAnsweredAt: row.last_answered_at ? new Date(row.last_answered_at).toISOString() : null,
+    answerCount: row.answer_count,
+    created: new Date(row.created_at).toISOString(),
+    updated: new Date(row.updated_at).toISOString(),
+  };
+}
+
+interface NotificationRuleRow {
+  id: number;
+  name: string | null;
+  enabled: number;
+  events_json: string;
+  destination: string;
+  callers_json: string;
+  filters_json: string | null;
+  template: string | null;
+  delivered_count: number;
+  last_delivered_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function jsonStringArray(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseNotificationFilters(value: string | null): Record<string, string[]> | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const filters: Record<string, string[]> = {};
+    for (const [key, allowed] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(allowed)) continue;
+      filters[key] = allowed.filter((entry): entry is string => typeof entry === "string");
+    }
+    return Object.keys(filters).length > 0 ? filters : null;
+  } catch {
+    return null;
+  }
+}
+
+function notificationRuleFromRow(row: NotificationRuleRow): BlueBubblesNotificationRule {
+  return {
+    id: row.id,
+    name: row.name,
+    enabled: row.enabled !== 0,
+    events: jsonStringArray(row.events_json) as BlueBubblesNotificationEvent[],
+    destination: row.destination,
+    callers: jsonStringArray(row.callers_json),
+    filters: parseNotificationFilters(row.filters_json),
+    template: row.template,
+    deliveredCount: row.delivered_count,
+    lastDeliveredAt: row.last_delivered_at ? new Date(row.last_delivered_at).toISOString() : null,
+    lastError: row.last_error,
+    created: new Date(row.created_at).toISOString(),
+    updated: new Date(row.updated_at).toISOString(),
+  };
+}
+
 export class BlueBubblesStore {
   readonly database: DatabaseSync;
   readonly attachmentRoot: string;
@@ -516,7 +628,50 @@ export class BlueBubblesStore {
       );
       CREATE INDEX IF NOT EXISTS scheduled_message_due
         ON scheduled_message(status, scheduled_for);
+      CREATE TABLE IF NOT EXISTS facetime_auto_answer_rule (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        callers_json TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        display_name TEXT NOT NULL,
+        max_duration_seconds INTEGER NOT NULL,
+        media_path TEXT NOT NULL,
+        media_filename TEXT NOT NULL,
+        media_mime TEXT NOT NULL,
+        media_size INTEGER NOT NULL,
+        last_answered_at INTEGER,
+        answer_count INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS facetime_auto_answer_rule_match
+        ON facetime_auto_answer_rule(enabled, priority, id);
+      CREATE TABLE IF NOT EXISTS notification_rule (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        events_json TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        callers_json TEXT NOT NULL,
+        filters_json TEXT,
+        template TEXT,
+        delivered_count INTEGER NOT NULL DEFAULT 0,
+        last_delivered_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS notification_rule_enabled
+        ON notification_rule(enabled, id);
     `);
+    const notificationColumns = this.database
+      .prepare("PRAGMA table_info(notification_rule)")
+      .all() as unknown as Array<{ name: string }>;
+    if (!notificationColumns.some((column) => column.name === "filters_json")) {
+      this.database.exec("ALTER TABLE notification_rule ADD COLUMN filters_json TEXT");
+    }
     const attachmentColumns = this.database.prepare("PRAGMA table_info(attachment)").all() as unknown as Array<{ name: string }>;
     if (!attachmentColumns.some((column) => column.name === "is_sticker")) {
       this.database.exec("ALTER TABLE attachment ADD COLUMN is_sticker INTEGER NOT NULL DEFAULT 0");
@@ -2010,6 +2165,224 @@ export class BlueBubblesStore {
     if (!message) return undefined;
     this.database.prepare("DELETE FROM scheduled_message WHERE id = ?").run(id);
     return message;
+  }
+
+  listAutoAnswerRules(): BlueBubblesAutoAnswerRule[] {
+    // Sorted the same way matching consumes them, so callers and tests observe
+    // one ordering rather than two that can drift apart.
+    return (this.database.prepare(
+      `SELECT * FROM facetime_auto_answer_rule
+       ORDER BY priority ASC, json_array_length(callers_json) DESC, id ASC`,
+    ).all() as unknown as AutoAnswerRuleRow[]).map(autoAnswerRuleFromRow);
+  }
+
+  getAutoAnswerRule(id: number): BlueBubblesAutoAnswerRule | undefined {
+    const row = this.database.prepare(
+      "SELECT * FROM facetime_auto_answer_rule WHERE id = ?",
+    ).get(id) as unknown as AutoAnswerRuleRow | undefined;
+    return row ? autoAnswerRuleFromRow(row) : undefined;
+  }
+
+  createAutoAnswerRule(input: {
+    name?: string | null;
+    enabled?: boolean;
+    callers: readonly string[];
+    mode: BlueBubblesAutoAnswerMode;
+    priority?: number;
+    displayName: string;
+    maxDurationSeconds: number;
+    mediaPath: string;
+    mediaFilename: string;
+    mediaMime: string;
+    mediaSize: number;
+  }): BlueBubblesAutoAnswerRule {
+    const now = Date.now();
+    const result = this.database.prepare(`
+      INSERT INTO facetime_auto_answer_rule (
+        name, enabled, callers_json, mode, priority, display_name,
+        max_duration_seconds, media_path, media_filename, media_mime, media_size,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.name ?? null,
+      input.enabled === false ? 0 : 1,
+      JSON.stringify([...input.callers]),
+      input.mode,
+      input.priority ?? 0,
+      input.displayName,
+      input.maxDurationSeconds,
+      input.mediaPath,
+      input.mediaFilename,
+      input.mediaMime,
+      input.mediaSize,
+      now,
+      now,
+    );
+    return this.getAutoAnswerRule(Number(result.lastInsertRowid))!;
+  }
+
+  updateAutoAnswerRule(
+    id: number,
+    changes: {
+      name?: string | null;
+      enabled?: boolean;
+      callers?: readonly string[];
+      mode?: BlueBubblesAutoAnswerMode;
+      priority?: number;
+      displayName?: string;
+      maxDurationSeconds?: number;
+      mediaPath?: string;
+      mediaFilename?: string;
+      mediaMime?: string;
+      mediaSize?: number;
+    },
+  ): BlueBubblesAutoAnswerRule | undefined {
+    if (!this.getAutoAnswerRule(id)) return undefined;
+    const assignments: string[] = [];
+    const values: Array<string | number | null> = [];
+    const assign = (column: string, value: string | number | null) => {
+      assignments.push(`${column} = ?`);
+      values.push(value);
+    };
+    if (changes.name !== undefined) assign("name", changes.name);
+    if (changes.enabled !== undefined) assign("enabled", changes.enabled ? 1 : 0);
+    if (changes.callers !== undefined) assign("callers_json", JSON.stringify([...changes.callers]));
+    if (changes.mode !== undefined) assign("mode", changes.mode);
+    if (changes.priority !== undefined) assign("priority", changes.priority);
+    if (changes.displayName !== undefined) assign("display_name", changes.displayName);
+    if (changes.maxDurationSeconds !== undefined) {
+      assign("max_duration_seconds", changes.maxDurationSeconds);
+    }
+    if (changes.mediaPath !== undefined) assign("media_path", changes.mediaPath);
+    if (changes.mediaFilename !== undefined) assign("media_filename", changes.mediaFilename);
+    if (changes.mediaMime !== undefined) assign("media_mime", changes.mediaMime);
+    if (changes.mediaSize !== undefined) assign("media_size", changes.mediaSize);
+    assign("updated_at", Date.now());
+    this.database.prepare(
+      `UPDATE facetime_auto_answer_rule SET ${assignments.join(", ")} WHERE id = ?`,
+    ).run(...values, id);
+    return this.getAutoAnswerRule(id);
+  }
+
+  recordAutoAnswerRuleAnswered(id: number): void {
+    this.database.prepare(`
+      UPDATE facetime_auto_answer_rule
+      SET answer_count = answer_count + 1, last_answered_at = ?
+      WHERE id = ?
+    `).run(Date.now(), id);
+  }
+
+  deleteAutoAnswerRule(id: number): BlueBubblesAutoAnswerRule | undefined {
+    const rule = this.getAutoAnswerRule(id);
+    if (!rule) return undefined;
+    this.database.prepare("DELETE FROM facetime_auto_answer_rule WHERE id = ?").run(id);
+    return rule;
+  }
+
+  /** Absolute media path for a rule. Never returned through the API. */
+  autoAnswerRuleMediaPath(id: number): string | undefined {
+    const row = this.database.prepare(
+      "SELECT media_path FROM facetime_auto_answer_rule WHERE id = ?",
+    ).get(id) as unknown as { media_path: string } | undefined;
+    return row?.media_path;
+  }
+
+  listNotificationRules(): BlueBubblesNotificationRule[] {
+    return (this.database.prepare(
+      "SELECT * FROM notification_rule ORDER BY id ASC",
+    ).all() as unknown as NotificationRuleRow[]).map(notificationRuleFromRow);
+  }
+
+  getNotificationRule(id: number): BlueBubblesNotificationRule | undefined {
+    const row = this.database.prepare(
+      "SELECT * FROM notification_rule WHERE id = ?",
+    ).get(id) as unknown as NotificationRuleRow | undefined;
+    return row ? notificationRuleFromRow(row) : undefined;
+  }
+
+  createNotificationRule(input: {
+    name?: string | null;
+    enabled?: boolean;
+    events: readonly string[];
+    destination: string;
+    callers?: readonly string[];
+    filters?: Record<string, string[]> | null;
+    template?: string | null;
+  }): BlueBubblesNotificationRule {
+    const now = Date.now();
+    const result = this.database.prepare(`
+      INSERT INTO notification_rule (
+        name, enabled, events_json, destination, callers_json, filters_json, template,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.name ?? null,
+      input.enabled === false ? 0 : 1,
+      JSON.stringify([...input.events]),
+      input.destination,
+      JSON.stringify([...(input.callers ?? [])]),
+      input.filters ? JSON.stringify(input.filters) : null,
+      input.template ?? null,
+      now,
+      now,
+    );
+    return this.getNotificationRule(Number(result.lastInsertRowid))!;
+  }
+
+  updateNotificationRule(
+    id: number,
+    changes: {
+      name?: string | null;
+      enabled?: boolean;
+      events?: readonly string[];
+      destination?: string;
+      callers?: readonly string[];
+      filters?: Record<string, string[]> | null;
+      template?: string | null;
+    },
+  ): BlueBubblesNotificationRule | undefined {
+    if (!this.getNotificationRule(id)) return undefined;
+    const assignments: string[] = [];
+    const values: Array<string | number | null> = [];
+    const assign = (column: string, value: string | number | null) => {
+      assignments.push(`${column} = ?`);
+      values.push(value);
+    };
+    if (changes.name !== undefined) assign("name", changes.name);
+    if (changes.enabled !== undefined) assign("enabled", changes.enabled ? 1 : 0);
+    if (changes.events !== undefined) assign("events_json", JSON.stringify([...changes.events]));
+    if (changes.destination !== undefined) assign("destination", changes.destination);
+    if (changes.callers !== undefined) assign("callers_json", JSON.stringify([...changes.callers]));
+    if (changes.filters !== undefined) {
+      assign("filters_json", changes.filters ? JSON.stringify(changes.filters) : null);
+    }
+    if (changes.template !== undefined) assign("template", changes.template);
+    assign("updated_at", Date.now());
+    this.database.prepare(
+      `UPDATE notification_rule SET ${assignments.join(", ")} WHERE id = ?`,
+    ).run(...values, id);
+    return this.getNotificationRule(id);
+  }
+
+  recordNotificationRuleDelivery(id: number, error?: string): void {
+    if (error) {
+      this.database.prepare(
+        "UPDATE notification_rule SET last_error = ? WHERE id = ?",
+      ).run(error.slice(0, 2_000), id);
+      return;
+    }
+    this.database.prepare(`
+      UPDATE notification_rule
+      SET delivered_count = delivered_count + 1, last_delivered_at = ?, last_error = NULL
+      WHERE id = ?
+    `).run(Date.now(), id);
+  }
+
+  deleteNotificationRule(id: number): BlueBubblesNotificationRule | undefined {
+    const rule = this.getNotificationRule(id);
+    if (!rule) return undefined;
+    this.database.prepare("DELETE FROM notification_rule WHERE id = ?").run(id);
+    return rule;
   }
 
   private async removeProfileFiles(paths: readonly string[]): Promise<void> {
