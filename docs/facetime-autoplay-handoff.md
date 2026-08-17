@@ -178,6 +178,21 @@ topics received on a good and a bad call. A healthy call shows
 `StreamGroupsState`, `RateControlConfig`, and `DeviceOrientation`; a stalled one
 shows only repeated `DeviceState` plus `GenerateKeyFrame`.
 
+When a call fails from one caller and works from everyone else, start with the
+peer itself rather than the media path:
+
+```bash
+rg -n 'FaceTime peer client:|FaceTime peer key material:' \
+  "$HOME/Library/Logs/iBlue/serve.error.log" | tail -n 20
+```
+
+The first line carries the caller's OS build, negotiation blob versions,
+whether it supports U+1 one-to-one media, and the RTP payload types it offered;
+the second carries the wrap mode, short MKI, and generation of every key it
+published. [The media key exchange audit](facetime-media-key-exchange-audit.md)
+reads those lines as a decision tree and lists where iBlue's exchange is
+narrower than upstream's.
+
 `facetime-native-joined-device-targeting.patch` addresses the same multi-device
 problem from the other side: it records which participant's device actually
 joined and addresses control to that one, rather than to a sibling device that
