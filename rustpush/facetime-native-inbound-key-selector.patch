@@ -1,0 +1,267 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -257,6 +257,22 @@
+     pub their_session_id: Mutex<HashMap<u64, String>>,
+ }
+ 
++/// Locate the two-byte SRTP key selector Apple appends after the ciphertext.
++///
++/// The layout is `ciphertext || MKI || [rollover trailer] || auth tag`, and the
++/// four-byte rollover trailer only rides on every 128th packet, so the selector
++/// sits at one of two offsets within a single stream.
++fn inbound_srtp_short_mki(
++    data: &[u8],
++    sequence_number: u16,
++    auth_tag_len: usize,
++) -> Option<[u8; 2]> {
++    let trailer_len = if sequence_number & 0x7f == 0 { 4 } else { 0 };
++    let end = data.len().checked_sub(auth_tag_len + trailer_len)?;
++    let start = end.checked_sub(2)?;
++    data.get(start..end)?.try_into().ok()
++}
++
+ fn native_peer_session_id_for_device(
+     session: &FTSession,
+     handle: &str,
+@@ -1734,7 +1750,13 @@
+         let session_handle = relay_session.clone();
+         tokio::spawn(async move {
+             let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+-            let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
++            // Keyed by SSRC and by the two-byte SRTP key selector, because a
++            // sender ratchets that selector within a call and a group call
++            // carries one per participant. Keying on the SSRC alone pinned the
++            // first key of whichever participant a HashMap happened to yield.
++            let mut channel_contexts: HashMap<(u32, [u8; 2]), (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
++            let mut logged_missing_media_keys: std::collections::HashSet<(u32, [u8; 2])> =
++                std::collections::HashSet::new();
+             let mut logged_audio_diagnostic = false;
+             let mut logged_unknown_payload_types: std::collections::HashSet<u8> =
+                 std::collections::HashSet::new();
+@@ -1875,19 +1897,48 @@
+                         let header = rtc_rtp::Header::unmarshal(&mut &recv.data[..]).unwrap();
+                         info!("Header {:?}", header);
+ 
+-                        if !channel_contexts.contains_key(&header.ssrc) {
+-                            let state = session_handle.state.lock().await;
+-                            // find right participant and interation
+-                            let Some(mkm) = state.states.iter().find_map(|i| i.1.mkm.first()) else {
+-                                warn!("No SKM!");
++                        let audio = matches!(header.payload_type, 20 | 104 | 108 | 13);
++                        let auth_tag_len = if audio { 4 } else { 10 };
++                        let Some(short_mki) = inbound_srtp_short_mki(
++                            &recv.data,
++                            header.sequence_number,
++                            auth_tag_len,
++                        ) else {
++                            warn!(
++                                "Dropping inbound FaceTime media packet with no room for a key \
++                                 selector: ssrc={} payload_type={} length={}",
++                                header.ssrc,
++                                header.payload_type,
++                                recv.data.len(),
++                            );
++                            continue
++                        };
++                        let channel = (header.ssrc, short_mki);
++
++                        if !channel_contexts.contains_key(&channel) {
++                            // Resolve the sender's key from the selector the
++                            // packet carries instead of guessing a participant.
++                            let Some((key, selector_matched)) = session_handle
++                                .inbound_media_key(recv.participant, short_mki, header.ssrc)
++                                .await
++                            else {
++                                if logged_missing_media_keys.insert(channel) {
++                                    warn!(
++                                        "No FaceTime media key for an inbound key selector: \
++                                         participant={:?} ssrc={} selector={} payload_type={}",
++                                        recv.participant,
++                                        header.ssrc,
++                                        encode_hex(&short_mki),
++                                        header.payload_type,
++                                    );
++                                }
+                                 continue
+                             };
+ 
+-                            let key = mkm.get_key(header.ssrc);
+-                            channel_contexts.insert(header.ssrc, (Context::new(
++                            channel_contexts.insert(channel, (Context::new(
+                                 &key[..16], 
+                                 &key[16..], 
+-                                if matches!(header.payload_type, 20 | 104 | 108 | 13) { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 },
++                                if audio { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 },
+                                 None, 
+                                 None
+                             ).unwrap(), if header.payload_type == 100 {
+@@ -1899,9 +1950,20 @@
+                             } else {
+                                 None
+                             }));
++                            if crate::ids::link::media_diagnostics_enabled() || !selector_matched {
++                                warn!(
++                                    "Opened FaceTime inbound media key context: participant={:?} \
++                                     ssrc={} selector={} selector_matched={} payload_type={}",
++                                    recv.participant,
++                                    header.ssrc,
++                                    encode_hex(&short_mki),
++                                    selector_matched,
++                                    header.payload_type,
++                                );
++                            }
+                         }
+ 
+-                        let (context, depacket) = channel_contexts.get_mut(&header.ssrc).unwrap();
++                        let (context, depacket) = channel_contexts.get_mut(&channel).unwrap();
+                         let mut result = match context.decrypt_rtp_with_header(&recv.data, &header) {
+                             Ok(res) => res,
+                             Err(e) => {
+@@ -4011,3 +4073,47 @@
+         })
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::inbound_srtp_short_mki;
++
++    #[test]
++    fn srtp_key_selector_sits_before_the_auth_tag() {
++        // ciphertext | selector | auth tag
++        let packet = [
++            0x90, 0x68, 0x00, 0x01, 0xaa, 0xbb, 0xcc, 0xdd,
++            0x00, 0x10,
++            0x01, 0x02, 0x03, 0x04,
++        ];
++        assert_eq!(inbound_srtp_short_mki(&packet, 1, 4), Some([0x00, 0x10]));
++    }
++
++    #[test]
++    fn srtp_key_selector_moves_ahead_of_the_rollover_trailer() {
++        // ciphertext | selector | rollover trailer | auth tag
++        let packet = [
++            0x90, 0x68, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd,
++            0x00, 0x11,
++            0x00, 0x00, 0x00, 0x20,
++            0x01, 0x02, 0x03, 0x04,
++        ];
++        assert_eq!(inbound_srtp_short_mki(&packet, 128, 4), Some([0x00, 0x11]));
++        // Every 128th sequence number carries the trailer, including zero.
++        assert_eq!(inbound_srtp_short_mki(&packet, 0, 4), Some([0x00, 0x11]));
++    }
++
++    #[test]
++    fn video_packets_reserve_a_ten_byte_auth_tag() {
++        let mut packet = vec![0x90, 0x64, 0x00, 0x01, 0xaa, 0xbb, 0xcc, 0xdd];
++        packet.extend_from_slice(&[0x00, 0x12]);
++        packet.extend_from_slice(&[0xff; 10]);
++        assert_eq!(inbound_srtp_short_mki(&packet, 1, 10), Some([0x00, 0x12]));
++    }
++
++    #[test]
++    fn a_packet_too_short_to_carry_a_selector_is_refused() {
++        assert_eq!(inbound_srtp_short_mki(&[0x90, 0x68, 0x00], 1, 4), None);
++        assert_eq!(inbound_srtp_short_mki(&[], 1, 4), None);
++    }
++}
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -3563,6 +3563,66 @@
+         )
+     }
+ 
++    /// Resolve the SRTP master material for an inbound packet from the
++    /// two-byte key selector it carries.
++    ///
++    /// Apple ratchets that selector within a call and every sender in a group
++    /// call has its own, so the first key of an arbitrary participant is only
++    /// ever correct by luck. Prefer the participant the relay named, then fall
++    /// back to any peer holding a key with this selector, which is what makes
++    /// a call survive a peer's mid-call rekey.
++    ///
++    /// Returns the master material and whether it was reached by an exact
++    /// selector match. A peer that advertises a short-MKI length other than
++    /// two is not putting this selector on the wire at all, so its key is
++    /// still usable; anything else that fails to match is somebody else's
++    /// packet or a generation this side has not been given.
++    pub async fn inbound_media_key(
++        &self,
++        participant: Option<u64>,
++        short_mki: [u8; 2],
++        ssrc: u32,
++    ) -> Option<([u8; 30], bool)> {
++        let state = self.state.lock().await;
++        let key_participant = participant.map(|participant| {
++            control_key_participant(&state.control_participant_aliases, participant)
++        });
++        let select = |peer: &ParticipantState| {
++            peer.mkm
++                .iter()
++                .find(|material| material.mki.starts_with(&short_mki))
++                .map(|material| material.get_key(ssrc))
++        };
++        if let Some(key) = key_participant
++            .and_then(|key_participant| state.states.get(&key_participant))
++            .and_then(select)
++        {
++            return Some((key, true));
++        }
++        if let Some(key) = state.states.values().find_map(select) {
++            return Some((key, true));
++        }
++        // No selector match. Only a sender that is not using Apple's two-byte
++        // selector can still be decrypted from what we hold.
++        let unselected = |peer: &ParticipantState| {
++            peer.mkm
++                .iter()
++                .find(|material| material.smkil != APPLE_RTP_SHORT_MKI.len() as u32)
++                .map(|material| material.get_key(ssrc))
++        };
++        if let Some(key) = key_participant
++            .and_then(|key_participant| state.states.get(&key_participant))
++            .and_then(unselected)
++        {
++            return Some((key, false));
++        }
++        state
++            .states
++            .values()
++            .find_map(unselected)
++            .map(|key| (key, false))
++    }
++
+     /// Re-advertise this participant's responder keys once the caller's VC
+     /// control channel proves that the incoming media leg is active. An early
+     /// command-211 can race the peer's join processing and be discarded even
+@@ -4308,4 +4368,30 @@
+             0, 0, 1, 19 << 1, 1, 0xaa,
+         ]));
+     }
++
++    #[test]
++    fn ratcheting_media_key_material_changes_the_short_srtp_selector() {
++        let material = QuickRelayMkmMaterial::create(0xeb28_319a_d867_23b1);
++        let rolled = material.roll("0F7F1D96-2E3F-4E4F-9E8C-9D0F4A3C77B1").unwrap();
++
++        assert_eq!(&material.mki[..2], &APPLE_RTP_SHORT_MKI);
++        assert_ne!(&rolled.mki[..2], &material.mki[..2]);
++        assert_ne!(rolled.mkm, material.mkm);
++        assert_eq!(rolled.mkgc, material.mkgc + 1);
++    }
++
++    #[test]
++    fn registering_a_peer_key_covers_the_next_two_ratchets() {
++        let material = QuickRelayMkmMaterial::create(7);
++        let generations = material.current_and_next("SESSION", 3);
++
++        assert_eq!(generations.len(), 3);
++        let selectors: Vec<_> = generations
++            .iter()
++            .map(|material| material.mki[..2].to_vec())
++            .collect();
++        assert_eq!(selectors[0], APPLE_RTP_SHORT_MKI.to_vec());
++        assert_ne!(selectors[0], selectors[1]);
++        assert_ne!(selectors[1], selectors[2]);
++    }
+ }

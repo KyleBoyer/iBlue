@@ -1,0 +1,338 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -182,6 +182,10 @@
+     handle: String,
+     token: Vec<u8>,
+     prekey: Vec<u8>,
++    /// The wrap mode the peer advertised alongside the prekey, kept so that
++    /// replaying a cached prekey into a fresh link cannot silently turn an
++    /// unsupported mode into mode 1.
++    wrap_mode: Option<u32>,
+ }
+ 
+ #[derive(Serialize, Deserialize, Default, Clone)]
+@@ -1605,6 +1609,7 @@
+                         peer_handle,
+                         session.native_peer_tokens.get(peer_handle).map(Vec::as_slice),
+                         prekey,
++                        None,
+                     )
+                     .await?;
+                 if let Some(peer_session_id) = session.native_peer_session_ids.get(peer_handle) {
+@@ -1618,6 +1623,7 @@
+                         &device.handle,
+                         Some(&device.token),
+                         &device.prekey,
++                        device.wrap_mode,
+                     )
+                     .await?;
+                 let token_key = base64_encode(&device.token);
+@@ -2225,23 +2231,27 @@
+             let Some(session) = state.sessions.get(group_id) else {
+                 return false;
+             };
+-            let require_stream_state_acknowledgement = !session.is_initiator;
+-            if require_stream_state_acknowledgement
+-                && session.native_command211_republished.is_empty()
+-            {
+-                return false;
+-            }
+             (
+                 session.connection.clone(),
+-                require_stream_state_acknowledgement,
++                !session.is_initiator,
+             )
+         };
+         match connection {
+             Some(connection) => {
+-                if require_stream_state_acknowledgement
+-                    && !connection.link.has_acknowledged_control_stream_state().await
+-                {
+-                    return false;
++                if require_stream_state_acknowledgement {
++                    // Readiness is a property of the key exchange, not of the
++                    // command that happened to carry it. Requiring a command
++                    // 210 or 211 here made an answered call depend on IDS
++                    // side-channel behaviour the caller controls: a peer that
++                    // published its prekey only over QuickRelay never cleared
++                    // this gate and the responder never played media.
++                    let (published, imported) = connection.link.key_exchange_state().await;
++                    if published == 0 || imported == 0 {
++                        return false;
++                    }
++                    if !connection.link.has_acknowledged_control_stream_state().await {
++                        return false;
++                    }
+                 }
+                 connection.link.is_media_ready().await
+             }
+@@ -3456,13 +3466,19 @@
+                             handle: sender.clone(),
+                             token: token.clone(),
+                             prekey: public_prekey.clone(),
++                            wrap_mode: received.prekey_wrap_mode,
+                         },
+                     );
+                     if !already_known {
+                         if let Some(connection) = &session.connection {
+                             match connection
+                                 .link
+-                                .seed_participant_prekey(&sender, Some(&token), &public_prekey)
++                                .seed_participant_prekey(
++                                    &sender,
++                                    Some(&token),
++                                    &public_prekey,
++                                    received.prekey_wrap_mode,
++                                )
+                                 .await
+                             {
+                                 Ok(participant_id) => warn!(
+@@ -3619,6 +3635,7 @@
+                                     handle: sender.clone(),
+                                     token: token.clone(),
+                                     prekey: public_prekey,
++                                    wrap_mode: received.prekey_wrap_mode,
+                                 },
+                             );
+                         }
+@@ -3746,12 +3763,18 @@
+                                 handle: sender.clone(),
+                                 token: token.clone(),
+                                 prekey: public_prekey.clone(),
++                                wrap_mode: received.prekey_wrap_mode,
+                             },
+                         );
+                         if let Some(connection) = &session.connection {
+                             let link = connection.link.clone();
+                             match link
+-                                .seed_participant_prekey(&sender, Some(&token), &public_prekey)
++                                .seed_participant_prekey(
++                                    &sender,
++                                    Some(&token),
++                                    &public_prekey,
++                                    received.prekey_wrap_mode,
++                                )
+                                 .await
+                             {
+                                 Ok(participant_id) => {
+@@ -3823,6 +3846,7 @@
+                                             handle: sender.clone(),
+                                             token: token.clone(),
+                                             prekey: prekey.clone(),
++                                            wrap_mode: received.prekey_wrap_mode,
+                                         }
+                                     })
+                                 } else {
+@@ -3836,6 +3860,7 @@
+                                     &device.handle,
+                                     Some(&device.token),
+                                     &device.prekey,
++                                    device.wrap_mode,
+                                 )
+                                 .await
+                             {
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -493,8 +493,21 @@
+     Ok(out)
+ }
+ 
++/// The only prekey wrap mode this build implements. Apple advertises the mode
++/// alongside the prekey, so a peer asking for anything else is a protocol
++/// difference worth naming rather than a silent mis-wrap.
++const SUPPORTED_PREKEY_WRAP_MODE: u64 = 1;
++
+ impl QuickRelayPreKey {
+     fn encrypt_key_material(&self, material: &[u8]) -> Result<Vec<u8>, PushError> {
++        if self.wrap_mode != SUPPORTED_PREKEY_WRAP_MODE {
++            warn!(
++                "FaceTime peer advertised prekey wrap mode {}; wrapping with mode {} anyway, \
++                 which this peer may be unable to unwrap",
++                self.wrap_mode,
++                SUPPORTED_PREKEY_WRAP_MODE,
++            );
++        }
+         let mut ctx = BigNumContext::new()?;
+         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+         let ephemeral = EcKey::generate(&group)?;
+@@ -1902,29 +1915,61 @@
+         })
+     }
+ 
++    /// Verify one QuickRelay material blob against the signing device behind a
++    /// participant allocation.
++    ///
++    /// Material can name a session this link never joined, a participant it
++    /// never allocated, or a device whose key is not cached, and every one of
++    /// those used to abort the process rather than the message. Refuse the
++    /// blob instead: the caller skips it and the call continues with the peers
++    /// that do verify.
+     async fn validate_signed_data(&self, participant: i64, data: &QuickRelaySignedData) -> Result<(), PushError> {
+-        let sid = Uuid::from_bytes(self.session_id.clone().try_into().unwrap());
+-        if Uuid::from_str(&data.session_id).unwrap() != sid {
+-            panic!("Bad session id!!");
++        let Ok(session_id) = <Vec<u8> as TryInto<[u8; 16]>>::try_into(self.session_id.clone()) else {
++            warn!("Refusing FaceTime QuickRelay material: local session id is not a UUID");
++            return Err(PushError::BadMsg);
++        };
++        let sid = Uuid::from_bytes(session_id);
++        let Ok(their_session) = Uuid::from_str(&data.session_id) else {
++            warn!("Refusing FaceTime QuickRelay material with an unparseable session id");
++            return Err(PushError::BadMsg);
++        };
++        if their_session != sid {
++            warn!("Refusing FaceTime QuickRelay material addressed to another session");
++            return Err(PushError::BadMsg);
+         }
+ 
+-        let user = self.state.lock().await.configuration.allocations.iter().find(|i| i.id == participant).expect("No participant?").clone();
++        let user = self.state.lock().await.configuration.allocations.iter()
++            .find(|i| i.id == participant).cloned();
++        let Some(user) = user else {
++            warn!("Refusing FaceTime QuickRelay material from unallocated participant {participant}");
++            return Err(PushError::BadMsg);
++        };
+         let mut token = self.identity.cache.lock().await.get_targets(
+             TOPIC, 
+             &self.handle, 
+             &[user.participant.clone()], 
+             &[MessageTarget::Token(user.token.clone().into())]
+         )?;
+-        assert!(!token.is_empty(), "Token not found!!");
++        if token.is_empty() {
++            warn!("Refusing FaceTime QuickRelay material: no cached device for participant {participant}");
++            return Err(PushError::BadMsg);
++        }
+ 
+         let token = token.remove(0);
+-        let key = token.delivery_data.get_device_key().expect("no device key??");
++        let Some(key) = token.delivery_data.get_device_key() else {
++            warn!("Refusing FaceTime QuickRelay material: participant {participant} has no device key");
++            return Err(PushError::BadMsg);
++        };
+         let verify_data = [
+             b"com.apple.FaceTime.QRKeying",
+             data.session_id.as_bytes(),
+             data.payload.as_ref(),
+         ].concat();
+-        key.verify(MessageDigest::sha256(), &verify_data, data.signature.as_ref().to_vec().try_into().unwrap())?;
++        let Ok(signature) = <Vec<u8> as TryInto<[u8; 64]>>::try_into(data.signature.as_ref().to_vec()) else {
++            warn!("Refusing FaceTime QuickRelay material with a malformed signature");
++            return Err(PushError::BadMsg);
++        };
++        key.verify(MessageDigest::sha256(), &verify_data, signature)?;
+ 
+         Ok(())
+     }
+@@ -1997,7 +2042,17 @@
+                     match item.material_type() {
+                         11 => {
+                             let parsed: QuickRelaySignedData = plist::from_bytes(item.material_content())?;
+-                            self.validate_signed_data(mat.owner_participant_id() as i64, &parsed).await?;
++                            if let Err(error) = self
++                                .validate_signed_data(mat.owner_participant_id() as i64, &parsed)
++                                .await
++                            {
++                                warn!(
++                                    "Skipping unverified FaceTime QuickRelay material: type={} owner={} {error:?}",
++                                    item.material_type(),
++                                    mat.owner_participant_id(),
++                                );
++                                continue;
++                            }
+ 
+                             let item: QuickRelayPreKey = plist::from_bytes(parsed.payload.as_ref())?;
+ 
+@@ -2026,7 +2081,17 @@
+                         }
+                         13 => {
+                             let parsed: QuickRelaySignedData = plist::from_bytes(item.material_content())?;
+-                            self.validate_signed_data(mat.owner_participant_id() as i64, &parsed).await?;
++                            if let Err(error) = self
++                                .validate_signed_data(mat.owner_participant_id() as i64, &parsed)
++                                .await
++                            {
++                                warn!(
++                                    "Skipping unverified FaceTime QuickRelay material: type={} owner={} {error:?}",
++                                    item.material_type(),
++                                    mat.owner_participant_id(),
++                                );
++                                continue;
++                            }
+ 
+                             let mut item: QuickRelayMkmMaterial = plist::from_bytes(parsed.payload.as_ref())?;
+                             if media_diagnostics_enabled() {
+@@ -2056,7 +2121,17 @@
+                         }
+                         14 => {
+                             let parsed: QuickRelaySignedData = plist::from_bytes(item.material_content())?;
+-                            self.validate_signed_data(mat.owner_participant_id() as i64, &parsed).await?;
++                            if let Err(error) = self
++                                .validate_signed_data(mat.owner_participant_id() as i64, &parsed)
++                                .await
++                            {
++                                warn!(
++                                    "Skipping unverified FaceTime QuickRelay material: type={} owner={} {error:?}",
++                                    item.material_type(),
++                                    mat.owner_participant_id(),
++                                );
++                                continue;
++                            }
+ 
+                             let mut item: QuickRelaySkmMaterial = plist::from_bytes(parsed.payload.as_ref())?;
+                             if media_diagnostics_enabled() {
+@@ -3151,6 +3226,7 @@
+         handle: &str,
+         token: Option<&[u8]>,
+         public_prekey: &[u8],
++        wrap_mode: Option<u32>,
+     ) -> Result<u64, PushError> {
+         let mut context = BigNumContext::new()?;
+         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+@@ -3171,9 +3247,19 @@
+             .prekey
+             .as_ref()
+             .is_some_and(|known| known.public_prekey.as_ref() != public_prekey);
++        // Record the mode the peer advertised rather than assuming the only
++        // one we implement. Wrapping still uses mode 1, but a mismatch now
++        // names itself in the log instead of looking like a decrypt failure.
++        let wrap_mode = wrap_mode.map_or(SUPPORTED_PREKEY_WRAP_MODE, u64::from);
++        if wrap_mode != SUPPORTED_PREKEY_WRAP_MODE {
++            warn!(
++                "FaceTime participant {handle} advertised prekey wrap mode {wrap_mode}, \
++                 which this build does not implement"
++            );
++        }
+         participant.prekey = Some(QuickRelayPreKey {
+             public_prekey: public_prekey.to_vec().into(),
+-            wrap_mode: 1,
++            wrap_mode,
+             creation_date: SystemTime::now()
+                 .duration_since(SystemTime::UNIX_EPOCH)
+                 .map_err(|_| PushError::BadMsg)?
+@@ -3409,6 +3495,25 @@
+         Ok(())
+     }
+ 
++    /// How many participants this side has published key material to, and how
++    /// many have delivered usable media key material back. Readiness is a
++    /// property of that exchange rather than of the command that carried it.
++    pub async fn key_exchange_state(&self) -> (usize, usize) {
++        let state = self.state.lock().await;
++        (
++            state
++                .states
++                .values()
++                .filter(|peer| peer.outgoing_key_material.is_some())
++                .count(),
++            state
++                .states
++                .values()
++                .filter(|peer| !peer.mkm.is_empty())
++                .count(),
++        )
++    }
++
+     /// Re-advertise this participant's responder keys once the caller's VC
+     /// control channel proves that the incoming media leg is active. An early
+     /// command-211 can race the peer's join processing and be discarded even

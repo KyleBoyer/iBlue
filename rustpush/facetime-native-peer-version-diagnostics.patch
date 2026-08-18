@@ -1,0 +1,155 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3560,6 +3560,50 @@
+                     let v2 = VcMediaNegotiationBlobV2::decode(avc.b2n.as_ref())?;
+                     info!("Got media blob {blob:?}");
+                     info!("Got v2 blob {v2:?}");
++
++                    // Record what the peer says it is, and what it offered.
++                    // Every field here is a capability or a version, never
++                    // content: the OS build, the negotiation blob versions,
++                    // whether it can run U+1 one-to-one media, and which RTP
++                    // payload types it published. A call that fails only with
++                    // one peer is otherwise indistinguishable from a call that
++                    // fails for everyone, because nothing recorded which
++                    // FaceTime release was on the other end.
++                    if crate::ids::link::media_diagnostics_enabled() {
++                        let call_info = VcCallInfoBlob::decode(
++                            avc.vc_session_participant_key_call_info_blob.as_ref(),
++                        )
++                        .ok();
++                        let offered_payloads = v2
++                            .stream_groups
++                            .iter()
++                            .flat_map(|group| {
++                                group.payloads.iter().filter_map(|payload| payload.rtp_payload)
++                            })
++                            .collect::<Vec<_>>();
++                        warn!(
++                            "FaceTime peer client: sender={} command={} device_type={:?} \
++                             os_version={:?} framework_version={:?} client_version={:?} \
++                             blob_version={:?} media_control_info_version={:?} \
++                             one_to_one_mode_supported={:?} offered_payloads={:?} \
++                             stream_groups={} prekey={} prekey_wrap_mode={:?}",
++                            sender,
++                            command,
++                            call_info.as_ref().and_then(|info| info.device_type.clone()),
++                            call_info.as_ref().and_then(|info| info.os_version.clone()),
++                            call_info.as_ref().and_then(|info| info.framework_version.clone()),
++                            call_info.as_ref().and_then(|info| info.client_version),
++                            blob.blob_version,
++                            blob.media_control_info_version,
++                            blob.face_time_settings
++                                .as_ref()
++                                .and_then(|settings| settings.one_to_one_mode_supported),
++                            offered_payloads,
++                            v2.stream_groups.len(),
++                            received.prekey.is_some(),
++                            received.prekey_wrap_mode,
++                        );
++                    }
+                     let is_incoming_invitation = message.r#type()
+                         == ConversationMessageType::Invitation
+                         && sender != target;
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -736,6 +736,32 @@
+     }
+ }
+ 
++/// Describe a peer's advertised media key parameters without ever printing key
++/// bytes. The wrap mode, the short-MKI length, and the generation counters are
++/// the fields most likely to differ between Apple releases, and a call that
++/// fails against one peer leaves no record of them today.
++fn describe_peer_mkm(material: &QuickRelayMkmMaterial) -> String {
++    format!(
++        "participant={} wrap_mode={} short_mki={} mki_len={} short_mki_len={} generation={}",
++        material.participant_id,
++        material.rtmpwm,
++        encode_hex(&material.mki[..material.mki.len().min(2)]),
++        material.mki.len(),
++        material.smkil,
++        material.mkgc,
++    )
++}
++
++fn describe_peer_skm(material: &QuickRelaySkmMaterial) -> String {
++    format!(
++        "participant={} wrap_mode={} ski_len={} generation={}",
++        material.participant_id,
++        material.rtmpwm,
++        material.ski.len(),
++        material.skgc,
++    )
++}
++
+ #[derive(Deserialize, Serialize, Clone)]
+ pub struct QuickRelaySignedData {
+     payload: Data,
+@@ -1976,6 +2002,15 @@
+                             let item: QuickRelayPreKey = plist::from_bytes(parsed.payload.as_ref())?;
+ 
+                             info!("heasdfasfre b {:?}", encode_hex(item.public_prekey.as_ref()));
++                            if media_diagnostics_enabled() {
++                                warn!(
++                                    "FaceTime peer key material: source=quickrelay type=prekey \
++                                     owner={} wrap_mode={} key_len={}",
++                                    mat.owner_participant_id(),
++                                    item.wrap_mode,
++                                    item.public_prekey.as_ref().len(),
++                                );
++                            }
+                             let mut state = self.state.lock().await;
+                             let participant = state.states.entry(mat.owner_participant_id()).or_default();
+                             participant.prekey = Some(item);
+@@ -1994,6 +2029,14 @@
+                             self.validate_signed_data(mat.owner_participant_id() as i64, &parsed).await?;
+ 
+                             let mut item: QuickRelayMkmMaterial = plist::from_bytes(parsed.payload.as_ref())?;
++                            if media_diagnostics_enabled() {
++                                warn!(
++                                    "FaceTime peer key material: source=quickrelay type=mkm \
++                                     owner={} {}",
++                                    mat.owner_participant_id(),
++                                    describe_peer_mkm(&item),
++                                );
++                            }
+ 
+                             let mut state = self.state.lock().await;
+                             let Ok(material) = state.decode_key_material(item.mkm.as_ref()) else {
+@@ -2016,6 +2059,14 @@
+                             self.validate_signed_data(mat.owner_participant_id() as i64, &parsed).await?;
+ 
+                             let mut item: QuickRelaySkmMaterial = plist::from_bytes(parsed.payload.as_ref())?;
++                            if media_diagnostics_enabled() {
++                                warn!(
++                                    "FaceTime peer key material: source=quickrelay type=skm \
++                                     owner={} {}",
++                                    mat.owner_participant_id(),
++                                    describe_peer_skm(&item),
++                                );
++                            }
+ 
+                             let mut state = self.state.lock().await;
+                             let Ok(material) = state.decode_key_material(item.skm.as_ref()) else {
+@@ -3260,6 +3311,20 @@
+         )
+         .to_string()
+         .to_uppercase();
++        if media_diagnostics_enabled() {
++            warn!(
++                "FaceTime peer key material: source=command-211 participant={} mkm=[{}] skm=[{}]",
++                participant_id,
++                media
++                    .as_ref()
++                    .map(describe_peer_mkm)
++                    .unwrap_or_else(|| "absent".to_string()),
++                session_material
++                    .as_ref()
++                    .map(describe_peer_skm)
++                    .unwrap_or_else(|| "absent".to_string()),
++            );
++        }
+         let mut state = self.state.lock().await;
+         let decrypted_skm = if let Some(mut item) = session_material {
+             item.skm = state.decode_key_material(item.skm.as_ref())?;

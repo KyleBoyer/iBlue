@@ -102,6 +102,10 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "facetime-native-group-prekey-seeding.patch"),
   join(projectRoot, "rustpush", "facetime-native-group-video-mode.patch"),
   join(projectRoot, "rustpush", "facetime-native-diagnostics-default-on.patch"),
+  join(projectRoot, "rustpush", "facetime-native-peer-version-diagnostics.patch"),
+  join(projectRoot, "rustpush", "facetime-native-peer-key-material-resilience.patch"),
+  join(projectRoot, "rustpush", "facetime-native-ensure-participant-keys.patch"),
+  join(projectRoot, "rustpush", "facetime-native-inbound-key-selector.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 
