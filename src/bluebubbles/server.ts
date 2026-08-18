@@ -4345,17 +4345,20 @@ export class BlueBubblesServer {
     const sourcePath = this.#autoAnswerRules.mediaPath(rule.id);
     if (!sourcePath) return;
     this.#autoAnswerRuleBusy = true;
-    // Dispatch rather than emit: this must reach notification rules and
-    // webhooks, not only a connected Socket.IO client.
-    this.service.dispatch("facetime-auto-answer-rule-matched", {
-      ruleId: rule.id,
-      name: rule.name,
-      sessionId: incoming.sessionId,
-      mode: incoming.mode,
-      caller: incoming.caller ?? null,
-      participants: incoming.participants,
-    });
     try {
+      // Dispatch rather than emit: this must reach notification rules and
+      // webhooks, not only a connected Socket.IO client. It stays inside the
+      // try because anything thrown between claiming the guard and the finally
+      // that releases it latches the guard on: every later ring then returns
+      // early, silently, and nothing is ever answered again until a restart.
+      this.service.dispatch("facetime-auto-answer-rule-matched", {
+        ruleId: rule.id,
+        name: rule.name,
+        sessionId: incoming.sessionId,
+        mode: incoming.mode,
+        caller: incoming.caller ?? null,
+        participants: incoming.participants,
+      });
       // The ring event is derived from the iMessage signal, which can beat the
       // native session into existence, and answering then fails with "not
       // awaiting an incoming answer". The previous polling responder never saw
