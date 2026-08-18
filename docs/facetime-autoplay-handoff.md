@@ -193,6 +193,26 @@ published. [The media key exchange audit](facetime-media-key-exchange-audit.md)
 reads those lines as a decision tree and lists where iBlue's exchange is
 narrower than upstream's.
 
+Four patches from that audit changed how key material is exchanged, and their
+log lines are the first thing to look for on a call that never plays media:
+
+- `Published FaceTime key material after a QuickRelay prekey` or
+  `… after a wire prekey` — this side published to a participant as soon as its
+  prekey arrived, rather than only during bootstrap or after an IDS command
+  210/211. A peer that never sends those commands is no longer left without our
+  keys.
+- `Opened FaceTime inbound media key context: … selector_matched=…` — which
+  peer key an inbound stream resolved to. `selector_matched=false` means the
+  sender is not using Apple's two-byte SRTP selector.
+- `No FaceTime media key for an inbound key selector` — packets arrived for a
+  key this side does not hold.
+- `Skipping unverified FaceTime QuickRelay material` — material that failed
+  verification is now skipped rather than taking the link down.
+
+Readiness for an answered call no longer waits for a command 210 or 211: it
+waits for the key exchange itself, so `native_media_ready` turns true once this
+side has published material and imported a peer's.
+
 `facetime-native-joined-device-targeting.patch` addresses the same multi-device
 problem from the other side: it records which participant's device actually
 joined and addresses control to that one, rather than to a sibling device that

@@ -1,0 +1,110 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -3481,10 +3481,30 @@
+                                 )
+                                 .await
+                             {
+-                                Ok(participant_id) => warn!(
+-                                    "Seeded FaceTime peer prekey from wire message: \
+-                                     participant={participant_id} sender={sender} command={command}"
+-                                ),
++                                Ok(participant_id) => {
++                                    warn!(
++                                        "Seeded FaceTime peer prekey from wire message: \
++                                         participant={participant_id} sender={sender} command={command}"
++                                    );
++                                    // A participant with a prekey is a
++                                    // participant we can wrap for, so publish
++                                    // now rather than waiting for a command 210
++                                    // or 211 that an older peer may never send.
++                                    match connection
++                                        .link
++                                        .ensure_participant_keys(participant_id)
++                                        .await
++                                    {
++                                        Ok(true) => warn!(
++                                            "Published FaceTime key material after a wire prekey: \
++                                             participant={participant_id} command={command}"
++                                        ),
++                                        Ok(false) => {}
++                                        Err(error) => warn!(
++                                            "Unable to publish FaceTime key material after a wire prekey: {error:?}"
++                                        ),
++                                    }
++                                }
+                                 Err(error) => warn!(
+                                     "Unable to seed FaceTime peer prekey from wire message: {error:?}"
+                                 ),
+--- a/src/ids/link.rs
++++ b/src/ids/link.rs
+@@ -2066,10 +2066,27 @@
+                                     item.public_prekey.as_ref().len(),
+                                 );
+                             }
+-                            let mut state = self.state.lock().await;
+-                            let participant = state.states.entry(mat.owner_participant_id()).or_default();
+-                            participant.prekey = Some(item);
+-
++                            {
++                                let mut state = self.state.lock().await;
++                                let participant = state.states.entry(mat.owner_participant_id()).or_default();
++                                participant.prekey = Some(item);
++                            }
++                            // Publish this side's key material for the peer
++                            // right here, the way upstream AVConference does.
++                            // Bootstrap only covers prekeys that arrived before
++                            // it ran, so a prekey delivered over QuickRelay
++                            // afterwards used to leave this participant unable
++                            // to decrypt our control channel for the whole call.
++                            match self.ensure_participant_keys(mat.owner_participant_id()).await {
++                                Ok(true) => warn!(
++                                    "Published FaceTime key material after a QuickRelay prekey: participant={}",
++                                    mat.owner_participant_id(),
++                                ),
++                                Ok(false) => {}
++                                Err(error) => warn!(
++                                    "Unable to publish FaceTime key material after a QuickRelay prekey: {error:?}"
++                                ),
++                            }
+                         },
+                         12 => {
+                             let ((body, _), header) = EncryptedAvcBlobHeader::from_bytes((item.material_content(), 0))?;
+@@ -3495,6 +3512,38 @@
+         Ok(())
+     }
+ 
++    /// Publish this side's wrapped media and session key material to one
++    /// participant if that has not happened yet.
++    ///
++    /// This is upstream AVConference's `ensure_keys`: key material belongs to a
++    /// participant and is published the moment that participant's prekey
++    /// arrives, on whichever transport delivered it. The GlobalLink bootstrap
++    /// this branch inherited publishes once, for whoever had a prekey at that
++    /// instant, which makes a peer's ability to decrypt us depend on message
++    /// ordering it controls.
++    ///
++    /// Returns whether anything was published. Callers may fire this on every
++    /// prekey they see; a participant that already has material is a no-op.
++    pub async fn ensure_participant_keys(&self, participant: u64) -> Result<bool, PushError> {
++        let (has_prekey, already_published) = {
++            let state = self.state.lock().await;
++            let key_participant = control_key_participant(
++                &state.control_participant_aliases,
++                participant,
++            );
++            let peer = state.states.get(&key_participant);
++            (
++                peer.is_some_and(|peer| peer.prekey.is_some()),
++                peer.is_some_and(|peer| peer.outgoing_key_material.is_some()),
++            )
++        };
++        if !has_prekey || already_published {
++            return Ok(false);
++        }
++        self.republish_outgoing_key_materials(participant).await?;
++        Ok(true)
++    }
++
+     /// How many participants this side has published key material to, and how
+     /// many have delivered usable media key material back. Readiness is a
+     /// property of that exchange rather than of the command that carried it.
