@@ -1,0 +1,79 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -291,6 +291,11 @@ pub enum ChannelFrame {
+ 
+ // time to track recently added members
+ const RECENT_MEMBER_TRACK_TIME: Duration = Duration::from_secs(15);
++/// Gap before an unacknowledged stream group state is published again, and how
++/// many publications are allowed in total. Four attempts 1.5s apart complete
++/// well inside the answering side's media-readiness deadline.
++const STREAM_GROUP_STATE_RETRY_INTERVAL: Duration = Duration::from_millis(1500);
++const STREAM_GROUP_STATE_MAX_ATTEMPTS: usize = 4;
+ 
+ impl FTSession {
+ 
+@@ -1760,7 +1765,8 @@ impl FTClient {
+             let mut logged_audio_diagnostic = false;
+             let mut logged_unknown_payload_types: std::collections::HashSet<u8> =
+                 std::collections::HashSet::new();
+-            let mut sent_stream_group_state = false;
++            let mut stream_group_state_attempts = 0usize;
++            let mut stream_group_state_sent_at: Option<std::time::Instant> = None;
+             let mut republished_responder_keys = false;
+             let mut raw_diagnostics_remaining = 32usize;
+             let capture_sender = inbound_capture_path.clone().map(|capture_path| {
+@@ -2190,8 +2196,28 @@ impl FTClient {
+                             continue;
+                         }
+ 
+-                        let should_send_stream_state = !sent_stream_group_state
+-                            || message.topic.as_deref() == Some("VCSessionMessageTopicFetchStreamGroupsState");
++                        // Media readiness gates on the peer acknowledging this
++                        // message, and it was published once and never retried.
++                        // A peer that does not acknowledge the first
++                        // transaction leaves the call stuck at "media keys are
++                        // not ready" for its whole duration. Re-publish a
++                        // bounded number of times while it is outstanding; the
++                        // peer sends control traffic continuously, so this needs
++                        // no timer of its own.
++                        let stream_state_acknowledged = session_handle
++                            .has_acknowledged_control_stream_state()
++                            .await;
++                        let stream_state_due_for_retry = match stream_group_state_sent_at {
++                            Some(sent_at) => {
++                                !stream_state_acknowledged
++                                    && stream_group_state_attempts < STREAM_GROUP_STATE_MAX_ATTEMPTS
++                                    && sent_at.elapsed() >= STREAM_GROUP_STATE_RETRY_INTERVAL
++                            }
++                            None => false,
++                        };
++                        let should_send_stream_state = stream_group_state_sent_at.is_none()
++                            || message.topic.as_deref() == Some("VCSessionMessageTopicFetchStreamGroupsState")
++                            || stream_state_due_for_retry;
+                         if should_send_stream_state {
+                             // Binary plists require string dictionary keys.
+                             // AVConference models these identifiers as u32,
+@@ -2237,10 +2263,20 @@ impl FTClient {
+                                 warn!("Unable to publish FaceTime stream group state: {error}");
+                                 session_handle.note_control_error("stream-state-failed").await;
+                             } else {
+-                                sent_stream_group_state = true;
+-                                info!(
+-                                    "Published FaceTime U1 media stream state transaction {}",
++                                stream_group_state_attempts += 1;
++                                stream_group_state_sent_at = Some(std::time::Instant::now());
++                                // warn! rather than info!: this is the message
++                                // whose acknowledgement gates media readiness,
++                                // and at info level its absence was invisible.
++                                warn!(
++                                    "FaceTime stream group state published: participant={} transaction={} \
++                                     attempt={}/{} retry={} acknowledged={}",
++                                    participant,
+                                     stream_state_transaction,
++                                    stream_group_state_attempts,
++                                    STREAM_GROUP_STATE_MAX_ATTEMPTS,
++                                    stream_state_due_for_retry,
++                                    stream_state_acknowledged,
+                                 );
+                             }
+                         }

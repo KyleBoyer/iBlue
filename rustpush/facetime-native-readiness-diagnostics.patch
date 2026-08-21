@@ -1,0 +1,143 @@
+--- a/src/facetime.rs
++++ b/src/facetime.rs
+@@ -2195,6 +2195,21 @@ impl FTClient {
+                             session_handle.note_control_error("acknowledgement-failed").await;
+                             continue;
+                         }
++                        if crate::ids::link::media_diagnostics_enabled() {
++                            // The generic send log names the participant and
++                            // counter but not the kind, so outbound control
++                            // traffic could not be counted by topic. Without
++                            // this, "we sent 209 control messages" says nothing
++                            // about whether any of them were the one that
++                            // matters.
++                            warn!(
++                                "FaceTime VC control sent: participant={} topic=Acknowledgement \
++                                 transaction={} in_reply_to={}",
++                                participant,
++                                transaction_id,
++                                message.topic.as_deref().unwrap_or("none"),
++                            );
++                        }
+ 
+                         // Media readiness gates on the peer acknowledging this
+                         // message, and it was published once and never retried.
+@@ -2323,38 +2338,93 @@ impl FTClient {
+ 
+     /// True only after the profile-owned relay has accepted AllocBind and, for
+     /// an incoming call, Jade's keys reached a concrete caller participant.
+-    pub async fn native_media_ready(&self, group_id: &str) -> bool {
++    /// Readiness, plus the gate that blocked it.
++    ///
++    /// This is polled every few hundred milliseconds while a call waits for
++    /// media, and every one of its refusals used to surface as the same opaque
++    /// "media keys are not ready" with no indication which of five conditions
++    /// failed. Naming the gate, with the values behind it, is the difference
++    /// between reading a log and adding another round of instrumentation.
++    pub async fn native_media_readiness(&self, group_id: &str) -> (bool, &'static str) {
+         let (connection, require_stream_state_acknowledgement) = {
+             let state = self.state.read().await;
+             let Some(session) = state.sessions.get(group_id) else {
+-                return false;
++                return (false, "no-session");
+             };
+-            (
+-                session.connection.clone(),
+-                !session.is_initiator,
+-            )
++            (session.connection.clone(), !session.is_initiator)
+         };
+-        match connection {
+-            Some(connection) => {
+-                if require_stream_state_acknowledgement {
+-                    // Readiness is a property of the key exchange, not of the
+-                    // command that happened to carry it. Requiring a command
+-                    // 210 or 211 here made an answered call depend on IDS
+-                    // side-channel behaviour the caller controls: a peer that
+-                    // published its prekey only over QuickRelay never cleared
+-                    // this gate and the responder never played media.
+-                    let (published, imported) = connection.link.key_exchange_state().await;
+-                    if published == 0 || imported == 0 {
+-                        return false;
+-                    }
+-                    if !connection.link.has_acknowledged_control_stream_state().await {
+-                        return false;
+-                    }
+-                }
+-                connection.link.is_media_ready().await
++        let Some(connection) = connection else {
++            return (false, "no-connection");
++        };
++        if require_stream_state_acknowledgement {
++            let (published, imported) = connection.link.key_exchange_state().await;
++            if published == 0 {
++                return (false, "no-key-material-published");
++            }
++            if imported == 0 {
++                return (false, "no-peer-key-material-imported");
++            }
++            if !connection.link.has_acknowledged_control_stream_state().await {
++                return (false, "stream-state-unacknowledged");
++            }
++        }
++        if !connection.link.is_media_ready().await {
++            return (false, "quickrelay-not-bootstrapped");
++        }
++        (true, "ready")
++    }
++
++    pub async fn native_media_ready(&self, group_id: &str) -> bool {
++        let (ready, blocker) = self.native_media_readiness(group_id).await;
++        if crate::ids::link::media_diagnostics_enabled() {
++            // Polled continuously, so report only when the verdict changes.
++            static LAST: std::sync::OnceLock<
++                std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
++            > = std::sync::OnceLock::new();
++            let last = LAST.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
++            let changed = match last.lock() {
++                Ok(mut map) => map.insert(group_id.to_string(), blocker) != Some(blocker),
++                Err(_) => true,
++            };
++            if changed {
++                let detail = self.native_media_readiness_detail(group_id).await;
++                warn!(
++                    "FaceTime media readiness: session={group_id} ready={ready} blocker={blocker} {detail}"
++                );
+             }
+-            None => false,
+         }
++        ready
++    }
++
++    /// The values behind the readiness verdict, for the diagnostic above.
++    async fn native_media_readiness_detail(&self, group_id: &str) -> String {
++        let (connection, is_initiator, members, participants) = {
++            let state = self.state.read().await;
++            match state.sessions.get(group_id) {
++                Some(session) => (
++                    session.connection.clone(),
++                    session.is_initiator,
++                    session.members.len(),
++                    session.participants.len(),
++                ),
++                None => return "session=missing".to_string(),
++            }
++        };
++        let Some(connection) = connection else {
++            return format!(
++                "is_initiator={is_initiator} members={members} participants={participants} connection=none"
++            );
++        };
++        let (published, imported) = connection.link.key_exchange_state().await;
++        let acknowledged = connection.link.has_acknowledged_control_stream_state().await;
++        let bootstrapped = connection.link.is_media_ready().await;
++        let (contexts, peer_uuids, mkms) = connection.link.control_context_summary().await;
++        format!(
++            "is_initiator={is_initiator} members={members} participants={participants} \
++             key_material_published={published} peer_key_material_imported={imported} \
++             stream_state_acknowledged={acknowledged} quickrelay_bootstrapped={bootstrapped} \
++             participant_contexts={contexts} peer_uuids={peer_uuids} peer_mkms={mkms}"
++        )
+     }
+ 
+     /// Privacy-safe VC-control handshake state for API diagnostics. The tuple

@@ -106,6 +106,8 @@ applyPatchStack(rustpushRoot, [
   join(projectRoot, "rustpush", "facetime-native-peer-key-material-resilience.patch"),
   join(projectRoot, "rustpush", "facetime-native-ensure-participant-keys.patch"),
   join(projectRoot, "rustpush", "facetime-native-inbound-key-selector.patch"),
+  join(projectRoot, "rustpush", "facetime-native-stream-state-retry.patch"),
+  join(projectRoot, "rustpush", "facetime-native-readiness-diagnostics.patch"),
 ]);
 applyPatch(applePrivateApisRoot, join(projectRoot, "rustpush", "apple-private-apis-iblue.patch"));
 
